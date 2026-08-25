@@ -52,23 +52,23 @@ const (
 var minBlockSizeTokens = 64
 
 var (
-	_ requestcontrol.DataProducer = &dataProducer{}
-	_ requestcontrol.PreRequest   = &dataProducer{}
-	_ plugin.StateDumper          = &dataProducer{}
+	_ requestcontrol.DataProducer = &DataProducer{}
+	_ requestcontrol.PreRequest   = &DataProducer{}
+	_ plugin.StateDumper          = &DataProducer{}
 )
 
-// dataProducer is a plugin that produces data consumed by approx prefix cache aware scheduling.
-type dataProducer struct {
+// DataProducer is a plugin that produces data consumed by approx prefix cache aware scheduling.
+type DataProducer struct {
 	typedName   plugin.TypedName
 	config      config
-	indexerInst indexerInterface
+	indexerInst IndexerInterface
 	pluginState *plugin.PluginState
 	wg          sync.WaitGroup // Used for waiting on async cache updates in tests.
 	dk          plugin.DataKey
 }
 
 // TypedName returns the type and name of the plugin.
-func (p *dataProducer) TypedName() plugin.TypedName {
+func (p *DataProducer) TypedName() plugin.TypedName {
 	return p.typedName
 }
 
@@ -91,11 +91,11 @@ type podBlockCount struct {
 // DumpState reports how many prefix-cache blocks the indexer currently tracks
 // per pod, ordered by block count and capped to maxDebugDumpPods so the debug
 // payload stays bounded when a pool has many pods.
-func (p *dataProducer) DumpState() (json.RawMessage, error) {
+func (p *DataProducer) DumpState() (json.RawMessage, error) {
 	return json.Marshal(p.snapshotState())
 }
 
-func (p *dataProducer) snapshotState() prefixIndexState {
+func (p *DataProducer) snapshotState() prefixIndexState {
 	state := prefixIndexState{MaxPods: maxDebugDumpPods}
 	if p.indexerInst == nil {
 		return state
@@ -122,21 +122,21 @@ func (p *dataProducer) snapshotState() prefixIndexState {
 }
 
 // Produces returns the data produced by the plugin.
-func (p *dataProducer) Produces() map[plugin.DataKey]any {
+func (p *DataProducer) Produces() map[plugin.DataKey]any {
 	return map[plugin.DataKey]any{p.dk: attrprefix.PrefixCacheMatchInfo{}}
 }
 
 // Consumes declares the TokenizedRequest dependency so the data-layer DAG orders
 // the token-producer before this producer runs and auto-creates one when none
 // is configured.
-func (p *dataProducer) Consumes() plugin.DataDependencies {
+func (p *DataProducer) Consumes() plugin.DataDependencies {
 	return plugin.DataDependencies{
 		Required: map[plugin.DataKey]any{tokenproducer.TokenizedPromptDataKey: fwksched.TokenizedRequest{}},
 	}
 }
 
 // newDataProducer returns a new DataProducer plugin.
-func newDataProducer(ctx context.Context, name string, config config, handle plugin.Handle) (*dataProducer, error) {
+func newDataProducer(ctx context.Context, name string, config config, handle plugin.Handle) (*DataProducer, error) {
 	log.FromContext(ctx).V(logutil.DEFAULT).Info("Prefix DataProducer initialized", "config", config)
 
 	// Note: 'blockSize' deprecation handling lives in ApproxPrefixCacheFactory so it
@@ -170,7 +170,7 @@ func newDataProducer(ctx context.Context, name string, config config, handle plu
 
 	indexer := newIndexer(ctx, config.LRUCapacityPerServer, name, ApproxPrefixCachePluginType)
 
-	p := &dataProducer{
+	p := &DataProducer{
 		typedName: plugin.TypedName{
 			Type: ApproxPrefixCachePluginType,
 			Name: name,
@@ -189,7 +189,7 @@ func newDataProducer(ctx context.Context, name string, config config, handle plu
 }
 
 // CleanUpInactivePods starts a goroutine that periodically removes inactive pods from the indexer.
-func (p *dataProducer) CleanUpInactivePods(ctx context.Context, handle plugin.Handle) {
+func (p *DataProducer) CleanUpInactivePods(ctx context.Context, handle plugin.Handle) {
 	ticker := time.NewTicker(podActiveCheckInterval)
 	defer ticker.Stop()
 
@@ -214,18 +214,18 @@ func (p *dataProducer) CleanUpInactivePods(ctx context.Context, handle plugin.Ha
 	}
 }
 
-// indexer returns the shared indexer.
-func (p *dataProducer) indexer() indexerInterface {
+// Indexer returns the shared Indexer.
+func (p *DataProducer) Indexer() IndexerInterface {
 	return p.indexerInst
 }
 
 // PluginState returns the shared plugin state.
-func (p *dataProducer) PluginState() *plugin.PluginState {
+func (p *DataProducer) PluginState() *plugin.PluginState {
 	return p.pluginState
 }
 
 // Produce is called by the director before scheduling requests.
-func (p *dataProducer) Produce(ctx context.Context, request *fwksched.InferenceRequest, pods []fwksched.Endpoint) error {
+func (p *DataProducer) Produce(ctx context.Context, request *fwksched.InferenceRequest, pods []fwksched.Endpoint) error {
 	blockSize := p.GetBlockSize(pods)
 	perPromptHashes := prefixhash.GetBlockHashes(ctx, request, blockSize, p.resolveMaxBlocks(blockSize))
 
@@ -255,7 +255,7 @@ func (p *dataProducer) Produce(ctx context.Context, request *fwksched.InferenceR
 
 // PreRequest records in the shared indexer the result of the scheduling selection.
 // It updates the indexer with the prefix hashes for the selected endpoint(s).
-func (p *dataProducer) PreRequest(ctx context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) error {
+func (p *DataProducer) PreRequest(ctx context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) error {
 	// Delete the state to avoid memory leak.
 	defer p.pluginState.Delete(request.RequestID)
 	primaryProfileResult := schedulingResult.ProfileResults[schedulingResult.PrimaryProfileName]
@@ -299,7 +299,7 @@ func (p *dataProducer) PreRequest(ctx context.Context, request *fwksched.Inferen
 	return nil
 }
 
-func (p *dataProducer) makeserver(targetEndpoint fwksched.Endpoint) server {
+func (p *DataProducer) makeserver(targetEndpoint fwksched.Endpoint) server {
 	gpuBlocks := defaultLRUCapacityPerServer
 	if p.config.AutoTune && targetEndpoint.GetMetrics() != nil && targetEndpoint.GetMetrics().CacheNumBlocks > 0 {
 		gpuBlocks = targetEndpoint.GetMetrics().CacheNumBlocks
@@ -313,7 +313,7 @@ func (p *dataProducer) makeserver(targetEndpoint fwksched.Endpoint) server {
 }
 
 // matchLongestPrefix returns a map of servers and length of prefix that each server caches, prefix length is defined in blocks.
-func (p *dataProducer) matchLongestPrefix(ctx context.Context, hashes []blockHash) map[ServerID]int {
+func (p *DataProducer) matchLongestPrefix(ctx context.Context, hashes []blockHash) map[ServerID]int {
 	loggerTrace := log.FromContext(ctx).V(logutil.TRACE)
 	res := make(map[ServerID]int)
 
@@ -341,7 +341,7 @@ func (p *dataProducer) matchLongestPrefix(ctx context.Context, hashes []blockHas
 // coarser granularity than the model server's true block size; a startup
 // warning is logged in newDataProducer when a configured value triggers the
 // override. See #1158.
-func (p *dataProducer) GetBlockSize(endpoints []fwksched.Endpoint) int {
+func (p *DataProducer) GetBlockSize(endpoints []fwksched.Endpoint) int {
 	blockSize := p.config.BlockSizeTokens
 	if p.config.AutoTune && len(endpoints) > 0 {
 		if endpoint := endpoints[0]; endpoint.GetMetrics() != nil {
@@ -364,7 +364,7 @@ func (p *dataProducer) GetBlockSize(endpoints []fwksched.Endpoint) int {
 // at most one context window of tokens. A token cap smaller than the block size
 // still resolves to 0 and hashes nothing; that is a misconfiguration, not a
 // request for unlimited matching.
-func (p *dataProducer) resolveMaxBlocks(blockSize int) int {
+func (p *DataProducer) resolveMaxBlocks(blockSize int) int {
 	if p.config.MaxPrefixTokensToMatch > 0 && blockSize > 0 {
 		return p.config.MaxPrefixTokensToMatch / blockSize
 	}

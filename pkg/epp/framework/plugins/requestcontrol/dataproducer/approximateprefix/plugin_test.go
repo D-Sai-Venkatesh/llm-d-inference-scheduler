@@ -142,7 +142,7 @@ func TestPreRequest(t *testing.T) {
 		perPromptHashes := prefixhash.GetBlockHashes(context.Background(), req1, config.BlockSizeTokens, defaultMaxPrefixBlocks)
 		for _, promptHashes := range perPromptHashes {
 			for _, hash := range promptHashes {
-				pods := p.indexer().Get(hash)
+				pods := p.Indexer().Get(hash)
 				assert.Contains(t, pods, ServerID(endpoint1.GetMetadata().ID))
 			}
 		}
@@ -189,9 +189,9 @@ func TestPreRequest(t *testing.T) {
 
 		// Since capacity is 2, the first request's hash should have been evicted.
 		// The latter two should still be present.
-		assert.Empty(t, p.indexer().Get(allHashes[0][0]))
-		assert.NotEmpty(t, p.indexer().Get(allHashes[1][0]))
-		assert.NotEmpty(t, p.indexer().Get(allHashes[2][0]))
+		assert.Empty(t, p.Indexer().Get(allHashes[0][0]))
+		assert.NotEmpty(t, p.Indexer().Get(allHashes[1][0]))
+		assert.NotEmpty(t, p.Indexer().Get(allHashes[2][0]))
 	})
 }
 
@@ -385,7 +385,7 @@ func TestPrefixPluginAutoTune(t *testing.T) {
 	p.wg.Wait()
 
 	// Check indexer state - should be in tracked pods
-	assert.Contains(t, p.indexer().Pods(), ServerID(endpoint.GetMetadata().ID))
+	assert.Contains(t, p.Indexer().Pods(), ServerID(endpoint.GetMetadata().ID))
 }
 
 func TestMaxPrefixTokensToMatch(t *testing.T) {
@@ -632,7 +632,7 @@ func TestFactory_DeprecatedBlockSizeMapped(t *testing.T) {
 		return
 	}
 
-	dp, ok := p.(*dataProducer)
+	dp, ok := p.(*DataProducer)
 	if !ok {
 		t.Fatalf("expected *dataProducer, got %T", p)
 	}
@@ -875,7 +875,7 @@ func TestDumpState(t *testing.T) {
 	idx.Add([]blockHash{1001, 1002, 1003}, podA)
 	idx.Add([]blockHash{2001, 2002}, podB)
 
-	p := &dataProducer{indexerInst: idx}
+	p := &DataProducer{indexerInst: idx}
 	payload, err := p.DumpState()
 	assert.NoError(t, err)
 	// Block hashes are derived from prompt content and must never reach the dump.
@@ -905,7 +905,7 @@ func TestDumpStateCapsPods(t *testing.T) {
 		idx.Add(hashes, pod)
 	}
 
-	p := &dataProducer{indexerInst: idx}
+	p := &DataProducer{indexerInst: idx}
 	payload, err := p.DumpState()
 	assert.NoError(t, err)
 
@@ -922,7 +922,7 @@ func TestDumpStateCapsPods(t *testing.T) {
 
 func TestDumpStateEmpty(t *testing.T) {
 	// A nil indexer should still produce valid JSON instead of panicking.
-	p := &dataProducer{}
+	p := &DataProducer{}
 	payload, err := p.DumpState()
 	assert.NoError(t, err)
 	assert.True(t, json.Valid(payload))

@@ -38,7 +38,7 @@ type indexer struct {
 }
 
 // newIndexer initializes an indexer with size limits and starts cache size reporting.
-func newIndexer(ctx context.Context, defaultLRUSize int, pluginName, pluginType string) indexerInterface {
+func newIndexer(ctx context.Context, defaultLRUSize int, pluginName, pluginType string) IndexerInterface {
 	i := &indexer{
 		hashToPods:     make(map[blockHash]podSet),
 		podToLRU:       make(map[ServerID]*lru.Cache[blockHash, struct{}]),

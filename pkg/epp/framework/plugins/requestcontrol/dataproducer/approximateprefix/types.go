@@ -26,9 +26,9 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/prefixhash"
 )
 
-// indexerInterface maintains an LRU cache of prompt prefix hashes and the server(s) that might have that
+// IndexerInterface maintains an LRU cache of prompt prefix hashes and the server(s) that might have that
 // prefix cached.
-type indexerInterface interface {
+type IndexerInterface interface {
 	Get(hash blockHash) podSet
 	Add(hashes []blockHash, server server)
 	RemovePod(server ServerID)

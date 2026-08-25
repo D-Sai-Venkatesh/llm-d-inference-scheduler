@@ -331,8 +331,9 @@ type Plugin struct {
 
 // compile-time assertions.
 var (
-	_ requestcontrol.DataProducer         = &Plugin{}
-	_ requestcontrol.TimeoutAwareProducer = &Plugin{}
+	_ requestcontrol.DataProducer           = &Plugin{}
+	_ requestcontrol.TimeoutAwareProducer   = &Plugin{}
+	_ requestcontrol.RequestHeaderProcessor = &Plugin{}
 )
 
 // TypedName returns the typed name of the plugin.
@@ -355,10 +356,18 @@ func (p *Plugin) ProduceTimeout() time.Duration {
 	return 0
 }
 
+func (p *Plugin) RequestHeader(ctx context.Context, request *scheduling.InferenceRequest) error {
+	return p.TokenizedRequest(ctx, request)
+}
+
 // Produce derives the request's TokenizedRequest via the configured backend and
 // stores it on the body. Skips when one is already present; errors propagate to
 // the Director, which logs and continues.
 func (p *Plugin) Produce(ctx context.Context, request *scheduling.InferenceRequest, _ []scheduling.Endpoint) error {
+	return p.TokenizedRequest(ctx, request) 
+}
+
+func (p *Plugin) TokenizedRequest(ctx context.Context, request *scheduling.InferenceRequest) error {
 	if request.Body == nil {
 		return errors.New("request body is nil")
 	}

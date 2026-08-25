@@ -6,10 +6,6 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 )
 
-const (
-
-)
-
 type ScoringStrategyParameters struct {
 	Type       string          `json:"type,omitempty"`
 	Weight     int             `json:"weight,omitempty"`
@@ -17,11 +13,11 @@ type ScoringStrategyParameters struct {
 }
 
 type ScoringStrategyWithWeights struct {
-	Type       string      
-	Weight     int       
-	Strategy    ScoringStrategy
+	Type     string
+	Weight   int
+	Strategy ScoringStrategy
 }
 
 type ScoringStrategy interface {
-	Score (item flowcontrol.QueueItemAccessor) float64
+	Score(item flowcontrol.QueueItemAccessor) float64
 }

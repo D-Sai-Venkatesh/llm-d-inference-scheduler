@@ -2,6 +2,7 @@ package lpm
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
@@ -17,13 +18,12 @@ const (
 )
 
 type ApproxPrefixScoringStrategyParameters struct {
+	// ApproxPrefixCacheProducerName is the approximateprefix instance to resolve via handle. There
+	// is no type-based default: handle.AddPlugin registers plugins under their config-supplied
+	// name verbatim, including the empty string when a name is omitted, so a type-keyed default
+	// here would only ever resolve a producer instance that happens to be named after its own
+	// type. Required; NewApproxPrefixScoringStrategy fails loud if unset.
 	ApproxPrefixCacheProducerName string `json:"approxPrefixCacheProducerName,omitempty"`
-}
-
-func (p *ApproxPrefixScoringStrategyParameters) setDefaults() {
-	if p.ApproxPrefixCacheProducerName == "" {
-		p.ApproxPrefixCacheProducerName = approximateprefix.ApproxPrefixCachePluginType
-	}
 }
 
 // NewApproxPrefixScoringStrategy resolves the named approximateprefix producer via handle and
@@ -36,7 +36,9 @@ func NewApproxPrefixScoringStrategy(raw json.RawMessage, handle plugin.Handle) (
 			return nil, fmt.Errorf("approx-prefix-scoring-strategy: failed to decode parameters: %w", err)
 		}
 	}
-	params.setDefaults()
+	if params.ApproxPrefixCacheProducerName == "" {
+		return nil, errors.New("approx-prefix-scoring-strategy: approxPrefixCacheProducerName is required")
+	}
 
 	producer, err := plugin.PluginByType[*approximateprefix.DataProducer](handle, params.ApproxPrefixCacheProducerName)
 	if err != nil {
@@ -52,10 +54,16 @@ type ApproxPrefixScoringStrategy struct {
 	indexer approximateprefix.IndexerInterface
 }
 
-// Score returns the longest prefix-match depth, in blocks, across every server the shared
-// indexer knows about. It reads the block hashes prefixhash-producer already computed
-// pre-admission rather than recomputing them, and stops at the first block no server has --
-// the same greedy walk approximateprefix.matchLongestPrefix performs internally.
+// Score returns the longest prefix-match depth, in blocks, that any single server holds across
+// every prompt in the request. It reads the block hashes prefixhash-producer already computed
+// pre-admission rather than recomputing them.
+//
+// Per prompt, it tracks each server's running match count rather than counting "some server has
+// this block": a block that only server B holds does not extend a match server A is building, so
+// per-server counts can diverge starting at the first block where their cached sets differ. The
+// walk still stops at the first block no server has at all, matching
+// approximateprefix.matchLongestPrefix, but the depth reported is the max over per-server counts,
+// not the count of blocks that had at least one cache hit somewhere.
 func (s *ApproxPrefixScoringStrategy) Score(item flowcontrol.QueueItemAccessor) float64 {
 	req := item.OriginalRequest().InferenceRequest()
 
@@ -64,12 +72,32 @@ func (s *ApproxPrefixScoringStrategy) Score(item flowcontrol.QueueItemAccessor) 
 		return 0
 	}
 
-	var depth int
-	for _, hash := range perPromptHashes[0] {
-		if len(s.indexer.Get(hash)) == 0 {
+	var maxDepth int
+	for _, hashes := range perPromptHashes {
+		if depth := s.matchDepth(hashes); depth > maxDepth {
+			maxDepth = depth
+		}
+	}
+	return float64(maxDepth)
+}
+
+// matchDepth returns the longest prefix-match depth, in blocks, that any single server in the
+// indexer holds for hashes. The walk stops at the first block no server has at all, then reports
+// the largest per-server running count reached up to that point.
+func (s *ApproxPrefixScoringStrategy) matchDepth(hashes []dataprodprefixhash.BlockHash) int {
+	counts := make(map[approximateprefix.ServerID]int)
+	maxDepth := 0
+	for _, hash := range hashes {
+		servers := s.indexer.Get(hash)
+		if len(servers) == 0 {
 			break
 		}
-		depth++
+		for server := range servers {
+			counts[server]++
+			if counts[server] > maxDepth {
+				maxDepth = counts[server]
+			}
+		}
 	}
-	return float64(depth)
+	return maxDepth
 }

@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	PluginType = "least-prefix-plugin"
+	PluginType                       = "least-prefix-plugin"
 	DefaultGenerationIntervalSeconds = 1
 )
 
@@ -34,6 +34,21 @@ func (p *Parameters) setDefaults() {
 	if p.GenerationIntervalSeconds == 0 {
 		p.GenerationIntervalSeconds = DefaultGenerationIntervalSeconds
 	}
+}
+
+func (p *Parameters) validate() error {
+	if p.GenerationIntervalSeconds <= 0 {
+		return fmt.Errorf("least-prefix-plugin: generationIntervalSeconds must be positive, got %d", p.GenerationIntervalSeconds)
+	}
+	for _, sp := range p.Strategies {
+		if sp.Weight == 0 {
+			return fmt.Errorf("least-prefix-plugin: strategy %q: weight must be non-zero", sp.Type)
+		}
+		if sp.Type == ApproxPrefixScoringStrategyType && p.PrefixCacheProducerName == "" {
+			return fmt.Errorf("least-prefix-plugin: strategy %q requires the top-level prefixCacheProducerName so buildPluginDAG can order plugin construction", sp.Type)
+		}
+	}
+	return nil
 }
 
 // StrategyFactory constructs the ScoringStrategy named by params.Type, dispatching to that
@@ -63,6 +78,9 @@ func ConfigParser(rawParameters *json.Decoder, _ plugin.Handle) (any, error) {
 		}
 	}
 	params.setDefaults()
+	if err := params.validate(); err != nil {
+		return nil, err
+	}
 	return params, nil
 }
 
@@ -85,6 +103,16 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 				if err := json.Unmarshal(sp.Parameters, &fields); err != nil {
 					return nil, fmt.Errorf("least-prefix-plugin: failed to decode strategy parameters: %w", err)
 				}
+			}
+			// buildPluginDAG only sees params.PrefixCacheProducerName -- it never reflects into
+			// Strategies[].Parameters -- so that is the only name a DAG edge can exist for. A
+			// strategy-level override naming a different producer would resolve at construction
+			// time with no guaranteed ordering against it, reintroducing the non-deterministic
+			// startup failure the top-level field exists to prevent. Reject that case instead of
+			// silently trusting the override.
+			if existing, ok := fields["approxPrefixCacheProducerName"]; ok && existing != params.PrefixCacheProducerName {
+				return nil, fmt.Errorf("least-prefix-plugin: strategy %q: approxPrefixCacheProducerName %q must match the top-level prefixCacheProducerName %q, or be omitted, so buildPluginDAG orders construction correctly",
+					sp.Type, existing, params.PrefixCacheProducerName)
 			}
 			fields["approxPrefixCacheProducerName"] = params.PrefixCacheProducerName
 
@@ -141,9 +169,9 @@ func (p *Plugin) runGenerationTicker(ctx context.Context, intervalSeconds int) {
 
 	for {
 		select {
-		case <- ctx.Done():
+		case <-ctx.Done():
 			return
-		case <- ticker.C:
+		case <-ticker.C:
 			p.generation.Add(1)
 		}
 	}

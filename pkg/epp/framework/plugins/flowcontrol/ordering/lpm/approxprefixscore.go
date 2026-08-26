@@ -2,7 +2,6 @@ package lpm
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
@@ -18,12 +17,19 @@ const (
 )
 
 type ApproxPrefixScoringStrategyParameters struct {
-	// ApproxPrefixCacheProducerName is the approximateprefix instance to resolve via handle. There
-	// is no type-based default: handle.AddPlugin registers plugins under their config-supplied
-	// name verbatim, including the empty string when a name is omitted, so a type-keyed default
-	// here would only ever resolve a producer instance that happens to be named after its own
-	// type. Required; NewApproxPrefixScoringStrategy fails loud if unset.
+	// ApproxPrefixCacheProducerName is the approximateprefix instance to resolve via handle.
+	// Defaults to ApproxPrefixCachePluginType, matching both applyStaticDefaults (an omitted
+	// plugin name defaults to its type) and registerDefaultPlugin (an implicitly-instantiated
+	// default producer is also named after its type) -- so the default resolves correctly unless
+	// the operator has given their approx-prefix-cache-producer instance an explicit custom name,
+	// in which case this must be set to match it.
 	ApproxPrefixCacheProducerName string `json:"approxPrefixCacheProducerName,omitempty"`
+}
+
+func (p *ApproxPrefixScoringStrategyParameters) setDefaults() {
+	if p.ApproxPrefixCacheProducerName == "" {
+		p.ApproxPrefixCacheProducerName = approximateprefix.ApproxPrefixCachePluginType
+	}
 }
 
 // NewApproxPrefixScoringStrategy resolves the named approximateprefix producer via handle and
@@ -36,9 +42,7 @@ func NewApproxPrefixScoringStrategy(raw json.RawMessage, handle plugin.Handle) (
 			return nil, fmt.Errorf("approx-prefix-scoring-strategy: failed to decode parameters: %w", err)
 		}
 	}
-	if params.ApproxPrefixCacheProducerName == "" {
-		return nil, errors.New("approx-prefix-scoring-strategy: approxPrefixCacheProducerName is required")
-	}
+	params.setDefaults()
 
 	producer, err := plugin.PluginByType[*approximateprefix.DataProducer](handle, params.ApproxPrefixCacheProducerName)
 	if err != nil {

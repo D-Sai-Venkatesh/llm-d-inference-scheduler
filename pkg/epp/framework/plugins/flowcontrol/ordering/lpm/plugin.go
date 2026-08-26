@@ -10,6 +10,7 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/approximateprefix"
 )
 
 const (
@@ -34,6 +35,12 @@ func (p *Parameters) setDefaults() {
 	if p.GenerationIntervalSeconds == 0 {
 		p.GenerationIntervalSeconds = DefaultGenerationIntervalSeconds
 	}
+	// Matches ApproxPrefixScoringStrategyParameters.setDefaults's default, so an omitted
+	// prefixCacheProducerName still gives buildPluginDAG the same name the strategy resolves at
+	// construction time.
+	if p.PrefixCacheProducerName == "" {
+		p.PrefixCacheProducerName = approximateprefix.ApproxPrefixCachePluginType
+	}
 }
 
 func (p *Parameters) validate() error {
@@ -43,9 +50,6 @@ func (p *Parameters) validate() error {
 	for _, sp := range p.Strategies {
 		if sp.Weight == 0 {
 			return fmt.Errorf("least-prefix-plugin: strategy %q: weight must be non-zero", sp.Type)
-		}
-		if sp.Type == ApproxPrefixScoringStrategyType && p.PrefixCacheProducerName == "" {
-			return fmt.Errorf("least-prefix-plugin: strategy %q requires the top-level prefixCacheProducerName so buildPluginDAG can order plugin construction", sp.Type)
 		}
 	}
 	return nil

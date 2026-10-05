@@ -26,6 +26,8 @@ import (
 
 	configPb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/types/known/structpb"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -112,6 +114,14 @@ func (s *StreamingServer) HandleResponseBody(ctx context.Context, reqCtx *Reques
 		metrics.RecordResponseSizes(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.apiSurface, fairnessID, priority, reqCtx.responseSize)
 		metrics.RecordRequestTTFT(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.apiSurface, fairnessID, priority, reqCtx.modelServerStreaming, reqCtx.RequestReceivedTimestamp, reqCtx.firstTokenTimestamp)
 		metrics.RecordRequestTPOT(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.apiSurface, fairnessID, priority, reqCtx.modelServerStreaming, reqCtx.RequestReceivedTimestamp, reqCtx.firstTokenTimestamp, reqCtx.responseCompleteTimestamp, reqCtx.Usage.CompletionTokens)
+		// The engine's own count, next to the prefix producer's prediction on request_orchestration.
+		// Observed once at end of stream, from the accumulated usage, alongside the other token metrics.
+		if span := trace.SpanFromContext(ctx); span.IsRecording() {
+			span.SetAttributes(attribute.Int("llm_d.epp.response.prompt_tokens", reqCtx.Usage.PromptTokens))
+			if reqCtx.Usage.PromptTokenDetails != nil {
+				span.SetAttributes(attribute.Int("llm_d.epp.response.cached_tokens", reqCtx.Usage.PromptTokenDetails.CachedTokens))
+			}
+		}
 	}
 	return s.director.HandleResponseBody(ctx, reqCtx, endOfStream)
 }

@@ -24,11 +24,14 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-router/pkg/common/clamp"
 	errcommon "github.com/llm-d/llm-d-router/pkg/common/error"
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/types"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
@@ -195,12 +198,29 @@ func (fcac *FlowControlAdmissionController) Admit(
 	// dispatch: rejections short-circuit into an immediate error response that never reads these fields,
 	// and their durations carry no signal (a capacity rejection is ~0, a TTL eviction is the configured
 	// TTL, a cancellation is the client's disconnect time).
+	// The queue_wait span starts when the request is handed to flow control and ends when it is
+	// dispatched or rejected, so its start and end are the enqueue and dequeue times in the trace.
+	tracer := tracing.Tracer("llm-d-router/pkg/epp/requestcontrol")
+	spanCtx, span := tracer.Start(ctx, "flow_control.queue_wait")
+	span.SetAttributes(
+		attribute.String("llm_d.epp.flow_control.fairness_id", fcReq.fairnessID),
+		attribute.Int("llm_d.epp.flow_control.priority", priority),
+	)
 	start := time.Now()
-	outcome, err := fcac.flowController.EnqueueAndWait(ctx, fcReq)
+	outcome, err := fcac.flowController.EnqueueAndWait(spanCtx, fcReq)
+	waited := time.Since(start)
 	if outcome == types.QueueOutcomeDispatched {
-		reqCtx.FlowControlQueueDuration = time.Since(start)
+		reqCtx.FlowControlQueueDuration = waited
 		reqCtx.FlowControlAdmitted = true
 	}
+	span.SetAttributes(
+		attribute.String("llm_d.epp.flow_control.outcome", outcome.String()),
+		attribute.Float64("llm_d.epp.flow_control.queue_ms", float64(waited.Microseconds())/1000),
+	)
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+	}
+	span.End()
 	logger.V(logutil.DEBUG).Info("Flow control outcome",
 		"requestID", reqCtx.SchedulingRequest.RequestID, "outcome", outcome, "error", err)
 	// Pool emptiness (nil metadata = whole pool) is a live probe, so it is passed lazily and runs only when the

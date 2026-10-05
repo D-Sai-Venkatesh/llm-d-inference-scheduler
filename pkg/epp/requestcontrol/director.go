@@ -49,6 +49,7 @@ import (
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 	"github.com/llm-d/llm-d-router/pkg/epp/handlers"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
@@ -297,6 +298,7 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 	}
 
 	reqCtx.SchedulingRequest.SchedulingResult = result
+	recordPrefixPrediction(span, result)
 
 	// Prepare Request (Populates RequestContext and call PreRequest plugins)
 	// Insert target endpoint to instruct Envoy to route requests to the specified target pod and attach the port number.
@@ -312,6 +314,65 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 		return reqCtx, err
 	}
 	return reqCtx, nil
+}
+
+// recordPrefixPrediction puts the prefix producer's predicted cache match on the span: for the
+// primary target endpoint as attributes, and for every scored candidate as "endpoint=tokens". Next to
+// the cached tokens the model server reports in the response (handlers/response.go), a trace then
+// shows how far the prefix index's view of each endpoint was from what the engine actually had.
+func recordPrefixPrediction(span trace.Span, result *fwksched.SchedulingResult) {
+	if !span.IsRecording() || result == nil {
+		return
+	}
+	pr := result.ProfileResults[result.PrimaryProfileName]
+	if pr == nil || len(pr.TargetEndpoints) == 0 {
+		return
+	}
+	target := pr.TargetEndpoints[0]
+	if md := target.GetMetadata(); md != nil {
+		span.SetAttributes(attribute.String("llm_d.epp.target_endpoint", md.Name))
+	}
+	if key, info := prefixMatchInfo(target); info != nil {
+		bs := int64(info.BlockSizeTokens())
+		span.SetAttributes(
+			attribute.String("llm_d.epp.prefix.key", key),
+			attribute.Int64("llm_d.epp.prefix.predicted_cached_tokens", int64(info.CachedBlockCount())*bs),
+			attribute.Int64("llm_d.epp.prefix.indexed_tokens", int64(info.TotalBlocks())*bs),
+			attribute.Int("llm_d.epp.prefix.match_blocks", info.MatchBlocks()),
+			attribute.Int("llm_d.epp.prefix.block_size_tokens", info.BlockSizeTokens()),
+		)
+	}
+	candidates := make([]string, 0, len(pr.ScoredCandidates))
+	for _, c := range pr.ScoredCandidates {
+		md := c.GetMetadata()
+		if md == nil {
+			continue
+		}
+		predicted := int64(0)
+		if _, info := prefixMatchInfo(c.Endpoint); info != nil {
+			predicted = int64(info.CachedBlockCount()) * int64(info.BlockSizeTokens())
+		}
+		candidates = append(candidates, fmt.Sprintf("%s=%d", md.Name, predicted))
+	}
+	span.SetAttributes(attribute.StringSlice("llm_d.epp.prefix.candidates_predicted_cached_tokens", candidates))
+}
+
+// prefixMatchInfo returns the first PrefixCacheMatchInfo a prefix producer attached to the endpoint,
+// with the key it was stored under ("PrefixCacheMatchInfoDataKey/<producer>").
+func prefixMatchInfo(ep fwksched.Endpoint) (string, *attrprefix.PrefixCacheMatchInfo) {
+	if ep == nil {
+		return "", nil
+	}
+	for _, k := range ep.Keys() {
+		raw, ok := ep.Get(k)
+		if !ok {
+			continue
+		}
+		if info, ok := raw.(*attrprefix.PrefixCacheMatchInfo); ok && info != nil && info.BlockSizeTokens() > 0 {
+			return k.String(), info
+		}
+	}
+	return "", nil
 }
 
 // modelRewriteIfNeeded rewrites the model name in the payload when the resolved target

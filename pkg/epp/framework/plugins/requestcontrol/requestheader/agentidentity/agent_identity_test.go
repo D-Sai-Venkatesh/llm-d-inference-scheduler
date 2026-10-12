@@ -19,6 +19,7 @@ package agentidentity
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -47,30 +48,38 @@ func TestRequestHeader(t *testing.T) {
 		headers       map[string]string
 		body          *fwkrh.InferenceRequestBody
 		wantIdentity  string
+		wantThread    string
+		wantParent    string
 		wantAttrFound bool
 	}{
+		// Compatibility cases: agent-identity must keep the value the plugin
+		// produced before thread and parent existed.
 		{
 			name:          "claude code session header",
 			headers:       map[string]string{ClaudeCodeSessionHeader: "session-abc"},
 			wantIdentity:  "session-abc",
+			wantThread:    "session-abc",
 			wantAttrFound: true,
 		},
 		{
 			name:          "opencode session header",
 			headers:       map[string]string{OpenCodeSessionHeader: "oc-session-1"},
 			wantIdentity:  "oc-session-1",
+			wantThread:    "oc-session-1",
 			wantAttrFound: true,
 		},
 		{
 			name:          "codex session header (hyphenated, >= 0.131.0)",
 			headers:       map[string]string{CodexSessionHeader: "codex-session-1"},
 			wantIdentity:  "codex-session-1",
+			wantThread:    "codex-session-1",
 			wantAttrFound: true,
 		},
 		{
 			name:          "codex legacy session header (underscored, <= 0.130.x)",
 			headers:       map[string]string{CodexSessionHeaderLegacy: "codex-legacy-1"},
 			wantIdentity:  "codex-legacy-1",
+			wantThread:    "codex-legacy-1",
 			wantAttrFound: true,
 		},
 		{
@@ -80,6 +89,7 @@ func TestRequestHeader(t *testing.T) {
 				CodexSessionHeaderLegacy: "codex-old",
 			},
 			wantIdentity:  "codex-new",
+			wantThread:    "codex-new",
 			wantAttrFound: true,
 		},
 		{
@@ -89,6 +99,7 @@ func TestRequestHeader(t *testing.T) {
 				OpenCodeSessionHeader:   "oc-session-1",
 			},
 			wantIdentity:  "session-abc",
+			wantThread:    "session-abc",
 			wantAttrFound: true,
 		},
 		{
@@ -98,6 +109,7 @@ func TestRequestHeader(t *testing.T) {
 				CodexSessionHeader:    "codex-session-1",
 			},
 			wantIdentity:  "oc-session-1",
+			wantThread:    "oc-session-1",
 			wantAttrFound: true,
 		},
 		{
@@ -113,6 +125,7 @@ func TestRequestHeader(t *testing.T) {
 				OpenCodeSessionHeader:   "oc-session-1",
 			},
 			wantIdentity:  "oc-session-1",
+			wantThread:    "oc-session-1",
 			wantAttrFound: true,
 		},
 		{
@@ -128,6 +141,7 @@ func TestRequestHeader(t *testing.T) {
 				ClaudeCodeSessionHeader: "  session-abc  ",
 			},
 			wantIdentity:  "session-abc",
+			wantThread:    "session-abc",
 			wantAttrFound: true,
 		},
 		{
@@ -151,6 +165,98 @@ func TestRequestHeader(t *testing.T) {
 			headers:       nil,
 			wantAttrFound: false,
 		},
+		// Thread and parent extraction per harness.
+		{
+			name: "claude code depth-1 sub-agent: agent id, no parent header",
+			headers: map[string]string{
+				ClaudeCodeSessionHeader: "session-abc",
+				ClaudeCodeAgentHeader:   "agent-1",
+			},
+			wantIdentity:  "session-abc",
+			wantThread:    "agent-1",
+			wantParent:    "session-abc",
+			wantAttrFound: true,
+		},
+		{
+			name: "claude code nested sub-agent: agent and parent headers",
+			headers: map[string]string{
+				ClaudeCodeSessionHeader: "session-abc",
+				ClaudeCodeAgentHeader:   "agent-2",
+				ClaudeCodeParentHeader:  "agent-1",
+			},
+			wantIdentity:  "session-abc",
+			wantThread:    "agent-2",
+			wantParent:    "agent-1",
+			wantAttrFound: true,
+		},
+		{
+			name: "codex main thread: thread id, no parent",
+			headers: map[string]string{
+				CodexSessionHeader: "codex-root",
+				CodexThreadHeader:  "thread-1",
+			},
+			wantIdentity:  "codex-root",
+			wantThread:    "thread-1",
+			wantAttrFound: true,
+		},
+		{
+			name: "codex sub-agent: parent thread id",
+			headers: map[string]string{
+				CodexSessionHeader: "codex-root",
+				CodexThreadHeader:  "thread-2",
+				CodexParentHeader:  "thread-1",
+			},
+			wantIdentity:  "codex-root",
+			wantThread:    "thread-2",
+			wantParent:    "thread-1",
+			wantAttrFound: true,
+		},
+		// Canonical llm-d headers own the request.
+		{
+			name: "canonical session wins over claude code session",
+			headers: map[string]string{
+				CanonicalSessionHeader:  "llmd-session",
+				ClaudeCodeSessionHeader: "session-abc",
+			},
+			wantIdentity:  "llmd-session",
+			wantThread:    "llmd-session",
+			wantAttrFound: true,
+		},
+		{
+			name: "canonical all three fields",
+			headers: map[string]string{
+				CanonicalSessionHeader: "llmd-session",
+				CanonicalThreadHeader:  "llmd-thread",
+				CanonicalParentHeader:  "llmd-parent",
+			},
+			wantIdentity:  "llmd-session",
+			wantThread:    "llmd-thread",
+			wantParent:    "llmd-parent",
+			wantAttrFound: true,
+		},
+		{
+			name: "canonical thread with no parent is its own root; harness headers ignored",
+			headers: map[string]string{
+				CanonicalThreadHeader:   "llmd-thread",
+				ClaudeCodeSessionHeader: "session-abc",
+			},
+			wantIdentity:  "llmd-thread",
+			wantThread:    "llmd-thread",
+			wantAttrFound: true,
+		},
+		{
+			name: "canonical thread with parent but no session leaves no attribute",
+			headers: map[string]string{
+				CanonicalThreadHeader: "llmd-thread",
+				CanonicalParentHeader: "llmd-parent",
+			},
+			wantAttrFound: false,
+		},
+		{
+			name:          "canonical parent alone leaves no attribute",
+			headers:       map[string]string{CanonicalParentHeader: "llmd-parent"},
+			wantAttrFound: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -165,10 +271,27 @@ func TestRequestHeader(t *testing.T) {
 			}
 			got, ok := scheduling.ReadRequestAttribute[string](req, AgentIdentityKey)
 			if ok != tt.wantAttrFound {
-				t.Errorf("attribute found = %v, want %v", ok, tt.wantAttrFound)
+				t.Fatalf("agent-identity attribute found = %v, want %v", ok, tt.wantAttrFound)
 			}
-			if ok && got != tt.wantIdentity {
+			if !tt.wantAttrFound {
+				return
+			}
+			if got != tt.wantIdentity {
 				t.Errorf("agent identity = %q, want %q", got, tt.wantIdentity)
+			}
+			thread, ok := scheduling.ReadRequestAttribute[string](req, ThreadIDKey)
+			if !ok {
+				t.Fatal("agent-thread-id attribute not found")
+			}
+			if thread != tt.wantThread {
+				t.Errorf("thread id = %q, want %q", thread, tt.wantThread)
+			}
+			parent, ok := scheduling.ReadRequestAttribute[string](req, ParentThreadIDKey)
+			if !ok {
+				t.Fatal("agent-parent-thread-id attribute not found")
+			}
+			if parent != tt.wantParent {
+				t.Errorf("parent thread id = %q, want %q", parent, tt.wantParent)
 			}
 			// FairnessID must never be set by the plugin.
 			if req.FairnessID != "" {
@@ -178,58 +301,50 @@ func TestRequestHeader(t *testing.T) {
 	}
 }
 
-func TestPluginFactory_PriorityHeaders(t *testing.T) {
-	tests := []struct {
-		name    string
-		raw     string
-		want    []string
-		wantErr bool
-	}{
-		{
-			name: "nil parameters → defaults only",
-			raw:  "",
-			want: defaultPriorityHeaders,
-		},
-		{
-			name: "empty additionalSessionHeaders → defaults only",
-			raw:  `{"additionalSessionHeaders":[]}`,
-			want: defaultPriorityHeaders,
-		},
-		{
-			name: "extras prepended before defaults",
-			raw:  `{"additionalSessionHeaders":["x-custom-1","x-custom-2"]}`,
-			want: append([]string{"x-custom-1", "x-custom-2"}, defaultPriorityHeaders...),
-		},
-		{
-			name: "mixed-case extras lowercased to match request header map",
-			raw:  `{"additionalSessionHeaders":["X-Tenant-ID","X-User-Session"]}`,
-			want: append([]string{"x-tenant-id", "x-user-session"}, defaultPriorityHeaders...),
-		},
-		{
-			name:    "malformed json → factory error",
-			raw:     `{"additionalSessionHeaders": not-json}`,
-			wantErr: true,
-		},
-	}
+func TestPluginFactory(t *testing.T) {
+	t.Run("default chain order", func(t *testing.T) {
+		pi, err := PluginFactory("test", nil, nil)
+		if err != nil {
+			t.Fatalf("PluginFactory: %v", err)
+		}
+		handlers := pi.(*Plugin).handlers
+		want := []string{
+			"agentidentity.canonicalHandler", "agentidentity.customHandler", "agentidentity.claudeCodeHandler", "agentidentity.openCodeHandler", "agentidentity.codexHandler",
+		}
+		if len(handlers) != len(want) {
+			t.Fatalf("chain has %d handlers, want %d", len(handlers), len(want))
+		}
+		// The chain order is the resolution order: canonical llm-d headers,
+		// the operator's custom session headers, then the harness handlers.
+		for i, name := range want {
+			if got := fmt.Sprintf("%T", handlers[i]); got != name {
+				t.Errorf("handlers[%d] = %s, want %s", i, got, name)
+			}
+		}
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			pi, err := PluginFactory("test", fwkplugin.StrictDecoder(json.RawMessage(tt.raw)), nil)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("expected error, got nil")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("PluginFactory: %v", err)
-			}
-			got := pi.(*Plugin).priorityHeaders
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("priorityHeaders mismatch:\n got=%v\nwant=%v", got, tt.want)
-			}
-		})
-	}
+	t.Run("additional session headers are lowercased into the custom handler", func(t *testing.T) {
+		pi, err := PluginFactory("test",
+			fwkplugin.StrictDecoder(json.RawMessage(`{"additionalSessionHeaders":["X-Tenant-ID","x-user-session"]}`)), nil)
+		if err != nil {
+			t.Fatalf("PluginFactory: %v", err)
+		}
+		custom, ok := pi.(*Plugin).handlers[1].(customHandler)
+		if !ok {
+			t.Fatal("handlers[1] is not customHandler")
+		}
+		want := []string{"x-tenant-id", "x-user-session"}
+		if !reflect.DeepEqual(custom.sessionHeaders, want) {
+			t.Errorf("custom session headers = %v, want %v", custom.sessionHeaders, want)
+		}
+	})
+
+	t.Run("malformed json", func(t *testing.T) {
+		if _, err := PluginFactory("test",
+			fwkplugin.StrictDecoder(json.RawMessage(`{"additionalSessionHeaders": not-json}`)), nil); err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
 }
 
 // TestRequestHeader_CustomHeader proves end-to-end that a header added
@@ -256,7 +371,8 @@ func TestRequestHeader_CustomHeader(t *testing.T) {
 		t.Errorf("agent identity = %q, want %q", got, "tenant-42")
 	}
 
-	// And it wins over a default-bucket header (because it is prepended).
+	// And it wins over a default-bucket header (because the custom handler
+	// sits ahead of the harness handlers in the chain).
 	req2 := &scheduling.InferenceRequest{
 		Headers: map[string]string{
 			"x-tenant-id":           "tenant-42",
@@ -286,15 +402,18 @@ func TestAgentIdentityKeyMatchesDocumentedConfig(t *testing.T) {
 	}
 }
 
-func TestProducesAgentIdentity(t *testing.T) {
+func TestProduces(t *testing.T) {
 	t.Parallel()
 
-	plugin := &Plugin{}
-	produced, ok := plugin.Produces()[AgentIdentityKey]
-	if !ok {
-		t.Fatalf("Produces() does not declare %s", AgentIdentityKey)
-	}
-	if _, ok := produced.(string); !ok {
-		t.Fatalf("Produces()[%s] has type %T, want string", AgentIdentityKey, produced)
+	p := &Plugin{}
+	produced := p.Produces()
+	for _, key := range []fwkplugin.DataKey{AgentIdentityKey, ThreadIDKey, ParentThreadIDKey} {
+		value, ok := produced[key]
+		if !ok {
+			t.Fatalf("Produces() does not declare %s", key)
+		}
+		if _, ok := value.(string); !ok {
+			t.Fatalf("Produces()[%s] has type %T, want string", key, value)
+		}
 	}
 }

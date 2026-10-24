@@ -40,6 +40,7 @@ type ringMetrics struct {
 	pickOversized         prometheus.Counter
 	pickAnonymous         prometheus.Counter
 	pickDelayedDispatches prometheus.Counter
+	pickTransparent       prometheus.Counter
 	pickGuestTokens       prometheus.Counter
 	pickNoVictims         prometheus.Counter
 	rotationInterval      prometheus.Histogram
@@ -89,6 +90,11 @@ func newRingMetrics(mgr *ringManager) *ringMetrics {
 			Name:      "ring_window_delayed_dispatches_total",
 			Help:      metricsutil.HelpMsgWithStability("Dispatches whose request waited at least 1s in the flow-control queue.", compbasemetrics.ALPHA),
 		}),
+		pickTransparent: prometheus.NewCounter(prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "ring_window_transparent_dispatches_total",
+			Help:      metricsutil.HelpMsgWithStability("Dispatches in transparent mode: the idle pool cannot retain anything, so oldest-first is served without membership churn.", compbasemetrics.ALPHA),
+		}),
 		pickGuestTokens: prometheus.NewCounter(prometheus.CounterOpts{
 			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
 			Name:      "ring_window_guest_tokens_total",
@@ -125,6 +131,7 @@ func (m *ringMetrics) register(reg prometheus.Registerer) error {
 		registerOrReuse(reg, &m.pickOversized),
 		registerOrReuse(reg, &m.pickAnonymous),
 		registerOrReuse(reg, &m.pickDelayedDispatches),
+		registerOrReuse(reg, &m.pickTransparent),
 		registerOrReuse(reg, &m.pickGuestTokens),
 		registerOrReuse(reg, &m.pickNoVictims),
 		registerOrReuse(reg, &m.rotationInterval),

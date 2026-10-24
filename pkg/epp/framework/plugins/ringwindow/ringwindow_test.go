@@ -19,6 +19,7 @@ package ringwindow
 import (
 	"context"
 	"fmt"
+	"sort"
 	"testing"
 	"time"
 
@@ -170,6 +171,15 @@ func resetScan(r *RingWindow) {
 	r.mgr.slot = 0
 }
 
+// hashOrder returns ids sorted by their placement hash (the plugin's
+// first-placement ring order), so tests can compute expectations under
+// the per-process salt.
+func hashOrder(ids ...string) []string {
+	out := append([]string(nil), ids...)
+	sort.Slice(out, func(i, j int) bool { return placementHash(out[i]) < placementHash(out[j]) })
+	return out
+}
+
 func counters(r *RingWindow) managerCounters {
 	r.mgr.mu.Lock()
 	defer r.mgr.mu.Unlock()
@@ -194,16 +204,29 @@ func joinWindow(t *testing.T, r *RingWindow, ids ...string) {
 
 func TestColdStartJoinsInRingOrder(t *testing.T) {
 	r := newTestPlugin(testConfig())
-	// All four arrive at once; each Pick dispatches one and joins it.
-	require.Equal(t, "A", pickID(t, r, makeQueue("A", 0, time.Minute, 280),
-		makeQueue("B", 0, time.Minute, 280), makeQueue("C", 0, time.Minute, 280),
-		makeQueue("D", 0, time.Minute, 280)))
-	require.Equal(t, "B", pickID(t, r, makeQueue("B", 0, time.Minute, 280),
-		makeQueue("C", 0, time.Minute, 280), makeQueue("D", 0, time.Minute, 280)))
-	require.Equal(t, "C", pickID(t, r, makeQueue("C", 0, time.Minute, 280),
-		makeQueue("D", 0, time.Minute, 280)))
-	require.Equal(t, "D", pickID(t, r, makeQueue("D", 0, time.Minute, 280)))
-	require.Equal(t, []string{"A", "B", "C", "D"}, memberIDs(r))
+	// All four arrive at once; joins follow ring (hash) order, one per
+	// Pick. A joined session's queue is not re-presented (its next turn
+	// has not arrived yet), so each Pick admits the next head outsider.
+	H := hashOrder("A", "B", "C", "D")
+	remaining := []string{"A", "B", "C", "D"}
+	qs := func(ids ...string) []fwkfc.FlowQueueAccessor {
+		out := make([]fwkfc.FlowQueueAccessor, 0, len(ids))
+		for _, id := range ids {
+			out = append(out, makeQueue(id, 0, time.Minute, 280))
+		}
+		return out
+	}
+	for _, want := range H {
+		got := pickID(t, r, qs(remaining...)...)
+		require.Equal(t, want, got)
+		for i, id := range remaining {
+			if id == got {
+				remaining = append(remaining[:i], remaining[i+1:]...)
+				break
+			}
+		}
+	}
+	require.Equal(t, H, memberIDs(r))
 }
 
 func TestMemberServesBackAndForth(t *testing.T) {
@@ -220,19 +243,20 @@ func TestMemberServesBackAndForth(t *testing.T) {
 			makeQueue("D", 0, time.Minute, 280),
 		}
 	}
-	// The round-counter order (V0-REVIEW code review, issue 1): round r
-	// serves [r, r+1, …, r+L−1] then the interior in reverse. Four rounds
-	// form the full period — a 24-serve cycle, NOT a period-4 round-robin.
+	// The round-counter order: round r serves [r, r+1, …, r+L−1] then the
+	// interior in reverse, over the members in ring (hash) order H0..H3.
+	// Four rounds form the full period — a 24-serve cycle, not period-4.
 	resetScan(r)
+	H := hashOrder("A", "B", "C", "D")
 	var got []string
 	for i := 0; i < 24; i++ {
 		got = append(got, pickID(t, r, queues()...))
 	}
 	require.Equal(t, []string{
-		"A", "B", "C", "D", "C", "B", // round 0
-		"B", "C", "D", "A", "D", "C", // round 1
-		"C", "D", "A", "B", "A", "D", // round 2
-		"D", "A", "B", "C", "B", "A", // round 3
+		H[0], H[1], H[2], H[3], H[2], H[1], // round 0
+		H[1], H[2], H[3], H[0], H[3], H[2], // round 1
+		H[2], H[3], H[0], H[1], H[0], H[3], // round 2
+		H[3], H[0], H[1], H[2], H[1], H[0], // round 3
 	}, got)
 	// Every member served exactly six times per period: equal service.
 	counts := map[string]int{}
@@ -266,8 +290,9 @@ func TestQuietMemberSkippedKeepsPlace(t *testing.T) {
 	for _, id := range got {
 		require.NotEqual(t, "C", id, "quiet member must never be served")
 	}
-	// One round serves each live member at each of its slots.
-	require.Equal(t, []string{"A", "B", "D"}, got[:3], "round 0 serves the live members at their slots")
+	// One round serves each live member at its slots (hash order, C quiet).
+	want := hashOrder("A", "B", "D")
+	require.Equal(t, want, got[:3], "round 0 serves the live members at their slots")
 	// C returns: it must be served within one round (2L-2 = 6 serves).
 	resetScan(r)
 	all := append(live(), makeQueue("C", 0, time.Minute, 280))
@@ -343,9 +368,10 @@ func TestElasticDPreventsRotationStorm(t *testing.T) {
 		queues = append(queues, makeQueue(id, 2*time.Second, time.Second, 320))
 	}
 	got := pickID(t, r, queues...)
-	require.Equal(t, "E", got, "the head outsider joins through the normal path")
+	waiting := []string{"E", "F", "G", "H", "I", "J", "K", "L", "M", "N"}
+	require.Contains(t, waiting, got, "the hash-head outsider joins through the normal path")
 	require.Equal(t, int64(0), counters(r).rotations, "elastic D_eff must not rotate on a 1s budget with 10 waiting")
-	require.True(t, isMember(r, "E"))
+	require.True(t, isMember(r, got))
 }
 
 func TestElasticDFiresWhenTrulyExpired(t *testing.T) {
@@ -553,7 +579,7 @@ func TestBusyRotationDemotesNotClears(t *testing.T) {
 	require.Equal(t, int64(0), counters(r).noVictims)
 	require.Equal(t, int64(0), counters(r).demotions["clear"], "the window must not clear")
 	require.Equal(t, int64(1), counters(r).demotions["rotate"])
-	require.Equal(t, []string{"A", "B", "D", "E"}, memberIDs(r), "the oldest-released member is demoted, the rest stay")
+	require.Equal(t, hashOrder("A", "B", "D", "E"), memberIDs(r), "the oldest-released member is demoted, the rest stay")
 }
 
 // TestDemotionReSeqsVictim: a demoted session rejoins the outsider line at
@@ -569,13 +595,13 @@ func TestDemotionReSeqsVictim(t *testing.T) {
 	setFinish(r, "D", 30*time.Second)
 	setFinish(r, "B", 10*time.Second)
 	setFinish(r, "A", 5*time.Second)
-	// F is already waiting when the rotation fires, so F's ring position
-	// predates C's demotion. E expires → rotation demotes C (re-seq to the
-	// tail, behind F and everyone else).
+	// E (expired) and F (fresh) both wait; the seat goes to the head by
+	// ring order (hash), the D clock may have been triggered by E.
+	head := hashOrder("E", "F")[0]
 	got := pickID(t, r,
 		makeQueue("E", 120*time.Second, time.Minute, 320),
 		makeQueue("F", 60*time.Second, time.Minute, 280))
-	require.Equal(t, "E", got)
+	require.Equal(t, head, got)
 	require.False(t, isMember(r, "C"))
 
 	// No member waits and nobody's D-clock has expired, so the head
@@ -640,8 +666,9 @@ func TestRecoveryLaxityRunsScan(t *testing.T) {
 			makeQueue("D", 20*time.Second, 100*time.Second, 280),
 		}
 	}
-	require.Equal(t, "A", pickID(t, r, queues()...), "the scan serves in round-counter order")
-	require.Equal(t, "B", pickID(t, r, queues()...))
+	H := hashOrder("A", "B", "C", "D")
+	require.Equal(t, H[0], pickID(t, r, queues()...), "the scan serves in round-counter order")
+	require.Equal(t, H[1], pickID(t, r, queues()...))
 	require.Equal(t, float64(0), testutil.ToFloat64(r.metrics.pickRecoveries))
 
 	// Tight budget (D = 25 s): only A — which the scan reaches next but
@@ -654,7 +681,7 @@ func TestRecoveryLaxityRunsScan(t *testing.T) {
 			makeQueue("D", 20*time.Second, 25*time.Second, 280),
 		}
 		if withA {
-			qs = append([]fwkfc.FlowQueueAccessor{makeQueue("A", 50*time.Second, 25*time.Second, 280)}, qs...)
+			qs = append([]fwkfc.FlowQueueAccessor{makeQueue("A", 90*time.Second, 25*time.Second, 280)}, qs...)
 		}
 		return qs
 	}
@@ -681,7 +708,7 @@ func TestNoVictimsKeepsWindow(t *testing.T) {
 	require.Equal(t, int64(0), counters(r).oversized, "not oversized: G fits an empty window")
 	require.Equal(t, int64(1), counters(r).noVictims)
 	require.False(t, isMember(r, "G"), "G runs as a non-member")
-	require.Equal(t, []string{"A", "B"}, memberIDs(r), "the window stays intact")
+	require.Equal(t, hashOrder("A", "B"), memberIDs(r), "the window stays intact")
 }
 
 // TestRotationGuardAtColdStart: with D = 0 and no measured turn duration,
@@ -689,7 +716,7 @@ func TestNoVictimsKeepsWindow(t *testing.T) {
 // not rotations (code review issue 8).
 func TestRotationGuardAtColdStart(t *testing.T) {
 	r := newTestPlugin(testConfig())
-	require.Equal(t, "A", pickID(t, r,
+	require.Equal(t, hashOrder("A", "B")[0], pickID(t, r,
 		makeQueue("A", 0, 0, 280),
 		makeQueue("B", 0, 0, 280)))
 	require.Equal(t, int64(0), counters(r).rotations, "cold start with D=0 must not count joins as rotations")
@@ -717,4 +744,88 @@ func TestShallowQueueWindowDoesNotCollapse(t *testing.T) {
 	require.Equal(t, 1<<30, w0, "D=0: no D-width")
 	require.Equal(t, 1<<30, w5, "D below the elastic floor: the floor paces; no D-width")
 	require.Equal(t, 1, w30, "D above the floor: the D-width applies")
+}
+
+// TestRoundClockOnePerRound: at D=0 the window advances exactly once per
+// completed round — never per Pick.
+func TestRoundClockOnePerRound(t *testing.T) {
+	r := newTestPlugin(testConfig())
+	joinWindow(t, r, "A", "B", "C", "D")
+	for _, id := range []string{"A", "B", "C", "D"} {
+		setCommitted(r, id, 70)
+	}
+	resetScan(r)
+	queues := func() []fwkfc.FlowQueueAccessor {
+		return []fwkfc.FlowQueueAccessor{
+			makeQueue("A", 0, 0, 280), makeQueue("B", 0, 0, 280),
+			makeQueue("C", 0, 0, 280), makeQueue("D", 0, 0, 280),
+		}
+	}
+	// Before a round completes: an expired outsider waits (D=0), no rotation.
+	got := pickID(t, r, append(queues(), makeQueue("E", 300*time.Second, 0, 280))...)
+	require.NotEqual(t, "E", got, "no rotation before a round completes at D=0")
+	require.Equal(t, int64(0), counters(r).rotations)
+
+	// Serve one full round (2L-2 = 6 serves).
+	H := hashOrder("A", "B", "C", "D")
+	for i := 0; i < 6; i++ {
+		pickID(t, r, queues()...)
+	}
+	// Now the round clock ticks: exactly one rotation for E.
+	got = pickID(t, r, append(queues(), makeQueue("E", 300*time.Second, 0, 280))...)
+	require.Equal(t, "E", got)
+	require.Equal(t, int64(1), counters(r).rotations)
+	_ = H
+	// And not a second one until another round completes: the follow-up
+	// pick may serve any waiting member (E included — it just joined),
+	// but no further rotation may fire.
+	pickID(t, r, makeQueue("E", 0, 0, 280))
+	require.Equal(t, int64(1), counters(r).rotations, "one place per round, not per Pick")
+}
+
+// TestTransparentModeWhenPoolDies: when the idle pool cannot hold one mean
+// footprint, serve oldest-first without membership churn.
+func TestTransparentModeWhenPoolDies(t *testing.T) {
+	r := newTestPlugin(testConfig())
+	joinWindow(t, r, "A", "B")
+	for _, id := range []string{"A", "B"} {
+		setCommitted(r, id, 70000)
+	}
+	r.mgr.noteKVUsage(0.999) // idle pool = 480 tokens << 70k footprint
+	got := pickID(t, r,
+		makeQueue("A", 30*time.Second, time.Minute, 280),
+		makeQueue("B", 5*time.Second, time.Minute, 280))
+	require.Equal(t, "A", got, "transparent mode serves the oldest arrival")
+	require.Equal(t, int64(0), counters(r).rotations)
+	require.Equal(t, float64(1), testutil.ToFloat64(r.metrics.pickTransparent))
+}
+
+// TestHashCohortReentry: a demoted session (cohort >= 1) sorts behind every
+// first-placement session (cohort 0), whatever their hashes.
+func TestHashCohortReentry(t *testing.T) {
+	r := newTestPlugin(testConfig())
+	joinWindow(t, r, "A", "B", "C", "D")
+	for _, id := range []string{"A", "B", "C", "D"} {
+		setCommitted(r, id, 80)
+	}
+	setFinish(r, "A", 90*time.Second)
+	// A busy rotation demotes A (the oldest release).
+	pickID(t, r,
+		makeQueue("A", 0, time.Minute, 320),
+		makeQueue("B", 0, time.Minute, 320),
+		makeQueue("C", 0, time.Minute, 320),
+		makeQueue("D", 0, time.Minute, 320),
+		makeQueue("E", 120*time.Second, time.Minute, 320))
+	require.False(t, isMember(r, "A"))
+	r.mgr.mu.Lock()
+	gen := r.mgr.sessions["A"].sortGen
+	r.mgr.mu.Unlock()
+	require.GreaterOrEqual(t, gen, int64(1), "demotion moves the session to a re-entry cohort")
+
+	// A (demoted, cohort 1) and F (never seen, cohort 0) both wait: F
+	// must be the head — cohort 0 beats cohort 1 regardless of hash order.
+	got := pickID(t, r,
+		makeQueue("A", 300*time.Second, time.Minute, 320),
+		makeQueue("F", 5*time.Second, time.Minute, 280))
+	require.Equal(t, "F", got, "a demoted session rejoins behind every first-placement session")
 }

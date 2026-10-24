@@ -52,7 +52,11 @@ func (r *RingWindow) PreRequest(_ context.Context, request *fwksched.InferenceRe
 	if md == nil {
 		return nil
 	}
-	capacity := endpointCapacity(endpoint.GetMetrics(), r.cfg.CapacityTokens)
+	metrics := endpoint.GetMetrics()
+	capacity := endpointCapacity(metrics, r.cfg.CapacityTokens)
+	if metrics != nil && metrics.Updated() {
+		r.mgr.noteKVUsage(metrics.KVCacheUsagePercent)
+	}
 
 	now := time.Now()
 	estimate := max(estimateTokens(request.RequestSizeBytes), 1)

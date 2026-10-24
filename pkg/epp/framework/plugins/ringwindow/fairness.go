@@ -186,34 +186,75 @@ func (r *RingWindow) Pick(_ context.Context, band fwkfc.PriorityBandAccessor) (f
 		return si.seq < sj.seq
 	})
 
-	// 1. ROTATE: the least-slack waiting outsider whose D-clock has expired
-	// (and whose budget is known at all).
-	var rot *candidate
-	for _, c := range cands {
-		if c.anon || c.member {
-			continue
+	// 0. OFF-SWITCH — when the idle pool cannot hold even one mean
+	// footprint, no membership policy can retain anything (the TP2-deep
+	// capacity wall). Serve oldest-first without churning labels: the
+	// documented, honest FCFS regime instead of an accidental one.
+	if m.transparentLocked() {
+		var oldest *candidate
+		for _, c := range cands {
+			if c.anon {
+				continue
+			}
+			if oldest == nil || c.arrival.Before(oldest.arrival) {
+				oldest = c
+			}
 		}
-		if rot == nil || c.slack < rot.slack {
-			rot = c
+		if oldest != nil {
+			r.metrics.pickTransparent.Inc()
+			return oldest.queue, nil
 		}
 	}
-	if rot != nil && rot.dEff > 0 && rot.slack <= 0 {
-		m.lastDEff = rot.dEff
-		m.lastWidthD = m.widthDLocked(rot.d)
-		prevRotation := m.lastRotation
-		_, oversized, noVictims := m.rotate(rot.session, rot.est, rot.d, now)
-		m.reserveLocked(rot.session, rot.est, now)
-		r.metrics.pickRotations.Inc()
-		if !prevRotation.IsZero() {
-			r.metrics.rotationInterval.Observe(now.Sub(prevRotation).Seconds())
+
+	// 1. ROTATE — the window advances one place per completed round (the
+	// design's clock: "one place per round, sped up only by D"). Trigger
+	// and admission are split: the D clock watches the LEAST-SLACK
+	// outsider (enforcing the promise for the worst waiter), while the
+	// seat goes to the HEAD outsider by ring order (fairness is the
+	// ring's, not the deadline's). At D = 0 the round clock is the only
+	// pace — the elastic floor never substitutes a deadline for a
+	// missing one.
+	nonMembers := nonMemberIDs(cands)
+	if head := m.headOutsiderLocked(nonMembers); head != nil {
+		var hc *candidate
+		for _, c := range cands {
+			if c.session == head.id {
+				hc = c
+				break
+			}
 		}
-		if oversized {
-			r.metrics.pickOversized.Inc()
+		if hc != nil {
+			roundElapsed := m.round > m.lastRotationRound
+			dDemand := false
+			var dSlack time.Duration
+			for _, c := range cands {
+				if _, out := nonMembers[c.session]; !out {
+					continue
+				}
+				if c.d > 0 && c.dEff > 0 && c.slack <= 0 && (!dDemand || c.slack < dSlack) {
+					dDemand, dSlack = true, c.slack
+				}
+			}
+			if roundElapsed || dDemand {
+				m.lastRotationRound = m.round
+				m.lastDEff = hc.dEff
+				m.lastWidthD = m.widthDLocked(hc.d)
+				prevRotation := m.lastRotation
+				_, oversized, noVictims := m.rotate(head.id, hc.est, hc.d, now)
+				m.reserveLocked(head.id, hc.est, now)
+				r.metrics.pickRotations.Inc()
+				if !prevRotation.IsZero() {
+					r.metrics.rotationInterval.Observe(now.Sub(prevRotation).Seconds())
+				}
+				if oversized {
+					r.metrics.pickOversized.Inc()
+				}
+				if noVictims {
+					r.metrics.pickNoVictims.Inc()
+				}
+				return hc.queue, nil
+			}
 		}
-		if noVictims {
-			r.metrics.pickNoVictims.Inc()
-		}
-		return rot.queue, nil
 	}
 
 	// 2. MEMBER: rescue by laxity relative to the scan, then the
@@ -228,6 +269,12 @@ func (r *RingWindow) Pick(_ context.Context, band fwkfc.PriorityBandAccessor) (f
 		var rec *candidate
 		recUrgency := time.Duration(0)
 		for _, c := range memberCand {
+			if c.d <= 0 {
+				// No published deadline: there is nothing to rescue
+				// against, and rescue-on-every-pick would freeze the
+				// scan (and the round clock with it) at D=0.
+				continue
+			}
 			dist := m.scanDistanceLocked(c.session)
 			if dist < 0 {
 				continue

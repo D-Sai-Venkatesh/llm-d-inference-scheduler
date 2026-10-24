@@ -20,6 +20,9 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	crand "crypto/rand"
+	"encoding/binary"
 )
 
 // reservationTTL bounds an admission reservation whose session never reached
@@ -61,10 +64,20 @@ type session struct {
 	// the per-session service prediction of decision D10.
 	lastTurnDur time.Duration
 	turnCount   int64
-	// seq is the ring position: assigned on first join and re-assigned on
-	// demotion and on rejoin after a sweep, so a demoted session rejoins
-	// the outsider line at the tail rather than at the head.
+	// seq is the creation tie-break (arrival order).
 	seq int64
+	// sortGen is the placement cohort: 0 = first placement (the salted
+	// hash cohort), >= 1 = re-entry cohorts (demotion), strictly behind
+	// every earlier cohort. Hash + immutable positions alone livelocks
+	// (the victim returns to its rank and is the head again forever);
+	// re-entry to the cohort tail is what breaks the cycle.
+	sortGen int64
+	// orderKey is the position within the cohort: a salted hash of the
+	// session id for gen 0 (spreads session sizes around the ring —
+	// arrival order correlates with footprint on this workload, which
+	// would pinch the window exactly where recompute is dearest), a
+	// sequence number for re-entry cohorts.
+	orderKey uint64
 	// member labels the session as inside the window. Labels govern
 	// scheduling only; they never pin or protect blocks.
 	member       bool
@@ -102,6 +115,36 @@ func (s *session) dispatchable(now time.Time) bool {
 // ring-window plugin's hooks. v0 assumes a single serving pool (single
 // replica): one ring, one budget. Capacity is learned from the endpoints
 // seen at PreRequest; the pool capacity is the most recently seen one.
+// placementSalt randomizes the first-placement hash per process, so
+// clients cannot grind session ids for ring positions and a weak string
+// hash cannot reproduce the arrival-order size gradient. Logged at startup.
+var placementSalt = func() uint64 {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return 0x9e3779b97f4a7c15
+	}
+	return binary.LittleEndian.Uint64(b[:])
+}()
+
+// placementHash is a well-mixing hash of the session id under the salt
+// (splitmix64 over FNV-1a; never a plain string hash — Java-style hashes
+// are near-monotone over sequential ids and would recreate the ramp).
+func placementHash(id string) uint64 {
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(id); i++ {
+		h ^= uint64(id[i])
+		h *= 1099511628211
+	}
+	h ^= placementSalt
+	h += 0x9e3779b97f4a7c15
+	h ^= h >> 30
+	h *= 0xbf58476d1ce4e5b9
+	h ^= h >> 27
+	h *= 0x94d049bb133111eb
+	h ^= h >> 31
+	return h
+}
+
 type ringManager struct {
 	mu sync.Mutex
 
@@ -113,6 +156,17 @@ type ringManager struct {
 	// rather than a reported cache_config_info.
 	capacity           float64
 	capacityFromConfig bool
+	// kvUsage is the latest engine KV utilization (running-set pinned
+	// fraction) learned at PreRequest; -1 until the first report. The
+	// idle pool (1-kv)*C is what idle members' blocks actually live in —
+	// the quantity the theta*C budget was guessing at.
+	kvUsage float64
+	// cohortGen counts re-entry cohorts; reentrySeq orders within them.
+	cohortGen  int64
+	reentrySeq uint64
+	// lastIdlePool / transparent feed the off-switch telemetry.
+	lastIdlePool float64
+	transparent  bool
 	// endpoints caches the last-seen capacity per endpoint id.
 	endpoints map[string]float64
 
@@ -128,6 +182,12 @@ type ringManager struct {
 	// skips.
 	round int64
 	slot  int
+	// lastRotationRound is the round during which the window last advanced
+	// one place. The design's clock: "one place per round, sped up only by
+	// D" (transcript-2026-10-23) — rotation is eligible once a round has
+	// completed since the last rotation, and sooner only when a real D
+	// (D > 0) demands it.
+	lastRotationRound int64
 
 	// turnDurSum/turnDurCount maintain the running mean turn duration
 	// since plugin start (no window, no constant): the ŝ used by the
@@ -175,6 +235,7 @@ func newRingManager(cfg Config) *ringManager {
 		// off at TP2/TP4).
 		capacity:           float64(cfg.CapacityTokens),
 		capacityFromConfig: true,
+		kvUsage:            -1,
 		cfg:                cfg,
 		counters:           managerCounters{demotions: make(map[string]int64)},
 	}
@@ -186,10 +247,26 @@ func (m *ringManager) ensureSessionLocked(id string) *session {
 	s, ok := m.sessions[id]
 	if !ok {
 		m.nextSeq++
-		s = &session{id: id, seq: m.nextSeq, lastActivity: time.Now()}
+		s = &session{
+			id: id, seq: m.nextSeq,
+			sortGen:      0,
+			orderKey:     placementHash(id),
+			lastActivity: time.Now(),
+		}
 		m.sessions[id] = s
 	}
 	return s
+}
+
+// lessOrders the two sessions by (cohort, order within cohort, seq).
+func orderLess(a, b *session) bool {
+	if a.sortGen != b.sortGen {
+		return a.sortGen < b.sortGen
+	}
+	if a.orderKey != b.orderKey {
+		return a.orderKey < b.orderKey
+	}
+	return a.seq < b.seq
 }
 
 // members returns the member set in ring (seq) order.
@@ -200,7 +277,7 @@ func (m *ringManager) membersLocked() []*session {
 			out = append(out, s)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].seq < out[j].seq })
+	sort.Slice(out, func(i, j int) bool { return orderLess(out[i], out[j]) })
 	return out
 }
 
@@ -276,8 +353,15 @@ func (m *ringManager) widthDLocked(d time.Duration) int {
 // (member count + 1 ≤ W_D, operator's raw D). It records which width binds,
 // for telemetry.
 func (m *ringManager) fitsLocked(est float64, d time.Duration, now time.Time) bool {
-	if m.memberSumLocked(now)+est > m.budgetTokensLocked() {
+	sum := m.memberSumLocked(now) + est
+	if sum > m.budgetTokensLocked() {
 		m.lastBinding = "budget"
+		return false
+	}
+	if pool := m.idlePoolLocked(); pool >= 0 && sum > pool {
+		// The free pool is the physical space idle members' blocks occupy;
+		// theta*C was a guess at it that ignored the running set.
+		m.lastBinding = "retention"
 		return false
 	}
 	if len(m.membersLocked())+1 > m.widthDLocked(d) {
@@ -313,8 +397,13 @@ func (m *ringManager) demotionVictimsLocked(now time.Time) []*session {
 // tail, so a demoted session rejoins the outsider line behind everyone.
 func (m *ringManager) demoteLocked(s *session, reason string) {
 	s.member = false
-	m.nextSeq++
-	s.seq = m.nextSeq
+	// Re-entry cohort: strictly behind every earlier cohort, FIFO within
+	// it. A demoted session must not return to its hash rank (livelock)
+	// nor keep a queue-jump on return.
+	m.cohortGen++
+	m.reentrySeq++
+	s.sortGen = m.cohortGen
+	s.orderKey = m.reentrySeq
 	m.counters.demotions[reason]++
 }
 
@@ -439,8 +528,10 @@ func (m *ringManager) reanchorToLocked(id string) {
 		if p == pos {
 			m.slot = i + 1
 			if m.slot >= len(seq) {
-				m.round++
-				m.slot = 0
+				// Clamp inside the round: the round counter advances only
+				// on serves (a join re-anchoring at the sequence end must
+				// not tick the rotation clock).
+				m.slot = len(seq) - 1
 			}
 			return
 		}
@@ -565,7 +656,7 @@ func (m *ringManager) headOutsiderLocked(waitingOutsiders map[string]bool) *sess
 		if s == nil {
 			continue
 		}
-		if best == nil || s.seq < best.seq {
+		if best == nil || orderLess(s, best) {
 			best = s
 		}
 	}
@@ -583,6 +674,58 @@ func (m *ringManager) noteCapacity(endpointID string, capacity float64) {
 	m.endpoints[endpointID] = capacity
 	m.capacity = capacity
 	m.capacityFromConfig = false
+}
+
+// noteKVUsage records the latest engine KV utilization (single-pool v0).
+func (m *ringManager) noteKVUsage(kv float64) {
+	if kv < 0 || kv > 1 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.kvUsage = kv
+}
+
+// idlePoolLocked is the token space idle members' blocks actually live in:
+// (1-kv)*C. -1 while KV is unknown (before the first PreRequest report).
+func (m *ringManager) idlePoolLocked() float64 {
+	if m.kvUsage < 0 || m.capacity <= 0 {
+		return -1
+	}
+	return (1 - m.kvUsage) * m.capacity
+}
+
+// meanFootprintLocked is the measured mean committed footprint.
+func (m *ringManager) meanFootprintLocked() float64 {
+	var sum float64
+	var n int
+	for _, s := range m.sessions {
+		if s.committedTokens > 0 {
+			sum += float64(s.committedTokens)
+			n++
+		}
+	}
+	if n == 0 {
+		return 0
+	}
+	return sum / float64(n)
+}
+
+// transparentLocked reports the off-switch: the idle pool cannot hold even
+// one mean footprint, so no membership policy can retain anything — serve
+// oldest-first without churning labels (the documented FCFS regime).
+func (m *ringManager) transparentLocked() bool {
+	pool := m.idlePoolLocked()
+	if pool < 0 {
+		return false
+	}
+	fp := m.meanFootprintLocked()
+	if fp <= 0 {
+		return false
+	}
+	m.lastIdlePool = pool
+	m.transparent = pool < fp
+	return m.transparent
 }
 
 // chargePreRequest is the PreRequest hook body: bind the session, charge the

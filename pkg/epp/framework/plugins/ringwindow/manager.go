@@ -244,18 +244,27 @@ func (m *ringManager) inflightCountLocked() int {
 
 // widthDLocked is the D-width of the window: a member's worst gap under the
 // round-counter order is ~gapFactorPerServe serves per member, each taking
-// ŝ/ĉ wall time, so W ≤ dEff·ĉ/(gapFactorPerServe·ŝ). Returns a large value
-// while ŝ is unknown (before the first turn completes).
-func (m *ringManager) widthDLocked(dEff time.Duration) int {
+// ŝ/ĉ wall time, so W ≤ d·ĉ/(gapFactorPerServe·ŝ). The width applies only
+// when the operator's D is the binding term of the deadline: when the
+// elastic floor is active (ŝ·N̂/ĉ > d, including D=0), the floor already
+// paces rotation at one pass per round and capping the width on top of it
+// would double-count — the D-width degenerates to N̂/2.7 with no deadline
+// information, and at shallow queues it collapses the window to one member,
+// discarding locality exactly where it is free (V0-REVIEW verification
+// round, residuals 1+2). With the floor active the budget binds.
+func (m *ringManager) widthDLocked(d time.Duration) int {
 	ŝ := m.meanTurnDurLocked()
-	if ŝ <= 0 {
+	if ŝ <= 0 || d <= 0 {
 		return 1 << 30
 	}
 	ĉ := m.inflightCountLocked()
 	if ĉ < 1 {
 		ĉ = 1
 	}
-	w := int(float64(dEff) * float64(ĉ) / (gapFactorPerServe * float64(ŝ)))
+	if stretch := ŝ * time.Duration(m.lastNWaiting) / time.Duration(ĉ); stretch > d {
+		return 1 << 30
+	}
+	w := int(float64(d) * float64(ĉ) / (gapFactorPerServe * float64(ŝ)))
 	if w < 1 {
 		w = 1
 	}
@@ -264,13 +273,14 @@ func (m *ringManager) widthDLocked(dEff time.Duration) int {
 
 // fitsLocked reports whether a session of est tokens can join the window
 // under both widths: the budget width (Σ + est ≤ θ·C) and the D-width
-// (member count + 1 ≤ W_D). It records which width binds, for telemetry.
-func (m *ringManager) fitsLocked(est float64, dEff time.Duration, now time.Time) bool {
+// (member count + 1 ≤ W_D, operator's raw D). It records which width binds,
+// for telemetry.
+func (m *ringManager) fitsLocked(est float64, d time.Duration, now time.Time) bool {
 	if m.memberSumLocked(now)+est > m.budgetTokensLocked() {
 		m.lastBinding = "budget"
 		return false
 	}
-	if len(m.membersLocked())+1 > m.widthDLocked(dEff) {
+	if len(m.membersLocked())+1 > m.widthDLocked(d) {
 		m.lastBinding = "d"
 		return false
 	}
@@ -311,11 +321,11 @@ func (m *ringManager) demoteLocked(s *session, reason string) {
 // demoteUntilFit demotes members in eviction order until a session of est
 // tokens fits both widths, or no demotable member remains. reason labels the
 // demotion counter. Returns whether it fits now.
-func (m *ringManager) demoteUntilFitLocked(est float64, dEff time.Duration, reason string, now time.Time) bool {
-	for !m.fitsLocked(est, dEff, now) {
+func (m *ringManager) demoteUntilFitLocked(est float64, d time.Duration, reason string, now time.Time) bool {
+	for !m.fitsLocked(est, d, now) {
 		victims := m.demotionVictimsLocked(now)
 		if len(victims) == 0 {
-			return m.fitsLocked(est, dEff, now)
+			return m.fitsLocked(est, d, now)
 		}
 		m.demoteLocked(victims[0], reason)
 	}
@@ -332,9 +342,9 @@ func (m *ringManager) demoteUntilFitLocked(est float64, dEff time.Duration, reas
 //     runs as a non-member and the window stays intact (V0-REVIEW code
 //     review, issue 7: this is not the oversized case and must not be
 //     counted as it).
-func (m *ringManager) admitWithDemotion(id string, est float64, dEff time.Duration, reason string, now time.Time) (joined, oversized, noVictims bool) {
+func (m *ringManager) admitWithDemotion(id string, est float64, d time.Duration, reason string, now time.Time) (joined, oversized, noVictims bool) {
 	s := m.ensureSessionLocked(id)
-	if !m.demoteUntilFitLocked(est, dEff, reason, now) {
+	if !m.demoteUntilFitLocked(est, d, reason, now) {
 		if est > m.budgetTokensLocked() {
 			for _, mem := range m.membersLocked() {
 				m.demoteLocked(mem, "clear")
@@ -354,7 +364,7 @@ func (m *ringManager) admitWithDemotion(id string, est float64, dEff time.Durati
 // rotates one place — the outsider joins (demoting in eviction order until
 // the budget covers it) and is dispatched first in the new window. Members
 // never trigger rotation (decision D4).
-func (m *ringManager) rotate(id string, est float64, dEff time.Duration, now time.Time) (joined, oversized, noVictims bool) {
+func (m *ringManager) rotate(id string, est float64, d time.Duration, now time.Time) (joined, oversized, noVictims bool) {
 	m.counters.rotations++
 	if !m.lastRotation.IsZero() {
 		m.rotationIntervals = append(m.rotationIntervals, now.Sub(m.lastRotation))
@@ -363,20 +373,20 @@ func (m *ringManager) rotate(id string, est float64, dEff time.Duration, now tim
 		}
 	}
 	m.lastRotation = now
-	return m.admitWithDemotion(id, est, dEff, "rotate", now)
+	return m.admitWithDemotion(id, est, d, "rotate", now)
 }
 
 // guest is Pick step 3's non-fitting path: the GPU must not idle while no
 // member waits, so the head outsider runs even though it does not fit
 // (decision D6, the weak sense).
-func (m *ringManager) guest(id string, est float64, dEff time.Duration, now time.Time) (joined, oversized, noVictims bool) {
+func (m *ringManager) guest(id string, est float64, d time.Duration, now time.Time) (joined, oversized, noVictims bool) {
 	m.counters.guests++
-	return m.admitWithDemotion(id, est, dEff, "guest", now)
+	return m.admitWithDemotion(id, est, d, "guest", now)
 }
 
 // joinQuiet admits the head outsider when it fits without demoting anyone.
-func (m *ringManager) joinQuiet(id string, est float64, dEff time.Duration, now time.Time) bool {
-	if !m.fitsLocked(est, dEff, now) {
+func (m *ringManager) joinQuiet(id string, est float64, d time.Duration, now time.Time) bool {
+	if !m.fitsLocked(est, d, now) {
 		return false
 	}
 	s := m.ensureSessionLocked(id)
@@ -387,7 +397,10 @@ func (m *ringManager) joinQuiet(id string, est float64, dEff time.Duration, now 
 
 // roundSeqFor is the serve sequence of one round: the member positions in
 // ring order starting at round mod L, then the interior positions in
-// reverse. L + (L−2) slots; for L < 3 the backward phase is empty.
+// reverse. L + (L−2) slots; for L < 3 the backward phase is empty. The
+// double-serve at each round boundary (…C B | B C D…) is intentional: it is
+// what makes the counts equal over L rounds, and the second serve is a free
+// hit because that member's blocks are the youngest in the queue.
 func roundSeqFor(round int64, L int) []int {
 	r := int(round % int64(L))
 	if r < 0 {

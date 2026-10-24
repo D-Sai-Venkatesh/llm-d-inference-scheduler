@@ -199,9 +199,9 @@ func (r *RingWindow) Pick(_ context.Context, band fwkfc.PriorityBandAccessor) (f
 	}
 	if rot != nil && rot.dEff > 0 && rot.slack <= 0 {
 		m.lastDEff = rot.dEff
-		m.lastWidthD = m.widthDLocked(rot.dEff)
+		m.lastWidthD = m.widthDLocked(rot.d)
 		prevRotation := m.lastRotation
-		_, oversized, noVictims := m.rotate(rot.session, rot.est, rot.dEff, now)
+		_, oversized, noVictims := m.rotate(rot.session, rot.est, rot.d, now)
 		m.reserveLocked(rot.session, rot.est, now)
 		r.metrics.pickRotations.Inc()
 		if !prevRotation.IsZero() {
@@ -255,7 +255,7 @@ func (r *RingWindow) Pick(_ context.Context, band fwkfc.PriorityBandAccessor) (f
 					// advanced it inside pickNextMemberLocked.
 					m.reserveLocked(pick.id, c.est, now)
 					m.lastDEff = c.dEff
-					m.lastWidthD = m.widthDLocked(c.dEff)
+					m.lastWidthD = m.widthDLocked(c.d)
 					r.metrics.pickMemberServes.Inc()
 					if c.waitMs >= 1000 {
 						// bucket boundary of the delayed-dispatch
@@ -279,13 +279,13 @@ func (r *RingWindow) Pick(_ context.Context, band fwkfc.PriorityBandAccessor) (f
 		}
 		if hc != nil {
 			m.lastDEff = hc.dEff
-			m.lastWidthD = m.widthDLocked(hc.dEff)
+			m.lastWidthD = m.widthDLocked(hc.d)
 			if m.fitsLocked(hc.est, hc.dEff, now) {
-				m.joinQuiet(hc.session, hc.est, hc.dEff, now)
+				m.joinQuiet(hc.session, hc.est, hc.d, now)
 				m.reserveLocked(hc.session, hc.est, now)
 				r.metrics.pickJoins.Inc()
 			} else {
-				_, oversized, noVictims := m.guest(hc.session, hc.est, hc.dEff, now)
+				_, oversized, noVictims := m.guest(hc.session, hc.est, hc.d, now)
 				m.reserveLocked(hc.session, hc.est, now)
 				r.metrics.pickGuests.Inc()
 				r.metrics.pickGuestTokens.Add(hc.est)

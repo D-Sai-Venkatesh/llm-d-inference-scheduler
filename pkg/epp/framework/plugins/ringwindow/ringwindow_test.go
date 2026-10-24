@@ -613,7 +613,10 @@ func TestC256Magnitudes(t *testing.T) {
 	widthD := r.mgr.lastWidthD
 	r.mgr.mu.Unlock()
 	require.InDelta(t, 114, int(dEff.Seconds()), 3, "D_eff = mean*N/c = 70*126/77 ≈ 114.5 s, not 8820 s")
-	require.InDelta(t, 46, widthD, 2, "W_D = dEff*c/(2.7*mean) ≈ 46")
+	// The elastic floor (114.5 s) exceeds the operator's D (60 s), so the
+	// D-width is bypassed and the budget binds (V0-REVIEW verification
+	// residuals 1+2): the width must NOT degenerate to N̂/2.7 = 46.
+	require.Equal(t, 1<<30, widthD, "with the elastic floor active the D-width is bypassed; the budget binds")
 }
 
 // TestRecoveryLaxityRunsScan: raw least-slack recovery is round-robin
@@ -691,4 +694,27 @@ func TestRotationGuardAtColdStart(t *testing.T) {
 		makeQueue("B", 0, 0, 280)))
 	require.Equal(t, int64(0), counters(r).rotations, "cold start with D=0 must not count joins as rotations")
 	require.Equal(t, float64(1), testutil.ToFloat64(r.metrics.pickJoins))
+}
+
+// TestShallowQueueWindowDoesNotCollapse: with the elastic floor active
+// (D=0 or D below the floor), the D-width must not pinch the window to one
+// member at shallow queue depths (V0-REVIEW verification residual 2).
+func TestShallowQueueWindowDoesNotCollapse(t *testing.T) {
+	r := newTestPlugin(testConfig())
+	joinWindow(t, r, "A")
+	setCommitted(r, "A", 70)
+	noteMeanTurn(r, 10*time.Second, 10)
+	// N̂ = 1 (B waiting), ĉ = 1: the elastic floor is 10 s. With D = 0 the
+	// width must be unbounded; with D = 5 s (below the floor) it must also
+	// be unbounded (the floor already paces rotation); with D = 30 s (above
+	// the floor) the width applies: 30·1/(2.7·10) = 1.
+	r.mgr.mu.Lock()
+	r.mgr.lastNWaiting = 1
+	w0 := r.mgr.widthDLocked(0)
+	w5 := r.mgr.widthDLocked(5 * time.Second)
+	w30 := r.mgr.widthDLocked(30 * time.Second)
+	r.mgr.mu.Unlock()
+	require.Equal(t, 1<<30, w0, "D=0: no D-width")
+	require.Equal(t, 1<<30, w5, "D below the elastic floor: the floor paces; no D-width")
+	require.Equal(t, 1, w30, "D above the floor: the D-width applies")
 }

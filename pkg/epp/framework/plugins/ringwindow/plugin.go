@@ -191,16 +191,24 @@ func (r *RingWindow) Extract(_ context.Context, event fwkdl.EndpointEvent) error
 // client headers, so they are omitted from the dump; the ring order is
 // shown by sequence number.
 type stateDump struct {
-	Members      int              `json:"members"`
-	MemberSum    float64          `json:"memberSumTokens"`
-	Budget       float64          `json:"budgetTokens"`
-	Capacity     float64          `json:"capacityTokens"`
-	MeanTurnSec  float64          `json:"meanTurnSeconds"`
-	Rotations    int64            `json:"rotations"`
-	Guests       int64            `json:"guests"`
-	Oversized    int64            `json:"oversizedGuests"`
-	Demotions    map[string]int64 `json:"demotions"`
-	Sessions     []sessionView    `json:"sessions"`
+	Members            int              `json:"members"`
+	MemberSum          float64          `json:"memberSumTokens"`
+	Budget             float64          `json:"budgetTokens"`
+	Capacity           float64          `json:"capacityTokens"`
+	CapacityFromConfig bool             `json:"capacityFromConfig"`
+	MeanTurnSec        float64          `json:"meanTurnSeconds"`
+	WaitingTurns       int              `json:"waitingTurns"`
+	InflightTurns      int              `json:"inflightTurns"`
+	DEffSeconds        float64          `json:"dEffectiveSeconds"`
+	WidthD             int              `json:"widthDMembers"`
+	Binding            string           `json:"widthBinding"`
+	Rotations          int64            `json:"rotations"`
+	Guests             int64            `json:"guests"`
+	Oversized          int64            `json:"oversizedGuests"`
+	NoVictims          int64            `json:"noVictims"`
+	Demotions          map[string]int64 `json:"demotions"`
+	ServeSequence      []string         `json:"serveSequence"`
+	Sessions           []sessionView    `json:"sessions"`
 }
 
 // DumpState reports the window, the counters and the per-session ledger.
@@ -210,16 +218,24 @@ func (r *RingWindow) DumpState() (json.RawMessage, error) {
 	defer m.mu.Unlock()
 	now := time.Now()
 	dump := stateDump{
-		Members:     len(m.membersLocked()),
-		MemberSum:   m.memberSumLocked(now),
-		Budget:      m.budgetTokensLocked(),
-		Capacity:    m.capacity,
-		MeanTurnSec: m.meanTurnDurLocked().Seconds(),
-		Rotations:   m.counters.rotations,
-		Guests:      m.counters.guests,
-		Oversized:   m.counters.oversized,
-		Demotions:   m.counters.demotions,
-		Sessions:    m.sessionViewsLocked(),
+		Members:            len(m.membersLocked()),
+		MemberSum:          m.memberSumLocked(now),
+		Budget:             m.budgetTokensLocked(),
+		Capacity:           m.capacity,
+		CapacityFromConfig: m.capacityFromConfig,
+		MeanTurnSec:        m.meanTurnDurLocked().Seconds(),
+		WaitingTurns:       m.lastNWaiting,
+		InflightTurns:      m.inflightCountLocked(),
+		DEffSeconds:        m.lastDEff.Seconds(),
+		WidthD:             m.lastWidthD,
+		Binding:            m.lastBinding,
+		Rotations:          m.counters.rotations,
+		Guests:             m.counters.guests,
+		Oversized:          m.counters.oversized,
+		NoVictims:          m.counters.noVictims,
+		Demotions:          m.counters.demotions,
+		ServeSequence:      append([]string(nil), m.serveHistory...),
+		Sessions:           m.sessionViewsLocked(),
 	}
 	return json.Marshal(dump)
 }

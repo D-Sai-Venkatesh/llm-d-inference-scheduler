@@ -18,19 +18,20 @@ package ringwindow
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	fwkfc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	fwkfcmocks "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol/mocks"
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
-	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // testConfig uses round numbers: capacity 480 tokens, theta 0.8 → budget
@@ -160,6 +161,15 @@ func runTurn(t *testing.T, r *RingWindow, id string, sizeBytes, totalTokens int,
 	r.mgr.settleResponse(id, int64(sizeBytes/4), int64(totalTokens), dur, time.Now())
 }
 
+// resetScan points the round-counter cursor at the start of round 0, so
+// tests assert exact sequences.
+func resetScan(r *RingWindow) {
+	r.mgr.mu.Lock()
+	defer r.mgr.mu.Unlock()
+	r.mgr.round = 0
+	r.mgr.slot = 0
+}
+
 func counters(r *RingWindow) managerCounters {
 	r.mgr.mu.Lock()
 	defer r.mgr.mu.Unlock()
@@ -210,20 +220,27 @@ func TestMemberServesBackAndForth(t *testing.T) {
 			makeQueue("D", 0, time.Minute, 280),
 		}
 	}
-	// The joins re-anchored the cursor at D; the sweep continues backward
-	// from there and wraps: C B A D, then repeats with a rotated turnaround.
+	// The round-counter order (V0-REVIEW code review, issue 1): round r
+	// serves [r, r+1, …, r+L−1] then the interior in reverse. Four rounds
+	// form the full period — a 24-serve cycle, NOT a period-4 round-robin.
+	resetScan(r)
 	var got []string
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 24; i++ {
 		got = append(got, pickID(t, r, queues()...))
 	}
-	require.Equal(t, []string{"C", "B", "A", "D", "C", "B", "A", "D"}, got)
-	// Every member served exactly once per pass.
+	require.Equal(t, []string{
+		"A", "B", "C", "D", "C", "B", // round 0
+		"B", "C", "D", "A", "D", "C", // round 1
+		"C", "D", "A", "B", "A", "D", // round 2
+		"D", "A", "B", "C", "B", "A", // round 3
+	}, got)
+	// Every member served exactly six times per period: equal service.
 	counts := map[string]int{}
 	for _, id := range got {
 		counts[id]++
 	}
 	for _, id := range []string{"A", "B", "C", "D"} {
-		require.Equal(t, 2, counts[id], "member %s should be served twice in 8 serves", id)
+		require.Equal(t, 6, counts[id], "member %s should be served six times per period", id)
 	}
 }
 
@@ -234,6 +251,7 @@ func TestQuietMemberSkippedKeepsPlace(t *testing.T) {
 		setCommitted(r, id, 70)
 	}
 	// C is in a tool call: A, B, D have turns waiting, C does not.
+	resetScan(r)
 	live := func() []fwkfc.FlowQueueAccessor {
 		return []fwkfc.FlowQueueAccessor{
 			makeQueue("A", 0, time.Minute, 280),
@@ -248,19 +266,19 @@ func TestQuietMemberSkippedKeepsPlace(t *testing.T) {
 	for _, id := range got {
 		require.NotEqual(t, "C", id, "quiet member must never be served")
 	}
-	// One pass over the ring serves each live member once; the fourth
-	// serve is the start of the next pass.
-	require.Equal(t, []string{"B", "A", "D"}, got[:3], "one pass serves each live member once")
-	// C returns: it must be served within one pass.
+	// One round serves each live member at each of its slots.
+	require.Equal(t, []string{"A", "B", "D"}, got[:3], "round 0 serves the live members at their slots")
+	// C returns: it must be served within one round (2L-2 = 6 serves).
+	resetScan(r)
 	all := append(live(), makeQueue("C", 0, time.Minute, 280))
 	served := false
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 6; i++ {
 		if pickID(t, r, all...) == "C" {
 			served = true
 			break
 		}
 	}
-	require.True(t, served, "returning member served within one pass")
+	require.True(t, served, "returning member served within one round")
 }
 
 func TestRotationOnOutsiderSlackExpiry(t *testing.T) {
@@ -382,8 +400,9 @@ func TestDemotionSkipsWaitingAndRunning(t *testing.T) {
 	for _, id := range []string{"A", "B", "C", "D"} {
 		setCommitted(r, id, 80)
 	}
-	// A has a turn waiting; B has a turn in flight (charged but not
-	// settled); C and D are quiet. C is the oldest release.
+	// A has a turn waiting (now a valid victim — but C is older); B has a
+	// turn in flight (never a victim: its blocks are pinned); C and D are
+	// quiet. C is the oldest release.
 	r.mgr.mu.Lock()
 	r.mgr.sessions["B"].inflightTokens = 80
 	r.mgr.mu.Unlock()
@@ -476,4 +495,200 @@ func TestTurnHitRatioTelemetry(t *testing.T) {
 	}
 	r.ResponseBody(context.Background(), req, resp, nil)
 	require.Equal(t, 1, testutil.CollectAndCount(r.metrics.turnHitRatio), "one hit-ratio observation")
+}
+
+// --- V0-REVIEW code-review regression tests ---
+
+// TestTwoMemberWindowNeverStalls: the old cursor deadlocked a 2-member
+// window at both edges and Pick returned nil forever (code review issue 4).
+func TestTwoMemberWindowNeverStalls(t *testing.T) {
+	r := newTestPlugin(testConfig())
+	joinWindow(t, r, "A", "B")
+	setCommitted(r, "A", 70)
+	setCommitted(r, "B", 70)
+	resetScan(r)
+	queues := func() []fwkfc.FlowQueueAccessor {
+		return []fwkfc.FlowQueueAccessor{
+			makeQueue("A", 0, time.Minute, 280),
+			makeQueue("B", 0, time.Minute, 280),
+		}
+	}
+	var got []string
+	for i := 0; i < 8; i++ {
+		id := pickID(t, r, queues()...)
+		require.NotEmpty(t, id, "a 2-member window must never stall (pick %d)", i)
+		got = append(got, id)
+	}
+	counts := map[string]int{}
+	for _, id := range got {
+		counts[id]++
+	}
+	require.InDelta(t, 4, counts["A"], 1, "equal service in a 2-member window")
+	require.InDelta(t, 4, counts["B"], 1, "equal service in a 2-member window")
+}
+
+// TestBusyRotationDemotesNotClears: in the busy steady state every member
+// has a turn waiting; the rotation must demote the oldest-released member,
+// not take the oversized path and clear the window (code review issue 5).
+func TestBusyRotationDemotesNotClears(t *testing.T) {
+	r := newTestPlugin(testConfig())
+	joinWindow(t, r, "A", "B", "C", "D")
+	for _, id := range []string{"A", "B", "C", "D"} {
+		setCommitted(r, id, 80)
+	}
+	setFinish(r, "C", 90*time.Second)
+	setFinish(r, "D", 30*time.Second)
+	setFinish(r, "B", 10*time.Second)
+	setFinish(r, "A", 5*time.Second)
+	// Every member has a turn waiting when E's D-clock expires.
+	got := pickID(t, r,
+		makeQueue("A", 0, time.Minute, 320),
+		makeQueue("B", 0, time.Minute, 320),
+		makeQueue("C", 0, time.Minute, 320),
+		makeQueue("D", 0, time.Minute, 320),
+		makeQueue("E", 120*time.Second, time.Minute, 320))
+	require.Equal(t, "E", got)
+	require.Equal(t, int64(1), counters(r).rotations)
+	require.Equal(t, int64(0), counters(r).oversized, "a busy rotation is not an oversized guest")
+	require.Equal(t, int64(0), counters(r).noVictims)
+	require.Equal(t, int64(0), counters(r).demotions["clear"], "the window must not clear")
+	require.Equal(t, int64(1), counters(r).demotions["rotate"])
+	require.Equal(t, []string{"A", "B", "D", "E"}, memberIDs(r), "the oldest-released member is demoted, the rest stay")
+}
+
+// TestDemotionReSeqsVictim: a demoted session rejoins the outsider line at
+// the tail, so it cannot be the head outsider ahead of later sessions
+// (code review issue 6).
+func TestDemotionReSeqsVictim(t *testing.T) {
+	r := newTestPlugin(testConfig())
+	joinWindow(t, r, "A", "B", "C", "D")
+	for _, id := range []string{"A", "B", "C", "D"} {
+		setCommitted(r, id, 80)
+	}
+	setFinish(r, "C", 90*time.Second)
+	setFinish(r, "D", 30*time.Second)
+	setFinish(r, "B", 10*time.Second)
+	setFinish(r, "A", 5*time.Second)
+	// F is already waiting when the rotation fires, so F's ring position
+	// predates C's demotion. E expires → rotation demotes C (re-seq to the
+	// tail, behind F and everyone else).
+	got := pickID(t, r,
+		makeQueue("E", 120*time.Second, time.Minute, 320),
+		makeQueue("F", 60*time.Second, time.Minute, 280))
+	require.Equal(t, "E", got)
+	require.False(t, isMember(r, "C"))
+
+	// No member waits and nobody's D-clock has expired, so the head
+	// outsider — the earliest seq — dispatches. C was just demoted
+	// (re-seq'd behind F), so F is the head even though C has waited
+	// longer in wall time.
+	got = pickID(t, r,
+		makeQueue("C", 40*time.Second, time.Minute, 320),
+		makeQueue("F", 30*time.Second, time.Minute, 280))
+	require.Equal(t, "F", got, "a just-demoted session rejoins behind everyone, regardless of wall-clock wait")
+}
+
+// TestC256Magnitudes: the elastic D_eff must include the measured
+// concurrency (code review issue 3). With mean turn 70 s, 126 waiting and
+// 77 in flight, the achievable round is ~115 s, not 8,820 s.
+func TestC256Magnitudes(t *testing.T) {
+	r := newTestPlugin(testConfig())
+	joinWindow(t, r, "A")
+	setCommitted(r, "A", 70000)
+	noteMeanTurn(r, 70*time.Second, 100)
+	// 77 sessions with a turn in flight: ĉ = 77.
+	for i := 0; i < 77; i++ {
+		r.mgr.chargePreRequest(fmt.Sprintf("run-%d", i), "pod", 1000, time.Now())
+	}
+	// 126 waiting turns: A (member) plus 125 outsiders.
+	var queues []fwkfc.FlowQueueAccessor
+	queues = append(queues, makeQueue("A", 0, 60*time.Second, 280000))
+	for i := 0; i < 125; i++ {
+		queues = append(queues, makeQueue(fmt.Sprintf("w-%d", i), 0, 60*time.Second, 280000))
+	}
+	got := pickID(t, r, queues...)
+	require.NotEmpty(t, got)
+	r.mgr.mu.Lock()
+	dEff := r.mgr.lastDEff
+	widthD := r.mgr.lastWidthD
+	r.mgr.mu.Unlock()
+	require.InDelta(t, 114, int(dEff.Seconds()), 3, "D_eff = mean*N/c = 70*126/77 ≈ 114.5 s, not 8820 s")
+	require.InDelta(t, 46, widthD, 2, "W_D = dEff*c/(2.7*mean) ≈ 46")
+}
+
+// TestRecoveryLaxityRunsScan: raw least-slack recovery is round-robin
+// (code review issue 2); with laxity relative to the scan, a generous
+// budget leaves the scan in charge and a tight budget rescues only the
+// member the scan cannot reach in time.
+func TestRecoveryLaxityRunsScan(t *testing.T) {
+	r := newTestPlugin(testConfig())
+	joinWindow(t, r, "A", "B", "C", "D")
+	for _, id := range []string{"A", "B", "C", "D"} {
+		setCommitted(r, id, 70)
+	}
+	noteMeanTurn(r, 10*time.Second, 10)
+	resetScan(r)
+	// Generous budget: nobody's urgency is negative, the scan runs.
+	queues := func() []fwkfc.FlowQueueAccessor {
+		return []fwkfc.FlowQueueAccessor{
+			makeQueue("A", 50*time.Second, 100*time.Second, 280),
+			makeQueue("B", 40*time.Second, 100*time.Second, 280),
+			makeQueue("C", 30*time.Second, 100*time.Second, 280),
+			makeQueue("D", 20*time.Second, 100*time.Second, 280),
+		}
+	}
+	require.Equal(t, "A", pickID(t, r, queues()...), "the scan serves in round-counter order")
+	require.Equal(t, "B", pickID(t, r, queues()...))
+	require.Equal(t, float64(0), testutil.ToFloat64(r.metrics.pickRecoveries))
+
+	// Tight budget (D = 25 s): only A — which the scan reaches next but
+	// whose budget is already blown — is rescued; the rest scan.
+	resetScan(r)
+	tight := func(withA bool) []fwkfc.FlowQueueAccessor {
+		qs := []fwkfc.FlowQueueAccessor{
+			makeQueue("B", 40*time.Second, 25*time.Second, 280),
+			makeQueue("C", 30*time.Second, 25*time.Second, 280),
+			makeQueue("D", 20*time.Second, 25*time.Second, 280),
+		}
+		if withA {
+			qs = append([]fwkfc.FlowQueueAccessor{makeQueue("A", 50*time.Second, 25*time.Second, 280)}, qs...)
+		}
+		return qs
+	}
+	require.Equal(t, "A", pickID(t, r, tight(true)...), "the member the scan cannot reach in time is rescued")
+	require.Equal(t, "B", pickID(t, r, tight(false)...), "with A served, the scan resumes")
+}
+
+// TestNoVictimsKeepsWindow: when every member is running (nothing
+// demotable), the admission runs as a non-member and the window stays
+// intact — and is not counted as oversized (code review issue 7).
+func TestNoVictimsKeepsWindow(t *testing.T) {
+	r := newTestPlugin(testConfig())
+	joinWindow(t, r, "A", "B")
+	for _, id := range []string{"A", "B"} {
+		setCommitted(r, id, 160)
+		r.mgr.mu.Lock()
+		r.mgr.sessions[id].inflightTokens = 160 // running: not demotable
+		r.mgr.mu.Unlock()
+	}
+	noteMeanTurn(r, 5*time.Second, 10)
+	// G does not fit (320 + 70 > 384) and no member can be demoted.
+	got := pickID(t, r, makeQueue("G", 0, time.Minute, 280))
+	require.Equal(t, "G", got, "never idle: G runs")
+	require.Equal(t, int64(0), counters(r).oversized, "not oversized: G fits an empty window")
+	require.Equal(t, int64(1), counters(r).noVictims)
+	require.False(t, isMember(r, "G"), "G runs as a non-member")
+	require.Equal(t, []string{"A", "B"}, memberIDs(r), "the window stays intact")
+}
+
+// TestRotationGuardAtColdStart: with D = 0 and no measured turn duration,
+// the rotation test is skipped and the first joins are counted as joins,
+// not rotations (code review issue 8).
+func TestRotationGuardAtColdStart(t *testing.T) {
+	r := newTestPlugin(testConfig())
+	require.Equal(t, "A", pickID(t, r,
+		makeQueue("A", 0, 0, 280),
+		makeQueue("B", 0, 0, 280)))
+	require.Equal(t, int64(0), counters(r).rotations, "cold start with D=0 must not count joins as rotations")
+	require.Equal(t, float64(1), testutil.ToFloat64(r.metrics.pickJoins))
 }

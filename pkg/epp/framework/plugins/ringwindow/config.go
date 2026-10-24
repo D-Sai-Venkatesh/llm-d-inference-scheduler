@@ -28,6 +28,10 @@ type Config struct {
 	// own operator parameter — plugin configurations are private in llm-d,
 	// so the gate's KV threshold cannot be read from here. Default 0.8
 	// mirrors the gate's default; the operator keeps the two in sync.
+	// Until request token counts are available before flow control
+	// (TODO #3221), footprints are estimated as body-bytes/4, which
+	// over-counts by the JSON envelope and tool schemas (~10–25%), so the
+	// effective budget is slightly narrower than θ·C in prompt tokens.
 	Theta float64 `json:"theta"`
 	// RotatingTurnaround serves the window in back-and-forth order with the
 	// turnaround position rotating one place per reversal, which spreads
@@ -49,10 +53,10 @@ const PluginType = "ring-window"
 
 func defaultConfig() Config {
 	return Config{
-		CapacityTokens:      4194304,
-		Theta:               0.8,
-		RotatingTurnaround:  true,
-		EvictionTTLSeconds:  3600,
+		CapacityTokens:       4194304,
+		Theta:                0.8,
+		RotatingTurnaround:   true,
+		EvictionTTLSeconds:   3600,
 		EvictionSweepSeconds: 10,
 	}
 }

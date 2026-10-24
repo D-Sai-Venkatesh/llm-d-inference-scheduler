@@ -31,16 +31,19 @@ import (
 // collected from the manager at scrape time, so they stay current when no
 // request arrives.
 type ringMetrics struct {
-	ledger *ringLedgerCollector
-	pickRotations        prometheus.Counter
-	pickRecoveries       prometheus.Counter
-	pickMemberServes     prometheus.Counter
-	pickJoins            prometheus.Counter
-	pickGuests           prometheus.Counter
-	pickOversized        prometheus.Counter
-	pickAnonymous        prometheus.Counter
+	ledger                *ringLedgerCollector
+	pickRotations         prometheus.Counter
+	pickRecoveries        prometheus.Counter
+	pickMemberServes      prometheus.Counter
+	pickJoins             prometheus.Counter
+	pickGuests            prometheus.Counter
+	pickOversized         prometheus.Counter
+	pickAnonymous         prometheus.Counter
 	pickDelayedDispatches prometheus.Counter
-	turnHitRatio         prometheus.Histogram
+	pickGuestTokens       prometheus.Counter
+	pickNoVictims         prometheus.Counter
+	rotationInterval      prometheus.Histogram
+	turnHitRatio          prometheus.Histogram
 }
 
 func newRingMetrics(mgr *ringManager) *ringMetrics {
@@ -86,6 +89,22 @@ func newRingMetrics(mgr *ringManager) *ringMetrics {
 			Name:      "ring_window_delayed_dispatches_total",
 			Help:      metricsutil.HelpMsgWithStability("Dispatches whose request waited at least 1s in the flow-control queue.", compbasemetrics.ALPHA),
 		}),
+		pickGuestTokens: prometheus.NewCounter(prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "ring_window_guest_tokens_total",
+			Help:      metricsutil.HelpMsgWithStability("Token estimates of never-idle guest dispatches; with the guest count this is the window's displacement cost.", compbasemetrics.ALPHA),
+		}),
+		pickNoVictims: prometheus.NewCounter(prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "ring_window_no_victims_total",
+			Help:      metricsutil.HelpMsgWithStability("Admissions that found no demotable member (every member running): the candidate ran as a non-member with the window intact. Not the oversized case.", compbasemetrics.ALPHA),
+		}),
+		rotationInterval: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "ring_window_rotation_interval_seconds",
+			Help:      metricsutil.HelpMsgWithStability("Time between window rotations — the rotation pacing, i.e. the thing under test.", compbasemetrics.ALPHA),
+			Buckets:   []float64{0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600},
+		}),
 		turnHitRatio: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
 			Name:      "ring_window_turn_hit_ratio",
@@ -106,6 +125,9 @@ func (m *ringMetrics) register(reg prometheus.Registerer) error {
 		registerOrReuse(reg, &m.pickOversized),
 		registerOrReuse(reg, &m.pickAnonymous),
 		registerOrReuse(reg, &m.pickDelayedDispatches),
+		registerOrReuse(reg, &m.pickGuestTokens),
+		registerOrReuse(reg, &m.pickNoVictims),
+		registerOrReuse(reg, &m.rotationInterval),
 		registerOrReuse(reg, &m.turnHitRatio),
 	)
 }
@@ -146,7 +168,13 @@ func (c *ringLedgerCollector) descs() []*prometheus.Desc {
 		fq("ring_window_member_sum_tokens", "Sum of member footprints, idle members included.", nil),
 		fq("ring_window_budget_tokens", "Membership budget theta*C in tokens.", nil),
 		fq("ring_window_capacity_tokens", "Pool KV capacity in tokens.", nil),
+		fq("ring_window_capacity_from_fallback", "1 while the capacity is still the configured fallback rather than a reported cache_config_info — assert it drops to 0 at run start.", nil),
 		fq("ring_window_mean_turn_seconds", "Running mean completed-turn duration in seconds (the elastic-D and D-width input).", nil),
+		fq("ring_window_waiting_turns", "Waiting queue heads at the last Pick (N-hat, half of every pacing formula).", nil),
+		fq("ring_window_inflight_turns", "Sessions with a turn in flight (c-hat, the concurrency divisor of the elastic D and the D-width).", nil),
+		fq("ring_window_d_effective_seconds", "The elastic budget of the last dispatched candidate: max(D, mean*sN/c).", nil),
+		fq("ring_window_width_d_members", "The D-width of the window at the last admission check (W_D).", nil),
+		fq("ring_window_width_binding", "1 on the width that bound the last failed admission: budget or d.", []string{"binding"}),
 		fq("ring_window_demotions_total", "Demotions from the window, by reason.", []string{"reason"}),
 	}
 }
@@ -158,8 +186,23 @@ func (c *ringLedgerCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(descs[1], prometheus.GaugeValue, snap.memberSum)
 	ch <- prometheus.MustNewConstMetric(descs[2], prometheus.GaugeValue, snap.budget)
 	ch <- prometheus.MustNewConstMetric(descs[3], prometheus.GaugeValue, snap.capacity)
-	ch <- prometheus.MustNewConstMetric(descs[4], prometheus.GaugeValue, snap.meanTurnDur.Seconds())
-	for reason, n := range snap.counters.demotions {
-		ch <- prometheus.MustNewConstMetric(descs[5], prometheus.CounterValue, float64(n), reason)
+	ch <- prometheus.MustNewConstMetric(descs[4], prometheus.GaugeValue, boolFloat(snap.capacityFromConfig))
+	ch <- prometheus.MustNewConstMetric(descs[5], prometheus.GaugeValue, snap.meanTurnDur.Seconds())
+	ch <- prometheus.MustNewConstMetric(descs[6], prometheus.GaugeValue, float64(snap.waiting))
+	ch <- prometheus.MustNewConstMetric(descs[7], prometheus.GaugeValue, float64(snap.inflight))
+	ch <- prometheus.MustNewConstMetric(descs[8], prometheus.GaugeValue, snap.dEff.Seconds())
+	ch <- prometheus.MustNewConstMetric(descs[9], prometheus.GaugeValue, float64(snap.widthD))
+	if snap.binding != "" {
+		ch <- prometheus.MustNewConstMetric(descs[10], prometheus.GaugeValue, 1, snap.binding)
 	}
+	for reason, n := range snap.counters.demotions {
+		ch <- prometheus.MustNewConstMetric(descs[11], prometheus.CounterValue, float64(n), reason)
+	}
+}
+
+func boolFloat(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }

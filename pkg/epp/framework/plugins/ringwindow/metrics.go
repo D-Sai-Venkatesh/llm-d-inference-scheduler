@@ -37,6 +37,7 @@ type ringMetrics struct {
 	pickMemberServes      prometheus.Counter
 	pickJoins             prometheus.Counter
 	pickGuests            prometheus.Counter
+	pickGuardDeferred     prometheus.Counter
 	pickOversized         prometheus.Counter
 	pickAnonymous         prometheus.Counter
 	pickDelayedDispatches prometheus.Counter
@@ -69,6 +70,10 @@ func newRingMetrics(mgr *ringManager) *ringMetrics {
 			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
 			Name:      "ring_window_joins_total",
 			Help:      metricsutil.HelpMsgWithStability("Head outsiders that joined the window without any demotion.", compbasemetrics.ALPHA),
+		}),
+		pickGuardDeferred: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "llm_d_epp_ring_window_pick_guard_deferred_total",
+			Help: "Guest candidates deferred by the cold-insert guard (footprint > fraction of idle pool, slack remaining)",
 		}),
 		pickGuests: prometheus.NewCounter(prometheus.CounterOpts{
 			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,

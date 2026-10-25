@@ -112,6 +112,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestattributereporter"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/arcwindow"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/ringwindow"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/thunderagent"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/outlenbucket"
@@ -781,6 +782,7 @@ func (r *Runner) registerInTreePlugins() {
 	// Alpha
 	fwkplugin.Register(agentidentity.PluginType, fwkplugin.StabilityAlpha, agentidentity.PluginFactory)
 	fwkplugin.Register(ringwindow.PluginType, fwkplugin.StabilityAlpha, ringwindow.Factory)
+	fwkplugin.Register(arcwindow.PluginType, fwkplugin.StabilityAlpha, arcwindow.Factory)
 	fwkplugin.Register(thunderagent.ThunderAgentPluginType, fwkplugin.StabilityAlpha, thunderagent.Factory)
 	fwkplugin.Register(outlenbucket.PluginType, fwkplugin.StabilityAlpha, outlenbucket.PluginFactory)
 }

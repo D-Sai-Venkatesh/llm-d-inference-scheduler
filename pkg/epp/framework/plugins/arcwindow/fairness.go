@@ -204,7 +204,11 @@ func (r *ArcWindow) Pick(ctx context.Context, band fwkfc.PriorityBandAccessor) (
 				pressed = c
 			}
 		}
-		if pressed != nil && pressed.dEff > 0 {
+		// The demand path requires a CONFIGURED deadline (D > 0): with D
+		// parked the arc moves ONLY by the heartbeat (the freeze rule) —
+		// the elastic stretch must not self-generate a deadline (the
+		// 2026-10-25 finding: dDemand dominated 1139:1 at c256 with D=0).
+		if pressed != nil && pressed.d > 0 {
 			// The population tier: a deadline-pressed off-ring session
 			// is admitted to the ring first (the budget does not bound D).
 			if pressed.offRing {

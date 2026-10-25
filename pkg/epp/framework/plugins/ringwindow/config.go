@@ -46,6 +46,13 @@ type Config struct {
 	EvictionTTLSeconds float64 `json:"evictionTtlSeconds"`
 	// EvictionSweepSeconds is how often the hygiene sweep runs.
 	EvictionSweepSeconds float64 `json:"evictionSweepSeconds"`
+	// GuestGuardFraction is the cold-insert guard (the prefill-tax
+	// ceiling, pace-control, operationalized): a GUEST whose footprint
+	// estimate exceeds this fraction of the measured idle pool is DEFERRED
+	// while it still has deadline slack — protecting the members' pool
+	// from a single huge cold insert. 0 (default) disables the guard;
+	// members and starving/deadline-pressed candidates are never deferred.
+	GuestGuardFraction float64 `json:"guestGuardFraction"`
 }
 
 // PluginType is the plugin type registered with the framework.
@@ -58,6 +65,7 @@ func defaultConfig() Config {
 		RotatingTurnaround:   true,
 		EvictionTTLSeconds:   3600,
 		EvictionSweepSeconds: 10,
+		GuestGuardFraction:   0,
 	}
 }
 
@@ -70,6 +78,9 @@ func (c Config) validate() error {
 	}
 	if c.EvictionTTLSeconds <= 0 {
 		return fmt.Errorf("evictionTtlSeconds must be > 0, got %v", c.EvictionTTLSeconds)
+	}
+	if c.GuestGuardFraction < 0 || c.GuestGuardFraction > 1 {
+		return fmt.Errorf("guestGuardFraction must be in [0, 1], got %v", c.GuestGuardFraction)
 	}
 	if c.EvictionSweepSeconds <= 0 {
 		return fmt.Errorf("evictionSweepSeconds must be > 0, got %v", c.EvictionSweepSeconds)

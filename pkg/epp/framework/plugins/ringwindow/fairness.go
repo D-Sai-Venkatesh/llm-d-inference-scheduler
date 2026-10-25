@@ -325,6 +325,17 @@ func (r *RingWindow) Pick(_ context.Context, band fwkfc.PriorityBandAccessor) (f
 			}
 		}
 		if hc != nil {
+			// Cold-insert guard (config-gated, default off): defer a guest
+			// whose footprint would blow through the measured idle pool —
+			// while it still has deadline slack. The deadline path (slack
+			// <= 0) and the off-switch remain the escapes; the deferred
+			// candidate is re-evaluated next Pick.
+			if m.cfg.GuestGuardFraction > 0 && hc.slack > 0 {
+				if pool := m.idlePoolLocked(); pool > 0 && hc.est > pool*m.cfg.GuestGuardFraction {
+					r.metrics.pickGuardDeferred.Inc()
+					return nil, nil
+				}
+			}
 			m.lastDEff = hc.dEff
 			m.lastWidthD = m.widthDLocked(hc.d)
 			if m.fitsLocked(hc.est, hc.dEff, now) {

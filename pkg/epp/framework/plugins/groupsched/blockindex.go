@@ -67,6 +67,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sync"
+	"time"
 )
 
 // Errors returned by the index. All are programming or wiring faults on
@@ -120,7 +121,8 @@ type BlockIndex struct {
 type sessionBlocks struct {
 	id      string
 	window  int
-	waiting map[string][]Hash // reqID -> chained hashes
+	waiting map[string][]Hash      // reqID -> chained hashes
+	waitSince map[string]time.Time // reqID -> arrival (the entry-order input)
 	dispHist [][]Hash
 	dispSet map[Hash]struct{}
 	waitSet map[Hash]struct{}
@@ -218,7 +220,7 @@ func (b *BlockIndex) Track(id string, window int) *sessionBlocks {
 		window = DefaultDispatchWindow
 	}
 	s := &sessionBlocks{id: id, window: window,
-		waiting: make(map[string][]Hash),
+		waiting: make(map[string][]Hash), waitSince: make(map[string]time.Time),
 		dispSet: make(map[Hash]struct{}), waitSet: make(map[Hash]struct{})}
 	b.sessions[id] = s
 	return s
@@ -305,7 +307,7 @@ func (b *BlockIndex) TrackLocked(id string, window int) *sessionBlocks {
 		window = DefaultDispatchWindow
 	}
 	s := &sessionBlocks{id: id, window: window,
-		waiting: make(map[string][]Hash),
+		waiting: make(map[string][]Hash), waitSince: make(map[string]time.Time),
 		dispSet: make(map[Hash]struct{}), waitSet: make(map[Hash]struct{})}
 	b.sessions[id] = s
 	return s
@@ -599,4 +601,206 @@ func sameHashes(a, b []Hash) bool {
 		}
 	}
 	return true
+}
+
+// ---- the scheduler-facing core: Locked variants and waiting-order queries ----
+// The scheduler holds its own lock and calls these; the public API above
+// wraps the same logic for standalone use and tests.
+
+// UpdateWaitingLocked is UpdateWaiting under an already-held lock, with
+// the arrival time recorded for the entry-order queries.
+func (b *BlockIndex) UpdateWaitingLocked(id, reqID string, hashes []Hash) {
+	s := b.TrackLocked(id, 0)
+	old := s.set()
+	if _, ok := s.waiting[reqID]; ok {
+		delete(s.waiting, reqID)
+		s.rebuildWaitSet()
+	}
+	s.waiting[reqID] = hashes
+	s.waitSince[reqID] = time.Now()
+	for _, h := range hashes {
+		s.waitSet[h] = struct{}{}
+	}
+	b.applyDeltaLocked(s, old)
+}
+
+// SettleDispatchedLocked is SettleDispatched under an already-held lock.
+func (b *BlockIndex) SettleDispatchedLocked(id, reqID string, hashes []Hash) {
+	s := b.TrackLocked(id, 0)
+	old := s.set()
+	if _, ok := s.waiting[reqID]; ok {
+		delete(s.waiting, reqID)
+		delete(s.waitSince, reqID)
+		s.rebuildWaitSet()
+	}
+	if hashes != nil {
+		s.pushDispatched(hashes)
+	}
+	b.applyDeltaLocked(s, old)
+}
+
+// CancelLocked is Cancel under an already-held lock.
+func (b *BlockIndex) CancelLocked(id, reqID string) error {
+	s, ok := b.sessions[id]
+	if !ok {
+		return ErrNotTracked
+	}
+	if _, ok := s.waiting[reqID]; !ok {
+		return fmt.Errorf("groupsched: no waiting request %s for %s", reqID, id)
+	}
+	old := s.set()
+	delete(s.waiting, reqID)
+	delete(s.waitSince, reqID)
+	s.rebuildWaitSet()
+	b.applyDeltaLocked(s, old)
+	return nil
+}
+
+// WaitingSince returns the arrival time of the session's OLDEST waiting
+// request (zero if none) — the "oldest waiting request first" input.
+func (b *BlockIndex) WaitingSince(id string) time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.waitingSinceLocked(id)
+}
+
+func (b *BlockIndex) waitingSinceLocked(id string) time.Time {
+	s, ok := b.sessions[id]
+	if !ok {
+		return time.Time{}
+	}
+	var oldest time.Time
+	for _, t := range s.waitSince {
+		if oldest.IsZero() || t.Before(oldest) {
+			oldest = t
+		}
+	}
+	return oldest
+}
+
+// OldestWaiting returns the reqID of the session's oldest waiting
+// request, or "".
+func (b *BlockIndex) OldestWaiting(id string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := b.sessions[id]
+	if !ok {
+		return ""
+	}
+	var bestID string
+	var best time.Time
+	for rid, t := range s.waitSince {
+		if best.IsZero() || t.Before(best) || (t.Equal(best) && rid < bestID) {
+			best, bestID = t, rid
+		}
+	}
+	return bestID
+}
+
+// ExitingLocked reports the exiting state under an already-held lock.
+func (b *BlockIndex) ExitingLocked(id string) bool {
+	s, ok := b.sessions[id]
+	return ok && s.exiting
+}
+
+// MarkExitingLocked is MarkExiting under an already-held lock.
+func (b *BlockIndex) MarkExitingLocked(id string) {
+	s, ok := b.sessions[id]
+	if !ok || s.exiting {
+		return
+	}
+	if _, isSeated := b.seated[id]; !isSeated {
+		return
+	}
+	s.exiting = true
+	for h := range s.set() {
+		b.dec(b.blocksNE, h)
+	}
+}
+
+// UnseatLocked is Unseat under an already-held lock.
+func (b *BlockIndex) UnseatLocked(id string) {
+	s, ok := b.sessions[id]
+	if !ok {
+		return
+	}
+	if _, isSeated := b.seated[id]; !isSeated {
+		return
+	}
+	b.releaseLocked(s, !s.exiting)
+	delete(b.seated, id)
+}
+
+// ForgetLocked is Forget under an already-held lock.
+func (b *BlockIndex) ForgetLocked(id string) {
+	s, ok := b.sessions[id]
+	if !ok {
+		return
+	}
+	if _, isSeated := b.seated[id]; isSeated {
+		b.releaseLocked(s, !s.exiting)
+		delete(b.seated, id)
+	}
+	delete(b.sessions, id)
+}
+
+// TrySeatLocked is TrySeat under an already-held lock.
+func (b *BlockIndex) TrySeatLocked(id string, budgetBlocks int) (bool, int) {
+	s := b.TrackLocked(id, 0)
+	if _, isSeated := b.seated[id]; isSeated {
+		return true, 0
+	}
+	cost := 0
+	for h := range s.set() {
+		if _, held := b.blocksNE[h]; !held {
+			cost++
+		}
+	}
+	if len(b.blocksNE)+cost > budgetBlocks {
+		return false, cost
+	}
+	b.seated[id] = struct{}{}
+	s.exiting = false
+	set := s.set()
+	for h := range set {
+		b.blocks[h]++
+		b.blocksNE[h]++
+	}
+	return true, cost
+}
+
+// FitBlocksLocked is FitBlocks under an already-held lock.
+func (b *BlockIndex) FitBlocksLocked(hashes []Hash) int {
+	n := 0
+	for _, h := range hashes {
+		if _, held := b.blocksNE[h]; !held {
+			n++
+		}
+	}
+	return n
+}
+
+// UniqueBlocksNELocked is UniqueBlocksNE under an already-held lock.
+func (b *BlockIndex) UniqueBlocksNELocked() int { return len(b.blocksNE) }
+
+// SetBlocks returns the session's full block set (the fit input).
+func (b *BlockIndex) SetBlocks(id string) []Hash {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := b.sessions[id]
+	if !ok {
+		return nil
+	}
+	out := make([]Hash, 0, len(s.dispSet)+len(s.waitSet))
+	for h := range s.set() {
+		out = append(out, h)
+	}
+	return out
+}
+
+// TrackedCount is the number of session records (the leak test's input).
+func (b *BlockIndex) TrackedCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.sessions)
 }

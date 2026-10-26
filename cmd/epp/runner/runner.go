@@ -113,6 +113,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestattributereporter"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/arcwindow"
+	groupsched "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/groupsched"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/ringwindow"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/thunderagent"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/outlenbucket"
@@ -783,6 +784,7 @@ func (r *Runner) registerInTreePlugins() {
 	fwkplugin.Register(agentidentity.PluginType, fwkplugin.StabilityAlpha, agentidentity.PluginFactory)
 	fwkplugin.Register(ringwindow.PluginType, fwkplugin.StabilityAlpha, ringwindow.Factory)
 	fwkplugin.Register(arcwindow.PluginType, fwkplugin.StabilityAlpha, arcwindow.Factory)
+	fwkplugin.Register(groupsched.PluginType, fwkplugin.StabilityAlpha, groupsched.Factory)
 	fwkplugin.Register(thunderagent.ThunderAgentPluginType, fwkplugin.StabilityAlpha, thunderagent.Factory)
 	fwkplugin.Register(outlenbucket.PluginType, fwkplugin.StabilityAlpha, outlenbucket.PluginFactory)
 }

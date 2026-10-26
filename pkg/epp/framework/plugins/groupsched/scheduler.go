@@ -111,11 +111,15 @@ type member struct {
 	inflight int
 	// lastActivity is the last arrival, dispatch or completion.
 	lastActivity time.Time
-	// coldEntry is this member's outstanding cold-entry charge against
-	// the stagger cap; released EXACTLY once (S0-2) at the first of:
-	// prefill complete, any termination, unseat.
+	// coldEntry is this member's outstanding cold-entry charge in TOKENS
+	// against the stagger cap; released EXACTLY once (S0-2) at the first
+	// of: prefill complete, any termination, unseat.
 	coldEntry int64
 	coldDone  bool
+	// entryRecorded marks that the entry turn's cost has been measured
+	// (R4: a fully warm entry has uncached 0, which the old
+	// entryCost==0&&earned==0 test misread as "still the entry turn").
+	entryRecorded bool
 	// lastSizeBytes is the last known wire size (the estimate delta's
 	// baseline; updated at PreRequest with the exact size).
 	lastSizeBytes int64
@@ -129,11 +133,12 @@ type member struct {
 }
 
 type waiter struct {
-	id           string
-	since        time.Time // the OLDEST arrival (B5)
-	newcomer     bool
-	coldEstimate int64
-	lastSizeBytes int64
+	id        string
+	since     time.Time // the OLDEST arrival (B5)
+	newcomer  bool
+	// coldTokens is the entry's cold-prefill estimate in TOKENS
+	// (R1: one unit everywhere — blocks x blockSize).
+	coldTokens int64
 }
 
 // Scheduler is the group scheduler state machine over a BlockIndex.
@@ -155,6 +160,10 @@ type Scheduler struct {
 	members   map[string]*member
 	waiters   map[string]*waiter
 	everSeated map[string]struct{}
+	// lastSeen is the per-record activity time for the silence GC (R2):
+	// updated at Dispatched and Settle; a headless, unseated record
+	// older than TTL is forgotten.
+	lastSeen map[string]time.Time
 
 	coldInFlight int64
 	// pendingTotal is the sum of seated members' pendingBlocks (the
@@ -185,7 +194,7 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 	}
 	s := &Scheduler{cfg: cfg, index: idx, blockSize: cfg.BlockSizeTokens,
 		members: map[string]*member{}, waiters: map[string]*waiter{},
-		everSeated: map[string]struct{}{}}
+		everSeated: map[string]struct{}{}, lastSeen: map[string]time.Time{}}
 	s.counters.exits = map[string]int64{}
 	return s, nil
 }
@@ -294,8 +303,17 @@ func (s *Scheduler) PickFromHeads(heads []Head, now time.Time) int {
 		if s.onServe != nil {
 			s.onServe()
 		}
+		return best
 	}
-	return best
+	// R9: no member head is dispatchable — serve the oldest ANONYMOUS
+	// head (FCFS pass-through, the siblings' behaviour; anonymous
+	// traffic is never tracked, never seated, never starved).
+	for i, h := range heads {
+		if h.Session == "" {
+			return i
+		}
+	}
+	return -1
 }
 
 // FCFSPick returns the oldest head (the pre-capacity pass-through, A5).
@@ -345,7 +363,7 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 		if w.since.IsZero() || h.Arrival.Before(w.since) {
 			w.since = h.Arrival
 		}
-		w.coldEstimate = s.estimateCostLocked(h.Session, h.SizeBytes)
+		w.coldTokens = s.estimateCostLocked(h.Session, h.SizeBytes) * int64(s.blockSize) // tokens (R1)
 	}
 	// vanished: members clear their waiting marker; waiters leave
 	for id, m := range s.members {
@@ -396,8 +414,7 @@ func (s *Scheduler) Dispatched(id, reqID string, keys []Hash, sizeBytes int64, n
 	if s.index == nil {
 		return
 	}
-	old := s.index.SetSizeLocked(id, sizeBytes) // baseline before settle
-	_ = old
+	s.index.SetSizeLocked(id, sizeBytes) // the estimate baseline
 	s.index.SettleDispatchedLocked(id, reqID, keys)
 	if m, ok := s.members[id]; ok {
 		m.lastActivity = now
@@ -407,8 +424,7 @@ func (s *Scheduler) Dispatched(id, reqID string, keys []Hash, sizeBytes int64, n
 			m.pendingBlocks = 0 // the exact keys are in NE now (D13 reconciles)
 		}
 		if !m.coldDone && m.coldEntry > 0 {
-			// refine the charge to the exact block count (the cap check
-			// used the estimate; the release uses this exact value)
+			// refine the charge to the exact token count (R1: one unit)
 			s.coldInFlight = max(s.coldInFlight-m.coldEntry, 0)
 			m.coldEntry = int64(len(keys)) * int64(s.blockSize)
 			s.coldInFlight += m.coldEntry
@@ -442,6 +458,7 @@ func (s *Scheduler) releaseColdLocked(id string) {
 func (s *Scheduler) Settle(id string, usage struct{ Prompt, Cached int }, natural bool, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.lastSeen[id] = now
 	m, seated := s.members[id]
 	if seated {
 		m.inflight = max(m.inflight-1, 0)
@@ -468,8 +485,9 @@ func (s *Scheduler) Settle(id string, usage struct{ Prompt, Cached int }, natura
 	if uncached < 0 {
 		uncached = 0
 	}
-	if m.entryCost == 0 && m.earned == 0 {
-		m.entryCost = uncached // the entry turn's cold cost (measured)
+	if !m.entryRecorded {
+		m.entryCost = uncached // the entry turn's cold cost (measured; may be 0 when fully warm)
+		m.entryRecorded = true
 	} else {
 		m.earned += int64(usage.Cached)
 	}
@@ -509,7 +527,8 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 			return
 		}
 		ne := int64(s.index.UniqueBlocksNELocked()) + s.pendingTotal
-		if ne+head.coldEstimate <= int64(s.budgetBlocks) && s.coldAllows(head) {
+		estBlocks := head.coldTokens / int64(s.blockSize)
+		if ne+estBlocks <= int64(s.budgetBlocks) && s.coldAllows(head) {
 			s.seatLocked(head, now)
 			continue
 		}
@@ -550,9 +569,12 @@ func (s *Scheduler) entryHeadLocked() *waiter {
 }
 
 // coldAllows staggers ALL cold entries (B6: re-entries too — WEKA
-// re-entries are fully cold), using the cost estimate.
+// re-entries are fully cold), in TOKENS (R1). R11's rule: one cold entry
+// is ALWAYS allowed — a session bigger than the cap must be seatable
+// when nothing cold is in flight, or newcomers-first + hold-the-line
+// deadlocks the queue on it forever.
 func (s *Scheduler) coldAllows(w *waiter) bool {
-	return s.coldInFlight+w.coldEstimate <= s.cfg.ColdEntryCapTokens
+	return s.coldInFlight == 0 || s.coldInFlight+w.coldTokens <= s.cfg.ColdEntryCapTokens
 }
 
 // rotationVictimLocked (§7 demand-driven exit, B4: no-waiting is a
@@ -653,7 +675,7 @@ func (s *Scheduler) exitLocked(m *member, reason string, now time.Time) {
 	// waiting-since (FIFO survives the exit)
 	if !m.waitingSince.IsZero() {
 		s.waiters[m.id] = &waiter{id: m.id, since: m.waitingSince,
-			coldEstimate: s.estimateCostLocked(m.id, m.lastSizeBytes)}
+			coldTokens: s.estimateCostLocked(m.id, m.lastSizeBytes) * int64(s.blockSize)}
 	}
 }
 
@@ -669,7 +691,7 @@ func (s *Scheduler) seatLocked(w *waiter, now time.Time) {
 		id:        w.id,
 		seatTime:  now,
 		lastActivity: now,
-		lastSizeBytes: w.lastSizeBytes,
+		lastSizeBytes: s.index.LastSizeBytesLocked(w.id),
 		// the head that triggered this seating is still queued (the
 		// serve happens after rotate): inherit its presence so the
 		// engine-idle rule cannot evict a member that is about to
@@ -677,12 +699,12 @@ func (s *Scheduler) seatLocked(w *waiter, now time.Time) {
 		// zero waitingSince — found by TestNewcomerFirst)
 		waitingSince: w.since,
 	}
-	// B6: ALL entries carry a cold charge (the estimate)
-	m.coldEntry = w.coldEstimate
+	// B6: ALL entries carry a cold charge (tokens, R1)
+	m.coldEntry = w.coldTokens
 	s.coldInFlight += m.coldEntry
 	// the budget counts the admission estimate (blocks) until the exact
 	// keys land at PreRequest
-	m.pendingBlocks = w.coldEstimate
+	m.pendingBlocks = w.coldTokens / int64(s.blockSize)
 	s.pendingTotal += m.pendingBlocks
 	if w.newcomer {
 		wait := now.Sub(w.since).Seconds()
@@ -730,14 +752,31 @@ func (s *Scheduler) Tick(now time.Time) {
 			delete(s.everSeated, id) // B7: prune consistently with the waiter path
 		}
 	}
-	for id, w := range s.waiters {
-		if now.Sub(w.since) > time.Duration(s.cfg.TTLSeconds*float64(time.Second)) {
-			delete(s.waiters, id)
+	// R2: NO TTL on waiters — a waiter exists because its head was
+	// present at the last sync; rotation waits are minutes. Headless,
+	// unseated records are GC'd by lastSeen (silence, not queue age).
+	s.gcSilentRecordsLocked(now)
+	s.rotateLocked(now)
+}
+
+// gcSilentRecordsLocked forgets headless, unseated records whose last
+// activity is older than the TTL (R2: silence, not queue age — a waiter
+// with a live head is NEVER forgotten, however long it waits).
+func (s *Scheduler) gcSilentRecordsLocked(now time.Time) {
+	ttl := time.Duration(s.cfg.TTLSeconds * float64(time.Second))
+	for id, seen := range s.lastSeen {
+		if _, isMember := s.members[id]; isMember {
+			continue
+		}
+		if _, isWaiter := s.waiters[id]; isWaiter {
+			continue // has a live head (syncWaiters keeps waiters honest)
+		}
+		if now.Sub(seen) > ttl {
 			s.index.ForgetLocked(id)
 			delete(s.everSeated, id)
+			delete(s.lastSeen, id)
 		}
 	}
-	s.rotateLocked(now)
 }
 
 func (s *Scheduler) isNewcomerLocked(id string) bool {

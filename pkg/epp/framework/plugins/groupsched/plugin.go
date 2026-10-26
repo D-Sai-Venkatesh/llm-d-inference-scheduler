@@ -42,6 +42,7 @@ import (
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	sourcenotifications "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/notifications"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 )
 
@@ -82,6 +83,30 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	sched, err := NewScheduler(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("invalid parameters of the '%s' plugin: %w", PluginType, err)
+	}
+	// STARTUP fail-closed gate: a missing token-producer is a full-outage
+	// misconfiguration (every request would error at PreRequest — the
+	// backstop), burning an arm before anyone noticed. Fail construction
+	// instead. The handle sees sibling plugins as they are constructed
+	// (config order; the data graph derives producers before consumers),
+	// so the token-producer listed before this plugin is visible here.
+	// The producer's BACKEND is not inspectable from outside the plugin —
+	// a token-producer on the estimate backend still passes this gate
+	// (it produces tokens; quality is the config author's responsibility,
+	// guarded by the config comment).
+	if handle != nil {
+		hasProducer := false
+		for _, p := range handle.GetAllPlugins() {
+			if p != nil && p.TypedName().Type == tokenizer.PluginType {
+				hasProducer = true
+				break
+			}
+		}
+		if !hasProducer {
+			return nil, fmt.Errorf(
+				"the '%s' plugin requires a token-producer (tier-A block keys; tier B failed the CP2 trust measurements and there is no fallback): none is configured before it — add the token-producer with the vllm render backend",
+				PluginType)
+		}
 	}
 	r := &GroupScheduler{
 		typedName: fwkplugin.TypedName{Type: PluginType, Name: name},

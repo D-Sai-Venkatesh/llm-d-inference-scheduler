@@ -66,6 +66,7 @@ type GroupScheduler struct {
 
 	sched   *Scheduler
 	metrics *groupMetrics
+	handle  fwkplugin.Handle
 
 	fcfsOnce sync.Once
 }
@@ -84,34 +85,17 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	if err != nil {
 		return nil, fmt.Errorf("invalid parameters of the '%s' plugin: %w", PluginType, err)
 	}
-	// STARTUP fail-closed gate: a missing token-producer is a full-outage
-	// misconfiguration (every request would error at PreRequest — the
-	// backstop), burning an arm before anyone noticed. Fail construction
-	// instead. The handle sees sibling plugins as they are constructed
-	// (config order; the data graph derives producers before consumers),
-	// so the token-producer listed before this plugin is visible here.
-	// The producer's BACKEND is not inspectable from outside the plugin —
-	// a token-producer on the estimate backend still passes this gate
-	// (it produces tokens; quality is the config author's responsibility,
-	// guarded by the config comment).
-	if handle != nil {
-		hasProducer := false
-		for _, p := range handle.GetAllPlugins() {
-			if p != nil && p.TypedName().Type == tokenizer.PluginType {
-				hasProducer = true
-				break
-			}
-		}
-		if !hasProducer {
-			return nil, fmt.Errorf(
-				"the '%s' plugin requires a token-producer (tier-A block keys; tier B failed the CP2 trust measurements and there is no fallback): none is configured before it — add the token-producer with the vllm render backend",
-				PluginType)
-		}
-	}
+
 	r := &GroupScheduler{
 		typedName: fwkplugin.TypedName{Type: PluginType, Name: name},
 		cfg:       cfg,
 		sched:     sched,
+		// the handle is held for the RegisterDependencies-time gate: plugin
+		// construction order is NOT the config order (the runner may build
+		// the fairness policy first), so the token-producer check cannot
+		// run at Factory time — RegisterDependencies runs after ALL
+		// plugins are constructed and added.
+		handle: handle,
 	}
 	r.metrics = newGroupMetrics(r.sched)
 	if handle != nil {
@@ -176,9 +160,32 @@ func sessionID(request *fwksched.InferenceRequest) string {
 	return id
 }
 
-// RegisterDependencies subscribes to endpoint lifecycle events (the
-// measured-capacity source).
+// validateTokenProducer is the gate body (testable without a registrar).
+func (r *GroupScheduler) validateTokenProducer() error {
+	if r.handle == nil {
+		return nil // unit/test mode
+	}
+	for _, p := range r.handle.GetAllPlugins() {
+		if p != nil && p.TypedName().Type == tokenizer.PluginType {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"the '%s' plugin requires a token-producer (tier-A block keys; tier B failed the CP2 trust measurements and there is no fallback) — add the token-producer with the vllm render backend",
+		PluginType)
+}
+
+// RegisterDependencies runs after every plugin is constructed — the
+// STARTUP fail-closed gate lives here: a missing token-producer is a
+// full-outage misconfiguration (every request would error at PreRequest,
+// the backstop), burning an arm before anyone noticed. The producer's
+// BACKEND is not inspectable from outside the plugin — an estimate-backend
+// producer still passes this gate (it produces tokens; tier-A quality is
+// the config author's responsibility, guarded by the config comment).
 func (r *GroupScheduler) RegisterDependencies(reg fwkdl.Registrar) error {
+	if err := r.validateTokenProducer(); err != nil {
+		return err
+	}
 	return reg.Register(fwkdl.PendingRegistration{
 		Owner:      r.typedName,
 		SourceType: sourcenotifications.EndpointNotificationSourceType,

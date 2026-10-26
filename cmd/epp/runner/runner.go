@@ -103,6 +103,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/usagelimits"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/usagelimits/priorityholdback"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/usagelimits/softreflectiveceiling"
+	groupsched "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/groupsched"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/admitter/latencyslo"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/admitter/probabilisticadmitter"
 	reqdataprodprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/approximateprefix"
@@ -858,6 +859,7 @@ func (r *Runner) registerInTreePlugins() {
 	fwkplugin.Register(agentidentity.PluginType, fwkplugin.StabilityAlpha, agentidentity.PluginFactory)
 	fwkplugin.Register(ringwindow.PluginType, fwkplugin.StabilityAlpha, ringwindow.Factory)
 	fwkplugin.Register(arcwindow.PluginType, fwkplugin.StabilityAlpha, arcwindow.Factory)
+	fwkplugin.Register(groupsched.PluginType, fwkplugin.StabilityAlpha, groupsched.Factory)
 	fwkplugin.Register(outlenbucket.PluginType, fwkplugin.StabilityAlpha, outlenbucket.PluginFactory)
 }
 

@@ -42,7 +42,6 @@ import (
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	sourcenotifications "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/notifications"
-	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 )
 
@@ -120,13 +119,17 @@ func (r *GroupScheduler) runTicker(ctx context.Context) {
 
 func (r *GroupScheduler) TypedName() fwkplugin.TypedName { return r.typedName }
 
-// Consumes requires agent identity AND the tokenizer's output: the
-// fail-closed gate (no tier-B fallback; CP2's M3 verdict).
+// Consumes requires agent identity. The tokenizer's output is enforced
+// at RUNTIME instead: the data layer forbids a FairnessPolicy (flow
+// control layer) from declaring a DataProducer's key in Consumes (the
+// layer order is request-control before flow-control), so the fail-closed
+// gate is PreRequest's error on a missing TokenizedRequest — without the
+// token-producer EVERY request fails loudly at dispatch; nothing ever
+// falls back to tier B (CP2's M3 verdict).
 func (r *GroupScheduler) Consumes() fwkplugin.DataDependencies {
 	return fwkplugin.DataDependencies{
 		Required: map[fwkplugin.DataKey]any{
 			agentidentity.AgentIdentityKey: "",
-			tokenizer.TokenizedPromptDataKey: nil,
 		},
 	}
 }

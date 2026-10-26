@@ -49,7 +49,7 @@ func body(sysChunks int, privChunks int, base rune) []byte {
 
 func mustSeat(t *testing.T, idx *BlockIndex, id string, b []byte, budget int) (cost int) {
 	idx.Track(id, 0)
-	if err := idx.UpdateWaiting(id, b); err != nil {
+	if err := idx.UpdateWaiting(id, "r", b); err != nil {
 		t.Fatalf("UpdateWaiting: %v", err)
 	}
 	ok, cost := idx.TrySeat(id, budget)
@@ -180,10 +180,10 @@ func TestExitingMemberUpdatesDoNotTouchNE(t *testing.T) {
 	mustSeat(t, idx, "b", body(3, 2, 'N'), 1000)
 	idx.MarkExiting("a")
 	// a grows while exiting: new waiting blocks must NOT enter the budget
-	if err := idx.UpdateWaiting("a", body(0, 2, 'Q')); err != nil {
+	if err := idx.UpdateWaiting("a", "r", body(0, 2, 'Q')); err != nil {
 		t.Fatal(err)
 	}
-	if err := idx.SettleDispatched("a", body(0, 2, 'Q')); err != nil {
+	if err := idx.SettleDispatched("a", "r", body(0, 2, 'Q')); err != nil {
 		t.Fatal(err)
 	}
 	if got := idx.UniqueBlocksNE(); got != 5 {
@@ -197,7 +197,7 @@ func TestTrySeatAtomicBudget(t *testing.T) {
 	idx := newIdx(t)
 	mustSeat(t, idx, "a", body(2, 2, 'A'), 100) // 4 blocks
 	// budget exactly 6: b shares 2, adds 2 private -> total 6, fits
-	if err := idx.UpdateWaiting("b", body(2, 2, 'B')); err != nil {
+	if err := idx.UpdateWaiting("b", "r", body(2, 2, 'B')); err != nil {
 		t.Fatal(err)
 	}
 	ok, cost := idx.TrySeat("b", 6)
@@ -205,7 +205,7 @@ func TestTrySeatAtomicBudget(t *testing.T) {
 		t.Fatalf("seat b: ok=%v cost=%d want true/2", ok, cost)
 	}
 	// c would exceed
-	if err := idx.UpdateWaiting("c", body(0, 5, 'C')); err != nil {
+	if err := idx.UpdateWaiting("c", "r", body(0, 5, 'C')); err != nil {
 		t.Fatal(err)
 	}
 	ok, cost = idx.TrySeat("c", 6)
@@ -223,7 +223,7 @@ func TestSeatWithSetNoPreSettle(t *testing.T) {
 	idx := newIdx(t)
 	bd := body(2, 1, 'A')
 	mustSeat(t, idx, "a", bd, 1000)
-	if err := idx.SettleDispatched("a", bd); err != nil {
+	if err := idx.SettleDispatched("a", "r", bd); err != nil {
 		t.Fatal(err)
 	}
 	s := idx.sessions["a"]
@@ -231,7 +231,7 @@ func TestSeatWithSetNoPreSettle(t *testing.T) {
 		t.Fatalf("R6: dispatch history after one settle: %d want 1 (no pre-settle)", len(s.dispHist))
 	}
 	// settling again (same body, second turn) is a second real dispatch
-	if err := idx.SettleDispatched("a", bd); err != nil {
+	if err := idx.SettleDispatched("a", "r", bd); err != nil {
 		t.Fatal(err)
 	}
 	if len(s.dispHist) != 2 {
@@ -243,12 +243,12 @@ func TestRecordPersistsAcrossResidencies(t *testing.T) {
 	idx := newIdx(t)
 	bd := body(2, 2, 'A')
 	mustSeat(t, idx, "a", bd, 1000)
-	if err := idx.SettleDispatched("a", bd); err != nil {
+	if err := idx.SettleDispatched("a", "r", bd); err != nil {
 		t.Fatal(err)
 	}
 	idx.Unseat("a")
 	// re-seat: the session's history still counts (multi-chain re-entry)
-	if err := idx.UpdateWaiting("a", body(0, 1, 'Z')); err != nil {
+	if err := idx.UpdateWaiting("a", "r", body(0, 1, 'Z')); err != nil {
 		t.Fatal(err)
 	}
 	ok, cost := idx.TrySeat("a", 1000)
@@ -267,16 +267,16 @@ func TestSettleWindowSlideReleases(t *testing.T) {
 	// five divergent turns: the 4-window slides, the first turn's private
 	// blocks leave the set and the counters
 	mustSeat(t, idx, "a", body(2, 1, 'A'), 1000)
-	if err := idx.SettleDispatched("a", body(2, 1, 'A')); err != nil {
+	if err := idx.SettleDispatched("a", "r", body(2, 1, 'A')); err != nil {
 		t.Fatal(err) // settle the entry request so the window arithmetic is clean
 	}
 	peak := 0
 	for i := 0; i < 5; i++ {
 		bd := body(2, 1, rune('A'+i))
-		if err := idx.UpdateWaiting("a", bd); err != nil {
+		if err := idx.UpdateWaiting("a", fmt.Sprintf("w%d", i), bd); err != nil {
 			t.Fatal(err)
 		}
-		if err := idx.SettleDispatched("a", bd); err != nil {
+		if err := idx.SettleDispatched("a", fmt.Sprintf("w%d", i), bd); err != nil {
 			t.Fatal(err)
 		}
 		if u := idx.UniqueBlocks(); u > peak {
@@ -293,7 +293,7 @@ func TestSettleWindowSlideReleases(t *testing.T) {
 func TestReplaceWaitingCancelAndMutation(t *testing.T) {
 	idx := newIdx(t)
 	orig := body(2, 2, 'A')
-	if err := idx.UpdateWaiting("a", orig); err != nil {
+	if err := idx.UpdateWaiting("a", "r", orig); err != nil {
 		t.Fatal(err)
 	}
 	ok, _ := idx.TrySeat("a", 1000)
@@ -302,25 +302,25 @@ func TestReplaceWaitingCancelAndMutation(t *testing.T) {
 	}
 	before := idx.UniqueBlocksNE()
 	// cancel: the waiting request's blocks leave the budget
-	if err := idx.ReplaceWaiting("a", orig, nil); err != nil {
+	if err := idx.Cancel("a", "r"); err != nil {
 		t.Fatal(err)
 	}
 	if got := idx.UniqueBlocksNE(); got != 0 {
 		t.Fatalf("cancel: NE %d want 0 (was %d)", got, before)
 	}
 	// mutation: swap in a new body
-	if err := idx.UpdateWaiting("a", orig); err != nil {
+	if err := idx.UpdateWaiting("a", "r", orig); err != nil {
 		t.Fatal(err)
 	}
 	mutated := body(2, 3, 'M')
-	if err := idx.ReplaceWaiting("a", orig, mutated); err != nil {
+	if err := idx.UpdateWaiting("a", "r", mutated); err != nil {
 		t.Fatal(err)
 	}
 	if got := idx.UniqueBlocksNE(); got != 5 {
 		t.Fatalf("mutation: NE %d want 5", got)
 	}
 	// settling the MUTATED body works (no orphan waiting entry)
-	if err := idx.SettleDispatched("a", mutated); err != nil {
+	if err := idx.SettleDispatched("a", "r", mutated); err != nil {
 		t.Fatal(err)
 	}
 	if n := len(idx.sessions["a"].waiting); n != 0 {
@@ -356,10 +356,10 @@ func TestRandomizedPropertyInvariants(t *testing.T) {
 			var b []byte
 			b = append(b, body(sysN, 0, 'S')...)
 			b = append(b, body(0, privN, rune(alphabet[rng.Intn(len(alphabet))]))...)
-			_ = idx.UpdateWaiting(id, b)
+			_ = idx.UpdateWaiting(id, "r", b)
 			state[id] = b
 		case 2:
-			_ = idx.UpdateWaiting(id, state[id])
+			_ = idx.UpdateWaiting(id, "r", state[id])
 			ok, _ := idx.TrySeat(id, 3+rng.Intn(20))
 			_ = ok
 		case 3:
@@ -368,7 +368,7 @@ func TestRandomizedPropertyInvariants(t *testing.T) {
 			idx.MarkExiting(id)
 		case 5:
 			if len(state[id]) > 0 {
-				_ = idx.SettleDispatched(id, state[id])
+				_ = idx.SettleDispatched(id, "r", state[id])
 			}
 		case 6:
 			idx.Forget(id)
@@ -392,9 +392,9 @@ func TestConcurrentSharedPrefixes(t *testing.T) {
 			id := fmt.Sprintf("s%d", w)
 			for i := 0; i < 40; i++ {
 				bd := append(body(2, 0, 'S'), body(0, 1+rngInt(3), rune('A'+w))...)
-				_ = idx.UpdateWaiting(id, bd)
+				_ = idx.UpdateWaiting(id, "r", bd)
 				idx.TrySeat(id, 1000)
-				_ = idx.SettleDispatched(id, bd)
+				_ = idx.SettleDispatched(id, "r", bd)
 				if i%7 == 0 {
 					idx.MarkExiting(id)
 				}

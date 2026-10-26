@@ -120,7 +120,7 @@ type BlockIndex struct {
 type sessionBlocks struct {
 	id      string
 	window  int
-	waiting [][]Hash
+	waiting map[string][]Hash // reqID -> chained hashes
 	dispHist [][]Hash
 	dispSet map[Hash]struct{}
 	waitSet map[Hash]struct{}
@@ -218,6 +218,7 @@ func (b *BlockIndex) Track(id string, window int) *sessionBlocks {
 		window = DefaultDispatchWindow
 	}
 	s := &sessionBlocks{id: id, window: window,
+		waiting: make(map[string][]Hash),
 		dispSet: make(map[Hash]struct{}), waitSet: make(map[Hash]struct{})}
 	b.sessions[id] = s
 	return s
@@ -304,6 +305,7 @@ func (b *BlockIndex) TrackLocked(id string, window int) *sessionBlocks {
 		window = DefaultDispatchWindow
 	}
 	s := &sessionBlocks{id: id, window: window,
+		waiting: make(map[string][]Hash),
 		dispSet: make(map[Hash]struct{}), waitSet: make(map[Hash]struct{})}
 	b.sessions[id] = s
 	return s
@@ -360,9 +362,7 @@ func (b *BlockIndex) MarkExiting(id string) {
 		return // idempotent
 	}
 	if _, isSeated := b.seated[id]; !isSeated {
-		s.exiting = true // unseated records: sticky for the next residency? no —
-		s.exiting = false // an unseated session is not exiting; keep state clean
-		return
+		return // an unseated session is not exiting
 	}
 	s.exiting = true
 	for h := range s.set() {
@@ -373,16 +373,24 @@ func (b *BlockIndex) MarkExiting(id string) {
 // ---- waiting / dispatch bookkeeping ----
 
 // UpdateWaiting ingests a newly arrived request body for a session
-// (tracked, seated or not). If seated, the session's NEW blocks are
-// counted into the group (the budget counter only while non-exiting) —
-// the growth re-check substrate (D13).
-func (b *BlockIndex) UpdateWaiting(id string, body []byte) error {
+// (tracked, seated or not), keyed by the request ID the caller uses at
+// dispatch — the scheduler never has to keep the body, and a rewritten
+// body is simply re-registered under its reqID. If seated, the session's
+// NEW blocks are counted into the group (the budget counter only while
+// non-exiting) — the growth re-check substrate (D13).
+func (b *BlockIndex) UpdateWaiting(id, reqID string, body []byte) error {
 	hashes := b.HashBody(body)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	s := b.TrackLocked(id, 0) // first sight creates the record
 	old := s.set()
-	s.waiting = append(s.waiting, hashes)
+	if _, ok := s.waiting[reqID]; ok {
+		// a retry rewrote the body under the same reqID: drop the old
+		// entry (and its waitSet contribution) before registering the new
+		delete(s.waiting, reqID)
+		s.rebuildWaitSet()
+	}
+	s.waiting[reqID] = hashes
 	for _, h := range hashes {
 		s.waitSet[h] = struct{}{}
 	}
@@ -390,56 +398,51 @@ func (b *BlockIndex) UpdateWaiting(id string, body []byte) error {
 	return nil
 }
 
-// SettleDispatched moves a request from waiting to the dispatch window.
-// The body must be byte-identical to the one recorded by UpdateWaiting
-// (or a body never waited — dispatched directly); a mutated body must go
-// through ReplaceWaiting first. Window slides release blocks that left
-// the session's set.
-func (b *BlockIndex) SettleDispatched(id string, body []byte) error {
-	hashes := b.HashBody(body)
+// SettleDispatched moves a request from waiting to the dispatch window,
+// matched by the request ID registered at UpdateWaiting. A reqID that
+// never waited is dispatched directly (its hashes are computed from the
+// body the caller passes). Window slides release blocks that left the
+// session's set.
+func (b *BlockIndex) SettleDispatched(id, reqID string, body []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	s := b.TrackLocked(id, 0) // first sight creates the record
 	old := s.set()
-	// remove the matching waiting entry (exactly one; no duplicate scan)
-	for i, w := range s.waiting {
-		if sameHashes(w, hashes) {
-			s.waiting = append(s.waiting[:i], s.waiting[i+1:]...)
-			s.rebuildWaitSet()
-			break
-		}
+	hashes, ok := s.waiting[reqID]
+	if !ok {
+		// never waited (dispatched directly): hash the body now
+	 hashes = b.HashBodyLocked(body)
+	} else {
+		delete(s.waiting, reqID)
+		s.rebuildWaitSet()
 	}
 	s.pushDispatched(hashes)
 	b.applyDeltaLocked(s, old)
 	return nil
 }
 
-// ReplaceWaiting swaps a waiting request's blocks (client retry rewrote
-// the body, or a cancellation supplies nil for newBody). O(Δ) counter
-// maintenance.
-func (b *BlockIndex) ReplaceWaiting(id string, oldBody, newBody []byte) error {
-	oldH := b.HashBody(oldBody)
-	newH := b.HashBody(newBody)
+// HashBodyLocked is HashBody under an already-held lock.
+func (b *BlockIndex) HashBodyLocked(body []byte) []Hash {
+	return hashBody(body, b.chunkBytes, b.salt)
+}
+
+// Cancel drops a waiting request (client disconnect, queue eviction),
+// matched by request ID. O(Δ) counter maintenance.
+func (b *BlockIndex) Cancel(id, reqID string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	s, ok := b.sessions[id]
 	if !ok {
 		return ErrNotTracked
 	}
-	old := s.set()
-	for i, w := range s.waiting {
-		if sameHashes(w, oldH) {
-			if newH == nil {
-				s.waiting = append(s.waiting[:i], s.waiting[i+1:]...)
-			} else {
-				s.waiting[i] = newH
-			}
-			s.rebuildWaitSet()
-			b.applyDeltaLocked(s, old)
-			return nil
-		}
+	if _, ok := s.waiting[reqID]; !ok {
+		return fmt.Errorf("groupsched: no waiting request %s for %s", reqID, id)
 	}
-	return fmt.Errorf("groupsched: no waiting entry matches the old body for %s", id)
+	old := s.set()
+	delete(s.waiting, reqID)
+	s.rebuildWaitSet()
+	b.applyDeltaLocked(s, old)
+	return nil
 }
 
 // applyDeltaLocked applies the counter diff between the session's
@@ -566,12 +569,24 @@ func (b *BlockIndex) checkInvariantLocked() {
 			}
 		}
 	}
-	if len(want) != len(b.blocks) {
-		panic(fmt.Sprintf("invariant: blocks %d != recomputed %d", len(b.blocks), len(want)))
+	if !sameCounts(want, b.blocks) {
+		panic(fmt.Sprintf("invariant: blocks %v != recomputed %v", b.blocks, want))
 	}
-	if len(wantNE) != len(b.blocksNE) {
-		panic(fmt.Sprintf("invariant: blocksNE %d != recomputed %d", len(b.blocksNE), len(wantNE)))
+	if !sameCounts(wantNE, b.blocksNE) {
+		panic(fmt.Sprintf("invariant: blocksNE %v != recomputed %v", b.blocksNE, wantNE))
 	}
+}
+
+func sameCounts(a, c map[Hash]int) bool {
+	if len(a) != len(c) {
+		return false
+	}
+	for h, n := range a {
+		if c[h] != n {
+			return false
+		}
+	}
+	return true
 }
 
 func sameHashes(a, b []Hash) bool {

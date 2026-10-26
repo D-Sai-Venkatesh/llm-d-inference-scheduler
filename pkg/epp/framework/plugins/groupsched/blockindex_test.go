@@ -18,265 +18,404 @@ package groupsched
 
 import (
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync"
 	"testing"
 )
 
-// mkBody builds a deterministic body of n chunks from a prefix, so
-// bodies sharing `prefix` share their leading hashes.
-// privChunks returns n chunks of distinct content (letter 'A'+i per chunk).
-func privChunks(n, chunkBytes int, base rune) []byte {
+// newIdx builds an index at the campaign's measured block size (64
+// tokens — the review's S0-3: 40,183 blocks x 64 = 2.57M).
+func newIdx(t *testing.T) *BlockIndex {
+	idx, err := NewBlockIndex(64)
+	if err != nil {
+		t.Fatalf("NewBlockIndex: %v", err)
+	}
+	return idx
+}
+
+// body builds a body from aligned chunks with a per-chunk distinct
+// filler so within-body dedup cannot hide counting errors.
+func body(sysChunks int, privChunks int, base rune) []byte {
 	var b strings.Builder
-	for i := 0; i < n; i++ {
-		b.WriteString(strings.Repeat(string(base+rune(i%26)), chunkBytes))
+	for i := 0; i < sysChunks; i++ {
+		b.WriteString(strings.Repeat("S", 256)) // 64 tokens x 4 B = 256 B chunks
+	}
+	for i := 0; i < privChunks; i++ {
+		b.WriteString(strings.Repeat(string(base+rune(i%26)), 256))
 	}
 	return []byte(b.String())
 }
 
-func mkBody(prefix string, extraChunks int, chunkBytes int) []byte {
-	var b strings.Builder
-	b.WriteString(prefix)
-	pad := chunkBytes - (len(prefix) % chunkBytes)
-	if pad < chunkBytes {
-		b.WriteString(strings.Repeat("p", pad))
+func mustSeat(t *testing.T, idx *BlockIndex, id string, b []byte, budget int) (cost int) {
+	idx.Track(id, 0)
+	if err := idx.UpdateWaiting(id, b); err != nil {
+		t.Fatalf("UpdateWaiting: %v", err)
 	}
-	for i := 0; i < extraChunks; i++ {
-		b.WriteString(strings.Repeat(fmt.Sprintf("%c", 'a'+rune(i%26)), chunkBytes))
+	ok, cost := idx.TrySeat(id, budget)
+	if !ok {
+		t.Fatalf("TrySeat(%s) rejected", id)
 	}
-	return []byte(b.String())
+	return cost
 }
 
-func TestHashBodyChunking(t *testing.T) {
-	body := mkBody("system-prompt", 3, 1024)
-	hs := HashBody(body, 1024)
-	want := (len(body) + 1023) / 1024 // ceil: exact multiples have no partial chunk
-	if len(hs) != want {
-		t.Fatalf("chunks: got %d want %d", len(hs), want)
+// ---- S0-3: units ----
+
+func TestFailClosedOnUnknownBlockSize(t *testing.T) {
+	if _, err := NewBlockIndex(0); err == nil {
+		t.Fatal("block size 0 must fail closed")
 	}
-	// empty body: one chunk
-	if got := len(HashBody(nil, 1024)); got != 1 {
-		t.Fatalf("empty body chunks: %d", got)
+	if _, err := NewBlockIndex(-1); err == nil {
+		t.Fatal("negative block size must fail closed")
 	}
-	// exact multiple: no trailing partial
-	if got := len(HashBody(make([]byte, 2048), 1024)); got != 2 {
-		t.Fatalf("exact-multiple chunks: %d", got)
-	}
-	// determinism
-	again := HashBody(body, 1024)
-	for i := range hs {
-		if hs[i] != again[i] {
-			t.Fatal("hashing not deterministic")
+	for _, bs := range []int{16, 64, 256} {
+		idx, err := NewBlockIndex(bs)
+		if err != nil {
+			t.Fatalf("bs=%d: %v", bs, err)
+		}
+		want := bs * 4
+		if bs*4 < minChunkBytes {
+			want = minChunkBytes
+		}
+		if idx.ChunkBytes() != want {
+			t.Fatalf("bs=%d chunkBytes=%d want %d", bs, idx.ChunkBytes(), want)
+		}
+		// one chunk per engine block (subject to the 64-byte floor)
+		wantChunks := (256 + idx.ChunkBytes() - 1) / idx.ChunkBytes()
+		if n := len(idx.HashBody(make([]byte, 256))); n != wantChunks {
+			t.Fatalf("bs=%d: 256B body -> %d chunks, want %d", bs, n, wantChunks)
+		}
+		if idx.EstimateTokens(40183) != int64(40183*bs) {
+			t.Fatalf("token estimate wrong at bs=%d", bs)
 		}
 	}
 }
 
-func TestSharedPrefixCountedOnce(t *testing.T) {
-	// THE test of D4/tier B: two sessions sharing a long system prompt
-	// must add only their divergent tails to the group's unique count.
-	sys := strings.Repeat("You are an agent. ", 200) // ~3.6KB
-	a := mkBody(sys+"USER-A", 2, 1024)
-	bod := mkBody(sys+"USER-B", 2, 1024)
-	ha, hb := HashBody(a, 1024), HashBody(bod, 1024)
+// ---- S0-2: chained hashes ----
 
-	idx := NewBlockIndex()
-	addedA := idx.SeatWithSet("a", ha, 4)
-	addedB := idx.SeatWithSet("b", hb, 4)
-
-	if addedA != len(ha) {
-		t.Fatalf("first seat adds all its blocks: %d vs %d", addedA, len(ha))
-	}
-	if addedB >= addedA {
-		t.Fatalf("shared prefix must discount: addedB %d, addedA %d", addedB, addedA)
-	}
-	// group unique = shared prefix + both tails, strictly less than the sum
-	sum := len(ha) + len(hb)
-	if idx.UniqueBlocks() >= sum {
-		t.Fatalf("unique %d should be < sum %d", idx.UniqueBlocks(), sum)
-	}
-	if idx.UniqueBlocks() != addedA+addedB {
-		t.Fatalf("unique %d != added %d+%d", idx.UniqueBlocks(), addedA, addedB)
+func TestChainedHashPositionSensitive(t *testing.T) {
+	idx := newIdx(t)
+	sysA := body(2, 0, 'A') // "SSSS..." x2
+	sysB := body(1, 1, 'Z') // "SSS..." + "ZZZ..." — same total, different structure
+	// the same private chunk after different prefixes must NOT match
+	tailX := []byte(strings.Repeat("X", 256))
+	h1 := idx.HashBody(append(append([]byte{}, sysA...), tailX...))
+	h2 := idx.HashBody(append(append([]byte{}, sysB...), tailX...))
+	if sameHashes(h1[2:], h2[2:]) {
+		t.Fatal("identical content after divergent prefixes must hash differently (chaining)")
 	}
 }
 
-func TestFitBlocksDiscountsCommonality(t *testing.T) {
-	sys := strings.Repeat("shared system prompt ", 150)
-	idx := NewBlockIndex()
-	idx.SeatWithSet("a", HashBody(mkBody(sys+"A", 3, 1024), 1024), 4)
-	// candidate b: same system prompt, different tail
-	fit := idx.FitBlocks(HashBody(mkBody(sys+"B", 2, 1024), 1024))
-	full := idx.FitBlocks(HashBody(mkBody(strings.Repeat("totally different ", 100), 2, 1024), 1024))
-	if fit == 0 || fit >= full {
-		t.Fatalf("shared-prefix fit %d should be less than unrelated fit %d", fit, full)
+func TestChainedHashNoWithinBodyDedup(t *testing.T) {
+	idx := newIdx(t)
+	// a body of 5 IDENTICAL chunks must count as 5 blocks, not 1
+	rep := strings.Repeat(strings.Repeat("R", 256), 5)
+	if n := len(idx.HashBody([]byte(rep))); n != 5 {
+		t.Fatalf("repeated chunks: %d blocks, want 5 (no within-body dedup)", n)
 	}
 }
 
-func TestUnseatReleasesBlocks(t *testing.T) {
-	idx := NewBlockIndex()
-	ha := HashBody(mkBody("solo-session", 3, 1024), 1024)
-	idx.SeatWithSet("a", ha, 4)
-	if idx.UniqueBlocks() != len(ha) {
-		t.Fatalf("unique after seat: %d vs %d", idx.UniqueBlocks(), len(ha))
-	}
-	idx.Unseat("a")
-	if idx.UniqueBlocks() != 0 || idx.UniqueBlocksNE() != 0 {
-		t.Fatalf("after unseat: %d/%d", idx.UniqueBlocks(), idx.UniqueBlocksNE())
-	}
-}
-
-func TestRefcountingOnSharedUnseat(t *testing.T) {
-	// chunk-ALIGNED shared prefix (the real case: the shared system
-	// prompt starts at body offset 0, so all its full chunks align)
-	sys := []byte(strings.Repeat("common ", 300))
-	for len(sys)%1024 != 0 {
-		sys = append(sys, ' ')
-	}
-	idx := NewBlockIndex()
-	// distinct tails: session a adds one private chunk, session b two
-	ha := HashBody(append(append([]byte{}, sys...), privChunks(1, 1024, 'A')...), 1024)
-	hb := HashBody(append(append([]byte{}, sys...), privChunks(2, 1024, 'N')...), 1024)
-	idx.SeatWithSet("a", ha, 4)
-	idx.SeatWithSet("b", hb, 4)
-	both := idx.UniqueBlocks()
-	if both != 6 { // 3 shared + 1 (a only) + 2 (b only)
-		t.Fatalf("unique with both seated: %d (want 6)", both)
-	}
-	// unseating one holder must NOT release the shared blocks
-	idx.Unseat("a")
-	if idx.UniqueBlocks() == 0 {
-		t.Fatal("shared blocks released while another member holds them")
-	}
-	if idx.UniqueBlocks() != 5 { // 3 shared + 2 (b only); a's private block released
-		t.Fatalf("unique after unseating a: %d (want 5)", idx.UniqueBlocks())
-	}
-	if idx.UniqueBlocks() > both {
-		t.Fatalf("unique grew on unseat: %d > %d", idx.UniqueBlocks(), both)
-	}
-	idx.Unseat("b")
-	if idx.UniqueBlocks() != 0 {
-		t.Fatalf("all released: %d", idx.UniqueBlocks())
-	}
-}
-
-func TestMarkExiting(t *testing.T) {
-	idx := NewBlockIndex()
-	ha := HashBody(mkBody("member", 3, 1024), 1024)
-	idx.SeatWithSet("a", ha, 4)
-	if idx.UniqueBlocksNE() != len(ha) {
-		t.Fatalf("NE before exiting: %d", idx.UniqueBlocksNE())
-	}
-	idx.MarkExiting("a")
-	if idx.UniqueBlocksNE() != 0 {
-		t.Fatalf("NE after exiting: %d (should not count against budget)", idx.UniqueBlocksNE())
-	}
-	if idx.UniqueBlocks() != len(ha) {
-		t.Fatalf("still seated+counted: %d", idx.UniqueBlocks())
-	}
-	// an exiting member's blocks do not block admission
-	if fit := idx.FitBlocks(ha); fit != len(dedup(ha)) {
-		t.Fatalf("fit past exiting member: %d vs %d", fit, len(dedup(ha)))
-	}
-}
-
-func TestSettleDispatchedWindow(t *testing.T) {
-	idx := NewBlockIndex()
-	// a growing chain: turn 2's prompt contains turn 1's
-	turn1 := mkBody("chain start", 2, 1024)
-	turn2 := append(append([]byte{}, turn1...), mkBody(" plus more", 2, 1024)...)
-	idx.SeatWithSet("a", HashBody(turn1, 1024), 4)
-	before := idx.UniqueBlocks()
-	idx.SettleDispatched("a", turn2, 1024)
-	after := idx.UniqueBlocks()
-	if after < before {
-		t.Fatalf("growth shrank the set: %d -> %d", before, after)
-	}
-	// window of 4: settling 5 distinct bodies drops the oldest
-	sizes := []int{}
-	for i := 0; i < 6; i++ {
-		idx.SettleDispatched("a", mkBody(fmt.Sprintf("divergent-%d ", i)+strings.Repeat("x", 300), 1, 1024), 1024)
-		sizes = append(sizes, idx.UniqueBlocks())
-	}
-	for i := 1; i < len(sizes); i++ {
-		if sizes[i] < sizes[i-1]-2 || sizes[i] > sizes[i-1]+3 {
-			t.Logf("window slide sizes: %v (informational)", sizes)
+func TestChainedHashSharedPrefixShares(t *testing.T) {
+	idx := newIdx(t)
+	a := idx.HashBody(body(3, 1, 'A'))
+	b := idx.HashBody(body(3, 2, 'N'))
+	shared := 0
+	for i := 0; i < 3 && i < len(a) && i < len(b); i++ {
+		if a[i] == b[i] {
+			shared++
+		} else {
 			break
 		}
 	}
+	if shared != 3 {
+		t.Fatalf("aligned shared prefix: %d shared chunks, want 3", shared)
+	}
 }
 
-func TestConcurrent(t *testing.T) {
-	idx := NewBlockIndex()
+func TestEmptyBodyNoPhantomBlock(t *testing.T) {
+	idx := newIdx(t)
+	if n := len(idx.HashBody(nil)); n != 0 {
+		t.Fatalf("empty body: %d chunks, want 0 (no phantom shared block)", n)
+	}
+}
+
+// ---- S0-1: exiting state (the review's R1/R2/R3) ----
+
+func TestExitingUnseatDoesNotStealNE(t *testing.T) {
+	// R1: a and b share 3 chunks; MarkExiting(a) then Unseat(a) must
+	// leave b's budget contribution intact.
+	idx := newIdx(t)
+	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
+	neB := 0
+	mustSeat(t, idx, "b", body(3, 2, 'N'), 1000)
+	_ = neB
+	neBoth := idx.UniqueBlocksNE() // 3 shared + 1 + 2 = 6
+	if neBoth != 6 {
+		t.Fatalf("NE both: %d want 6", neBoth)
+	}
+	idx.MarkExiting("a")
+	idx.Unseat("a")
+	if got := idx.UniqueBlocksNE(); got != 5 { // 3 shared + 2 private to b
+		t.Fatalf("R1: NE after exiting-unseat: %d want 5 (stolen from b!)", got)
+	}
+}
+
+func TestMarkExitingIdempotent(t *testing.T) {
+	idx := newIdx(t)
+	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
+	idx.MarkExiting("a")
+	idx.MarkExiting("a")
+	idx.MarkExiting("a")
+	if got := idx.UniqueBlocksNE(); got != 0 {
+		t.Fatalf("R2: NE after triple MarkExiting: %d want 0", got)
+	}
+	if got := idx.UniqueBlocks(); got != 4 {
+		t.Fatalf("still seated+counted: %d want 4", got)
+	}
+}
+
+func TestExitingMemberUpdatesDoNotTouchNE(t *testing.T) {
+	idx := newIdx(t)
+	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
+	mustSeat(t, idx, "b", body(3, 2, 'N'), 1000)
+	idx.MarkExiting("a")
+	// a grows while exiting: new waiting blocks must NOT enter the budget
+	if err := idx.UpdateWaiting("a", body(0, 2, 'Q')); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.SettleDispatched("a", body(0, 2, 'Q')); err != nil {
+		t.Fatal(err)
+	}
+	if got := idx.UniqueBlocksNE(); got != 5 {
+		t.Fatalf("R3: NE after exiting member growth: %d want 5", got)
+	}
+}
+
+// ---- seating semantics ----
+
+func TestTrySeatAtomicBudget(t *testing.T) {
+	idx := newIdx(t)
+	mustSeat(t, idx, "a", body(2, 2, 'A'), 100) // 4 blocks
+	// budget exactly 6: b shares 2, adds 2 private -> total 6, fits
+	if err := idx.UpdateWaiting("b", body(2, 2, 'B')); err != nil {
+		t.Fatal(err)
+	}
+	ok, cost := idx.TrySeat("b", 6)
+	if !ok || cost != 2 {
+		t.Fatalf("seat b: ok=%v cost=%d want true/2", ok, cost)
+	}
+	// c would exceed
+	if err := idx.UpdateWaiting("c", body(0, 5, 'C')); err != nil {
+		t.Fatal(err)
+	}
+	ok, cost = idx.TrySeat("c", 6)
+	if ok || cost != 5 {
+		t.Fatalf("seat c: ok=%v cost=%d want false/5", ok, cost)
+	}
+	if idx.Seated("c") {
+		t.Fatal("c must not be seated on rejection")
+	}
+}
+
+func TestSeatWithSetNoPreSettle(t *testing.T) {
+	// R6: the seat request must NOT be pre-settled; settling the same
+	// body later must occupy exactly one window slot.
+	idx := newIdx(t)
+	bd := body(2, 1, 'A')
+	mustSeat(t, idx, "a", bd, 1000)
+	if err := idx.SettleDispatched("a", bd); err != nil {
+		t.Fatal(err)
+	}
+	s := idx.sessions["a"]
+	if len(s.dispHist) != 1 {
+		t.Fatalf("R6: dispatch history after one settle: %d want 1 (no pre-settle)", len(s.dispHist))
+	}
+	// settling again (same body, second turn) is a second real dispatch
+	if err := idx.SettleDispatched("a", bd); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.dispHist) != 2 {
+		t.Fatalf("second settle: %d want 2", len(s.dispHist))
+	}
+}
+
+func TestRecordPersistsAcrossResidencies(t *testing.T) {
+	idx := newIdx(t)
+	bd := body(2, 2, 'A')
+	mustSeat(t, idx, "a", bd, 1000)
+	if err := idx.SettleDispatched("a", bd); err != nil {
+		t.Fatal(err)
+	}
+	idx.Unseat("a")
+	// re-seat: the session's history still counts (multi-chain re-entry)
+	if err := idx.UpdateWaiting("a", body(0, 1, 'Z')); err != nil {
+		t.Fatal(err)
+	}
+	ok, cost := idx.TrySeat("a", 1000)
+	if !ok {
+		t.Fatal("re-seat rejected")
+	}
+	// 4 original blocks + 1 new private = 5 in the all-seated counter
+	if got := idx.UniqueBlocks(); got != 5 {
+		t.Fatalf("re-entry counts history: %d want 5", got)
+	}
+	_ = cost
+}
+
+func TestSettleWindowSlideReleases(t *testing.T) {
+	idx := newIdx(t)
+	// five divergent turns: the 4-window slides, the first turn's private
+	// blocks leave the set and the counters
+	mustSeat(t, idx, "a", body(2, 1, 'A'), 1000)
+	if err := idx.SettleDispatched("a", body(2, 1, 'A')); err != nil {
+		t.Fatal(err) // settle the entry request so the window arithmetic is clean
+	}
+	peak := 0
+	for i := 0; i < 5; i++ {
+		bd := body(2, 1, rune('A'+i))
+		if err := idx.UpdateWaiting("a", bd); err != nil {
+			t.Fatal(err)
+		}
+		if err := idx.SettleDispatched("a", bd); err != nil {
+			t.Fatal(err)
+		}
+		if u := idx.UniqueBlocks(); u > peak {
+			peak = u
+		}
+	}
+	// window = 4 bodies x 1 private + 2 shared = 6 max; first body's
+	// private block must be released by the slide
+	if got := idx.UniqueBlocks(); got > 6 {
+		t.Fatalf("window slide did not release: %d > 6", got)
+	}
+}
+
+func TestReplaceWaitingCancelAndMutation(t *testing.T) {
+	idx := newIdx(t)
+	orig := body(2, 2, 'A')
+	if err := idx.UpdateWaiting("a", orig); err != nil {
+		t.Fatal(err)
+	}
+	ok, _ := idx.TrySeat("a", 1000)
+	if !ok {
+		t.Fatal("seat")
+	}
+	before := idx.UniqueBlocksNE()
+	// cancel: the waiting request's blocks leave the budget
+	if err := idx.ReplaceWaiting("a", orig, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := idx.UniqueBlocksNE(); got != 0 {
+		t.Fatalf("cancel: NE %d want 0 (was %d)", got, before)
+	}
+	// mutation: swap in a new body
+	if err := idx.UpdateWaiting("a", orig); err != nil {
+		t.Fatal(err)
+	}
+	mutated := body(2, 3, 'M')
+	if err := idx.ReplaceWaiting("a", orig, mutated); err != nil {
+		t.Fatal(err)
+	}
+	if got := idx.UniqueBlocksNE(); got != 5 {
+		t.Fatalf("mutation: NE %d want 5", got)
+	}
+	// settling the MUTATED body works (no orphan waiting entry)
+	if err := idx.SettleDispatched("a", mutated); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(idx.sessions["a"].waiting); n != 0 {
+		t.Fatalf("orphan waiting entries: %d", n)
+	}
+}
+
+func TestDoubleUnseatIsSafeNoOp(t *testing.T) {
+	idx := newIdx(t)
+	mustSeat(t, idx, "a", body(2, 1, 'A'), 1000)
+	idx.Unseat("a")
+	after := idx.UniqueBlocks()
+	idx.Unseat("a") // the seated-set guard makes this a no-op, not an underflow
+	if idx.UniqueBlocks() != after {
+		t.Fatalf("double unseat changed counters: %d -> %d", after, idx.UniqueBlocks())
+	}
+}
+
+// ---- the invariant + randomized property test (the review's demand) ----
+
+func TestRandomizedPropertyInvariants(t *testing.T) {
+	idx := newIdx(t)
+	rng := rand.New(rand.NewSource(42))
+	alphabet := "ABCDEFGHIJKLMNOP"
+	state := map[string][]byte{}
+	ids := []string{"s0", "s1", "s2", "s3"}
+	for step := 0; step < 2000; step++ {
+		id := ids[rng.Intn(len(ids))]
+		switch rng.Intn(8) {
+		case 0, 1: // new waiting body (shared prefix + random tail)
+			sysN := rng.Intn(3)
+			privN := 1 + rng.Intn(3)
+			var b []byte
+			b = append(b, body(sysN, 0, 'S')...)
+			b = append(b, body(0, privN, rune(alphabet[rng.Intn(len(alphabet))]))...)
+			_ = idx.UpdateWaiting(id, b)
+			state[id] = b
+		case 2:
+			_ = idx.UpdateWaiting(id, state[id])
+			ok, _ := idx.TrySeat(id, 3+rng.Intn(20))
+			_ = ok
+		case 3:
+			idx.Unseat(id)
+		case 4:
+			idx.MarkExiting(id)
+		case 5:
+			if len(state[id]) > 0 {
+				_ = idx.SettleDispatched(id, state[id])
+			}
+		case 6:
+			idx.Forget(id)
+			delete(state, id)
+		case 7:
+			idx.FitBlocks(idx.HashBody(state[id]))
+		}
+		idx.mu.Lock()
+		idx.checkInvariantLocked()
+		idx.mu.Unlock()
+	}
+}
+
+func TestConcurrentSharedPrefixes(t *testing.T) {
+	idx := newIdx(t)
 	var wg sync.WaitGroup
 	for w := 0; w < 8; w++ {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
 			id := fmt.Sprintf("s%d", w)
-			for i := 0; i < 50; i++ {
-				idx.SeatWithSet(id, HashBody(mkBody(fmt.Sprintf("body-%d-%d ", w, i)+strings.Repeat("z", 400), 1, 1024), 1024), 4)
-				idx.FitBlocks(HashBody(mkBody("probe", 1, 1024), 1024))
-				idx.UpdateWaiting(id, mkBody(fmt.Sprintf("wait-%d-%d", w, i), 1, 1024), 1024, 4)
-				idx.UniqueBlocks()
-				idx.MarkExiting(id)
-				idx.Unseat(id)
+			for i := 0; i < 40; i++ {
+				bd := append(body(2, 0, 'S'), body(0, 1+rngInt(3), rune('A'+w))...)
+				_ = idx.UpdateWaiting(id, bd)
+				idx.TrySeat(id, 1000)
+				_ = idx.SettleDispatched(id, bd)
+				if i%7 == 0 {
+					idx.MarkExiting(id)
+				}
+				if i%5 == 0 {
+					idx.Unseat(id)
+				}
+				idx.UniqueBlocksNE()
 			}
 		}(w)
 	}
 	wg.Wait()
-	if idx.UniqueBlocks() != 0 {
-		t.Fatalf("leaked blocks after all unseats: %d", idx.UniqueBlocks())
-	}
+	idx.mu.Lock()
+	idx.checkInvariantLocked()
+	idx.mu.Unlock()
 }
 
-func TestBytesToBlocksHint(t *testing.T) {
-	if got := BytesToBlocksHint(256); got != 1024 {
-		t.Fatalf("hint for 256-token blocks: %d", got)
-	}
-	if got := BytesToBlocksHint(0); got != DefaultChunkBytes {
-		t.Fatalf("default hint: %d", got)
-	}
-	if got := BytesToBlocksHint(1); got != 64 {
-		t.Fatalf("floor: %d", got)
-	}
-}
+var rngMu sync.Mutex
+var prng = rand.New(rand.NewSource(7))
 
-func TestMisalignedBoundaryLoss(t *testing.T) {
-	// The documented tier-B approximation: a shared prefix that is NOT a
-	// multiple of the chunk size loses its final partial chunk (the
-	// boundary chunk mixes shared tail + private head, so it hashes
-	// differently per session). The loss is bounded by ONE chunk per
-	// sharing boundary — assert that, no more.
-	sys := strings.Repeat("common ", 300) // 2100 bytes: 2 full + 52 partial
-	ha := HashBody([]byte(sys+string(privChunks(8, 1024, 'A'))), 1024)
-	hb := HashBody([]byte(sys+string(privChunks(8, 1024, 'N'))), 1024)
-	idx := NewBlockIndex()
-	addedA := idx.SeatWithSet("a", ha, 4)
-	addedB := idx.SeatWithSet("b", hb, 4)
-	// perfect alignment would share 2 chunks; misalignment shares only
-	// those 2 (the 52-byte tail is lost in the boundary chunk), so b
-	// re-adds everything after chunk 2 — but never MORE than its body.
-	if addedB > len(hb) {
-		t.Fatalf("added more than the body: %d > %d", addedB, len(hb))
-	}
-	if addedA+addedB > len(ha)+len(hb) {
-		t.Fatal("invariant: added blocks cannot exceed the bodies' blocks")
-	}
-	// aligned sharing would be 2 chunks; misalignment shares fewer
-	shared := len(dedup(ha)) + len(dedup(hb)) - (addedA + addedB)
-	t.Logf("shared chunks under misalignment: %d (aligned would be 2; the boundary chunk is lost, documented)", shared)
-	if shared > 2 {
-		t.Fatalf("shared more than alignment allows: %d", shared)
-	}
-}
-
-func dedup(hs []Hash) []Hash {
-	seen := map[Hash]struct{}{}
-	var out []Hash
-	for _, h := range hs {
-		if _, ok := seen[h]; !ok {
-			seen[h] = struct{}{}
-			out = append(out, h)
-		}
-	}
-	return out
+func rngInt(n int) int {
+	rngMu.Lock()
+	defer rngMu.Unlock()
+	return prng.Intn(n)
 }

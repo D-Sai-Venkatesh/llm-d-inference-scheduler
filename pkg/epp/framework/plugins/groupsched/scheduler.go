@@ -27,30 +27,22 @@ import (
 
 // ---- §9 parameters (the only knobs; spec defaults) ----
 
-// Config is the group scheduler's parameter surface: exactly ALGORITHM-
-// group.md §9. No other knobs exist; capacity and block size are
-// measured (cache_config_info), never configured.
+// Config is the group scheduler's parameter surface: ALGORITHM-group.md
+// §9 plus BlockSizeTokens, a WIRING FACT (not a tuning knob): it must
+// equal the token processor's block size so the index's unit matches the
+// engine's. Measured capacity (num_gpu_blocks) arrives from the endpoint
+// metrics; a mismatch with the measured CacheBlockSize fails loudly.
 type Config struct {
-	// GroupBudgetFraction is the cache share the group's unique blocks
-	// may hold (θ_g). Default 0.95.
 	GroupBudgetFraction float64 `json:"groupBudgetFraction"`
-	// Rho is the payback multiple: a member may leave once its earned
-	// cached tokens ≥ ρ × its measured entry cost. Default 4.
-	Rho int `json:"rho"`
-	// NMax is the residency turn cap before an unpaid member may leave
-	// (n_max = 2ρ). 0 means derive from Rho.
-	NMax int `json:"nMax"`
-	// IdleSeconds is T_idle: a member silent longer than this gives up
-	// its seat. Default 20 (> the trace's 15s gap cap).
-	IdleSeconds float64 `json:"idleSeconds"`
-	// TTLSeconds is the silence before a session leaves the system
-	// (Unseat then Forget). Default 30 (≥ the p99 think gap).
-	TTLSeconds float64 `json:"ttlSeconds"`
-	// ColdEntryCapTokens staggers in-flight cold-entry prefill
-	// (~one large session). Default 131072.
-	ColdEntryCapTokens int64 `json:"coldEntryCapTokens"`
-	// InFlightCap is the per-session in-flight bound. Default 64.
-	InFlightCap int `json:"inFlightCap"`
+	Rho                 int     `json:"rho"`
+	NMax                int     `json:"nMax"`
+	IdleSeconds         float64 `json:"idleSeconds"`
+	TTLSeconds          float64 `json:"ttlSeconds"`
+	ColdEntryCapTokens  int64   `json:"coldEntryCapTokens"`
+	InFlightCap         int     `json:"inFlightCap"`
+	// BlockSizeTokens is the engine's KV block size in tokens (the token
+	// processor's value; 64 on the campaign stacks, M4). Required > 0.
+	BlockSizeTokens int `json:"blockSizeTokens"`
 }
 
 func defaultConfig() Config {
@@ -62,6 +54,7 @@ func defaultConfig() Config {
 		TTLSeconds:          30,
 		ColdEntryCapTokens:  131072,
 		InFlightCap:         64,
+		BlockSizeTokens:     64,
 	}
 }
 
@@ -85,127 +78,155 @@ func (c Config) validate() error {
 	if c.ColdEntryCapTokens <= 0 || c.InFlightCap <= 0 {
 		return fmt.Errorf("coldEntryCapTokens and inFlightCap must be > 0")
 	}
+	if c.BlockSizeTokens <= 0 {
+		return fmt.Errorf("blockSizeTokens is required (the token processor's block size; got %d)", c.BlockSizeTokens)
+	}
 	return nil
 }
 
-// ---- per-session scheduling state (§3, on top of the block index) ----
+// ---- the queue-head snapshot (S0-1: waiting state comes from the
+// flow-control queues at Pick time, not from PreRequest) ----
 
-// member is the scheduling state of a seated session: the payback
-// residency ledger and the seat bookkeeping. Block sets live in the
-// BlockIndex's session records.
+// Head is one waiting queue head as seen at Pick: the session (agent
+// identity), the request id, the enqueue time, and the wire size (the
+// conservative-cost input).
+type Head struct {
+	Session   string
+	ReqID     string
+	Arrival   time.Time
+	SizeBytes int64
+}
+
+// ---- per-session scheduling state (§3) ----
+
 type member struct {
 	id string
 	// seatTime orders exits: earliest-seated leaves first.
 	seatTime time.Time
-	// residency payback ledger (§7, in tokens from usage reports)
-	entryCost int64 // uncached tokens of the entry turn (measured)
-	earned    int64 // cached tokens accumulated this residency
-	resTurns  int   // settled dispatches this residency
+	// residency payback ledger (§7, tokens from usage reports)
+	entryCost int64
+	earned    int64
+	resTurns  int
 	// inflight counts dispatched, unsettled requests.
 	inflight int
-	// lastActivity is the last request arrival or completion.
+	// lastActivity is the last arrival, dispatch or completion.
 	lastActivity time.Time
-	// coldEntry is the admission-time prefill estimate still counted
-	// against the stagger cap; settled to the measured entry cost.
+	// coldEntry is this member's outstanding cold-entry charge against
+	// the stagger cap; released EXACTLY once (S0-2) at the first of:
+	// prefill complete, any termination, unseat.
 	coldEntry int64
-	// waited tracks arrival of the current waiting head (entry order).
+	coldDone  bool
+	// lastSizeBytes is the last known wire size (the estimate delta's
+	// baseline; updated at PreRequest with the exact size).
+	lastSizeBytes int64
+	// pendingBlocks is the seat-time admission ESTIMATE still counted
+	// against the budget; converts to exact blocks at PreRequest
+	// (Dispatched) and releases at exit. Without it a newcomer seats at
+	// index-cost 0 and the budget understates until the exact keys land.
+	pendingBlocks int64
+	// waitingSince is the member's oldest queued head (B5: kept oldest).
 	waitingSince time.Time
-	// newcomer is cleared at first seat.
-	newcomer bool
 }
 
-// waiter is a non-member with a waiting request.
 type waiter struct {
-	id          string
-	since       time.Time
-	newcomer    bool
-	coldEstimate int64 // blocks × block size (the stagger input)
+	id           string
+	since        time.Time // the OLDEST arrival (B5)
+	newcomer     bool
+	coldEstimate int64
+	lastSizeBytes int64
 }
 
 // Scheduler is the group scheduler state machine over a BlockIndex.
-// The 80% dispatch gate is NOT here: it stays exactly as deployed (the
-// stack's saturation detector decides how much runs; this policy only
-// decides who — the same split as the sibling plugins).
+// The 80% dispatch gate stays in the stack's saturation detector.
 type Scheduler struct {
-	mu sync.Mutex
+	mu  sync.Mutex
 	cfg Config
 	// observers are the optional metric hooks (nil in tests).
 	onExit  func(reason string, resTurns int)
 	onEntry func(waitSeconds float64)
 	onServe func()
 
-	// index is nil until the first measured capacity arrives (M4: block
-	// size from cache_config_info). Before that the scheduler serves
-	// oldest-waiting members without budgeting — see the CP3 report's
-	// ambiguity list.
-	index        *BlockIndex
-	budgetBlocks int // 0.95 × num_gpu_blocks
+	index        *BlockIndex // attached at startup (block size from config)
+	budgetBlocks int         // 0 until num_gpu_blocks arrives (metrics)
+	numBlocks    int
 	blockSize    int
+	blockSizeMismatch error
 
-	members map[string]*member
-	waiters map[string]*waiter
-	// everSeated tracks sessions that have held a seat at least once
-	// (the newcomer flag's other side — instance-scoped, so restarts and
-	// tests are isolated).
+	members   map[string]*member
+	waiters   map[string]*waiter
 	everSeated map[string]struct{}
 
-	// coldInFlight is the running cold-entry prefill estimate.
 	coldInFlight int64
+	// pendingTotal is the sum of seated members' pendingBlocks (the
+	// budget's estimate component).
+	pendingTotal int64
 
-	// metrics counters (§13)
 	counters struct {
-		exits       map[string]int64 // by reason: paid / idle / nmax / budget / engineIdle
-		entryWaits  []float64        // seconds, newcomer seat waits
-		resTurns    []int
-		refillShare float64          // uncached / total prompt tokens at settles
+		exits      map[string]int64
+		entryWaits []float64
+		resTurns   []int
+		refillShare float64
 		uncachedTok int64
 		totalTok    int64
 		served      int64
+		fcfsServed  int64
 	}
 }
 
-// NewScheduler builds the state machine; the index attaches at the first
-// measured capacity (SetCapacity).
-func NewScheduler(cfg Config) *Scheduler {
+// NewScheduler builds the state machine. The index attaches NOW (A5:
+// block size from the token processor's config, known at startup).
+func NewScheduler(cfg Config) (*Scheduler, error) {
 	if err := cfg.validate(); err != nil {
-		panic(err) // the plugin Factory surfaces this as a startup error
+		return nil, err
 	}
-	s := &Scheduler{cfg: cfg, members: map[string]*member{}, waiters: map[string]*waiter{},
+	idx, err := NewBlockIndex(cfg.BlockSizeTokens)
+	if err != nil {
+		return nil, err
+	}
+	s := &Scheduler{cfg: cfg, index: idx, blockSize: cfg.BlockSizeTokens,
+		members: map[string]*member{}, waiters: map[string]*waiter{},
 		everSeated: map[string]struct{}{}}
 	s.counters.exits = map[string]int64{}
-	return s
+	return s, nil
 }
 
-// SetCapacity attaches the block index from measured engine facts. Once
-// set, the budget is live. Called from the endpoint metrics path.
-func (s *Scheduler) SetCapacity(blockSizeTokens, numBlocks int) error {
+// SetNumBlocks attaches the measured capacity (num_gpu_blocks from the
+// endpoint metrics). A measured block size that differs from the config
+// value fails loudly (recorded; HasCapacity stays until it matches).
+func (s *Scheduler) SetNumBlocks(blockSizeTokens, numBlocks int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.index != nil {
-		return nil // single-pool v0: first capacity wins (the sibling's pattern)
+	if blockSizeTokens > 0 && blockSizeTokens != s.blockSize {
+		s.blockSizeMismatch = fmt.Errorf(
+			"groupsched: measured CacheBlockSize %d != configured BlockSizeTokens %d (the token processor's value); refusing the capacity",
+			blockSizeTokens, s.blockSize)
+		return s.blockSizeMismatch
 	}
-	idx, err := NewBlockIndex(blockSizeTokens)
-	if err != nil {
-		return err
+	if s.numBlocks > 0 || numBlocks <= 0 {
+		return nil // first capacity wins (single-pool v0)
 	}
-	s.index = idx
-	s.blockSize = blockSizeTokens
+	s.numBlocks = numBlocks
 	s.budgetBlocks = int(s.cfg.GroupBudgetFraction * float64(numBlocks))
 	return nil
 }
 
-// HasCapacity reports whether the measured engine facts have arrived.
+// HasCapacity reports whether the measured num_gpu_blocks has arrived.
 func (s *Scheduler) HasCapacity() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.index != nil
+	return s.numBlocks > 0
 }
 
-// HashTokens computes the chained token-block keys for a request — the
-// tier-A input (CP2b): 64-token blocks (the measured block size), each
-// key chained from the previous, the cache salt folded into the first
-// block. Structure-compatible with kvblock's ComputeBlockKeysFromTokens;
-// no dependency on the indexer.
+// BlockSizeMismatch reports the loud-failure state, if any.
+func (s *Scheduler) BlockSizeMismatch() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.blockSizeMismatch
+}
+
+// HashTokens computes the chained token-block keys — the tier-A input
+// (CP2b): blockSizeTokens-token blocks, each key chained from the
+// previous, the cache salt folded into the first block.
 func (s *Scheduler) HashTokens(tokens []uint32, cacheSalt string, blockSizeTokens int) []Hash {
 	if blockSizeTokens <= 0 {
 		blockSizeTokens = s.blockSize
@@ -233,115 +254,225 @@ func (s *Scheduler) HashTokens(tokens []uint32, cacheSalt string, blockSizeToken
 	return out
 }
 
-// ---- arrival (PreRequest) ----
+// ---- Pick (§5): the waiting set is the queue-head snapshot ----
 
-// Arrive records a waiting request: the block keys enter the session's
-// set (seated or not), and a non-member becomes a waiter.
-func (s *Scheduler) Arrive(id string, reqID string, keys []Hash, now time.Time) {
+// PickFromHeads runs one dispatch decision against the current queue
+// heads: sync the waiter view, enforce the budget, rotate, then serve
+// the oldest queued head of any non-exiting member under the in-flight
+// cap. Returns the index into heads of the chosen request, or -1.
+func (s *Scheduler) PickFromHeads(heads []Head, now time.Time) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.index == nil {
-		return // pre-capacity: tracked from the first measured facts
+		return -1
 	}
-	s.index.UpdateWaitingLocked(id, reqID, keys)
-	if m, ok := s.members[id]; ok {
-		m.lastActivity = now
-		return
-	}
-	w, ok := s.waiters[id]
-	if !ok {
-		w = &waiter{id: id, newcomer: s.isNewcomerLocked(id)}
-		s.waiters[id] = w
-	}
-	w.since = now
-	w.coldEstimate = int64(len(keys)) * int64(s.blockSize)
-}
-
-// isNewcomerLocked reports whether the session has never held a seat.
-// The block index's records persist across residencies (CP1), so
-// "never seated" is scheduler state, not index state.
-func (s *Scheduler) isNewcomerLocked(id string) bool {
-	_, seen := s.everSeated[id]
-	return !seen
-}
-
-// ---- dispatch (§5) ----
-
-// Pick returns the request to dispatch next: the oldest waiting request
-// of any non-exiting member under the in-flight cap. Non-members never
-// run unseated (D10). Before budget enforcement and rotation run
-// (demand-driven, eager — D3).
-func (s *Scheduler) Pick(now time.Time) (reqID string, session string, ok bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.index == nil {
-		return "", "", false
-	}
+	s.syncWaitersLocked(heads, now)
 	s.enforceBudgetLocked(now)
 	s.rotateLocked(now)
 
-	var best *member
-	var bestSince time.Time
-	for _, m := range s.members {
-		if s.index.ExitingLocked(m.id) {
-			continue // exiting members' new requests are held (§6.3)
+	best := -1
+	var bestArrival time.Time
+	for i, h := range heads {
+		if h.Session == "" {
+			continue // anonymous traffic is not tracked (passes through last)
+		}
+		m, seated := s.members[h.Session]
+		if !seated || s.index.ExitingLocked(h.Session) {
+			continue
 		}
 		if m.inflight >= s.cfg.InFlightCap {
 			continue
 		}
-		if w := s.index.WaitingSince(m.id); !w.IsZero() && (best == nil || w.Before(bestSince)) {
-			best, bestSince = m, w
+		if best < 0 || h.Arrival.Before(bestArrival) {
+			best, bestArrival = i, h.Arrival
 		}
 	}
-	if best == nil {
-		return "", "", false
+	if best >= 0 {
+		s.members[heads[best].Session].inflight++
+		s.members[heads[best].Session].lastActivity = now
+		s.counters.served++
+		if s.onServe != nil {
+			s.onServe()
+		}
 	}
-	reqID = s.index.OldestWaiting(best.id)
-	if reqID == "" {
-		return "", "", false
-	}
-	best.inflight++
-	best.lastActivity = now
-	s.counters.served++
-	if s.onServe != nil {
-		s.onServe()
-	}
-	return reqID, best.id, true
+	return best
 }
 
-// ---- settle (ResponseBody: the payback ledger, §7) ----
+// FCFSPick returns the oldest head (the pre-capacity pass-through, A5).
+func FCFSPick(heads []Head) int {
+	best := -1
+	var bestArrival time.Time
+	for i, h := range heads {
+		if best < 0 || h.Arrival.Before(bestArrival) {
+			best, bestArrival = i, h.Arrival
+		}
+	}
+	return best
+}
 
-// Settle records a completed (or terminated) dispatched request: the
-// payback ledger from the usage report, the in-flight decrement (the
-// finalizer runs for every termination cause), and the block-settle.
-func (s *Scheduler) Settle(id, reqID string, keys []Hash, usage struct{ Prompt, Cached int }, natural bool, now time.Time) {
+// FCFSServed counts pre-capacity dispatches (the gauge substrate).
+func (s *Scheduler) FCFSServed() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.counters.fcfsServed++
+	return s.counters.fcfsServed
+}
+
+// syncWaitersLocked reconciles the waiter view with the queue-head
+// snapshot: new sessions become waiters (estimates from history + wire
+// size), vanished sessions leave, member waiting-since tracks the oldest
+// queued head (the victim preference's input).
+func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
+	present := map[string]time.Time{}
+	for _, h := range heads {
+		if h.Session == "" {
+			continue
+		}
+		present[h.Session] = h.Arrival
+		if m, seated := s.members[h.Session]; seated {
+			if m.waitingSince.IsZero() || h.Arrival.Before(m.waitingSince) {
+				m.waitingSince = h.Arrival
+			}
+			m.lastActivity = now
+			continue
+		}
+		w, ok := s.waiters[h.Session]
+		if !ok {
+			w = &waiter{id: h.Session, newcomer: s.isNewcomerLocked(h.Session)}
+			s.waiters[h.Session] = w
+		}
+		// B5: keep the OLDEST arrival across fan-out re-arrivals
+		if w.since.IsZero() || h.Arrival.Before(w.since) {
+			w.since = h.Arrival
+		}
+		w.coldEstimate = s.estimateCostLocked(h.Session, h.SizeBytes)
+	}
+	// vanished: members clear their waiting marker; waiters leave
+	for id, m := range s.members {
+		if _, ok := present[id]; !ok {
+			m.waitingSince = time.Time{}
+		}
+	}
+	for id := range s.waiters {
+		if _, ok := present[id]; !ok {
+			delete(s.waiters, id)
+		}
+	}
+}
+
+// estimateCostLocked is the conservative admission cost of a QUEUED
+// request (S0-1 b/c): the session's persisted history blocks not held by
+// the non-exiting group, plus the wire-size DELTA over the last known
+// body (bytes/4/blockSize, zero sharing assumed). A session with no
+// history costs its full wire size the same way.
+func (s *Scheduler) estimateCostLocked(id string, sizeBytes int64) int64 {
+	hist := s.index.SetBlocks(id) // persisted across residencies (CP1)
+	known := int64(0)
+	for _, h := range hist {
+		if !s.index.HasNELocked(h) {
+			known++
+		}
+	}
+	// the baseline is the session's last DISPATCHED body size (the index
+	// record, updated at PreRequest) — never the current head's size, or
+	// the second sight of the same head would estimate zero new blocks
+	// (found by the integration test: w seated on the retry pick)
+	lastBytes := s.index.LastSizeBytesLocked(id)
+	delta := sizeBytes - lastBytes
+	if delta < 0 {
+		delta = 0
+	}
+	return known + delta/4/int64(s.blockSize)
+}
+
+// ---- PreRequest (post-dispatch): the exact tier-A correction ----
+
+// Dispatched records a released request at PreRequest: the exact keys
+// replace the estimate (D13 absorbs the error at the next enforcement),
+// in-flight and the cold charge are taken, and the size baseline moves.
+func (s *Scheduler) Dispatched(id, reqID string, keys []Hash, sizeBytes int64, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.index == nil {
 		return
 	}
+	old := s.index.SetSizeLocked(id, sizeBytes) // baseline before settle
+	_ = old
+	s.index.SettleDispatchedLocked(id, reqID, keys)
+	if m, ok := s.members[id]; ok {
+		m.lastActivity = now
+		m.lastSizeBytes = sizeBytes
+		if m.pendingBlocks > 0 {
+			s.pendingTotal -= m.pendingBlocks
+			m.pendingBlocks = 0 // the exact keys are in NE now (D13 reconciles)
+		}
+		if !m.coldDone && m.coldEntry > 0 {
+			// refine the charge to the exact block count (the cap check
+			// used the estimate; the release uses this exact value)
+			s.coldInFlight = max(s.coldInFlight-m.coldEntry, 0)
+			m.coldEntry = int64(len(keys)) * int64(s.blockSize)
+			s.coldInFlight += m.coldEntry
+		}
+	}
+}
+
+// Chunk is the first response chunk: prefill complete — the cold-entry
+// charge is released HERE (B3: not at end of decode), exactly once.
+func (s *Scheduler) Chunk(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.releaseColdLocked(id)
+}
+
+func (s *Scheduler) releaseColdLocked(id string) {
+	m, ok := s.members[id]
+	if !ok || m.coldDone || m.coldEntry <= 0 {
+		return
+	}
+	s.coldInFlight = max(s.coldInFlight-m.coldEntry, 0)
+	m.coldEntry = 0
+	m.coldDone = true
+}
+
+// ---- settle (ResponseBody at EndOfStream: the finalizer) ----
+
+// Settle records a terminated dispatched request: the in-flight
+// decrement for EVERY cause; n_max counts every settled turn (A8); the
+// payback ledger only on natural completion.
+func (s *Scheduler) Settle(id string, usage struct{ Prompt, Cached int }, natural bool, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	m, seated := s.members[id]
 	if seated {
 		m.inflight = max(m.inflight-1, 0)
 		m.lastActivity = now
+		s.releaseColdLocked(id) // S0-2: any termination releases the charge
 	}
-	s.index.SettleDispatchedLocked(id, reqID, keys)
-	if !seated || !natural {
+	if !seated {
 		return
 	}
-	// payback ledger (tokens from the engine's own report)
+	m.resTurns++ // A8: every settled turn counts toward n_max
+	// the settled request was the tracked queued head: clear the marker
+	// (the next Pick re-establishes it if more heads remain — the TTL
+	// path cannot see stale queue presence)
+	m.waitingSince = time.Time{}
+	// §6.3: an exiting member leaves when its in-flight requests drain
+	if s.index.ExitingLocked(id) && m.inflight == 0 {
+		s.exitLocked(m, "exiting-drain", now)
+		return
+	}
+	if !natural {
+		return
+	}
 	uncached := int64(usage.Prompt - usage.Cached)
 	if uncached < 0 {
 		uncached = 0
 	}
-	if m.resTurns == 0 {
+	if m.entryCost == 0 && m.earned == 0 {
 		m.entryCost = uncached // the entry turn's cold cost (measured)
-		m.coldEntry = 0        // stagger settled to the actual
-		s.coldInFlight = max(s.coldInFlight-uncached, 0)
 	} else {
 		m.earned += int64(usage.Cached)
 	}
-	m.resTurns++
 	s.counters.resTurns = append(s.counters.resTurns, m.resTurns)
 	s.counters.uncachedTok += uncached
 	s.counters.totalTok += int64(usage.Prompt)
@@ -350,22 +481,8 @@ func (s *Scheduler) Settle(id, reqID string, keys []Hash, usage struct{ Prompt, 
 	}
 }
 
-// Cancel drops a waiting request (disconnect/eviction of a queued
-// request; the finalizer path).
-func (s *Scheduler) Cancel(id, reqID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.index == nil {
-		return
-	}
-	_ = s.index.CancelLocked(id, reqID)
-	s.pruneWaiterLocked(id)
-}
+// ---- rotation (§7) ----
 
-// ---- rotation (§7): exit by eligibility, entry by order ----
-
-// eligibleLocked reports whether a member may leave: nothing in flight
-// AND (paid back | idle past T_idle | past n_max turns).
 func (s *Scheduler) eligibleLocked(m *member, now time.Time) (string, bool) {
 	if m.inflight > 0 {
 		return "", false
@@ -382,11 +499,8 @@ func (s *Scheduler) eligibleLocked(m *member, now time.Time) (string, bool) {
 	return "", false
 }
 
-// rotateLocked seats waiters (demand-driven: only when a waiter could
-// fit, possibly after an eligible member leaves) — D3, checked eagerly
-// on every dispatch decision.
 func (s *Scheduler) rotateLocked(now time.Time) {
-	if len(s.waiters) == 0 || s.index == nil {
+	if len(s.waiters) == 0 {
 		return
 	}
 	for {
@@ -394,19 +508,16 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 		if head == nil {
 			return
 		}
-		cost := s.index.FitBlocksLocked(s.index.SetBlocks(head.id))
-		if s.index.UniqueBlocksNELocked()+cost <= s.budgetBlocks && s.coldAllows(head) {
+		ne := int64(s.index.UniqueBlocksNELocked()) + s.pendingTotal
+		if ne+head.coldEstimate <= int64(s.budgetBlocks) && s.coldAllows(head) {
 			s.seatLocked(head, now)
-			continue // seat the next head too while room remains
+			continue
 		}
-		// the head does not fit: demand-driven exit via an ELIGIBLE
-		// member (D9), then retry the head once; hold the line — nobody
-		// behind the head jumps ahead
 		if reason, victim := s.rotationVictimLocked(now); victim != nil {
 			if victim.inflight > 0 {
 				s.index.MarkExitingLocked(victim.id)
 				s.counters.exits["exiting"]++
-				return // drains on its own; the head waits
+				return
 			}
 			s.exitLocked(victim, reason, now)
 			continue
@@ -415,13 +526,10 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 	}
 }
 
-// entryHeadLocked is the next session to seat: newcomers first (D7),
-// then the oldest waiting request; hold the line — if the head does not
-// fit, nobody behind it jumps ahead (no skipping in this function; the
-// budget check happens at the caller).
+// entryHeadLocked: newcomers first (D7; oldest within the class), then
+// oldest waiting (A4/A7: re-entrants keep their original since).
 func (s *Scheduler) entryHeadLocked() *waiter {
 	var head *waiter
-	// newcomers first, oldest arrival among them
 	for _, w := range s.waiters {
 		if !w.newcomer {
 			continue
@@ -441,25 +549,20 @@ func (s *Scheduler) entryHeadLocked() *waiter {
 	return head
 }
 
-// coldAllows enforces the cold-entry stagger: in-flight cold prefill
-// (admission estimates, settled at entry-turn completion) stays under
-// the cap.
+// coldAllows staggers ALL cold entries (B6: re-entries too — WEKA
+// re-entries are fully cold), using the cost estimate.
 func (s *Scheduler) coldAllows(w *waiter) bool {
-	if !w.newcomer {
-		return true // re-entry: its blocks are partly warm
-	}
 	return s.coldInFlight+w.coldEstimate <= s.cfg.ColdEntryCapTokens
 }
 
-// rotationVictimLocked picks the member to evict for the head waiter
-// (§7's demand-driven exit): ONLY eligible members (paid back, silent
-// past T_idle, or past n_max — D9: no eviction of members that have not
-// gotten their value), nothing waiting, earliest-seated first. The
-// engine-idle rule (nothing running anywhere, a waiter blocked) is the
-// liveness fallback.
+// rotationVictimLocked (§7 demand-driven exit, B4: no-waiting is a
+// PREFERENCE not an exclusion — paid members with queued next turns
+// must remain evictable): eligible members, sorted by (has-waiting,
+// seatTime); the engine-idle rule as the liveness fallback.
 func (s *Scheduler) rotationVictimLocked(now time.Time) (string, *member) {
 	var best *member
 	var bestReason string
+	bestHasWaiting := false
 	for _, m := range s.members {
 		if s.index.ExitingLocked(m.id) {
 			continue
@@ -468,25 +571,21 @@ func (s *Scheduler) rotationVictimLocked(now time.Time) (string, *member) {
 		if !ok {
 			continue
 		}
-		if !s.index.WaitingSince(m.id).IsZero() {
-			continue // prefer members with nothing waiting (§7 order)
-		}
-		if best == nil || m.seatTime.Before(best.seatTime) {
-			best, bestReason = m, reason
+		hasWaiting := !m.waitingSince.IsZero()
+		if best == nil ||
+			(hasWaiting && !bestHasWaiting) ||
+			(hasWaiting == bestHasWaiting && m.seatTime.Before(best.seatTime)) {
+			best, bestReason, bestHasWaiting = m, reason, hasWaiting
 		}
 	}
 	if best != nil {
 		return bestReason, best
 	}
-	// engine-idle rule: nothing in flight anywhere, no member has a
-	// waiting request (the engine would truly idle), and a waiter is
-	// blocked -> the longest-idle member leaves. Without the no-waiting
-	// condition this livelocks: evicting a member whose request is about
-	// to dispatch, to seat a waiter that cannot co-fit, just swaps
-	// membership forever (found by TestSmokeNonMembersNeverRunUnseated).
+	// engine-idle rule: no member in flight AND no member dispatchable
+	// (A1's livelock guard) while a waiter is blocked
 	idle := true
 	for _, m := range s.members {
-		if m.inflight > 0 || !s.index.WaitingSince(m.id).IsZero() {
+		if m.inflight > 0 || !m.waitingSince.IsZero() {
 			idle = false
 			break
 		}
@@ -504,10 +603,11 @@ func (s *Scheduler) rotationVictimLocked(now time.Time) (string, *member) {
 	return bestReason, best
 }
 
-// budgetVictimLocked is the §6 growth order: eligible members, then
-// idle members (nothing in flight), then exiting (drain). Used ONLY by
-// budget re-enforcement — rotation never evicts an un-eligible member
-// for a waiter's room.
+// budgetVictimLocked is the §6 growth order: eligible, then idle
+// (nothing in flight), then the exiting class — the earliest-seated
+// member EVEN MID-FLIGHT (the caller marks it exiting, which drops its
+// NE contribution immediately; it leaves when its requests drain, §6.3).
+// Budget enforcement only — rotation never evicts an un-eligible member.
 func (s *Scheduler) budgetVictimLocked(now time.Time) (string, *member) {
 	if reason, m := s.rotationVictimLocked(now); m != nil {
 		return reason, m
@@ -524,71 +624,90 @@ func (s *Scheduler) budgetVictimLocked(now time.Time) (string, *member) {
 	if best != nil {
 		return "budget-idle", best
 	}
+	// the exiting class: earliest-seated regardless of inflight
+	for _, m := range s.members {
+		if s.index.ExitingLocked(m.id) {
+			continue
+		}
+		if best == nil || m.seatTime.Before(best.seatTime) {
+			best = m
+		}
+	}
+	if best != nil {
+		return "budget-exiting", best
+	}
 	return "", nil
 }
 
-// exitLocked removes a member (real exit; the exiting flag is only for
-// paid members still in flight — §7's drain path). A session with a
-// waiting request re-enters as a waiter (re-entry, not newcomer); a
-// session with nothing waiting simply leaves.
 func (s *Scheduler) exitLocked(m *member, reason string, now time.Time) {
+	s.releaseColdLocked(m.id) // S0-2: unseat releases the charge
+	s.pendingTotal -= m.pendingBlocks
+	m.pendingBlocks = 0
 	s.index.UnseatLocked(m.id)
 	delete(s.members, m.id)
 	s.counters.exits[reason]++
 	if s.onExit != nil {
 		s.onExit(reason, m.resTurns)
 	}
-	if since := s.index.WaitingSince(m.id); !since.IsZero() {
-		s.waiters[m.id] = &waiter{id: m.id, since: since, coldEstimate: 0}
+	// A7: a session with a queued head re-enters at its ORIGINAL
+	// waiting-since (FIFO survives the exit)
+	if !m.waitingSince.IsZero() {
+		s.waiters[m.id] = &waiter{id: m.id, since: m.waitingSince,
+			coldEstimate: s.estimateCostLocked(m.id, m.lastSizeBytes)}
 	}
 }
 
-// seatLocked seats a waiter (TrySeat under the budget already checked).
 func (s *Scheduler) seatLocked(w *waiter, now time.Time) {
-	ok, _ := s.index.TrySeatLocked(w.id, s.budgetBlocks)
-	if !ok {
+	// seat in the index first (history-based cost; the estimate-based
+	// budget check already ran in rotate — D13 reconciles the difference)
+	if ok, _ := s.index.TrySeatLocked(w.id, s.budgetBlocks); !ok {
 		return
 	}
-	wait := now.Sub(w.since).Seconds()
-	delete(s.waiters, w.id)
+	s.everSeated[w.id] = struct{}{}
+	s.waitersdelete(w.id)
+	m := &member{
+		id:        w.id,
+		seatTime:  now,
+		lastActivity: now,
+		lastSizeBytes: w.lastSizeBytes,
+		// the head that triggered this seating is still queued (the
+		// serve happens after rotate): inherit its presence so the
+		// engine-idle rule cannot evict a member that is about to
+		// dispatch (A1's livelock class, entering via the fresh record's
+		// zero waitingSince — found by TestNewcomerFirst)
+		waitingSince: w.since,
+	}
+	// B6: ALL entries carry a cold charge (the estimate)
+	m.coldEntry = w.coldEstimate
+	s.coldInFlight += m.coldEntry
+	// the budget counts the admission estimate (blocks) until the exact
+	// keys land at PreRequest
+	m.pendingBlocks = w.coldEstimate
+	s.pendingTotal += m.pendingBlocks
 	if w.newcomer {
+		wait := now.Sub(w.since).Seconds()
 		s.counters.entryWaits = append(s.counters.entryWaits, wait)
 		if s.onEntry != nil {
 			s.onEntry(wait)
 		}
 	}
-	s.everSeated[w.id] = struct{}{}
-	s.members[w.id] = &member{
-		id:           w.id,
-		seatTime:     now,
-		lastActivity: now,
-		newcomer:     w.newcomer,
-		coldEntry:    w.coldEstimate,
-	}
-	if w.newcomer {
-		s.coldInFlight += w.coldEstimate
-	}
+	s.members[w.id] = m
 }
+
+func (s *Scheduler) waitersdelete(id string) { delete(s.waiters, id) }
 
 // ---- budget enforcement (§6, growth) ----
 
-// enforceBudgetLocked re-checks the budget as members grow: when the
-// non-exiting unique blocks exceed 0.95 × num_gpu_blocks, members leave
-// in the D13 order: eligible, then idle, then exiting (held, drain).
 func (s *Scheduler) enforceBudgetLocked(now time.Time) {
-	if s.index == nil || s.budgetBlocks <= 0 {
-		return
+	if s.budgetBlocks <= 0 {
+		return // pre-capacity (A5): no budget yet
 	}
-	for s.index.UniqueBlocksNELocked() > s.budgetBlocks {
+	for int64(s.index.UniqueBlocksNELocked())+s.pendingTotal > int64(s.budgetBlocks) {
 		reason, victim := s.budgetVictimLocked(now)
 		if victim == nil {
-			// nobody leaves: the overflow is transient (growth settles
-			// or the engine-idle rule fires on the next rotation)
 			return
 		}
 		if victim.inflight > 0 {
-			// paid/still-in-flight members are marked exiting: their new
-			// requests are held and they leave on drain (§6.3)
 			s.index.MarkExitingLocked(victim.id)
 			s.counters.exits["exiting"]++
 			continue
@@ -599,33 +718,20 @@ func (s *Scheduler) enforceBudgetLocked(now time.Time) {
 
 // ---- lifecycle (§8): the ~1s ticker ----
 
-// Tick runs the periodic work: T_idle seat release, TTL silence
-// (Unseat then Forget — the CP1 condition), and rotation.
 func (s *Scheduler) Tick(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.index == nil {
-		return
-	}
-	// D13 between dispatches: growth is re-enforced on the ticker as
-	// well as on every dispatch decision (a growing member can overflow
-	// the budget while nothing dispatches).
 	s.enforceBudgetLocked(now)
-	// T_idle: a silent member with nothing waiting or in flight gives up
-	// its seat (handled by eligibility at rotation; here we only release
-	// when there are waiters — demand-driven. Absolute idleness is the
-	// TTL path below.)
-	// TTL: silence with nothing waiting or in flight -> leave the system
 	for id, m := range s.members {
 		if now.Sub(m.lastActivity) > time.Duration(s.cfg.TTLSeconds*float64(time.Second)) &&
-			m.inflight == 0 && s.index.WaitingSince(id).IsZero() {
+			m.inflight == 0 && m.waitingSince.IsZero() {
 			s.exitLocked(m, "ttl", now)
 			s.index.ForgetLocked(id)
+			delete(s.everSeated, id) // B7: prune consistently with the waiter path
 		}
 	}
 	for id, w := range s.waiters {
-		if now.Sub(w.since) > time.Duration(s.cfg.TTLSeconds*float64(time.Second)) &&
-			s.index.WaitingSince(id).IsZero() {
+		if now.Sub(w.since) > time.Duration(s.cfg.TTLSeconds*float64(time.Second)) {
 			delete(s.waiters, id)
 			s.index.ForgetLocked(id)
 			delete(s.everSeated, id)
@@ -634,19 +740,13 @@ func (s *Scheduler) Tick(now time.Time) {
 	s.rotateLocked(now)
 }
 
-// pruneWaiterLocked drops a waiter with no waiting requests left.
-func (s *Scheduler) pruneWaiterLocked(id string) {
-	if s.index == nil || !s.index.WaitingSince(id).IsZero() {
-		return
-	}
-	if _, still := s.waiters[id]; still {
-		delete(s.waiters, id)
-	}
+func (s *Scheduler) isNewcomerLocked(id string) bool {
+	_, seen := s.everSeated[id]
+	return !seen
 }
 
-// ---- introspection for metrics and tests ----
+// ---- introspection ----
 
-// Snapshot returns the legible state (§13 metrics substrate).
 type Snapshot struct {
 	Seats        int
 	UniqueBlocks int
@@ -658,13 +758,15 @@ type Snapshot struct {
 	EntryWaitP50 float64
 	RefillShare  float64
 	Served       int64
+	FCFSServed   int64
 }
 
 func (s *Scheduler) Snapshot() Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	snap := Snapshot{Seats: len(s.members), Waiters: len(s.waiters),
-		Exits: map[string]int64{}, BudgetBlocks: s.budgetBlocks}
+		Exits: map[string]int64{}, BudgetBlocks: s.budgetBlocks,
+		Served: s.counters.served, FCFSServed: s.counters.fcfsServed}
 	for k, v := range s.counters.exits {
 		snap.Exits[k] = v
 	}
@@ -685,7 +787,6 @@ func (s *Scheduler) Snapshot() Snapshot {
 		snap.EntryWaitP50 = w[n/2]
 	}
 	snap.RefillShare = s.counters.refillShare
-	snap.Served = s.counters.served
 	return snap
 }
 
@@ -693,10 +794,13 @@ func (s *Scheduler) Snapshot() Snapshot {
 func (s *Scheduler) Sessions() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.index == nil {
-		return 0
-	}
 	return s.index.TrackedCount()
 }
 
-var _ = sort.Float64s
+// Seated reports membership (tests).
+func (s *Scheduler) Seated(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.members[id]
+	return ok
+}

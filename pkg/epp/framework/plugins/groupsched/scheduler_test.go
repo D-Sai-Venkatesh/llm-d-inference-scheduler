@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// keys builds a deterministic chained-key set of n blocks.
+// keys builds a deterministic distinct-key set of n blocks.
 func keys(n int, seed Hash) []Hash {
 	out := make([]Hash, 0, n)
 	prev := seed
@@ -32,181 +32,263 @@ func keys(n int, seed Hash) []Hash {
 	return out
 }
 
+// bytesFor converts blocks to the wire size that estimates them at 4
+// bytes/token (the estimate path's convention).
+func bytesFor(blocks int) int64 { return int64(blocks) * 4 * 64 }
+
 func newSched(t *testing.T) *Scheduler {
-	s := NewScheduler(defaultConfig())
-	if err := s.SetCapacity(64, 1000); err != nil { // 1000 blocks; budget 950
+	s, err := NewScheduler(defaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNumBlocks(64, 1000); err != nil { // budget 950 blocks
 		t.Fatal(err)
 	}
 	return s
 }
 
-func TestSmokeMemberServedImmediately(t *testing.T) {
+func head(session string, ago time.Duration, sizeBytes int64) Head {
+	return Head{Session: session, ReqID: "r-" + session, Arrival: time.Now().Add(-ago), SizeBytes: sizeBytes}
+}
+
+// dispatch drives the released-request path: Pick chose the head, the
+// producer tokenized, PreRequest corrects with the exact keys.
+func dispatch(t *testing.T, s *Scheduler, session string, k []Hash, size int64) {
+	t.Helper()
+	s.Dispatched(session, "r-"+session, k, size, time.Now())
+}
+
+func settle(s *Scheduler, session string, prompt, cached int) {
+	s.Chunk(session)
+	s.Settle(session, struct{ Prompt, Cached int }{prompt, cached}, true, time.Now())
+}
+
+func TestMemberServedImmediately(t *testing.T) {
 	s := newSched(t)
 	now := time.Now()
-	s.Arrive("a", "r1", keys(10, 1), now)
-	// rotation seats the newcomer (fits)
-	s.Tick(now)
-	if snap := s.Snapshot(); snap.Seats != 1 {
-		t.Fatalf("seats after tick: %d", snap.Seats)
+	// one queued head; rotation seats the newcomer; Pick serves it
+	i := s.PickFromHeads([]Head{head("a", time.Second, bytesFor(10))}, now)
+	if i != 0 {
+		t.Fatalf("pick: %d", i)
 	}
-	// the member's request dispatches
-	reqID, sess, ok := s.Pick(now)
-	if !ok || reqID != "r1" || sess != "a" {
-		t.Fatalf("pick: %v %v %v", reqID, sess, ok)
+	dispatch(t, s, "a", keys(10, 1), bytesFor(10))
+	if !s.Seated("a") {
+		t.Fatal("a must be seated")
 	}
 }
 
-func TestSmokeNonMembersNeverRunUnseated(t *testing.T) {
+func TestNonMembersNeverRunUnseated(t *testing.T) {
 	s := newSched(t)
 	now := time.Now()
-	// two sessions, 600 blocks each: only one fits the 950 budget
-	s.Arrive("a", "ra", keys(600, 1), now)
-	s.Arrive("b", "rb", keys(600, 2), now)
-	s.Tick(now)
-	snap := s.Snapshot()
-	if snap.Seats != 1 {
-		t.Fatalf("seats: %d (budget 950, two 600s cannot both fit)", snap.Seats)
+	// two 600-block sessions: only one fits the 950 budget
+	h := []Head{head("a", 2*time.Second, bytesFor(600)), head("b", time.Second, bytesFor(600))}
+	i := s.PickFromHeads(h, now)
+	if i != 0 {
+		t.Fatalf("the older newcomer a must be served first, got %d", i)
 	}
-	// pick serves only the member
-	_, _, ok := s.Pick(now)
-	if !ok {
-		t.Fatal("the member's request must dispatch")
+	dispatch(t, s, "a", keys(600, 1), bytesFor(600))
+	settle(s, "a", 600, 0)
+	// a is quiet (nothing waiting, nothing in flight); b is blocked: the
+	// engine-idle rule seats b — b dispatches SEATED, never unseated (D10)
+	j := s.PickFromHeads(h[1:], now)
+	if j != 0 {
+		t.Fatalf("b must dispatch via the engine-idle rotation, got %d", j)
 	}
-	// settle it; a goes quiet (nothing waiting, nothing in flight) while
-	// b is blocked: the engine-idle rule rotates b in — b dispatches
-	// SEATED (a member), never unseated (D10)
-	s.Settle("a", "ra", keys(600, 1), struct{ Prompt, Cached int }{600, 0}, true, now)
-	reqID, sess, ok := s.Pick(now)
-	if !ok {
-		t.Fatal("the engine-idle rule must seat b and dispatch it")
-	}
-	if sess != "b" || reqID != "rb" {
-		t.Fatalf("dispatch went to %v/%v, want b/rb", sess, reqID)
-	}
-	if snap := s.Snapshot(); snap.Seats != 1 {
-		t.Fatalf("seats: %d (b must be the seated member)", snap.Seats)
+	if !s.Seated("b") {
+		t.Fatal("b must be the seated member")
 	}
 }
 
-func TestSmokePaybackRotation(t *testing.T) {
+func TestPaybackRotation(t *testing.T) {
 	s := newSched(t)
 	now := time.Now()
-	// member a: entry cost 100 uncached; needs earned >= 4*100 = 400 to leave
-	s.Arrive("a", "r1", keys(100, 1), now)
-	s.Tick(now)
-	if _, _, ok := s.Pick(now); !ok {
-		t.Fatal("seat+pick a")
+	// member a: entry cost 100 uncached, needs earned >= 400 to leave
+	i := s.PickFromHeads([]Head{head("a", time.Second, bytesFor(100))}, now)
+	if i != 0 {
+		t.Fatal("seat a")
 	}
-	s.Settle("a", "r1", keys(100, 1), struct{ Prompt, Cached int }{100, 0}, true, now)
-	// three more turns earning 150 cached each (450 >= 400): paid back
-	for i := 2; i <= 4; i++ {
-		s.Arrive("a", "r"+string(rune('0'+i)), keys(100, 1), now)
-		if _, _, ok := s.Pick(now); !ok {
-			t.Fatal("pick turn", i)
+	dispatch(t, s, "a", keys(100, 1), bytesFor(100))
+	settle(s, "a", 100, 0)
+	for turn := 0; turn < 3; turn++ {
+		j := s.PickFromHeads([]Head{head("a", time.Second, bytesFor(100))}, now)
+		if j != 0 {
+			t.Fatal("pick turn", turn)
 		}
-		s.Settle("a", "r"+string(rune('0'+i)), keys(100, 1), struct{ Prompt, Cached int }{100, 150}, true, now)
+		dispatch(t, s, "a", keys(100, 1), bytesFor(100))
+		settle(s, "a", 100, 150) // 450 earned >= 4 x 100
 	}
 	if snap := s.Snapshot(); snap.Exits["paid"] != 0 {
-		t.Fatalf("a left before a waiter needed the room (rotation must be demand-driven)")
+		t.Fatalf("a left before a waiter needed the room (rotation must be demand-driven): %v", snap.Exits)
 	}
-	// now b arrives and needs the room: a (paid, nothing waiting, nothing
-	// in flight) leaves; b seats
-	s.Arrive("b", "rb", keys(900, 2), now)
-	s.Tick(now)
+	// b arrives needing the room: a (paid, nothing waiting) leaves; b seats
+	k := s.PickFromHeads([]Head{head("b", time.Second, bytesFor(900))}, now)
+	if k != 0 {
+		t.Fatal("b must dispatch after the paid rotation")
+	}
 	snap := s.Snapshot()
-	if snap.Seats != 1 {
-		t.Fatalf("seats after rotation: %d", snap.Seats)
-	}
-	if snap.Exits["paid"] != 1 {
-		t.Fatalf("paid exits: %v", snap.Exits)
-	}
-	// b's request dispatches (a's would not: a is now a waiter)
-	if _, _, ok := s.Pick(now); !ok {
-		t.Fatal("b must dispatch")
+	if snap.Exits["paid"] != 1 || !s.Seated("b") {
+		t.Fatalf("paid exit + b seated: exits=%v seated(b)=%v", snap.Exits, s.Seated("b"))
 	}
 }
 
-func TestSmokeNewcomerFirst(t *testing.T) {
+func TestNewcomerFirst(t *testing.T) {
 	s := newSched(t)
 	now := time.Now()
-	// "re" is a RE-ENTERING session: seated once, paid out, exited with a
-	// new waiting request (an ex-member waiter, not a newcomer)
-	s.Arrive("re", "r1", keys(100, 1), now)
-	s.Tick(now)
-	if _, _, ok := s.Pick(now); !ok {
+	// seat and pay out "re" (an ex-member), then a fresh newcomer competes
+	i := s.PickFromHeads([]Head{head("re", time.Second, bytesFor(100))}, now)
+	if i != 0 {
 		t.Fatal("seat re")
 	}
-	s.Settle("re", "r1", keys(100, 1), struct{ Prompt, Cached int }{100, 0}, true, now)
-	for i := 2; i <= 4; i++ {
-		s.Arrive("re", "r"+string(rune('0'+i)), keys(100, 1), now)
-		if _, _, ok := s.Pick(now); !ok {
-			t.Fatal("pick turn", i)
-		}
-		s.Settle("re", "r"+string(rune('0'+i)), keys(100, 1), struct{ Prompt, Cached int }{100, 150}, true, now)
+	dispatch(t, s, "re", keys(100, 1), bytesFor(100))
+	settle(s, "re", 100, 0)
+	for turn := 0; turn < 3; turn++ {
+		s.PickFromHeads([]Head{head("re", time.Second, bytesFor(100))}, now)
+		dispatch(t, s, "re", keys(100, 1), bytesFor(100))
+		settle(s, "re", 100, 150)
 	}
-	// re paid (450 >= 400); a big newcomer arrives needing the room -> re exits
-	s.Arrive("fresh", "rf", keys(900, 2), now)
-	s.Tick(now)
-	if snap := s.Snapshot(); snap.Exits["paid"] != 1 {
-		t.Fatalf("re must have been rotated out: %v", snap.Exits)
+	// a big newcomer rotates the paid re out
+	j := s.PickFromHeads([]Head{head("fresh", time.Second, bytesFor(900))}, now)
+	if j != 0 {
+		t.Fatal("fresh seats")
 	}
-	// settle fresh's entry request so its state is clean for round 2
-	if _, _, ok := s.Pick(now); !ok {
-		t.Fatal("fresh must dispatch")
-	}
-	s.Settle("fresh", "rf", keys(900, 2), struct{ Prompt, Cached int }{900, 0}, true, now)
-	// re re-arrives (a waiter, NOT a newcomer); a fresh newcomer arrives after
-	s.Arrive("re", "r5", keys(100, 1), now.Add(time.Millisecond))
-	s.Arrive("fresh2", "rf2", keys(900, 3), now.Add(2*time.Millisecond))
-	s.Tick(now.Add(time.Second))
-	// budget seats one: the NEWCOMER (fresh2) goes before the ex-member (re)
-	if _, sess, ok := s.Pick(now.Add(time.Second)); !ok || sess != "fresh2" {
-		t.Fatalf("newcomer must be seated before the ex-member waiter, got %v", sess)
+	dispatch(t, s, "fresh", keys(900, 2), bytesFor(900))
+	settle(s, "fresh", 900, 0)
+	// re re-arrives (waiter, NOT newcomer); a second newcomer arrives after
+	h := []Head{head("re", 2*time.Second, bytesFor(100)), head("fresh2", time.Second, bytesFor(900))}
+	// budget seats one: the NEWCOMER (fresh2) goes before the ex-member
+	k := s.PickFromHeads(h, now.Add(time.Second))
+	if k != 1 {
+		t.Fatalf("newcomer must be seated before the ex-member waiter, got head %d", k)
 	}
 }
 
-func TestSmokeTTLSilenceForgets(t *testing.T) {
+func TestTTLSilenceForgets(t *testing.T) {
 	s := newSched(t)
 	now := time.Now()
-	s.Arrive("a", "r1", keys(10, 1), now)
-	s.Tick(now)
-	if _, _, ok := s.Pick(now); !ok {
-		t.Fatal("pick")
-	}
-	s.Settle("a", "r1", keys(10, 1), struct{ Prompt, Cached int }{10, 0}, true, now)
+	s.PickFromHeads([]Head{head("a", time.Second, bytesFor(10))}, now)
+	dispatch(t, s, "a", keys(10, 1), bytesFor(10))
+	settle(s, "a", 10, 0)
 	if n := s.Sessions(); n != 1 {
 		t.Fatalf("tracked sessions: %d", n)
 	}
-	// silence past the TTL: unseat AND forget (the CP1 condition)
 	later := now.Add(time.Duration(defaultConfig().TTLSeconds*float64(time.Second)) + time.Second)
 	s.Tick(later)
 	if n := s.Sessions(); n != 0 {
-		t.Fatalf("record leaked after TTL: %d sessions tracked (CP1 condition)", n)
+		t.Fatalf("record leaked after TTL: %d sessions (CP1 condition)", n)
 	}
-	if snap := s.Snapshot(); snap.Seats != 0 {
-		t.Fatalf("seats after TTL: %d", snap.Seats)
+	if s.Seated("a") {
+		t.Fatal("a must be unseated")
 	}
 }
 
-func TestSmokeGrowthReEnforcement(t *testing.T) {
+func TestGrowthReEnforcement(t *testing.T) {
 	s := newSched(t)
 	now := time.Now()
-	// two members of 400 blocks each (800 <= 950): both seat
-	s.Arrive("a", "ra", keys(400, 1), now)
-	s.Arrive("b", "rb", keys(400, 2), now)
-	s.Tick(now)
+	// two 400-block members (800 <= 950)
+	s.PickFromHeads([]Head{head("a", 2*time.Second, bytesFor(400))}, now)
+	dispatch(t, s, "a", keys(400, 1), bytesFor(400))
+	settle(s, "a", 400, 0)
+	s.PickFromHeads([]Head{head("b", time.Second, bytesFor(400))}, now)
+	dispatch(t, s, "b", keys(400, 2), bytesFor(400))
+	settle(s, "b", 400, 0)
 	if snap := s.Snapshot(); snap.Seats != 2 {
 		t.Fatalf("seats: %d", snap.Seats)
 	}
-	// both grow (D13): each adds 300 new blocks on the next turn
-	s.Arrive("a", "ra2", keys(700, 1), now) // 400 old + 300 new
-	s.Arrive("b", "rb2", keys(700, 2), now)
-	s.Tick(now)
+	// both grow to 700 (1400 > 950): mid-flight members are marked
+	// exiting (§6.3); after the drain (settle), the next enforcement
+	// removes one for real
+	s.PickFromHeads([]Head{head("a", time.Second, bytesFor(700))}, now)
+	dispatch(t, s, "a", keys(700, 1), bytesFor(700))
+	s.PickFromHeads([]Head{head("b", time.Second, bytesFor(700))}, now)
+	dispatch(t, s, "b", keys(700, 2), bytesFor(700))
+	s.Tick(now) // the overflow marks the earliest-seated member exiting
 	snap := s.Snapshot()
 	if snap.NEBlocks > snap.BudgetBlocks {
 		t.Fatalf("budget violated after growth: %d > %d", snap.NEBlocks, snap.BudgetBlocks)
 	}
-	if snap.Seats > 2 {
-		t.Fatalf("seats grew: %d", snap.Seats)
+	// drain both (their turns complete); the next enforcement evicts
+	settle(s, "a", 700, 0)
+	settle(s, "b", 700, 0)
+	s.Tick(now)
+	snap = s.Snapshot()
+	if snap.Seats > 1 {
+		t.Fatalf("after the drain one member must leave: %d seats (exits %v)", snap.Seats, snap.Exits)
+	}
+}
+
+func TestColdCapReleasedAtChunkNotDecodeEnd(t *testing.T) {
+	// B3 + S0-2: the stagger releases at prefill complete (the first
+	// chunk), not at end of decode; and non-natural entry turns release too.
+	s, err := NewScheduler(Config{GroupBudgetFraction: 0.95, Rho: 4, IdleSeconds: 20, TTLSeconds: 30,
+		ColdEntryCapTokens: bytesFor(10), InFlightCap: 64, BlockSizeTokens: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNumBlocks(64, 1000); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if i := s.PickFromHeads([]Head{head("a", time.Second, bytesFor(10))}, now); i != 0 {
+		t.Fatal("seat a")
+	}
+	dispatch(t, s, "a", keys(10, 1), bytesFor(10))
+	// decode is still running (no settle); the FIRST CHUNK releases the cap
+	s.Chunk("a")
+	s.mu.Lock()
+	cold := s.coldInFlight
+	s.mu.Unlock()
+	if cold != 0 {
+		t.Fatalf("cold cap must be released at the first chunk, still %d", cold)
+	}
+	// a second entry can now use the full cap (B6: re-entries are capped too)
+	if i := s.PickFromHeads([]Head{head("b", time.Second, bytesFor(10))}, now); i != 0 {
+		t.Fatal("b seats after the release")
+	}
+	// non-natural termination releases as well (settle without Chunk)
+	s.Settle("b", struct{ Prompt, Cached int }{}, false, now)
+	s.mu.Lock()
+	cold = s.coldInFlight
+	s.mu.Unlock()
+	if cold != 0 {
+		t.Fatalf("non-natural termination must release the charge, still %d", cold)
+	}
+}
+
+func TestEveryTurnCountsTowardNMax(t *testing.T) {
+	// A8: a session whose turns keep failing (non-natural) still reaches
+	// n_max and becomes eligible to leave.
+	s := newSched(t)
+	now := time.Now()
+	s.PickFromHeads([]Head{head("a", time.Second, bytesFor(10))}, now)
+	dispatch(t, s, "a", keys(10, 1), bytesFor(10))
+	settle(s, "a", 10, 0) // natural entry turn, resTurns=1
+	for turn := 0; turn < 7; turn++ {
+		s.PickFromHeads([]Head{head("a", time.Second, bytesFor(10))}, now)
+		dispatch(t, s, "a", keys(10, 1), bytesFor(10))
+		// NON-natural terminations (errors): no payback ledger, but turns count
+		s.Settle("a", struct{ Prompt, Cached int }{}, false, now)
+	}
+	// resTurns = 8 = n_max: eligible even though earned == 0
+	s.mu.Lock()
+	m := s.members["a"]
+	eligible := m != nil && m.resTurns >= s.cfg.nMax()
+	s.mu.Unlock()
+	if !eligible {
+		t.Fatal("n_max must count every settled turn, natural or not (A8)")
+	}
+}
+
+func TestPreCapacityFCFS(t *testing.T) {
+	// A5: before num_gpu_blocks arrives, FCFS pass-through (oldest head).
+	s, err := NewScheduler(defaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := []Head{head("x", 2*time.Second, 100), head("y", time.Second, 100)}
+	if i := FCFSPick(h); i != 0 {
+		t.Fatalf("FCFS must pick the oldest, got %d", i)
+	}
+	if s.HasCapacity() {
+		t.Fatal("no capacity yet")
 	}
 }

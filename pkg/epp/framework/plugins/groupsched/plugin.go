@@ -14,19 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package groupsched implements the group scheduler (ALGORITHM-group.md):
-// a working set of sessions whose unique prefix blocks fit ≤95% of the
-// GPU cache, members dispatched immediately (oldest waiting request
-// first, in-flight cap 64), rotation by payback (a member leaves when it
-// has earned ρ× its measured entry cost, went silent past T_idle, or hit
-// the turn cap — and only when a waiter needs the room), newcomers
-// first at entry, hold-the-line, cold-entry staggering, and no deadlines
-// anywhere. Block accounting is tier A (CP2b): chained token-block keys
-// from the token-producer's TokenizedRequest at the measured block size.
+// Package groupsched implements the group scheduler (ALGORITHM-group.md).
+// See scheduler.go's header for the algorithm summary.
 //
-// The flow-control gate stays exactly as deployed: the stack's
-// saturation detector decides how much runs (the 80% pinned-KV gate);
-// this policy only decides who.
+// Hook wiring (the director's order, S0-1's reality): a request blocks in
+// flow control at admission → the fairness Pick (HERE) sees it as a
+// queue head → the chosen queue is released → the data producers run
+// (the tokenizer sets TokenizedRequest) → PreRequest (HERE) corrects the
+// estimate with the exact tier-A keys → the engine → ResponseBody
+// (HERE) settles. The waiting set therefore comes from the queues at
+// Pick time; queued-request admission cost = persisted history blocks +
+// a conservative wire-size delta; the exact keys land at PreRequest and
+// D13's growth enforcement absorbs the estimate error.
 package groupsched
 
 import (
@@ -34,6 +33,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
@@ -59,20 +59,20 @@ var (
 	_ fwkfc.FairnessPolicy        = &GroupScheduler{}
 )
 
-// GroupScheduler is a single named instance shared by every hookup, so
-// all of them read and write the same group state.
+// GroupScheduler is a single named instance shared by every hookup.
 type GroupScheduler struct {
 	typedName fwkplugin.TypedName
 	cfg       Config
 
 	sched   *Scheduler
 	metrics *groupMetrics
+
+	fcfsOnce sync.Once
 }
 
-// Factory builds a GroupScheduler from raw plugin parameters. It FAILS
-// CLOSED at startup if the token-producer is not configured: without
-// the TokenizedRequest there is no tier-A input, and tier B failed the
-// CP2 trust measurements — no silent fallback (the CP3 decision line).
+// Factory builds a GroupScheduler. FAILS CLOSED without the
+// token-producer (Consumes) and on an invalid config; the index attaches
+// at startup with the config's block size (the token processor's value).
 func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
 	cfg := defaultConfig()
 	if rawParameters != nil {
@@ -80,13 +80,14 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 			return nil, fmt.Errorf("failed to parse the parameters of the '%s' plugin: %w", PluginType, err)
 		}
 	}
-	if err := cfg.validate(); err != nil {
+	sched, err := NewScheduler(cfg)
+	if err != nil {
 		return nil, fmt.Errorf("invalid parameters of the '%s' plugin: %w", PluginType, err)
 	}
 	r := &GroupScheduler{
 		typedName: fwkplugin.TypedName{Type: PluginType, Name: name},
 		cfg:       cfg,
-		sched:     NewScheduler(cfg),
+		sched:     sched,
 	}
 	r.metrics = newGroupMetrics(r.sched)
 	if handle != nil {
@@ -96,15 +97,13 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 			}
 		}
 		r.sched.onExit = r.metrics.ObserveExit
-	r.sched.onEntry = r.metrics.ObserveEntry
-	r.sched.onServe = r.metrics.ObserveServed
-	go r.runTicker(handle.Context())
+		r.sched.onEntry = r.metrics.ObserveEntry
+		r.sched.onServe = r.metrics.ObserveServed
+		go r.runTicker(handle.Context())
 	}
 	return r, nil
 }
 
-// runTicker runs the lifecycle tick (T_idle release, TTL silence,
-// rotation) every second until ctx is cancelled.
 func (r *GroupScheduler) runTicker(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -121,10 +120,8 @@ func (r *GroupScheduler) runTicker(ctx context.Context) {
 
 func (r *GroupScheduler) TypedName() fwkplugin.TypedName { return r.typedName }
 
-// Consumes declares agent identity AND the tokenized request as required
-// inputs: configuration loading fails when either provider is missing.
-// The tokenized-request requirement is the fail-closed gate (no tier-B
-// fallback; CP2's M3 verdict).
+// Consumes requires agent identity AND the tokenizer's output: the
+// fail-closed gate (no tier-B fallback; CP2's M3 verdict).
 func (r *GroupScheduler) Consumes() fwkplugin.DataDependencies {
 	return fwkplugin.DataDependencies{
 		Required: map[fwkplugin.DataKey]any{
@@ -134,21 +131,15 @@ func (r *GroupScheduler) Consumes() fwkplugin.DataDependencies {
 	}
 }
 
-// Produces declares the request attributes PreRequest writes for its
-// own later hooks.
+// Produces declares the request attributes PreRequest writes.
 func (r *GroupScheduler) Produces() map[fwkplugin.DataKey]any {
 	return map[fwkplugin.DataKey]any{
 		requestKeysKey: []Hash(nil),
 	}
 }
 
-// requestKeysKey stashes the request's block keys between PreRequest
-// (arrival) and the settle/finalizer path.
 var requestKeysKey = fwkplugin.NewDataKey("group-keys", PluginType)
 
-// sessionID returns the session identifier published by the
-// agent-identity plugin (the sibling plugins' pattern; anonymous
-// traffic is not tracked and passes through last).
 func sessionID(request *fwksched.InferenceRequest) string {
 	if request == nil {
 		return ""
@@ -157,8 +148,8 @@ func sessionID(request *fwksched.InferenceRequest) string {
 	return id
 }
 
-// RegisterDependencies subscribes the plugin to endpoint lifecycle
-// events (the capacity source: cache_config_info per M4).
+// RegisterDependencies subscribes to endpoint lifecycle events (the
+// measured-capacity source).
 func (r *GroupScheduler) RegisterDependencies(reg fwkdl.Registrar) error {
 	return reg.Register(fwkdl.PendingRegistration{
 		Owner:      r.typedName,
@@ -171,153 +162,142 @@ func (r *GroupScheduler) RegisterDependencies(reg fwkdl.Registrar) error {
 	})
 }
 
-// Extract learns an endpoint's block size and block count when it joins
-// the pool — the measured capacity the budget is denominated in (M4:
-// block size from cache_config_info; 64 on the campaign stacks).
+// Extract learns num_gpu_blocks (and checks the block size matches the
+// config — a mismatch fails loudly).
 func (r *GroupScheduler) Extract(_ context.Context, event fwkdl.EndpointEvent) error {
 	if event.Type != fwkdl.EventAddOrUpdate || event.Endpoint == nil {
 		return nil
 	}
 	if m := event.Endpoint.GetMetrics(); m != nil && m.CacheBlockSize > 0 && m.CacheNumBlocks > 0 {
-		return r.sched.SetCapacity(m.CacheBlockSize, m.CacheNumBlocks)
+		return r.sched.SetNumBlocks(m.CacheBlockSize, m.CacheNumBlocks)
 	}
 	return nil
 }
 
-// blockKeysFor derives the chained token-block keys from the request's
-// TokenizedRequest (tier A). Returns nil when the tokenized request is
-// absent — the caller treats that as a wiring fault, never tier B.
-func (r *GroupScheduler) blockKeysFor(request *fwksched.InferenceRequest) ([]Hash, string) {
-	if request == nil || request.Body == nil || request.Body.TokenizedRequest == nil {
-		return nil, ""
+// Pick is the dispatch decision (§5). The waiting set is the queue-head
+// snapshot (S0-1); pre-capacity it degrades to FCFS pass-through (A5).
+func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor) (fwkfc.FlowQueueAccessor, error) {
+	if band == nil {
+		return nil, nil //nolint:nilnil
 	}
-	tp := request.Body.TokenizedRequest
-	if len(tp.Prompts) == 0 {
-		return nil, ""
+	now := time.Now()
+	var queues []fwkfc.FlowQueueAccessor
+	var heads []Head
+	band.IterateQueues(func(q fwkfc.FlowQueueAccessor) bool {
+		if q == nil || q.Len() == 0 {
+			return true
+		}
+		h := q.Peek()
+		if h == nil {
+			return true
+		}
+		session, reqID, size := "", "", int64(0)
+		if req := h.OriginalRequest(); req != nil {
+			if ir := req.InferenceRequest(); ir != nil {
+				session = sessionID(ir)
+				reqID = ir.RequestID
+				size = int64(ir.RequestSizeBytes)
+				if size <= 0 {
+					size = int64(req.ByteSize())
+				}
+			}
+		}
+		queues = append(queues, q)
+		heads = append(heads, Head{Session: session, ReqID: reqID, Arrival: h.EnqueueTime(), SizeBytes: size})
+		return true
+	})
+	if len(heads) == 0 {
+		return nil, nil //nolint:nilnil
 	}
-	// single-prompt requests (chat) are the v0 scope; multi-prompt
-	// completions hash each prompt and concatenate (the sibling's
-	// per-prompt pattern)
-	var all []uint32
-	for _, p := range tp.Prompts {
-		all = append(all, p.TokenIDs...)
+	// A5: before the measured capacity arrives, FCFS pass-through (once
+	// per process log; the gauge counts it)
+	if !r.sched.HasCapacity() {
+		r.fcfsOnce.Do(func() {
+			fmt.Println("group-scheduler: num_gpu_blocks not yet measured; serving FCFS until the endpoint metrics arrive")
+		})
+		r.metrics.ObserveFCFS()
+		if i := FCFSPick(heads); i >= 0 {
+			return queues[i], nil
+		}
+		return nil, nil //nolint:nilnil
 	}
-	bs := 0
-	if latestMetrics != nil {
-		bs = latestMetrics.CacheBlockSize
+	if i := r.sched.PickFromHeads(heads, now); i >= 0 {
+		return queues[i], nil
 	}
-	return r.sched.HashTokens(all, tp.CacheSalt, bs), request.RequestID
+	return nil, nil //nolint:nilnil
 }
 
-// latestMetrics carries the freshest endpoint metrics for the block
-// size (refreshed at PreRequest; the Extract path sets the index).
-var latestMetrics *fwkdl.Metrics
+// NewState satisfies the FairnessPolicy contract.
+func (r *GroupScheduler) NewState(_ context.Context) any { return nil }
 
-// PreRequest records the request's arrival: the block keys enter the
-// session's waiting set, non-members become waiters, and the keys are
-// stashed for the settle path.
+// PreRequest runs after the request leaves the queue (dispatch): the
+// exact tier-A keys from the TokenizedRequest correct the estimate
+// (S0-1 d), the in-flight charge was already taken at Pick.
 func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) error {
 	id := sessionID(request)
 	if id == "" {
 		return nil
 	}
 	if endpoint := pickedEndpoint(schedulingResult); endpoint != nil {
-		if m := endpoint.GetMetrics(); m != nil && m.Updated() {
-			latestMetrics = m
-			if m.CacheBlockSize > 0 && m.CacheNumBlocks > 0 {
-				_ = r.sched.SetCapacity(m.CacheBlockSize, m.CacheNumBlocks)
+		if m := endpoint.GetMetrics(); m != nil && m.Updated() && m.CacheBlockSize > 0 && m.CacheNumBlocks > 0 {
+			if err := r.sched.SetNumBlocks(m.CacheBlockSize, m.CacheNumBlocks); err != nil {
+				return err // the loud mismatch failure
 			}
 		}
 	}
-	keys, reqID := r.blockKeysFor(request)
+	keys := r.blockKeysFor(request)
 	if keys == nil {
-		// fail closed: the tokenized request is required (Consumes
-		// enforces it at config load; this guards the runtime path)
 		return errors.New("group-scheduler: no TokenizedRequest on the request (token-producer required; no tier-B fallback)")
 	}
 	request.PutAttribute(requestKeysKey, keys)
-	r.sched.Arrive(id, reqID, keys, time.Now())
+	size := int64(request.RequestSizeBytes)
+	r.sched.Dispatched(id, request.RequestID, keys, size, time.Now())
 	return nil
 }
 
-// ResponseBody settles a dispatched request: the payback ledger from
-// the usage report, the in-flight decrement, and the block settle. The
-// EndOfStream call is the finalizer for EVERY termination cause
-// (natural, client-disconnect, evicted, error) — the in-flight
-// decrement happens regardless; the payback ledger only on natural.
+// blockKeysFor derives the chained token-block keys (tier A).
+func (r *GroupScheduler) blockKeysFor(request *fwksched.InferenceRequest) []Hash {
+	if request == nil || request.Body == nil || request.Body.TokenizedRequest == nil {
+		return nil
+	}
+	tp := request.Body.TokenizedRequest
+	if len(tp.Prompts) == 0 {
+		return nil
+	}
+	var all []uint32
+	for _, p := range tp.Prompts {
+		all = append(all, p.TokenIDs...)
+	}
+	return r.sched.HashTokens(all, tp.CacheSalt, r.cfg.BlockSizeTokens)
+}
+
+// ResponseBody: the first chunk is prefill complete (the cold-entry
+// release, B3); EndOfStream is the finalizer for every termination
+// cause (in-flight decrement always; the payback ledger natural-only).
 func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.InferenceRequest, response *fwkrc.Response, _ *fwkdl.EndpointMetadata) {
-	if request == nil || response == nil || !response.EndOfStream {
+	if request == nil || response == nil {
 		return
 	}
 	id := sessionID(request)
 	if id == "" {
 		return
 	}
-	keys, _ := fwksched.ReadRequestAttribute[[]Hash](request, requestKeysKey)
-	reqID := request.RequestID
-	usage := struct{ Prompt, Cached int }{
-		Prompt: response.Usage.PromptTokens,
+	if response.StartOfStream {
+		r.sched.Chunk(id)
 	}
+	if !response.EndOfStream {
+		return
+	}
+	usage := struct{ Prompt, Cached int }{Prompt: response.Usage.PromptTokens}
 	if response.Usage.PromptTokenDetails != nil {
 		usage.Cached = response.Usage.PromptTokenDetails.CachedTokens
 	}
-	r.sched.Settle(id, reqID, keys, usage, response.TerminationCause == fwkrc.TerminationCauseNatural, time.Now())
-}
-
-// Pick is the dispatch decision (§5): budget enforcement and rotation
-// run eagerly, then the oldest waiting request of any non-exiting
-// member under the in-flight cap dispatches. Non-members never run
-// unseated (D10).
-func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccessor) (fwkfc.FlowQueueAccessor, error) {
-	if band == nil {
-		return nil, nil //nolint:nilnil
-	}
-	reqID, _, ok := r.sched.Pick(time.Now())
-	if !ok {
-		return nil, nil //nolint:nilnil
-	}
-	// find the queue whose head matches the chosen request
-	var chosen fwkfc.FlowQueueAccessor
-	band.IterateQueues(func(q fwkfc.FlowQueueAccessor) bool {
-		if q != nil && q.Len() > 0 {
-			if h := q.Peek(); h != nil {
-				if h.OriginalRequest() != nil && h.OriginalRequest().InferenceRequest() != nil &&
-					h.OriginalRequest().InferenceRequest().RequestID == reqID {
-					chosen = q
-					return false
-				}
-			}
-		}
-		return true
-	})
-	if chosen == nil {
-		// the request vanished (cancelled between pick and here):
-		// release the in-flight charge the Pick took
-		r.sched.AbortPick(reqID)
-		return nil, nil //nolint:nilnil
-	}
-	return chosen, nil
+	r.sched.Settle(id, usage, response.TerminationCause == fwkrc.TerminationCauseNatural, time.Now())
 }
 
 // DumpState reports the group snapshot (§13).
 func (r *GroupScheduler) DumpState() (json.RawMessage, error) {
 	return json.Marshal(r.sched.Snapshot())
-}
-
-// NewState satisfies the FairnessPolicy contract.
-func (r *GroupScheduler) NewState(_ context.Context) any { return nil }
-
-// AbortPick releases a Pick's in-flight charge when the chosen request
-// is no longer dispatchable (the vanished-queue guard).
-func (s *Scheduler) AbortPick(reqID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, m := range s.members {
-		if s.index != nil && s.index.OldestWaiting(m.id) == reqID {
-			m.inflight = max(m.inflight-1, 0)
-			return
-		}
-	}
 }
 
 func pickedEndpoint(schedulingResult *fwksched.SchedulingResult) fwksched.Endpoint {

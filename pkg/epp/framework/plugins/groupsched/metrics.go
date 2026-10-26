@@ -64,8 +64,10 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "uncached share of settled prompt tokens (the refill cost)"})
 	g.served = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "dispatches_total",
 		Help: "requests dispatched to members"})
+	fcfsCounter = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: "llm_d_epp_group", Name: "fcfs_dispatches_total",
+		Help: "pre-capacity FCFS pass-through dispatches"})
 	for _, c := range []prometheus.Collector{g.seats, g.uniqueBlocks, g.neBlocks, g.budgetBlocks,
-		g.waiters, g.exits, g.residency, g.entryWait, g.refillShare, g.served} {
+		g.waiters, g.exits, g.residency, g.entryWait, g.refillShare, g.served, fcfsCounter} {
 		if err := reg.Register(c); err != nil {
 			return err
 		}
@@ -111,5 +113,15 @@ func (g *groupMetrics) ObserveEntry(waitSeconds float64) {
 func (g *groupMetrics) ObserveServed() {
 	if g.served != nil {
 		g.served.Inc()
+	}
+}
+
+// fcfsCounter is the pre-capacity pass-through counter.
+var fcfsCounter prometheus.Counter
+
+// ObserveFCFS records a pre-capacity FCFS dispatch.
+func (g *groupMetrics) ObserveFCFS() {
+	if fcfsCounter != nil {
+		fcfsCounter.Inc()
 	}
 }

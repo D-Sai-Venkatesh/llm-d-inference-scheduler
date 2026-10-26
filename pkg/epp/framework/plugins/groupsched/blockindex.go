@@ -123,6 +123,7 @@ type sessionBlocks struct {
 	window  int
 	waiting map[string][]Hash      // reqID -> chained hashes
 	waitSince map[string]time.Time // reqID -> arrival (the entry-order input)
+	lastSizeBytes int64            // last-known wire size (the estimate baseline)
 	dispHist [][]Hash
 	dispSet map[Hash]struct{}
 	waitSet map[Hash]struct{}
@@ -803,4 +804,31 @@ func (b *BlockIndex) TrackedCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return len(b.sessions)
+}
+
+// LastSizeBytesLocked returns the session's last dispatched body size
+// (the estimate delta's baseline; 0 when never dispatched).
+func (b *BlockIndex) LastSizeBytesLocked(id string) int64 {
+	s, ok := b.sessions[id]
+	if !ok {
+		return 0
+	}
+	return s.lastSizeBytes
+}
+
+// HasNELocked reports whether a hash is held by the non-exiting group
+// (the estimate path's membership test).
+func (b *BlockIndex) HasNELocked(h Hash) bool {
+	_, ok := b.blocksNE[h]
+	return ok
+}
+
+// SetSizeLocked records the session's last-known wire size (the estimate
+// delta's baseline). Stored on the session record so it persists across
+// residencies with the block set.
+func (b *BlockIndex) SetSizeLocked(id string, sizeBytes int64) int64 {
+	s := b.TrackLocked(id, 0)
+	old := s.lastSizeBytes
+	s.lastSizeBytes = sizeBytes
+	return old
 }

@@ -45,7 +45,7 @@ func reproIdx(t *testing.T) *BlockIndex {
 }
 
 func reproSeat(t *testing.T, idx *BlockIndex, id string, body []byte) {
-	if err := idx.UpdateWaiting(id, body); err != nil {
+	if err := idx.UpdateWaiting(id, "r", body); err != nil {
 		t.Fatal(err)
 	}
 	if ok, _ := idx.TrySeat(id, 1 << 20); !ok {
@@ -101,7 +101,7 @@ func TestReproExitingGrowsNE(t *testing.T) {
 	idx := reproIdx(t)
 	reproSeat(t, idx, "a", reproAligned("member a turn 1"))
 	idx.MarkExiting("a")
-	if err := idx.UpdateWaiting("a", append(reproAligned("member a turn 1"), privChunks(3, 1024, 'Q')...)); err != nil {
+	if err := idx.UpdateWaiting("a", "r", append(reproAligned("member a turn 1"), privChunks(3, 1024, 'Q')...)); err != nil {
 		t.Fatal(err)
 	}
 	if idx.UniqueBlocksNE() != 0 {
@@ -138,7 +138,7 @@ func TestReproDoublePush(t *testing.T) {
 	idx := reproIdx(t)
 	bd := reproAligned("turn one")
 	reproSeat(t, idx, "a", bd)
-	if err := idx.SettleDispatched("a", bd); err != nil {
+	if err := idx.SettleDispatched("a", "r", bd); err != nil {
 		t.Fatal(err)
 	}
 	if n := len(idx.sessions["a"].dispHist); n != 1 {
@@ -158,7 +158,7 @@ func TestReproMisalignedTurns(t *testing.T) {
 	t2 := []byte(`{"max_tokens":1024,"messages":"` + msgs + `next turn"}`)
 	idx := reproIdx(t)
 	reproSeat(t, idx, "a", t1)
-	if err := idx.SettleDispatched("a", t2); err != nil {
+	if err := idx.SettleDispatched("a", "r", t2); err != nil {
 		t.Fatal(err)
 	}
 	setBlocks := len(idx.sessions["a"].set())
@@ -171,13 +171,13 @@ func TestReproMisalignedTurns(t *testing.T) {
 func TestReproNilSettleDropsDuplicate(t *testing.T) {
 	idx := reproIdx(t)
 	bd := reproAligned("same body")
-	if err := idx.UpdateWaiting("a", bd); err != nil {
+	if err := idx.UpdateWaiting("a", "q1", bd); err != nil {
 		t.Fatal(err)
 	}
-	if err := idx.UpdateWaiting("a", bd); err != nil {
+	if err := idx.UpdateWaiting("a", "q2", bd); err != nil {
 		t.Fatal(err)
 	}
-	if err := idx.SettleDispatched("a", bd); err != nil {
+	if err := idx.SettleDispatched("a", "q1", bd); err != nil {
 		t.Fatal(err)
 	}
 	if n := len(idx.sessions["a"].waiting); n != 1 {

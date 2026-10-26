@@ -31,29 +31,44 @@ type stubPlugin struct{ tn fwkplugin.TypedName }
 
 func (s *stubPlugin) TypedName() fwkplugin.TypedName { return s.tn }
 
-// TestFactoryRequiresTokenProducer: construction fails without a
-// token-producer sibling on the handle (the startup fail-closed gate) and
-// succeeds with one.
+// TestFactoryRequiresTokenProducer: the startup fail-closed gate lives at
+// RegisterDependencies (construction order is not config order; the gate
+// runs after ALL plugins are built). It fails without a token-producer
+// sibling and passes with one.
 func TestFactoryRequiresTokenProducer(t *testing.T) {
 	ctx := t.Context()
 
-	t.Run("without a token-producer", func(t *testing.T) {
+	build := func(t *testing.T) *GroupScheduler {
+		t.Helper()
 		handle := testutils.NewTestHandle(ctx)
-		_, err := Factory("gs", nil, handle)
+		p, err := Factory("gs", nil, handle)
+		if err != nil {
+			t.Fatalf("Factory must succeed (the gate is not at construction): %v", err)
+		}
+		return p.(*GroupScheduler)
+	}
+
+	t.Run("without a token-producer", func(t *testing.T) {
+		gs := build(t)
+		err := gs.validateTokenProducer()
 		if err == nil || !strings.Contains(err.Error(), "token-producer") {
-			t.Fatalf("construction must fail without a token-producer, got: %v", err)
+			t.Fatalf("the gate must fail without a token-producer, got: %v", err)
 		}
 	})
 	t.Run("with a token-producer", func(t *testing.T) {
-		handle := testutils.NewTestHandle(ctx)
-		handle.AddPlugin("tp", &stubPlugin{tn: fwkplugin.TypedName{Type: tokenizer.PluginType, Name: "tp"}})
-		if _, err := Factory("gs", nil, handle); err != nil {
-			t.Fatalf("construction must succeed with a token-producer sibling: %v", err)
+		gs := build(t)
+		gs.handle.AddPlugin("tp", &stubPlugin{tn: fwkplugin.TypedName{Type: tokenizer.PluginType, Name: "tp"}})
+		if err := gs.validateTokenProducer(); err != nil {
+			t.Fatalf("the gate must pass with a token-producer sibling: %v", err)
 		}
 	})
 	t.Run("nil handle skips the gate (unit/test mode)", func(t *testing.T) {
-		if _, err := Factory("gs", nil, nil); err != nil {
-			t.Fatalf("nil handle must skip the startup gate: %v", err)
+		p, err := Factory("gs", nil, nil)
+		if err != nil {
+			t.Fatalf("Factory with nil handle: %v", err)
+		}
+		if err := p.(*GroupScheduler).validateTokenProducer(); err != nil {
+			t.Fatalf("nil handle must skip the gate: %v", err)
 		}
 	})
 }

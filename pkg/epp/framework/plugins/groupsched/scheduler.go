@@ -129,6 +129,10 @@ type waiter struct {
 type Scheduler struct {
 	mu sync.Mutex
 	cfg Config
+	// observers are the optional metric hooks (nil in tests).
+	onExit  func(reason string, resTurns int)
+	onEntry func(waitSeconds float64)
+	onServe func()
 
 	// index is nil until the first measured capacity arrives (M4: block
 	// size from cache_config_info). Before that the scheduler serves
@@ -299,6 +303,9 @@ func (s *Scheduler) Pick(now time.Time) (reqID string, session string, ok bool) 
 	best.inflight++
 	best.lastActivity = now
 	s.counters.served++
+	if s.onServe != nil {
+		s.onServe()
+	}
 	return reqID, best.id, true
 }
 
@@ -528,6 +535,9 @@ func (s *Scheduler) exitLocked(m *member, reason string, now time.Time) {
 	s.index.UnseatLocked(m.id)
 	delete(s.members, m.id)
 	s.counters.exits[reason]++
+	if s.onExit != nil {
+		s.onExit(reason, m.resTurns)
+	}
 	if since := s.index.WaitingSince(m.id); !since.IsZero() {
 		s.waiters[m.id] = &waiter{id: m.id, since: since, coldEstimate: 0}
 	}
@@ -543,6 +553,9 @@ func (s *Scheduler) seatLocked(w *waiter, now time.Time) {
 	delete(s.waiters, w.id)
 	if w.newcomer {
 		s.counters.entryWaits = append(s.counters.entryWaits, wait)
+		if s.onEntry != nil {
+			s.onEntry(wait)
+		}
 	}
 	s.everSeated[w.id] = struct{}{}
 	s.members[w.id] = &member{

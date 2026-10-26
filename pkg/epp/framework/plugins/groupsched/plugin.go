@@ -95,7 +95,10 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 				return nil, fmt.Errorf("failed to register metrics of the '%s' plugin: %w", PluginType, err)
 			}
 		}
-		go r.runTicker(handle.Context())
+		r.sched.onExit = r.metrics.ObserveExit
+	r.sched.onEntry = r.metrics.ObserveEntry
+	r.sched.onServe = r.metrics.ObserveServed
+	go r.runTicker(handle.Context())
 	}
 	return r, nil
 }
@@ -111,6 +114,7 @@ func (r *GroupScheduler) runTicker(ctx context.Context) {
 			return
 		case <-ticker.C:
 			r.sched.Tick(time.Now())
+			r.metrics.Refresh()
 		}
 	}
 }

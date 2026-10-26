@@ -73,6 +73,43 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	return nil
 }
 
-// Describe and Collect satisfy prometheus.Collector lazily via the
-// scheduler snapshot; the register path above uses the concrete
-// collectors, and the snapshot refresh runs on scrape via Collect.
+// Refresh pushes a scheduler snapshot into the gauges (the ticker calls
+// it every second; the counters and histograms are observed at their
+// events by the scheduler).
+func (g *groupMetrics) Refresh() {
+	if g.seats == nil {
+		return
+	}
+	snap := g.sched.Snapshot()
+	g.seats.Set(float64(snap.Seats))
+	g.uniqueBlocks.Set(float64(snap.UniqueBlocks))
+	g.neBlocks.Set(float64(snap.NEBlocks))
+	g.budgetBlocks.Set(float64(snap.BudgetBlocks))
+	g.waiters.Set(float64(snap.Waiters))
+	g.refillShare.Set(snap.RefillShare)
+	g.served.Add(0) // counter; the scheduler path adds directly below
+}
+
+// ObserveExit records a member exit (residency turns + the reason).
+func (g *groupMetrics) ObserveExit(reason string, resTurns int) {
+	if g.exits == nil {
+		return
+	}
+	g.exits.WithLabelValues(reason).Inc()
+	g.residency.Observe(float64(resTurns))
+}
+
+// ObserveEntry records a newcomer seat wait.
+func (g *groupMetrics) ObserveEntry(waitSeconds float64) {
+	if g.entryWait == nil {
+		return
+	}
+	g.entryWait.Observe(waitSeconds)
+}
+
+// ObserveServed records a dispatch.
+func (g *groupMetrics) ObserveServed() {
+	if g.served != nil {
+		g.served.Inc()
+	}
+}

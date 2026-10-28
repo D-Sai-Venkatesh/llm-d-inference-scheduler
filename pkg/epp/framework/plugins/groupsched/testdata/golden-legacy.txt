@@ -1,0 +1,1364 @@
+t=20 PICK 0 -> s00 req=s00-r01 blocks=18
+t=20 SEAT wait=0.000
+STATE seats=1 [s00]
+t=28 PICK 0 -> s00 req=s00-r02 blocks=29
+t=29 PICK 0 -> s01 req=s01-r01 blocks=18
+t=29 SEAT wait=0.000
+STATE seats=2 [s00,s01]
+t=32 SETTLE s00 req=s00-r01 natural=true
+t=37 PICK 0 -> s01 req=s01-r02 blocks=29
+t=38 PICK 0 -> s02 req=s02-r01 blocks=18
+t=38 SEAT wait=0.000
+STATE seats=3 [s00,s01,s02]
+t=41 SETTLE s01 req=s01-r01 natural=true
+t=41 PICK 0 -> s00 req=s00-r03 blocks=40
+t=46 PICK 0 -> s02 req=s02-r02 blocks=29
+t=47 SETTLE s00 req=s00-r02 natural=true
+t=47 PICK 0 -> s03 req=s03-r01 blocks=18
+t=47 SEAT wait=0.000
+STATE seats=4 [s00,s01,s02,s03]
+t=50 SETTLE s02 req=s02-r01 natural=true
+t=50 PICK 0 -> s01 req=s01-r03 blocks=40
+t=55 PICK 0 -> s03 req=s03-r02 blocks=29
+t=56 SETTLE s01 req=s01-r02 natural=true
+t=56 PICK 0 -> s04 req=s04-r01 blocks=18
+t=56 SEAT wait=0.000
+STATE seats=5 [s00,s01,s02,s03,s04]
+t=59 SETTLE s03 req=s03-r01 natural=true
+t=59 PICK 0 -> s00 req=s00-r04 blocks=52
+t=59 PICK 0 -> s02 req=s02-r03 blocks=40
+t=64 PICK 0 -> s04 req=s04-r02 blocks=29
+t=65 SETTLE s02 req=s02-r02 natural=true
+t=65 PICK 0 -> s05 req=s05-r01 blocks=18
+t=65 SEAT wait=0.000
+STATE seats=6 [s00,s01,s02,s03,s04,s05]
+t=67 SETTLE s00 req=s00-r03 natural=true
+t=68 SETTLE s04 req=s04-r01 natural=true
+t=68 PICK 0 -> s01 req=s01-r04 blocks=52
+t=68 PICK 0 -> s03 req=s03-r03 blocks=40
+t=74 SETTLE s03 req=s03-r02 natural=true
+t=74 PICK 0 -> s06 req=s06-r01 blocks=18
+t=74 SEAT wait=0.000
+STATE seats=7 [s00,s01,s02,s03,s04,s05,s06]
+t=76 SETTLE s01 req=s01-r03 natural=true
+t=77 SETTLE s05 req=s05-r01 natural=true
+t=77 PICK 0 -> s02 req=s02-r04 blocks=52
+t=77 PICK 0 -> s04 req=s04-r03 blocks=40
+t=78 PICK 0 -> s05 req=s05-r02 blocks=29
+t=82 PICK 0 -> s00 req=s00-r05 blocks=64
+t=82 PICK 0 -> s06 req=s06-r02 blocks=29
+t=83 SETTLE s04 req=s04-r02 natural=true
+t=83 PICK 0 -> s07 req=s07-r01 blocks=14
+t=83 SEAT wait=0.000
+STATE seats=8 [s00,s01,s02,s03,s04,s05,s06,s07]
+t=85 SETTLE s02 req=s02-r03 natural=true
+t=86 SETTLE s06 req=s06-r01 natural=true
+t=86 PICK 0 -> s03 req=s03-r04 blocks=52
+t=87 SETTLE s00 req=s00-r05 natural=true
+t=87 PICK 0 -> s00 req=s00-r06 blocks=77
+t=91 PICK 0 -> s01 req=s01-r05 blocks=64
+t=92 SETTLE s00 req=s00-r04 natural=true
+t=92 PICK 0 -> s08 req=s08-r01 blocks=18
+t=92 SEAT wait=0.000
+STATE seats=9 [s00,s01,s02,s03,s04,s05,s06,s07,s08]
+t=94 SETTLE s03 req=s03-r03 natural=false
+t=95 SETTLE s07 req=s07-r01 natural=true
+t=95 PICK 0 -> s04 req=s04-r04 blocks=52
+t=95 PICK 0 -> s06 req=s06-r03 blocks=40
+t=96 SETTLE s01 req=s01-r05 natural=true
+t=96 PICK 0 -> s01 req=s01-r06 blocks=77
+t=97 SETTLE s05 req=s05-r02 natural=true
+t=97 PICK 0 -> s00 req=s00-r07 blocks=90
+t=98 PICK 0 -> s05 req=s05-r03 blocks=40
+t=99 SETTLE s00 req=s00-r06 natural=true
+t=100 PICK 0 -> s02 req=s02-r05 blocks=64
+t=100 PICK 0 -> s08 req=s08-r02 blocks=29
+t=101 SETTLE s01 req=s01-r04 natural=true
+t=101 SETTLE s06 req=s06-r02 natural=true
+t=101 PICK 0 -> s09 req=s09-r01 blocks=18
+t=101 SEAT wait=0.000
+STATE seats=10 [s00,s01,s02,s03,s04,s05,s06,s07,s08,s09]
+t=103 SETTLE s04 req=s04-r03 natural=true
+t=104 SETTLE s08 req=s08-r01 natural=true
+t=105 SETTLE s02 req=s02-r05 natural=true
+t=105 PICK 0 -> s02 req=s02-r06 blocks=77
+t=106 PICK 0 -> s01 req=s01-r07 blocks=90
+t=108 SETTLE s01 req=s01-r06 natural=true
+t=109 PICK 0 -> s03 req=s03-r05 blocks=64
+t=109 PICK 0 -> s09 req=s09-r02 blocks=29
+t=110 SETTLE s02 req=s02-r04 natural=true
+t=110 PICK 0 -> s10 req=s10-r01 blocks=18
+t=110 SEAT wait=0.000
+STATE seats=11 [s00,s01,s02,s03,s04,s05,s06,s07,s08,s09,s10]
+t=112 PICK 0 -> s00 req=s00-r08 blocks=104
+t=113 SETTLE s09 req=s09-r01 natural=true
+t=113 PICK 0 -> s06 req=s06-r04 blocks=52
+t=113 PICK 0 -> s08 req=s08-r03 blocks=40
+t=114 SETTLE s03 req=s03-r05 natural=true
+t=114 PICK 0 -> s03 req=s03-r06 blocks=77
+t=115 PICK 0 -> s02 req=s02-r07 blocks=90
+t=116 SETTLE s00 req=s00-r07 natural=true
+t=117 SETTLE s02 req=s02-r06 natural=true
+t=118 PICK 0 -> s04 req=s04-r05 blocks=64
+t=118 PICK 0 -> s10 req=s10-r02 blocks=29
+t=119 SETTLE s03 req=s03-r04 natural=true
+t=119 SETTLE s08 req=s08-r02 natural=true
+t=119 PICK 0 -> s11 req=s11-r01 blocks=18
+t=119 SEAT wait=0.000
+STATE seats=12 [s00,s01,s02,s03,s04,s05,s06,s07,s08,s09,s10,s11]
+t=121 SETTLE s06 req=s06-r03 natural=true
+t=121 PICK 0 -> s01 req=s01-r08 blocks=104
+t=122 SETTLE s10 req=s10-r01 natural=true
+t=122 PICK 0 -> s09 req=s09-r03 blocks=40
+t=123 SETTLE s04 req=s04-r05 natural=true
+t=123 PICK 0 -> s04 req=s04-r06 blocks=77
+t=124 SETTLE s05 req=s05-r03 natural=true
+t=124 PICK 0 -> s03 req=s03-r07 blocks=90
+t=125 SETTLE s01 req=s01-r07 natural=true
+t=126 SETTLE s03 req=s03-r06 natural=true
+t=126 EXIT reason=ttl turns=1
+STATE seats=11 [s00,s01,s02,s03,s04,s05,s06,s08,s09,s10,s11]
+t=127 PICK 0 -> s11 req=s11-r02 blocks=29
+t=128 SETTLE s04 req=s04-r04 natural=true
+t=128 SETTLE s09 req=s09-r02 natural=true
+t=128 PICK 0 -> s12 req=s12-r01 blocks=18
+t=128 SEAT wait=0.000
+STATE seats=12 [s00,s01,s02,s03,s04,s05,s06,s08,s09,s10,s11,s12]
+t=130 PICK 0 -> s02 req=s02-r08 blocks=104
+t=131 SETTLE s11 req=s11-r01 natural=true
+t=131 PICK 0 -> s08 req=s08-r04 blocks=52
+t=131 PICK 0 -> s10 req=s10-r03 blocks=40
+t=132 PICK 0 -> s00 req=s00-r09 blocks=118
+t=133 PICK 0 -> s04 req=s04-r07 blocks=90
+t=134 SETTLE s02 req=s02-r07 natural=true
+t=135 SETTLE s04 req=s04-r06 natural=true
+t=136 PICK 0 -> s06 req=s06-r05 blocks=64
+t=136 PICK 0 -> s12 req=s12-r02 blocks=29
+t=137 SETTLE s10 req=s10-r02 natural=true
+t=137 PICK 0 -> s13 req=s13-r01 blocks=18
+t=137 SEAT wait=0.000
+STATE seats=13 [s00,s01,s02,s03,s04,s05,s06,s08,s09,s10,s11,s12,s13]
+t=138 SETTLE s00 req=s00-r08 natural=true
+t=139 SETTLE s08 req=s08-r03 natural=true
+t=139 PICK 0 -> s03 req=s03-r08 blocks=104
+t=140 SETTLE s12 req=s12-r01 natural=true
+t=140 PICK 0 -> s09 req=s09-r04 blocks=52
+t=140 PICK 0 -> s11 req=s11-r03 blocks=40
+t=141 SETTLE s06 req=s06-r05 natural=true
+t=141 PICK 0 -> s01 req=s01-r09 blocks=118
+t=141 PICK 0 -> s06 req=s06-r06 blocks=77
+t=143 SETTLE s03 req=s03-r07 natural=true
+t=145 PICK 0 -> s13 req=s13-r02 blocks=29
+t=146 SETTLE s06 req=s06-r04 natural=true
+t=146 SETTLE s11 req=s11-r02 natural=true
+t=146 PICK 0 -> s14 req=s14-r01 blocks=18
+t=146 SEAT wait=0.000
+STATE seats=14 [s00,s01,s02,s03,s04,s05,s06,s08,s09,s10,s11,s12,s13,s14]
+t=147 SETTLE s01 req=s01-r08 natural=true
+t=148 SETTLE s09 req=s09-r03 natural=true
+t=148 PICK 0 -> s04 req=s04-r08 blocks=104
+t=149 SETTLE s13 req=s13-r01 natural=true
+t=149 PICK 0 -> s10 req=s10-r04 blocks=52
+t=149 PICK 0 -> s12 req=s12-r03 blocks=40
+t=150 PICK 0 -> s02 req=s02-r09 blocks=118
+t=151 PICK 0 -> s06 req=s06-r07 blocks=90
+t=152 SETTLE s04 req=s04-r07 natural=true
+t=153 SETTLE s06 req=s06-r06 natural=true
+t=154 PICK 0 -> s08 req=s08-r05 blocks=64
+t=154 PICK 0 -> s14 req=s14-r02 blocks=29
+t=155 SETTLE s12 req=s12-r02 natural=true
+t=155 PICK 0 -> s15 req=s15-r01 blocks=18
+t=155 SEAT wait=0.000
+STATE seats=14 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15]
+t=155 EXIT reason=ttl turns=3
+t=156 SETTLE s02 req=s02-r08 natural=true
+t=157 SETTLE s10 req=s10-r03 natural=true
+t=157 PICK 0 -> s00 req=s00-r10 blocks=133
+t=158 SETTLE s14 req=s14-r01 natural=true
+t=158 PICK 0 -> s11 req=s11-r04 blocks=52
+t=158 PICK 0 -> s13 req=s13-r03 blocks=40
+t=159 SETTLE s08 req=s08-r05 natural=true
+t=159 PICK 0 -> s03 req=s03-r09 blocks=118
+t=159 PICK 0 -> s08 req=s08-r06 blocks=77
+t=162 SETTLE s00 req=s00-r10 natural=true
+t=163 PICK 0 -> s09 req=s09-r05 blocks=64
+t=163 PICK 0 -> s15 req=s15-r02 blocks=29
+t=164 SETTLE s08 req=s08-r04 natural=true
+t=164 SETTLE s13 req=s13-r02 natural=true
+t=164 PICK 0 -> s00 req=s00-r11 blocks=148
+t=164 SEAT wait=0.000
+STATE seats=15 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16]
+t=164 PICK 0 -> s16 req=s16-r01 blocks=18
+t=165 SETTLE s00 req=s00-r09 natural=true
+t=165 SETTLE s03 req=s03-r08 natural=true
+t=166 SETTLE s11 req=s11-r03 natural=true
+t=166 PICK 0 -> s01 req=s01-r10 blocks=133
+t=166 PICK 0 -> s06 req=s06-r08 blocks=104
+t=167 SETTLE s15 req=s15-r01 natural=true
+t=167 PICK 0 -> s12 req=s12-r04 blocks=52
+t=167 PICK 0 -> s14 req=s14-r03 blocks=40
+t=168 SETTLE s09 req=s09-r05 natural=true
+t=168 PICK 0 -> s04 req=s04-r09 blocks=118
+t=168 PICK 0 -> s09 req=s09-r06 blocks=77
+t=169 PICK 0 -> s08 req=s08-r07 blocks=90
+t=170 SETTLE s06 req=s06-r07 natural=true
+t=171 SETTLE s08 req=s08-r06 natural=true
+t=171 SETTLE s01 req=s01-r10 natural=true
+t=172 PICK 0 -> s10 req=s10-r05 blocks=64
+t=172 PICK 0 -> s16 req=s16-r02 blocks=29
+t=173 SETTLE s09 req=s09-r04 natural=true
+t=173 SETTLE s14 req=s14-r02 natural=true
+t=173 PICK 0 -> s01 req=s01-r11 blocks=148
+t=173 SEAT wait=0.000
+STATE seats=16 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17]
+t=173 PICK 0 -> s17 req=s17-r01 blocks=18
+t=174 SETTLE s01 req=s01-r09 natural=true
+t=174 SETTLE s04 req=s04-r08 natural=true
+t=175 SETTLE s12 req=s12-r03 natural=true
+t=175 PICK 0 -> s02 req=s02-r10 blocks=133
+t=176 SETTLE s00 req=s00-r11 natural=true
+t=176 SETTLE s16 req=s16-r01 natural=true
+t=176 PICK 0 -> s00 req=s00-r12 blocks=164
+t=176 PICK 0 -> s13 req=s13-r04 blocks=52
+t=177 SETTLE s10 req=s10-r05 natural=true
+t=177 PICK 1 -> s15 req=s15-r03 blocks=40
+t=177 PICK 0 -> s10 req=s10-r06 blocks=77
+t=178 PICK 0 -> s09 req=s09-r07 blocks=90
+t=180 SETTLE s09 req=s09-r06 natural=true
+t=180 SETTLE s02 req=s02-r10 natural=true
+t=181 PICK 0 -> s11 req=s11-r05 blocks=64
+t=181 PICK 0 -> s17 req=s17-r02 blocks=29
+t=182 SETTLE s10 req=s10-r04 natural=true
+t=182 SETTLE s15 req=s15-r02 natural=true
+t=182 PICK 0 -> s02 req=s02-r11 blocks=148
+t=182 SEAT wait=0.000
+STATE seats=17 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s18]
+t=182 PICK 0 -> s18 req=s18-r01 blocks=14
+t=183 SETTLE s02 req=s02-r09 natural=true
+t=184 SETTLE s13 req=s13-r03 natural=true
+t=184 PICK 0 -> s03 req=s03-r10 blocks=133
+t=184 PICK 0 -> s08 req=s08-r08 blocks=104
+t=185 SETTLE s01 req=s01-r11 natural=true
+t=185 SETTLE s17 req=s17-r01 natural=true
+t=185 PICK 0 -> s01 req=s01-r12 blocks=164
+t=185 PICK 0 -> s14 req=s14-r04 blocks=52
+t=186 SETTLE s11 req=s11-r05 natural=true
+t=186 PICK 2 -> s16 req=s16-r03 blocks=40
+t=186 PICK 0 -> s06 req=s06-r09 blocks=118
+t=187 PICK 1 -> s11 req=s11-r06 blocks=77
+t=187 PICK 0 -> s10 req=s10-r07 blocks=90
+t=188 SETTLE s08 req=s08-r07 natural=true
+t=189 SETTLE s10 req=s10-r06 natural=true
+t=189 SETTLE s03 req=s03-r10 natural=true
+t=190 PICK 0 -> s12 req=s12-r05 blocks=64
+t=191 SETTLE s11 req=s11-r04 natural=true
+t=191 SETTLE s16 req=s16-r02 natural=true
+t=191 PICK 0 -> s03 req=s03-r11 blocks=148
+t=191 SEAT wait=0.000
+STATE seats=18 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s18,s19]
+t=191 PICK 0 -> s19 req=s19-r01 blocks=18
+t=192 SETTLE s03 req=s03-r09 natural=true
+t=192 SETTLE s06 req=s06-r08 natural=true
+t=193 SETTLE s14 req=s14-r03 natural=true
+t=193 PICK 0 -> s00 req=s00-r13 blocks=180
+t=193 PICK 0 -> s04 req=s04-r10 blocks=133
+t=194 SETTLE s02 req=s02-r11 natural=true
+t=194 SETTLE s18 req=s18-r01 natural=true
+t=194 PICK 1 -> s09 req=s09-r08 blocks=104
+t=194 PICK 0 -> s02 req=s02-r12 blocks=164
+t=195 SETTLE s00 req=s00-r12 natural=true
+t=195 SETTLE s12 req=s12-r05 natural=true
+t=195 PICK 2 -> s17 req=s17-r03 blocks=40
+t=195 PICK 0 -> s12 req=s12-r06 blocks=77
+t=196 PICK 0 -> s15 req=s15-r04 blocks=52
+t=197 SETTLE s09 req=s09-r07 natural=true
+t=197 PICK 0 -> s11 req=s11-r07 blocks=90
+t=198 SETTLE s04 req=s04-r10 natural=true
+t=199 SETTLE s11 req=s11-r06 natural=true
+t=199 PICK 0 -> s13 req=s13-r05 blocks=64
+t=199 PICK 0 -> s19 req=s19-r02 blocks=29
+t=200 SETTLE s12 req=s12-r04 natural=true
+t=200 SETTLE s17 req=s17-r02 natural=true
+t=200 PICK 0 -> s04 req=s04-r11 blocks=148
+t=200 SEAT wait=0.000
+STATE seats=19 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s18,s19,s20]
+t=200 PICK 0 -> s20 req=s20-r01 blocks=18
+t=201 SETTLE s04 req=s04-r09 natural=true
+t=202 PICK 0 -> s01 req=s01-r13 blocks=180
+t=202 PICK 0 -> s10 req=s10-r08 blocks=104
+t=203 SETTLE s15 req=s15-r03 natural=true
+t=203 SETTLE s03 req=s03-r11 natural=true
+t=203 SETTLE s19 req=s19-r01 natural=true
+t=203 PICK 0 -> s03 req=s03-r12 blocks=164
+t=204 SETTLE s01 req=s01-r12 natural=true
+t=204 SETTLE s13 req=s13-r05 natural=true
+t=204 PICK 0 -> s08 req=s08-r09 blocks=118
+t=204 PICK 0 -> s13 req=s13-r06 blocks=77
+t=205 PICK 1 -> s16 req=s16-r04 blocks=52
+t=205 PICK 0 -> s12 req=s12-r07 blocks=90
+t=206 SETTLE s10 req=s10-r07 natural=true
+t=207 SETTLE s12 req=s12-r06 natural=true
+t=208 PICK 0 -> s14 req=s14-r05 blocks=64
+t=208 PICK 0 -> s20 req=s20-r02 blocks=29
+t=209 SETTLE s13 req=s13-r04 natural=true
+t=209 PICK 0 -> s21 req=s21-r01 blocks=18
+t=209 SEAT wait=0.000
+STATE seats=20 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s18,s19,s20,s21]
+t=210 SETTLE s08 req=s08-r08 natural=true
+t=211 PICK 0 -> s02 req=s02-r13 blocks=180
+t=211 PICK 0 -> s06 req=s06-r10 blocks=133
+t=212 SETTLE s16 req=s16-r03 natural=true
+t=212 SETTLE s04 req=s04-r11 natural=true
+t=212 SETTLE s20 req=s20-r01 natural=true
+t=212 PICK 0 -> s04 req=s04-r12 blocks=164
+t=212 PICK 0 -> s11 req=s11-r08 blocks=104
+t=213 SETTLE s02 req=s02-r12 natural=true
+t=213 SETTLE s14 req=s14-r05 natural=true
+t=213 PICK 2 -> s19 req=s19-r03 blocks=40
+t=213 PICK 0 -> s14 req=s14-r06 blocks=77
+t=214 PICK 2 -> s17 req=s17-r04 blocks=52
+t=214 PICK 0 -> s09 req=s09-r09 blocks=118
+t=215 PICK 1 -> s13 req=s13-r07 blocks=90
+t=215 PICK 0 -> s00 req=s00-r14 blocks=197
+t=216 SETTLE s11 req=s11-r07 natural=true
+t=216 SETTLE s13 req=s13-r06 natural=true
+t=216 SETTLE s06 req=s06-r10 natural=true
+t=217 PICK 0 -> s21 req=s21-r02 blocks=29
+t=218 SETTLE s14 req=s14-r04 natural=true
+t=218 SETTLE s19 req=s19-r02 natural=true
+t=218 PICK 0 -> s06 req=s06-r11 blocks=148
+t=218 SEAT wait=0.000
+STATE seats=21 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s18,s19,s20,s21,s22]
+t=218 PICK 0 -> s22 req=s22-r01 blocks=18
+t=219 SETTLE s06 req=s06-r09 natural=true
+t=219 SETTLE s00 req=s00-r13 natural=true
+t=219 PICK 0 -> s00 req=s00-r15 blocks=214
+t=219 PICK 0 -> s15 req=s15-r05 blocks=64
+t=220 SETTLE s09 req=s09-r08 natural=true
+t=220 PICK 0 -> s03 req=s03-r13 blocks=180
+t=220 PICK 0 -> s12 req=s12-r08 blocks=104
+t=221 SETTLE s17 req=s17-r03 natural=true
+t=221 SETTLE s21 req=s21-r01 natural=true
+t=221 PICK 0 -> s20 req=s20-r03 blocks=40
+t=222 SETTLE s03 req=s03-r12 natural=true
+t=222 PICK 0 -> s10 req=s10-r09 blocks=118
+t=223 PICK 0 -> s14 req=s14-r07 blocks=90
+t=224 SETTLE s12 req=s12-r07 natural=true
+t=224 SETTLE s00 req=s00-r15 natural=true
+t=224 SETTLE s15 req=s15-r05 natural=true
+t=224 PICK 0 -> s01 req=s01-r14 blocks=197
+t=224 PICK 0 -> s15 req=s15-r06 blocks=77
+t=225 SETTLE s14 req=s14-r06 natural=true
+t=225 EXIT reason=ttl turns=1
+STATE seats=20 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s19,s20,s21,s22]
+t=226 PICK 0 -> s22 req=s22-r02 blocks=29
+t=227 SETTLE s20 req=s20-r02 natural=true
+t=227 PICK 0 -> s23 req=s23-r01 blocks=18
+t=227 SEAT wait=0.000
+STATE seats=21 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s19,s20,s21,s22,s23]
+t=228 SETTLE s01 req=s01-r13 natural=true
+t=228 SETTLE s10 req=s10-r08 natural=true
+t=228 PICK 0 -> s00 req=s00-r16 blocks=232
+t=228 PICK 0 -> s01 req=s01-r15 blocks=214
+t=229 SETTLE s15 req=s15-r04 natural=true
+t=229 PICK 2 -> s16 req=s16-r05 blocks=64
+t=229 PICK 0 -> s04 req=s04-r13 blocks=180
+t=230 SETTLE s06 req=s06-r11 natural=true
+t=230 SETTLE s22 req=s22-r01 natural=true
+t=230 PICK 1 -> s08 req=s08-r10 blocks=133
+t=230 PICK 0 -> s06 req=s06-r12 blocks=164
+t=231 SETTLE s04 req=s04-r12 natural=true
+t=231 PICK 0 -> s13 req=s13-r08 blocks=104
+t=231 PICK 1 -> s21 req=s21-r03 blocks=40
+t=232 PICK 1 -> s19 req=s19-r04 blocks=52
+t=232 PICK 0 -> s11 req=s11-r09 blocks=118
+t=233 SETTLE s01 req=s01-r15 natural=true
+t=233 PICK 0 -> s02 req=s02-r14 blocks=197
+t=234 SETTLE s13 req=s13-r07 natural=true
+t=234 SETTLE s16 req=s16-r05 natural=true
+t=234 PICK 0 -> s15 req=s15-r07 blocks=90
+t=234 PICK 0 -> s16 req=s16-r06 blocks=77
+t=235 SETTLE s08 req=s08-r10 natural=true
+t=235 PICK 0 -> s23 req=s23-r02 blocks=29
+t=236 SETTLE s21 req=s21-r02 natural=true
+t=236 SETTLE s15 req=s15-r06 natural=true
+t=236 PICK 0 -> s24 req=s24-r01 blocks=18
+t=236 SEAT wait=0.000
+STATE seats=22 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s19,s20,s21,s22,s23,s24]
+t=237 SETTLE s08 req=s08-r09 natural=true
+t=237 SETTLE s02 req=s02-r13 natural=true
+t=237 PICK 0 -> s01 req=s01-r16 blocks=232
+t=237 PICK 0 -> s02 req=s02-r15 blocks=214
+t=238 SETTLE s16 req=s16-r04 natural=true
+t=238 SETTLE s11 req=s11-r08 natural=true
+t=238 PICK 0 -> s08 req=s08-r11 blocks=148
+t=238 PICK 1 -> s17 req=s17-r05 blocks=64
+t=239 SETTLE s19 req=s19-r03 natural=true
+t=239 SETTLE s23 req=s23-r01 natural=true
+t=239 PICK 1 -> s14 req=s14-r08 blocks=104
+t=239 PICK 0 -> s09 req=s09-r10 blocks=133
+t=240 SETTLE s00 req=s00-r16 natural=true
+t=240 PICK 1 -> s20 req=s20-r04 blocks=52
+t=240 PICK 1 -> s22 req=s22-r03 blocks=40
+t=241 PICK 0 -> s12 req=s12-r09 blocks=118
+t=242 SETTLE s14 req=s14-r07 natural=true
+t=242 SETTLE s02 req=s02-r15 natural=true
+t=242 PICK 0 -> s00 req=s00-r17 blocks=250
+t=242 PICK 0 -> s03 req=s03-r14 blocks=197
+t=243 SETTLE s17 req=s17-r05 natural=true
+t=243 PICK 0 -> s17 req=s17-r06 blocks=77
+t=244 SETTLE s09 req=s09-r10 natural=true
+t=244 PICK 0 -> s16 req=s16-r07 blocks=90
+t=244 PICK 0 -> s24 req=s24-r02 blocks=29
+t=245 SETTLE s22 req=s22-r02 natural=true
+t=245 PICK 0 -> s25 req=s25-r01 blocks=18
+t=245 SEAT wait=0.000
+STATE seats=23 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s19,s20,s21,s22,s23,s24,s25]
+t=246 SETTLE s03 req=s03-r13 natural=true
+t=246 SETTLE s12 req=s12-r08 natural=true
+t=246 SETTLE s16 req=s16-r06 natural=true
+t=246 PICK 0 -> s02 req=s02-r16 blocks=232
+t=246 PICK 0 -> s03 req=s03-r15 blocks=214
+t=247 SETTLE s17 req=s17-r04 natural=true
+t=247 SETTLE s09 req=s09-r09 natural=true
+t=247 SETTLE s20 req=s20-r03 natural=false
+t=247 PICK 1 -> s09 req=s09-r11 blocks=148
+t=247 PICK 0 -> s06 req=s06-r13 blocks=180
+t=248 SETTLE s00 req=s00-r14 natural=true
+t=248 SETTLE s24 req=s24-r01 natural=true
+t=248 PICK 0 -> s10 req=s10-r10 blocks=133
+t=248 PICK 0 -> s23 req=s23-r03 blocks=40
+t=249 SETTLE s06 req=s06-r12 natural=true
+t=249 SETTLE s01 req=s01-r16 natural=true
+t=249 PICK 0 -> s15 req=s15-r08 blocks=104
+t=249 PICK 0 -> s21 req=s21-r04 blocks=52
+t=250 SETTLE s08 req=s08-r11 natural=true
+t=250 PICK 0 -> s08 req=s08-r12 blocks=164
+t=251 SETTLE s03 req=s03-r15 natural=true
+t=251 PICK 0 -> s01 req=s01-r17 blocks=250
+t=251 PICK 0 -> s04 req=s04-r14 blocks=197
+t=252 PICK 0 -> s13 req=s13-r09 blocks=118
+t=253 SETTLE s15 req=s15-r07 natural=true
+t=253 SETTLE s10 req=s10-r10 natural=true
+t=253 PICK 0 -> s17 req=s17-r07 blocks=90
+t=253 PICK 0 -> s25 req=s25-r02 blocks=29
+t=254 SETTLE s23 req=s23-r02 natural=true
+t=254 PICK 0 -> s26 req=s26-r01 blocks=18
+t=254 SEAT wait=0.000
+STATE seats=24 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s19,s20,s21,s22,s23,s24,s25,s26]
+t=255 SETTLE s10 req=s10-r09 natural=true
+t=255 SETTLE s04 req=s04-r13 natural=true
+t=255 SETTLE s17 req=s17-r06 natural=true
+t=255 PICK 0 -> s03 req=s03-r16 blocks=232
+t=255 PICK 0 -> s04 req=s04-r15 blocks=214
+t=256 PICK 0 -> s10 req=s10-r11 blocks=148
+t=256 PICK 0 -> s19 req=s19-r05 blocks=64
+t=257 SETTLE s01 req=s01-r14 natural=true
+t=257 SETTLE s13 req=s13-r08 natural=true
+t=257 SETTLE s21 req=s21-r03 natural=true
+t=257 SETTLE s25 req=s25-r01 natural=true
+t=257 PICK 0 -> s11 req=s11-r10 blocks=133
+t=257 PICK 0 -> s24 req=s24-r03 blocks=40
+t=258 SETTLE s02 req=s02-r16 natural=true
+t=258 PICK 0 -> s22 req=s22-r04 blocks=52
+t=259 SETTLE s09 req=s09-r11 natural=true
+t=259 PICK 0 -> s09 req=s09-r12 blocks=164
+t=259 PICK 0 -> s14 req=s14-r09 blocks=118
+t=260 SETTLE s04 req=s04-r15 natural=true
+t=260 PICK 1 -> s16 req=s16-r08 blocks=104
+t=260 PICK 0 -> s02 req=s02-r17 blocks=250
+t=261 SETTLE s00 req=s00-r17 natural=true
+t=261 SETTLE s19 req=s19-r05 natural=true
+t=261 PICK 0 -> s00 req=s00-r18 blocks=269
+t=261 PICK 0 -> s19 req=s19-r06 blocks=77
+t=262 SETTLE s11 req=s11-r10 natural=true
+t=262 PICK 0 -> s26 req=s26-r02 blocks=29
+t=263 SETTLE s16 req=s16-r07 natural=true
+t=263 SETTLE s24 req=s24-r02 natural=true
+t=263 PICK 0 -> s20 req=s20-r05 blocks=64
+t=263 SEAT wait=0.000
+STATE seats=25 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s19,s20,s21,s22,s23,s24,s25,s26,s27]
+t=263 PICK 0 -> s27 req=s27-r01 blocks=18
+t=264 PICK 0 -> s04 req=s04-r16 blocks=232
+t=264 PICK 0 -> s11 req=s11-r11 blocks=148
+t=265 SETTLE s19 req=s19-r04 natural=true
+t=265 SETTLE s11 req=s11-r09 natural=true
+t=265 SETTLE s14 req=s14-r08 natural=true
+t=266 SETTLE s02 req=s02-r14 natural=true
+t=266 SETTLE s22 req=s22-r03 natural=true
+t=266 SETTLE s26 req=s26-r01 natural=true
+t=266 PICK 0 -> s12 req=s12-r10 blocks=133
+t=266 PICK 0 -> s23 req=s23-r04 blocks=52
+t=267 SETTLE s03 req=s03-r16 natural=true
+t=267 PICK 1 -> s25 req=s25-r03 blocks=40
+t=267 PICK 0 -> s08 req=s08-r13 blocks=180
+t=268 SETTLE s10 req=s10-r11 natural=true
+t=268 SETTLE s20 req=s20-r05 natural=true
+t=268 PICK 0 -> s10 req=s10-r12 blocks=164
+t=268 PICK 0 -> s17 req=s17-r08 blocks=104
+t=269 SETTLE s08 req=s08-r12 natural=true
+t=269 PICK 3 -> s20 req=s20-r06 blocks=77
+t=269 PICK 0 -> s03 req=s03-r17 blocks=250
+t=270 SETTLE s01 req=s01-r17 natural=true
+t=270 PICK 1 -> s06 req=s06-r14 blocks=197
+t=270 PICK 1 -> s15 req=s15-r09 blocks=118
+t=271 SETTLE s12 req=s12-r10 natural=true
+t=271 PICK 0 -> s01 req=s01-r18 blocks=269
+t=271 PICK 0 -> s19 req=s19-r07 blocks=90
+t=272 SETTLE s17 req=s17-r07 natural=true
+t=272 SETTLE s25 req=s25-r02 natural=true
+t=272 PICK 1 -> s27 req=s27-r02 blocks=29
+t=272 SEAT wait=0.000
+STATE seats=26 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s19,s20,s21,s22,s23,s24,s25,s26,s27,s28]
+t=272 PICK 0 -> s21 req=s21-r05 blocks=64
+t=273 SETTLE s20 req=s20-r04 natural=true
+t=273 SETTLE s06 req=s06-r13 natural=true
+t=273 SETTLE s19 req=s19-r06 natural=true
+t=273 PICK 1 -> s28 req=s28-r01 blocks=18
+t=273 PICK 0 -> s12 req=s12-r11 blocks=148
+t=274 SETTLE s12 req=s12-r09 natural=true
+t=274 SETTLE s23 req=s23-r03 natural=true
+t=274 PICK 0 -> s06 req=s06-r15 blocks=214
+t=275 SETTLE s03 req=s03-r14 natural=true
+t=275 SETTLE s15 req=s15-r08 natural=true
+t=275 SETTLE s27 req=s27-r01 natural=true
+t=275 PICK 0 -> s24 req=s24-r04 blocks=52
+t=275 PICK 0 -> s26 req=s26-r03 blocks=40
+t=276 SETTLE s04 req=s04-r16 natural=true
+t=276 SETTLE s11 req=s11-r11 natural=true
+t=276 PICK 0 -> s09 req=s09-r13 blocks=180
+t=276 PICK 0 -> s11 req=s11-r12 blocks=164
+t=277 SETTLE s21 req=s21-r05 natural=true
+t=277 PICK 0 -> s13 req=s13-r10 blocks=133
+t=277 PICK 0 -> s21 req=s21-r06 blocks=77
+t=278 SETTLE s09 req=s09-r12 natural=true
+t=278 PICK 0 -> s04 req=s04-r17 blocks=250
+t=279 SETTLE s02 req=s02-r17 natural=true
+t=279 SETTLE s06 req=s06-r15 natural=true
+t=279 PICK 0 -> s02 req=s02-r18 blocks=269
+t=279 PICK 0 -> s20 req=s20-r07 blocks=90
+t=280 PICK 0 -> s16 req=s16-r09 blocks=118
+t=281 SETTLE s26 req=s26-r02 natural=true
+t=281 SETTLE s20 req=s20-r06 natural=true
+t=281 PICK 0 -> s22 req=s22-r05 blocks=64
+t=281 SEAT wait=0.000
+STATE seats=27 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s19,s20,s21,s22,s23,s24,s25,s26,s27,s28,s29]
+t=281 PICK 0 -> s28 req=s28-r02 blocks=29
+t=282 SETTLE s21 req=s21-r04 natural=true
+t=282 SETTLE s13 req=s13-r10 natural=true
+t=282 PICK 0 -> s29 req=s29-r01 blocks=14
+t=283 SETTLE s24 req=s24-r03 natural=true
+t=283 PICK 0 -> s06 req=s06-r16 blocks=232
+t=284 SETTLE s04 req=s04-r14 natural=true
+t=284 PICK 0 -> s13 req=s13-r11 blocks=148
+t=284 PICK 0 -> s14 req=s14-r10 blocks=133
+t=285 SETTLE s13 req=s13-r09 natural=true
+t=285 SETTLE s28 req=s28-r01 natural=true
+t=285 SETTLE s12 req=s12-r11 natural=true
+t=285 PICK 0 -> s00 req=s00-r19 blocks=288
+t=285 PICK 0 -> s10 req=s10-r13 blocks=180
+t=286 SETTLE s16 req=s16-r08 natural=true
+t=286 SETTLE s22 req=s22-r05 natural=true
+t=286 PICK 0 -> s12 req=s12-r12 blocks=164
+t=286 PICK 2 -> s25 req=s25-r04 blocks=52
+t=287 SETTLE s00 req=s00-r18 natural=true
+t=287 SETTLE s10 req=s10-r12 natural=true
+t=287 PICK 3 -> s27 req=s27-r03 blocks=40
+t=287 PICK 0 -> s19 req=s19-r08 blocks=104
+t=288 SETTLE s03 req=s03-r17 natural=true
+t=288 PICK 3 -> s22 req=s22-r06 blocks=77
+t=288 PICK 2 -> s21 req=s21-r07 blocks=90
+t=289 SETTLE s21 req=s21-r06 natural=true
+t=289 SETTLE s14 req=s14-r10 natural=true
+t=289 PICK 0 -> s03 req=s03-r18 blocks=269
+t=289 PICK 1 -> s17 req=s17-r09 blocks=118
+t=290 SETTLE s19 req=s19-r07 natural=true
+t=290 PICK 0 -> s08 req=s08-r14 blocks=197
+t=290 SEAT wait=0.000
+STATE seats=28 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s19,s20,s21,s22,s23,s24,s25,s26,s27,s28,s29,s30]
+t=290 PICK 0 -> s23 req=s23-r05 blocks=64
+t=291 SETTLE s22 req=s22-r04 natural=true
+t=291 SETTLE s27 req=s27-r02 natural=true
+t=291 PICK 2 -> s30 req=s30-r01 blocks=18
+t=291 PICK 0 -> s00 req=s00-r20 blocks=308
+t=292 SETTLE s14 req=s14-r09 natural=true
+t=292 PICK 0 -> s14 req=s14-r11 blocks=148
+t=293 SETTLE s25 req=s25-r03 natural=true
+t=293 SETTLE s08 req=s08-r13 natural=true
+t=293 PICK 0 -> s11 req=s11-r13 blocks=180
+t=293 PICK 0 -> s26 req=s26-r04 blocks=52
+t=294 SETTLE s17 req=s17-r08 natural=true
+t=294 SETTLE s29 req=s29-r01 natural=true
+t=294 PICK 0 -> s08 req=s08-r15 blocks=214
+t=294 PICK 0 -> s20 req=s20-r08 blocks=104
+t=295 SETTLE s11 req=s11-r12 natural=true
+t=295 SETTLE s06 req=s06-r16 natural=true
+t=295 SETTLE s23 req=s23-r05 natural=true
+t=295 PICK 3 -> s28 req=s28-r03 blocks=40
+t=295 PICK 0 -> s01 req=s01-r19 blocks=288
+t=296 SETTLE s13 req=s13-r11 natural=true
+t=296 SETTLE s00 req=s00-r20 natural=true
+t=296 PICK 1 -> s15 req=s15-r10 blocks=133
+t=296 PICK 1 -> s23 req=s23-r06 blocks=77
+t=297 SETTLE s01 req=s01-r18 natural=true
+t=297 SETTLE s04 req=s04-r17 natural=true
+t=297 PICK 2 -> s13 req=s13-r12 blocks=164
+t=297 PICK 0 -> s04 req=s04-r18 blocks=269
+t=298 SETTLE s20 req=s20-r07 natural=true
+t=298 PICK 0 -> s06 req=s06-r17 blocks=250
+t=298 PICK 0 -> s09 req=s09-r14 blocks=197
+t=299 SETTLE s23 req=s23-r04 natural=true
+t=299 SETTLE s08 req=s08-r15 natural=true
+t=299 PICK 0 -> s22 req=s22-r07 blocks=90
+t=299 SEAT wait=0.000
+STATE seats=29 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s19,s20,s21,s22,s23,s24,s25,s26,s27,s28,s29,s30,s31]
+t=299 PICK 0 -> s24 req=s24-r05 blocks=64
+t=300 SETTLE s28 req=s28-r02 natural=true
+t=300 SETTLE s22 req=s22-r06 natural=true
+t=300 PICK 0 -> s30 req=s30-r02 blocks=29
+t=300 PICK 0 -> s31 req=s31-r01 blocks=18
+t=301 SETTLE s26 req=s26-r03 natural=true
+t=301 SETTLE s15 req=s15-r10 natural=true
+t=301 PICK 0 -> s01 req=s01-r20 blocks=308
+t=302 SETTLE s09 req=s09-r13 natural=true
+t=302 PICK 0 -> s00 req=s00-r21 blocks=328
+t=302 PICK 0 -> s09 req=s09-r15 blocks=214
+t=303 SETTLE s06 req=s06-r14 natural=true
+t=303 SETTLE s15 req=s15-r09 natural=true
+t=303 SETTLE s30 req=s30-r01 natural=true
+t=303 PICK 0 -> s02 req=s02-r19 blocks=288
+t=303 PICK 0 -> s08 req=s08-r16 blocks=232
+t=304 SETTLE s14 req=s14-r11 natural=true
+t=304 SETTLE s24 req=s24-r05 natural=true
+t=304 PICK 0 -> s12 req=s12-r13 blocks=180
+t=304 PICK 1 -> s15 req=s15-r11 blocks=148
+t=305 SETTLE s02 req=s02-r18 natural=true
+t=305 SETTLE s12 req=s12-r12 natural=true
+t=305 PICK 2 -> s21 req=s21-r08 blocks=104
+t=305 PICK 0 -> s14 req=s14-r12 blocks=164
+t=306 SETTLE s01 req=s01-r20 natural=true
+t=306 PICK 2 -> s24 req=s24-r06 blocks=77
+t=306 PICK 0 -> s16 req=s16-r10 blocks=133
+t=307 SETTLE s21 req=s21-r07 natural=true
+t=307 SETTLE s09 req=s09-r15 natural=true
+t=307 PICK 3 -> s27 req=s27-r04 blocks=52
+t=307 PICK 2 -> s23 req=s23-r07 blocks=90
+t=308 SETTLE s24 req=s24-r04 natural=true
+t=308 SETTLE s23 req=s23-r06 natural=true
+t=308 PICK 0 -> s10 req=s10-r14 blocks=197
+t=308 SEAT wait=0.000
+STATE seats=30 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s19,s20,s21,s22,s23,s24,s25,s26,s27,s28,s29,s30,s31,s32]
+t=308 PICK 0 -> s19 req=s19-r09 blocks=118
+t=309 PICK 2 -> s32 req=s32-r01 blocks=18
+t=309 PICK 0 -> s02 req=s02-r20 blocks=308
+t=310 PICK 0 -> s25 req=s25-r05 blocks=64
+t=311 SETTLE s10 req=s10-r13 natural=true
+t=311 SETTLE s16 req=s16-r10 natural=true
+t=311 PICK 0 -> s09 req=s09-r16 blocks=232
+t=312 SETTLE s31 req=s31-r01 natural=true
+t=312 PICK 0 -> s01 req=s01-r21 blocks=328
+t=312 PICK 0 -> s10 req=s10-r15 blocks=214
+t=313 SETTLE s16 req=s16-r09 natural=true
+t=313 SETTLE s27 req=s27-r03 natural=true
+t=313 SETTLE s19 req=s19-r08 natural=true
+t=313 PICK 0 -> s03 req=s03-r19 blocks=288
+t=313 PICK 0 -> s16 req=s16-r11 blocks=148
+t=314 SETTLE s00 req=s00-r21 natural=true
+t=314 SETTLE s02 req=s02-r20 natural=true
+t=314 PICK 4 -> s28 req=s28-r04 blocks=52
+t=314 PICK 4 -> s30 req=s30-r03 blocks=40
+t=315 SETTLE s03 req=s03-r18 natural=true
+t=315 SETTLE s08 req=s08-r16 natural=true
+t=315 SETTLE s25 req=s25-r05 natural=true
+t=315 PICK 6 -> s31 req=s31-r02 blocks=29
+t=315 PICK 1 -> s13 req=s13-r13 blocks=180
+t=316 SETTLE s13 req=s13-r12 natural=true
+t=316 SETTLE s15 req=s15-r11 natural=true
+t=316 PICK 2 -> s17 req=s17-r10 blocks=133
+t=316 PICK 2 -> s20 req=s20-r09 blocks=118
+t=317 SETTLE s06 req=s06-r17 natural=true
+t=317 SETTLE s10 req=s10-r15 natural=true
+t=317 PICK 4 -> s22 req=s22-r08 blocks=104
+t=317 SEAT wait=0.000
+STATE seats=31 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s19,s20,s21,s22,s23,s24,s25,s26,s27,s28,s29,s30,s31,s32,s33]
+t=317 PICK 2 -> s11 req=s11-r14 blocks=197
+t=318 SETTLE s00 req=s00-r19 natural=true
+t=318 SETTLE s22 req=s22-r07 natural=true
+t=318 SETTLE s24 req=s24-r06 natural=true
+t=318 PICK 5 -> s25 req=s25-r06 blocks=77
+t=318 PICK 3 -> s15 req=s15-r12 blocks=164
+t=319 SETTLE s25 req=s25-r04 natural=true
+t=319 SETTLE s11 req=s11-r13 natural=true
+t=319 SETTLE s30 req=s30-r02 natural=true
+t=319 PICK 4 -> s24 req=s24-r07 blocks=90
+t=319 PICK 4 -> s26 req=s26-r05 blocks=64
+t=320 SETTLE s20 req=s20-r08 natural=true
+t=320 PICK 3 -> s06 req=s06-r18 blocks=269
+t=320 PICK 3 -> s08 req=s08-r17 blocks=250
+t=321 SETTLE s28 req=s28-r03 natural=true
+t=321 SETTLE s32 req=s32-r01 natural=true
+t=321 SETTLE s17 req=s17-r10 natural=true
+t=321 PICK 6 -> s32 req=s32-r02 blocks=29
+t=321 PICK 6 -> s33 req=s33-r01 blocks=18
+t=322 SETTLE s17 req=s17-r09 natural=true
+t=322 PICK 0 -> s00 req=s00-r22 blocks=349
+t=322 PICK 1 -> s03 req=s03-r20 blocks=308
+t=323 SETTLE s08 req=s08-r14 natural=true
+t=323 SETTLE s04 req=s04-r18 natural=true
+t=323 SETTLE s09 req=s09-r16 natural=true
+t=323 PICK 0 -> s02 req=s02-r21 blocks=328
+t=323 PICK 0 -> s04 req=s04-r19 blocks=288
+t=324 SETTLE s14 req=s14-r12 natural=true
+t=324 SETTLE s01 req=s01-r21 natural=true
+t=324 SETTLE s26 req=s26-r05 natural=true
+t=324 PICK 0 -> s10 req=s10-r16 blocks=232
+t=324 PICK 0 -> s11 req=s11-r15 blocks=214
+STATE seats=29 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s16,s19,s20,s21,s22,s23,s24,s25,s26,s27,s28,s30,s31,s32,s33]
+t=324 EXIT reason=paid turns=12
+t=324 EXIT reason=paid turns=10
+t=324 EXIT reason=idle turns=1
+t=325 SETTLE s16 req=s16-r11 natural=true
+t=325 PICK 1 -> s14 req=s14-r13 blocks=180
+STATE seats=29 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s17,s19,s20,s21,s22,s23,s24,s25,s26,s27,s28,s30,s31,s32,s33]
+t=325 PICK 4 -> s23 req=s23-r08 blocks=104
+t=325 EXIT reason=paid turns=11
+t=325 EXIT reason=budget-idle turns=0
+t=326 SETTLE s26 req=s26-r04 natural=true
+t=326 SETTLE s23 req=s23-r07 natural=true
+t=326 PICK 3 -> s17 req=s17-r11 blocks=148
+STATE seats=28 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s17,s19,s20,s21,s22,s23,s24,s25,s27,s28,s30,s31,s32,s33]
+t=326 PICK 0 -> s09 req=s09-r17 blocks=250
+t=326 SEAT wait=0.000
+STATE seats=29 [s00,s01,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s17,s19,s20,s21,s22,s23,s24,s25,s27,s28,s30,s31,s32,s33,s34]
+t=326 EXIT reason=paid turns=5
+t=327 SETTLE s03 req=s03-r20 natural=true
+t=327 PICK 2 -> s21 req=s21-r09 blocks=118
+t=327 PICK 0 -> s12 req=s12-r14 blocks=197
+t=328 SETTLE s01 req=s01-r19 natural=true
+t=328 PICK 4 -> s34 req=s34-r01 blocks=18
+STATE seats=28 [s00,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s17,s19,s20,s21,s22,s23,s24,s25,s27,s28,s30,s31,s32,s33,s34]
+t=328 PICK 2 -> s25 req=s25-r07 blocks=90
+t=328 EXIT reason=paid turns=21
+t=329 SETTLE s11 req=s11-r15 natural=true
+t=329 PICK 1 -> s04 req=s04-r20 blocks=308
+t=329 PICK 3 -> s33 req=s33-r02 blocks=29
+t=330 SETTLE s12 req=s12-r13 natural=true
+t=330 SETTLE s25 req=s25-r06 natural=true
+t=330 PICK 3 -> s27 req=s27-r05 blocks=64
+t=330 PICK -1
+t=331 SETTLE s09 req=s09-r14 natural=true
+t=331 SETTLE s21 req=s21-r08 natural=true
+t=331 PICK 1 -> s12 req=s12-r15 blocks=214
+t=331 PICK -1
+t=332 PICK 3 -> s30 req=s30-r04 blocks=52
+t=332 PICK -1
+t=333 SETTLE s33 req=s33-r01 natural=true
+t=333 PICK 1 -> s03 req=s03-r21 blocks=328
+t=333 PICK 1 -> s11 req=s11-r16 blocks=232
+t=334 SETTLE s31 req=s31-r02 natural=true
+t=334 SETTLE s04 req=s04-r20 natural=true
+t=334 PICK 2 -> s19 req=s19-r10 blocks=133
+STATE seats=27 [s00,s02,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s17,s19,s20,s21,s22,s23,s24,s25,s27,s28,s30,s32,s33,s34]
+t=334 PICK 2 -> s24 req=s24-r08 blocks=104
+t=334 EXIT reason=paid turns=2
+t=335 SETTLE s02 req=s02-r21 natural=true
+t=335 SETTLE s27 req=s27-r05 natural=true
+t=335 PICK 6 -> s32 req=s32-r03 blocks=40
+t=335 PICK 1 -> s15 req=s15-r13 blocks=180
+t=336 SETTLE s02 req=s02-r19 natural=true
+t=336 SETTLE s10 req=s10-r16 natural=true
+t=336 SETTLE s12 req=s12-r15 natural=true
+t=336 PICK 3 -> s27 req=s27-r06 blocks=77
+t=336 SEAT wait=1.000
+STATE seats=27 [s00,s03,s04,s06,s08,s09,s10,s11,s12,s13,s14,s15,s17,s19,s20,s21,s22,s23,s24,s25,s27,s28,s30,s32,s33,s34,s35]
+t=336 PICK 5 -> s35 req=s35-r01 blocks=18
+t=336 EXIT reason=paid turns=21
+t=337 SETTLE s15 req=s15-r12 natural=true
+t=337 PICK 7 -> s34 req=s34-r02 blocks=29
+t=337 PICK 1 -> s13 req=s13-r14 blocks=197
+t=338 SETTLE s24 req=s24-r07 natural=true
+t=338 SETTLE s17 req=s17-r11 natural=true
+t=338 PICK 4 -> s22 req=s22-r09 blocks=118
+t=338 PICK 5 -> s28 req=s28-r05 blocks=64
+t=339 SETTLE s08 req=s08-r17 natural=true
+t=339 SETTLE s19 req=s19-r10 natural=true
+t=339 PICK 6 -> s26 req=s26-r06 blocks=77
+STATE seats=26 [s00,s03,s04,s06,s09,s10,s11,s12,s13,s14,s15,s19,s20,s21,s22,s23,s24,s25,s26,s27,s28,s30,s32,s33,s34,s35]
+t=339 PICK 4 -> s16 req=s16-r12 blocks=164
+STATE seats=27 [s00,s03,s04,s06,s09,s10,s11,s12,s13,s14,s15,s16,s19,s20,s21,s22,s23,s24,s25,s26,s27,s28,s30,s32,s33,s34,s35]
+t=339 EXIT reason=paid turns=17
+t=339 EXIT reason=budget-idle turns=1
+t=340 SETTLE s27 req=s27-r04 natural=true
+t=340 SETTLE s30 req=s30-r03 natural=true
+t=340 SETTLE s32 req=s32-r02 natural=true
+t=340 SETTLE s34 req=s34-r01 natural=true
+t=340 PICK 4 -> s10 req=s10-r17 blocks=250
+t=340 PICK 2 -> s04 req=s04-r21 blocks=328
+t=341 SETTLE s10 req=s10-r14 natural=true
+t=341 SETTLE s19 req=s19-r09 natural=true
+t=341 SETTLE s13 req=s13-r13 natural=true
+t=341 SETTLE s00 req=s00-r22 natural=true
+t=341 EXIT reason=exiting-drain turns=22
+STATE seats=26 [s03,s04,s06,s09,s10,s11,s12,s13,s14,s15,s16,s19,s20,s21,s22,s23,s24,s25,s26,s27,s28,s30,s32,s33,s34,s35]
+t=341 PICK 0 -> s01 req=s01-r22 blocks=349
+STATE seats=26 [s01,s03,s04,s06,s09,s10,s11,s12,s13,s14,s15,s16,s20,s21,s22,s23,s24,s25,s26,s27,s28,s30,s32,s33,s34,s35]
+t=341 PICK 2 -> s12 req=s12-r16 blocks=232
+t=341 EXIT reason=paid turns=10
+t=341 EXIT reason=budget-idle turns=0
+t=342 PICK 2 -> s13 req=s13-r15 blocks=214
+t=342 PICK 4 -> s20 req=s20-r10 blocks=133
+t=343 SETTLE s22 req=s22-r08 natural=true
+t=343 SETTLE s28 req=s28-r05 natural=true
+t=343 PICK 8 -> s33 req=s33-r03 blocks=40
+t=343 PICK 5 -> s25 req=s25-r08 blocks=104
+t=344 PICK 6 -> s28 req=s28-r06 blocks=77
+t=344 PICK 2 -> s06 req=s06-r19 blocks=288
+t=345 SETTLE s09 req=s09-r17 natural=true
+t=345 SETTLE s03 req=s03-r21 natural=true
+t=345 SETTLE s11 req=s11-r16 natural=true
+t=345 PICK 8 -> s35 req=s35-r02 blocks=29
+STATE seats=25 [s01,s03,s04,s06,s10,s11,s12,s13,s14,s15,s16,s20,s21,s22,s23,s24,s25,s26,s27,s28,s30,s32,s33,s34,s35]
+t=345 PICK 6 -> s23 req=s23-r09 blocks=118
+t=345 EXIT reason=paid turns=17
+t=346 SETTLE s03 req=s03-r19 natural=true
+t=346 EXIT reason=exiting-drain turns=21
+STATE seats=24 [s01,s04,s06,s10,s11,s12,s13,s14,s15,s16,s20,s21,s22,s23,s24,s25,s26,s27,s28,s30,s32,s33,s34,s35]
+t=346 SETTLE s06 req=s06-r18 natural=true
+t=346 PICK 6 -> s27 req=s27-r07 blocks=90
+t=346 PICK -1
+t=347 SETTLE s28 req=s28-r04 natural=true
+t=347 SETTLE s25 req=s25-r07 natural=true
+t=347 SETTLE s13 req=s13-r15 natural=true
+t=347 SETTLE s20 req=s20-r10 natural=true
+t=347 PICK 4 -> s11 req=s11-r17 blocks=250
+t=347 PICK 4 -> s14 req=s14-r14 blocks=197
+t=348 SETTLE s33 req=s33-r02 natural=true
+t=348 SETTLE s27 req=s27-r06 natural=true
+t=348 SETTLE s35 req=s35-r01 natural=true
+t=348 PICK -1
+t=349 SETTLE s20 req=s20-r09 natural=true
+t=349 PICK 10 -> s36 req=s36-r01 blocks=18
+t=349 SEAT wait=5.000
+STATE seats=24 [s01,s04,s06,s10,s11,s12,s13,s14,s15,s16,s21,s22,s23,s24,s25,s26,s27,s28,s30,s32,s33,s34,s35,s36]
+t=349 PICK 9 -> s31 req=s31-r03 blocks=40
+STATE seats=25 [s01,s04,s06,s10,s11,s12,s13,s14,s15,s16,s21,s22,s23,s24,s25,s26,s27,s28,s30,s31,s32,s33,s34,s35,s36]
+t=349 EXIT reason=paid turns=10
+t=350 SETTLE s11 req=s11-r14 natural=true
+t=350 PICK 9 -> s26 req=s26-r07 blocks=90
+t=350 PICK 3 -> s06 req=s06-r20 blocks=308
+t=351 SETTLE s14 req=s14-r13 natural=true
+t=351 SETTLE s23 req=s23-r08 natural=true
+t=351 SETTLE s26 req=s26-r06 natural=true
+t=351 PICK 10 -> s34 req=s34-r03 blocks=40
+t=351 PICK 5 -> s13 req=s13-r16 blocks=232
+t=352 SETTLE s04 req=s04-r21 natural=true
+t=352 PICK 5 -> s14 req=s14-r15 blocks=214
+t=352 PICK 8 -> s21 req=s21-r10 blocks=133
+t=353 SETTLE s12 req=s12-r16 natural=true
+t=353 PICK 8 -> s32 req=s32-r04 blocks=52
+t=353 PICK -1
+t=354 PICK 8 -> s24 req=s24-r09 blocks=118
+t=354 PICK 8 -> s28 req=s28-r07 blocks=90
+t=355 SETTLE s06 req=s06-r20 natural=true
+t=355 PICK 5 -> s12 req=s12-r17 blocks=250
+t=355 PICK 8 -> s30 req=s30-r05 blocks=64
+t=356 SETTLE s04 req=s04-r19 natural=true
+t=356 EXIT reason=exiting-drain turns=21
+STATE seats=24 [s01,s06,s10,s11,s12,s13,s14,s15,s16,s21,s22,s23,s24,s25,s26,s27,s28,s30,s31,s32,s33,s34,s35,s36]
+t=356 SETTLE s34 req=s34-r02 natural=true
+t=356 SETTLE s28 req=s28-r06 natural=true
+t=356 PICK 6 -> s16 req=s16-r13 blocks=180
+t=356 PICK -1
+t=357 SETTLE s14 req=s14-r15 natural=true
+t=357 SETTLE s21 req=s21-r10 natural=true
+t=357 PICK 6 -> s15 req=s15-r14 blocks=197
+t=357 PICK 9 -> s36 req=s36-r02 blocks=29
+t=358 SETTLE s16 req=s16-r12 natural=true
+t=358 PICK 9 -> s35 req=s35-r03 blocks=40
+t=358 PICK -1
+t=359 SETTLE s10 req=s10-r17 natural=true
+t=359 PICK 10 -> s21 req=s21-r11 blocks=148
+STATE seats=23 [s01,s06,s11,s12,s13,s14,s15,s16,s21,s22,s23,s24,s25,s26,s27,s28,s30,s31,s32,s33,s34,s35,s36]
+t=359 PICK -1
+t=359 EXIT reason=paid turns=17
+t=360 SETTLE s21 req=s21-r09 natural=true
+t=360 SETTLE s12 req=s12-r14 natural=true
+t=360 SETTLE s24 req=s24-r08 natural=true
+t=360 SETTLE s01 req=s01-r22 natural=true
+t=360 SETTLE s30 req=s30-r05 natural=true
+t=360 PICK 10 -> s30 req=s30-r06 blocks=77
+t=360 PICK 7 -> s17 req=s17-r12 blocks=164
+t=360 SEAT wait=7.000
+STATE seats=25 [s02,s06,s11,s12,s13,s14,s15,s16,s17,s21,s22,s23,s24,s25,s26,s27,s28,s30,s31,s32,s33,s34,s35,s36,s37]
+t=360 EXIT reason=budget-idle turns=1
+t=361 SETTLE s32 req=s32-r03 natural=true
+t=361 SETTLE s15 req=s15-r13 natural=true
+t=361 SETTLE s36 req=s36-r01 natural=true
+t=361 PICK 14 -> s37 req=s37-r01 blocks=18
+STATE seats=24 [s06,s11,s12,s13,s14,s15,s16,s17,s21,s22,s23,s24,s25,s26,s27,s28,s30,s31,s32,s33,s34,s35,s36,s37]
+t=361 PICK 8 -> s14 req=s14-r16 blocks=232
+t=361 EXIT reason=budget-idle turns=0
+t=362 PICK 9 -> s15 req=s15-r15 blocks=214
+t=362 SEAT wait=0.000
+STATE seats=25 [s06,s11,s12,s13,s14,s15,s16,s17,s21,s22,s23,s24,s25,s26,s27,s28,s30,s31,s32,s33,s34,s35,s36,s37,s38]
+t=362 PICK 11 -> s27 req=s27-r08 blocks=104
+t=363 SETTLE s13 req=s13-r16 natural=true
+t=363 PICK 13 -> s33 req=s33-r04 blocks=52
+t=363 PICK 13 -> s38 req=s38-r01 blocks=18
+t=364 SETTLE s35 req=s35-r02 natural=true
+t=364 PICK 11 -> s22 req=s22-r10 blocks=133
+t=364 PICK 11 -> s25 req=s25-r09 blocks=118
+t=365 SETTLE s30 req=s30-r04 natural=true
+t=365 SETTLE s27 req=s27-r07 natural=true
+t=365 PICK 9 -> s13 req=s13-r17 blocks=250
+t=365 PICK 11 -> s26 req=s26-r08 blocks=104
+t=366 SETTLE s11 req=s11-r17 natural=true
+t=366 EXIT reason=exiting-drain turns=17
+STATE seats=24 [s06,s12,s13,s14,s15,s16,s17,s21,s22,s23,s24,s25,s26,s27,s28,s30,s31,s32,s33,s34,s35,s36,s37,s38]
+t=366 PICK -1
+t=367 SETTLE s15 req=s15-r15 natural=true
+t=367 PICK -1
+t=368 PICK -1
+t=369 SETTLE s33 req=s33-r03 natural=true
+t=369 SETTLE s25 req=s25-r08 natural=true
+t=369 SETTLE s26 req=s26-r07 natural=true
+t=369 SETTLE s22 req=s22-r10 natural=true
+t=369 PICK 12 -> s28 req=s28-r08 blocks=104
+t=369 PICK 12 -> s34 req=s34-r04 blocks=52
+t=370 SETTLE s13 req=s13-r14 natural=true
+t=370 PICK 15 -> s37 req=s37-r02 blocks=29
+t=370 PICK 12 -> s23 req=s23-r10 blocks=133
+t=371 SETTLE s22 req=s22-r09 natural=true
+t=371 SETTLE s21 req=s21-r11 natural=true
+t=371 PICK 15 -> s30 req=s30-r07 blocks=90
+t=371 SEAT wait=0.000
+STATE seats=23 [s06,s12,s13,s14,s15,s16,s17,s23,s24,s25,s26,s27,s28,s30,s31,s32,s33,s34,s35,s36,s37,s38,s39]
+t=371 PICK 15 -> s36 req=s36-r03 blocks=40
+t=371 EXIT reason=paid turns=11
+t=371 EXIT reason=paid turns=10
+t=372 SETTLE s30 req=s30-r06 natural=true
+t=372 PICK 10 -> s15 req=s15-r16 blocks=232
+t=372 PICK 14 -> s38 req=s38-r02 blocks=29
+t=373 SETTLE s28 req=s28-r07 natural=true
+t=373 SETTLE s37 req=s37-r01 natural=true
+t=373 SETTLE s14 req=s14-r16 natural=true
+t=373 PICK 14 -> s39 req=s39-r01 blocks=18
+t=373 PICK -1
+t=374 SETTLE s12 req=s12-r17 natural=true
+t=374 PICK -1
+t=374 EXIT reason=paid turns=17
+STATE seats=22 [s06,s13,s14,s15,s16,s17,s23,s24,s25,s26,s27,s28,s30,s31,s32,s33,s34,s35,s36,s37,s38,s39]
+t=375 SETTLE s31 req=s31-r03 natural=true
+t=375 SETTLE s38 req=s38-r01 natural=true
+t=375 SETTLE s23 req=s23-r10 natural=true
+t=375 PICK 11 -> s14 req=s14-r17 blocks=250
+t=375 PICK -1
+t=376 SETTLE s36 req=s36-r02 natural=true
+t=376 PICK 15 -> s32 req=s32-r05 blocks=64
+t=376 PICK 15 -> s35 req=s35-r04 blocks=52
+t=377 SETTLE s06 req=s06-r19 natural=true
+t=377 EXIT reason=exiting-drain turns=20
+STATE seats=21 [s13,s14,s15,s16,s17,s23,s24,s25,s26,s27,s28,s30,s31,s32,s33,s34,s35,s36,s37,s38,s39]
+t=377 SETTLE s34 req=s34-r03 natural=true
+t=377 PICK 11 -> s17 req=s17-r13 blocks=180
+t=377 PICK 15 -> s23 req=s23-r11 blocks=148
+t=378 SETTLE s23 req=s23-r09 natural=true
+t=378 PICK 11 -> s16 req=s16-r14 blocks=197
+t=378 PICK -1
+t=379 SETTLE s17 req=s17-r12 natural=true
+t=379 PICK 15 -> s24 req=s24-r10 blocks=133
+t=379 PICK -1
+t=380 SETTLE s14 req=s14-r14 natural=true
+t=380 PICK 15 -> s40 req=s40-r01 blocks=14
+t=380 SEAT wait=0.000
+STATE seats=22 [s13,s14,s15,s16,s17,s23,s24,s25,s26,s27,s28,s30,s31,s32,s33,s34,s35,s36,s37,s38,s39,s40]
+t=380 PICK -1
+t=381 SETTLE s32 req=s32-r05 natural=true
+t=381 PICK 15 -> s32 req=s32-r06 blocks=77
+t=381 PICK 15 -> s39 req=s39-r02 blocks=29
+t=382 SETTLE s16 req=s16-r13 natural=true
+t=382 PICK 11 -> s16 req=s16-r15 blocks=214
+t=382 PICK 15 -> s27 req=s27-r09 blocks=118
+t=383 PICK 15 -> s37 req=s37-r03 blocks=40
+t=383 PICK -1
+t=384 SETTLE s35 req=s35-r03 natural=true
+t=384 SETTLE s13 req=s13-r17 natural=true
+t=384 SETTLE s15 req=s15-r16 natural=true
+t=384 SETTLE s24 req=s24-r10 natural=true
+t=384 PICK -1
+t=384 EXIT reason=paid turns=17
+STATE seats=21 [s14,s15,s16,s17,s23,s24,s25,s26,s27,s28,s30,s31,s32,s33,s34,s35,s36,s37,s38,s39,s40]
+t=385 SETTLE s39 req=s39-r01 natural=true
+t=385 PICK 16 -> s26 req=s26-r09 blocks=118
+t=385 PICK 16 -> s38 req=s38-r03 blocks=40
+t=386 SETTLE s32 req=s32-r04 natural=true
+t=386 PICK 12 -> s15 req=s15-r17 blocks=250
+t=386 PICK 16 -> s24 req=s24-r11 blocks=148
+t=387 SETTLE s24 req=s24-r09 natural=true
+t=387 SETTLE s16 req=s16-r15 natural=true
+t=387 PICK 16 -> s30 req=s30-r08 blocks=104
+t=387 PICK 16 -> s33 req=s33-r05 blocks=64
+t=388 SETTLE s27 req=s27-r08 natural=true
+t=388 PICK -1
+t=389 SETTLE s37 req=s37-r02 natural=true
+t=389 SETTLE s23 req=s23-r11 natural=true
+t=389 PICK 17 -> s25 req=s25-r10 blocks=133
+t=389 SEAT wait=0.000
+STATE seats=21 [s14,s15,s16,s17,s24,s25,s26,s27,s28,s30,s31,s32,s33,s34,s35,s36,s37,s38,s39,s40,s41]
+t=389 PICK 17 -> s28 req=s28-r09 blocks=118
+t=389 EXIT reason=paid turns=11
+t=390 SETTLE s15 req=s15-r14 natural=true
+t=390 SETTLE s30 req=s30-r07 natural=true
+t=390 PICK 17 -> s36 req=s36-r04 blocks=52
+t=390 PICK 17 -> s41 req=s41-r01 blocks=18
+t=391 SETTLE s26 req=s26-r08 natural=true
+t=391 SETTLE s38 req=s38-r02 natural=true
+t=391 PICK 12 -> s16 req=s16-r16 blocks=232
+t=391 PICK 17 -> s32 req=s32-r07 blocks=90
+t=392 SETTLE s40 req=s40-r01 natural=true
+t=392 SETTLE s33 req=s33-r05 natural=true
+t=392 PICK 17 -> s33 req=s33-r06 blocks=77
+t=392 PICK 17 -> s34 req=s34-r05 blocks=64
+t=393 SETTLE s32 req=s32-r06 natural=true
+t=393 PICK -1
+t=394 SETTLE s14 req=s14-r17 natural=true
+t=394 SETTLE s25 req=s25-r10 natural=true
+t=394 PICK 18 -> s39 req=s39-r03 blocks=40
+STATE seats=20 [s15,s16,s17,s24,s25,s26,s27,s28,s30,s31,s32,s33,s34,s35,s36,s37,s38,s39,s40,s41]
+t=394 PICK -1
+t=394 EXIT reason=paid turns=5
+t=395 SETTLE s28 req=s28-r08 natural=true
+t=395 PICK -1
+t=396 SETTLE s33 req=s33-r04 natural=true
+t=396 PICK 18 -> s25 req=s25-r11 blocks=148
+STATE seats=19 [s15,s16,s17,s24,s25,s26,s27,s28,s30,s32,s33,s34,s35,s36,s37,s38,s39,s40,s41]
+t=396 PICK -1
+t=396 EXIT reason=idle turns=1
+t=397 SETTLE s25 req=s25-r09 natural=true
+t=397 SETTLE s36 req=s36-r03 natural=true
+t=397 SETTLE s34 req=s34-r05 natural=true
+t=397 PICK 18 -> s34 req=s34-r06 blocks=77
+t=397 PICK -1
+t=398 SETTLE s24 req=s24-r11 natural=true
+t=398 PICK 19 -> s41 req=s41-r02 blocks=29
+t=398 SEAT wait=0.000
+STATE seats=19 [s15,s16,s17,s25,s26,s27,s28,s30,s32,s33,s34,s35,s36,s37,s38,s39,s40,s41,s42]
+t=398 PICK 19 -> s42 req=s42-r01 blocks=18
+t=398 EXIT reason=paid turns=11
+t=399 PICK 13 -> s17 req=s17-r14 blocks=197
+t=399 PICK 19 -> s35 req=s35-r05 blocks=64
+t=400 SETTLE s39 req=s39-r02 natural=true
+t=400 PICK -1
+t=401 PICK 19 -> s37 req=s37-r04 blocks=52
+t=401 PICK -1
+t=402 SETTLE s34 req=s34-r04 natural=true
+t=402 SETTLE s41 req=s41-r01 natural=true
+t=402 PICK 19 -> s33 req=s33-r07 blocks=90
+t=402 PICK -1
+t=403 SETTLE s17 req=s17-r13 natural=true
+t=403 SETTLE s16 req=s16-r16 natural=true
+t=403 PICK 13 -> s17 req=s17-r15 blocks=214
+t=403 PICK 19 -> s38 req=s38-r04 blocks=52
+t=404 SETTLE s33 req=s33-r06 natural=true
+t=404 SETTLE s35 req=s35-r05 natural=true
+t=404 PICK 19 -> s35 req=s35-r06 blocks=77
+t=404 PICK -1
+t=405 SETTLE s15 req=s15-r17 natural=true
+t=405 PICK 14 -> s16 req=s16-r17 blocks=250
+STATE seats=18 [s16,s17,s25,s26,s27,s28,s30,s32,s33,s34,s35,s36,s37,s38,s39,s40,s41,s42]
+t=405 PICK -1
+t=405 EXIT reason=paid turns=17
+t=406 PICK 20 -> s32 req=s32-r08 blocks=104
+t=406 PICK 20 -> s42 req=s42-r02 blocks=29
+t=407 PICK 20 -> s27 req=s27-r10 blocks=133
+t=407 SEAT wait=0.000
+STATE seats=19 [s16,s17,s25,s26,s27,s28,s30,s32,s33,s34,s35,s36,s37,s38,s39,s40,s41,s42,s43]
+t=407 PICK 20 -> s30 req=s30-r09 blocks=118
+t=408 SETTLE s25 req=s25-r11 natural=true
+t=408 SETTLE s17 req=s17-r15 natural=true
+t=408 PICK 21 -> s34 req=s34-r07 blocks=90
+STATE seats=18 [s16,s17,s26,s27,s28,s30,s32,s33,s34,s35,s36,s37,s38,s39,s40,s41,s42,s43]
+t=408 PICK 21 -> s43 req=s43-r01 blocks=18
+t=408 EXIT reason=paid turns=11
+t=409 SETTLE s35 req=s35-r04 natural=true
+t=409 SETTLE s37 req=s37-r03 natural=false
+t=409 SETTLE s34 req=s34-r06 natural=true
+t=409 PICK -1
+t=410 SETTLE s32 req=s32-r07 natural=true
+t=410 SETTLE s42 req=s42-r01 natural=true
+t=410 PICK 21 -> s26 req=s26-r10 blocks=133
+t=410 PICK -1
+t=411 SETTLE s16 req=s16-r14 natural=true
+t=411 SETTLE s38 req=s38-r03 natural=true
+t=411 PICK 21 -> s41 req=s41-r03 blocks=40
+t=411 PICK -1
+t=412 SETTLE s27 req=s27-r10 natural=true
+t=412 PICK 14 -> s17 req=s17-r16 blocks=232
+t=412 PICK 21 -> s39 req=s39-r04 blocks=52
+t=413 SETTLE s30 req=s30-r08 natural=true
+t=413 PICK 21 -> s36 req=s36-r05 blocks=64
+STATE seats=17 [s16,s17,s26,s27,s28,s30,s32,s33,s34,s35,s36,s37,s38,s39,s41,s42,s43]
+t=413 PICK -1
+t=413 EXIT reason=idle turns=1
+t=414 PICK 21 -> s27 req=s27-r11 blocks=148
+t=414 PICK 21 -> s28 req=s28-r10 blocks=133
+t=415 SETTLE s27 req=s27-r09 natural=true
+t=415 SETTLE s26 req=s26-r10 natural=true
+t=415 PICK 21 -> s35 req=s35-r07 blocks=90
+t=415 PICK -1
+t=416 SETTLE s35 req=s35-r06 natural=true
+t=416 PICK 21 -> s43 req=s43-r02 blocks=29
+t=416 SEAT wait=0.000
+STATE seats=18 [s16,s17,s26,s27,s28,s30,s32,s33,s34,s35,s36,s37,s38,s39,s41,s42,s43,s44]
+t=416 PICK 21 -> s44 req=s44-r01 blocks=18
+t=417 SETTLE s41 req=s41-r02 natural=true
+t=417 PICK 21 -> s26 req=s26-r11 blocks=148
+t=417 PICK 21 -> s33 req=s33-r08 blocks=104
+t=418 SETTLE s26 req=s26-r09 natural=true
+t=418 SETTLE s36 req=s36-r05 natural=true
+t=418 PICK 21 -> s36 req=s36-r06 blocks=77
+t=418 PICK -1
+t=419 SETTLE s28 req=s28-r10 natural=true
+t=419 PICK 21 -> s42 req=s42-r03 blocks=40
+t=419 PICK -1
+t=420 SETTLE s39 req=s39-r03 natural=true
+t=420 SETTLE s43 req=s43-r01 natural=true
+t=420 PICK -1
+t=421 SETTLE s33 req=s33-r07 natural=true
+t=421 PICK 21 -> s28 req=s28-r11 blocks=148
+t=421 PICK -1
+t=422 SETTLE s28 req=s28-r09 natural=true
+t=422 PICK -1
+t=423 SETTLE s36 req=s36-r04 natural=true
+t=423 PICK 21 -> s34 req=s34-r08 blocks=104
+t=423 PICK -1
+t=424 SETTLE s16 req=s16-r17 natural=true
+t=424 SETTLE s17 req=s17-r16 natural=true
+t=424 PICK 22 -> s37 req=s37-r05 blocks=64
+STATE seats=17 [s17,s26,s27,s28,s30,s32,s33,s34,s35,s36,s37,s38,s39,s41,s42,s43,s44]
+t=424 PICK -1
+t=424 EXIT reason=paid turns=6
+t=425 SETTLE s42 req=s42-r02 natural=true
+t=425 PICK 22 -> s45 req=s45-r01 blocks=18
+t=425 SEAT wait=0.000
+STATE seats=18 [s17,s26,s27,s28,s30,s32,s33,s34,s35,s36,s37,s38,s39,s41,s42,s43,s44,s45]
+t=425 PICK -1
+t=426 SETTLE s27 req=s27-r11 natural=true
+t=426 PICK 15 -> s17 req=s17-r17 blocks=250
+STATE seats=17 [s17,s26,s28,s30,s32,s33,s34,s35,s36,s37,s38,s39,s41,s42,s43,s44,s45]
+t=426 PICK 23 -> s32 req=s32-r09 blocks=118
+t=426 EXIT reason=paid turns=11
+t=427 SETTLE s34 req=s34-r07 natural=true
+t=427 PICK 23 -> s38 req=s38-r05 blocks=64
+t=427 PICK -1
+t=428 SETTLE s44 req=s44-r01 natural=true
+t=428 PICK 23 -> s36 req=s36-r07 blocks=90
+t=428 PICK -1
+t=429 SETTLE s26 req=s26-r11 natural=true
+t=429 SETTLE s37 req=s37-r05 natural=true
+t=429 PICK 24 -> s37 req=s37-r06 blocks=77
+STATE seats=16 [s17,s28,s30,s32,s33,s34,s35,s36,s37,s38,s39,s41,s42,s43,s44,s45]
+t=429 PICK 24 -> s41 req=s41-r04 blocks=52
+t=429 EXIT reason=paid turns=6
+t=430 SETTLE s36 req=s36-r06 natural=true
+t=430 PICK 25 -> s43 req=s43-r03 blocks=40
+t=430 PICK 25 -> s44 req=s44-r02 blocks=29
+t=431 PICK 24 -> s35 req=s35-r08 blocks=104
+t=431 PICK -1
+t=432 SETTLE s17 req=s17-r14 natural=true
+t=432 SETTLE s32 req=s32-r08 natural=true
+t=432 SETTLE s38 req=s38-r05 natural=true
+t=432 PICK 24 -> s30 req=s30-r10 blocks=133
+t=432 PICK 24 -> s38 req=s38-r06 blocks=77
+t=433 SETTLE s28 req=s28-r11 natural=true
+t=433 PICK 2 -> s02 req=s02-r22 blocks=349
+STATE seats=16 [s02,s17,s30,s32,s33,s34,s35,s36,s37,s38,s39,s41,s42,s43,s44,s45]
+t=433 PICK 5 -> s08 req=s08-r18 blocks=269
+STATE seats=18 [s02,s08,s17,s19,s30,s32,s33,s34,s35,s36,s37,s38,s39,s41,s42,s43,s44,s45]
+t=433 EXIT reason=paid turns=11
+t=433 EXIT reason=budget-idle turns=0
+t=434 SETTLE s37 req=s37-r04 natural=true
+t=434 SETTLE s35 req=s35-r07 natural=true
+t=434 PICK 13 -> s19 req=s19-r11 blocks=148
+STATE seats=19 [s00,s02,s08,s17,s19,s30,s32,s33,s34,s35,s36,s37,s38,s39,s41,s42,s43,s44,s45]
+t=434 PICK 0 -> s00 req=s00-r23 blocks=370
+t=434 EXIT reason=budget-idle turns=0
+t=435 SETTLE s43 req=s43-r02 natural=true
+t=435 PICK 22 -> s45 req=s45-r02 blocks=29
+t=435 PICK 21 -> s39 req=s39-r05 blocks=64
+t=436 SETTLE s38 req=s38-r04 natural=true
+t=436 PICK -1
+t=437 SETTLE s41 req=s41-r03 natural=true
+t=437 SETTLE s45 req=s45-r01 natural=true
+t=437 SETTLE s30 req=s30-r10 natural=true
+t=437 PICK 0 -> s00 req=s00-r24 blocks=392
+t=437 PICK 21 -> s33 req=s33-r09 blocks=118
+t=438 PICK 21 -> s42 req=s42-r04 blocks=52
+t=438 PICK -1
+t=439 PICK 21 -> s30 req=s30-r11 blocks=148
+t=439 PICK 4 -> s09 req=s09-r18 blocks=269
+STATE seats=20 [s00,s02,s08,s09,s17,s19,s30,s32,s33,s34,s35,s36,s37,s38,s39,s41,s42,s43,s44,s45]
+t=440 SETTLE s30 req=s30-r09 natural=true
+t=440 SETTLE s39 req=s39-r05 natural=true
+t=440 PICK 20 -> s37 req=s37-r07 blocks=90
+t=440 PICK 20 -> s39 req=s39-r06 blocks=77
+t=441 SETTLE s37 req=s37-r06 natural=true
+t=441 PICK -1
+t=442 PICK 20 -> s38 req=s38-r07 blocks=90
+t=442 PICK -1
+t=443 SETTLE s33 req=s33-r08 natural=true
+t=443 PICK 20 -> s34 req=s34-r09 blocks=118
+t=443 PICK 20 -> s36 req=s36-r08 blocks=104
+t=444 SETTLE s38 req=s38-r06 natural=true
+t=444 PICK -1
+t=445 SETTLE s39 req=s39-r04 natural=true
+t=445 SETTLE s42 req=s42-r03 natural=true
+t=445 SETTLE s17 req=s17-r17 natural=true
+t=445 PICK 2 -> s03 req=s03-r22 blocks=349
+STATE seats=20 [s00,s02,s03,s08,s09,s19,s30,s32,s33,s34,s35,s36,s37,s38,s39,s41,s42,s43,s44,s45]
+t=445 PICK 0 -> s00 req=s00-r25 blocks=414
+t=445 EXIT reason=paid turns=6
+t=446 SETTLE s19 req=s19-r11 natural=true
+t=446 PICK 11 -> s19 req=s19-r12 blocks=164
+t=446 PICK -1
+t=447 SETTLE s36 req=s36-r07 natural=true
+t=447 PICK -1
+t=448 PICK 20 -> s43 req=s43-r04 blocks=52
+t=448 PICK 20 -> s45 req=s45-r03 blocks=40
+t=449 SETTLE s34 req=s34-r08 natural=true
+t=449 SETTLE s44 req=s44-r02 natural=true
+t=449 PICK -1
+t=449 EXIT reason=paid turns=2
+STATE seats=19 [s00,s02,s03,s08,s09,s19,s30,s32,s33,s34,s35,s36,s37,s38,s39,s41,s42,s43,s45]
+t=450 SETTLE s00 req=s00-r25 natural=true
+t=450 PICK 20 -> s39 req=s39-r07 blocks=90
+t=450 PICK -1
+t=451 SETTLE s30 req=s30-r11 natural=true
+t=451 EXIT reason=exiting-drain turns=11
+STATE seats=18 [s00,s02,s03,s08,s09,s19,s32,s33,s34,s35,s36,s37,s38,s39,s41,s42,s43,s45]
+t=451 PICK 21 -> s32 req=s32-r10 blocks=133
+t=451 PICK 21 -> s35 req=s35-r09 blocks=118
+t=452 SETTLE s02 req=s02-r22 natural=true
+t=452 SETTLE s39 req=s39-r06 natural=true
+t=452 PICK 21 -> s41 req=s41-r05 blocks=64
+t=452 PICK -1
+t=453 PICK -1
+t=454 SETTLE s45 req=s45-r02 natural=true
+t=454 PICK 1 -> s02 req=s02-r23 blocks=370
+t=454 PICK -1
+t=455 PICK 21 -> s37 req=s37-r08 blocks=104
+t=455 PICK -1
+t=456 SETTLE s43 req=s43-r03 natural=true
+t=456 SETTLE s32 req=s32-r10 natural=true
+t=456 PICK -1
+t=457 SETTLE s35 req=s35-r08 natural=true
+t=457 SETTLE s41 req=s41-r05 natural=true
+t=457 PICK 1 -> s02 req=s02-r24 blocks=392
+t=457 PICK 3 -> s08 req=s08-r19 blocks=288
+t=458 PICK 23 -> s38 req=s38-r08 blocks=104
+t=458 PICK 23 -> s41 req=s41-r06 blocks=77
+t=459 SETTLE s32 req=s32-r09 natural=true
+t=459 SETTLE s08 req=s08-r18 natural=true
+t=459 SETTLE s37 req=s37-r07 natural=true
+t=459 PICK 0 -> s00 req=s00-r26 blocks=437
+STATE seats=17 [s00,s02,s03,s08,s09,s19,s33,s34,s35,s36,s37,s38,s39,s41,s42,s43,s45]
+t=459 PICK -1
+t=459 EXIT reason=paid turns=10
+t=460 SETTLE s00 req=s00-r23 natural=true
+t=460 PICK -1
+t=461 SETTLE s38 req=s38-r07 natural=true
+t=461 PICK 22 -> s42 req=s42-r05 blocks=64
+t=461 PICK -1
+t=462 SETTLE s41 req=s41-r04 natural=true
+t=462 PICK 22 -> s33 req=s33-r10 blocks=133
+t=462 PICK -1
+t=463 PICK 3 -> s08 req=s08-r20 blocks=308
+t=463 PICK 3 -> s09 req=s09-r19 blocks=288
+t=464 SETTLE s03 req=s03-r22 natural=true
+t=464 PICK 11 -> s19 req=s19-r13 blocks=180
+t=464 PICK 22 -> s36 req=s36-r09 blocks=118
+t=465 SETTLE s09 req=s09-r18 natural=true
+t=465 SETTLE s19 req=s19-r12 natural=true
+t=465 PICK 1 -> s02 req=s02-r25 blocks=414
+t=465 PICK 22 -> s39 req=s39-r08 blocks=104
+t=466 SETTLE s42 req=s42-r05 natural=true
+t=466 PICK 1 -> s03 req=s03-r23 blocks=370
+t=466 PICK 22 -> s42 req=s42-r06 blocks=77
+t=467 SETTLE s33 req=s33-r10 natural=true
+t=467 PICK 23 -> s45 req=s45-r04 blocks=52
+t=467 PICK -1
+t=468 SETTLE s08 req=s08-r20 natural=true
+t=468 PICK 22 -> s34 req=s34-r10 blocks=133
+t=468 PICK 22 -> s41 req=s41-r07 blocks=90
+t=469 SETTLE s36 req=s36-r08 natural=true
+t=469 SETTLE s39 req=s39-r07 natural=true
+t=469 PICK 1 -> s03 req=s03-r24 blocks=392
+t=469 PICK 3 -> s09 req=s09-r20 blocks=308
+t=470 SETTLE s00 req=s00-r24 natural=true
+t=470 SETTLE s33 req=s33-r09 natural=true
+t=470 SETTLE s41 req=s41-r06 natural=true
+t=470 SETTLE s02 req=s02-r25 natural=true
+t=470 PICK -1
+t=470 EXIT reason=paid turns=10
+STATE seats=16 [s00,s02,s03,s08,s09,s19,s34,s35,s36,s37,s38,s39,s41,s42,s43,s45]
+t=471 SETTLE s42 req=s42-r04 natural=true
+t=471 SETTLE s00 req=s00-r26 natural=true
+t=471 PICK 23 -> s43 req=s43-r05 blocks=64
+STATE seats=15 [s02,s03,s08,s09,s19,s34,s35,s36,s37,s38,s39,s41,s42,s43,s45]
+t=471 PICK -1
+t=471 EXIT reason=paid turns=4
+t=472 PICK -1
+t=473 SETTLE s34 req=s34-r10 natural=true
+t=473 PICK -1
+t=474 SETTLE s45 req=s45-r03 natural=true
+t=474 SETTLE s09 req=s09-r20 natural=true
+t=474 PICK 3 -> s08 req=s08-r21 blocks=328
+t=474 PICK -1
+t=475 PICK 23 -> s34 req=s34-r11 blocks=148
+t=475 PICK 23 -> s37 req=s37-r09 blocks=118
+t=476 SETTLE s34 req=s34-r09 natural=true
+t=476 SETTLE s43 req=s43-r05 natural=true
+t=476 PICK 23 -> s35 req=s35-r10 blocks=133
+t=476 PICK 23 -> s42 req=s42-r07 blocks=90
+t=477 PICK 25 -> s43 req=s43-r06 blocks=77
+t=477 PICK 2 -> s03 req=s03-r25 blocks=414
+t=478 SETTLE s42 req=s42-r06 natural=true
+t=478 PICK 2 -> s02 req=s02-r26 blocks=437
+t=478 PICK 24 -> s38 req=s38-r09 blocks=118
+t=479 PICK -1
+t=480 SETTLE s02 req=s02-r23 natural=true
+t=480 PICK 4 -> s09 req=s09-r21 blocks=328
+t=480 PICK -1
+t=481 SETTLE s43 req=s43-r04 natural=true
+t=481 SETTLE s37 req=s37-r08 natural=true
+t=481 SETTLE s35 req=s35-r10 natural=true
+t=481 PICK -1
+t=482 SETTLE s03 req=s03-r25 natural=true
+t=482 PICK -1
+t=483 PICK 24 -> s35 req=s35-r11 blocks=148
+t=483 PICK 24 -> s41 req=s41-r08 blocks=104
+t=484 SETTLE s35 req=s35-r09 natural=true
+t=484 SETTLE s38 req=s38-r08 natural=true
+t=484 PICK -1
+t=485 PICK 24 -> s39 req=s39-r09 blocks=118
+t=485 PICK -1
+t=486 SETTLE s08 req=s08-r21 natural=true
+t=486 PICK 12 -> s19 req=s19-r14 blocks=197
+t=486 PICK -1
+t=487 SETTLE s41 req=s41-r07 natural=true
+t=487 SETTLE s34 req=s34-r11 natural=true
+t=487 EXIT reason=exiting-drain turns=11
+STATE seats=14 [s02,s03,s08,s09,s19,s35,s36,s37,s38,s39,s41,s42,s43,s45]
+t=487 PICK 25 -> s43 req=s43-r07 blocks=90
+t=487 PICK -1
+t=488 PICK -1
+t=489 SETTLE s43 req=s43-r06 natural=true
+t=489 PICK 25 -> s36 req=s36-r10 blocks=133
+t=489 PICK -1
+SNAPSHOT served=557 fcfs=0 refill=0.0176
+EXITS budget-idle=7
+EXITS exiting=8
+EXITS exiting-drain=7
+EXITS idle=3
+EXITS paid=30
+EXITS ttl=3

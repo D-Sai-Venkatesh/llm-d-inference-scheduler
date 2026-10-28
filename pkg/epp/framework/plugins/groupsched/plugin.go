@@ -292,6 +292,16 @@ func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.Inferen
 			}
 		}
 	}
+	// V3: the engine-side stagger — seated turns get priority over cold
+	// entry prefills in vLLM's waiting loop (Phase-2 deployments with
+	// --scheduling-policy priority; lower value = higher priority).
+	if r.cfg.PriorityHeader == "engine" && request.Headers != nil {
+		if r.sched.Seated(id) {
+			request.Headers["X-Vllm-Priority"] = "0"
+		} else {
+			request.Headers["X-Vllm-Priority"] = "10"
+		}
+	}
 	keys := r.blockKeysFor(request)
 	if keys == nil {
 		return errors.New("group-scheduler: no TokenizedRequest on the request (token-producer required; no tier-B fallback)")

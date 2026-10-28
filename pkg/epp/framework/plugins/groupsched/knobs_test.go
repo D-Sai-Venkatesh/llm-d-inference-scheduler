@@ -23,6 +23,7 @@ package groupsched
 // and the always-on liveness fixes C3/C8.
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -324,5 +325,101 @@ func TestSeatExitEventsRecorded(t *testing.T) {
 	snap := s.Snapshot()
 	if snap.Config.RotationMode != "ledger" || len(snap.RecentEvents) == 0 {
 		t.Fatal("Snapshot must echo the config and recent events")
+	}
+}
+
+// ---- M2: the Pick hot-loop benchmark (Picks fire at ~1kHz) ----
+
+func BenchmarkPickFromHeads(b *testing.B) {
+	cfg := defaultConfig()
+	s, err := NewScheduler(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := s.SetNumBlocks(64, 60000); err != nil { // room for 32 members x ~1k blocks
+		b.Fatal(err)
+	}
+	now := time.Now()
+	// 32 seated members x ~1000 blocks each, settled (warm)
+	for i := 0; i < 32; i++ {
+		id := fmt.Sprintf("m%02d", i)
+		k := keys(1000, Hash(i+1))
+		if j := s.PickFromHeads([]Head{{Session: id, ReqID: "r1", Arrival: now, SizeBytes: bytesFor(1000)}}, now); j < 0 {
+			b.Fatalf("seat pick failed for %s", id)
+		}
+		s.Dispatched(id, "r1", k, bytesFor(1000), now)
+		s.Chunk(id)
+		s.Settle(id, "r1", struct{ Prompt, Cached int }{1000, 998}, true, now)
+	}
+	// 150 waiting heads (118 non-members + members' next turns)
+	var heads []Head
+	for i := 0; i < 118; i++ {
+		heads = append(heads, Head{Session: fmt.Sprintf("w%03d", i), ReqID: "r", Arrival: now, SizeBytes: bytesFor(800)})
+	}
+	for i := 0; i < 32; i++ {
+		heads = append(heads, Head{Session: fmt.Sprintf("m%02d", i), ReqID: "r2", Arrival: now, SizeBytes: bytesFor(1100)})
+	}
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		// a realistic mix: most picks find nothing dispatchable new —
+		// the state is unchanged between picks (the cache's win case)
+		s.PickFromHeads(heads, now.Add(time.Duration(n)*time.Millisecond))
+	}
+}
+
+// ---- M3: the WHISTLE-REPLAY test (requests die without EOS) ----
+
+func TestWhistleReplayNoFreeze(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.InflightReapSeconds = 60 // the test's accelerated reap bound
+	s, err := NewScheduler(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNumBlocks(64, 1000); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	// three members dispatch requests that are then CANCELLED with no
+	// Chunk and no Settle (the run-end whistle / client-disconnect-
+	// without-EOS class)
+	for i, id := range []string{"a", "b", "c"} {
+		k := keys(10, Hash(i+1))
+		if j := s.PickFromHeads([]Head{{Session: id, ReqID: "r-" + id, Arrival: now, SizeBytes: bytesFor(10)}}, now); j < 0 {
+			t.Fatalf("pick failed for %s", id)
+		}
+		s.Dispatched(id, "r-"+id, k, bytesFor(10), now)
+	}
+	// fresh load arrives: a big newcomer the valve would block while
+	// the dead cold charges linger
+	big := Head{Session: "big", ReqID: "r-big", Arrival: now.Add(time.Second), SizeBytes: bytesFor(100)}
+	// before the reap bound: the dead charges hold the valve
+	s.mu.Lock()
+	coldBefore := s.coldInFlight
+	s.mu.Unlock()
+	if coldBefore == 0 {
+		t.Fatal("expected cold charges in flight")
+	}
+	if j := s.PickFromHeads([]Head{big}, now.Add(2*time.Second)); j >= 0 {
+		t.Log("big dispatched early (valve allowed)")
+	}
+	// advance past the reap bound: the dead ids are reaped, the cold
+	// charges release with them (M3a), and the queue unfreezes
+	later := now.Add(61 * time.Second)
+	s.Tick(later)
+	s.mu.Lock()
+	coldAfter := s.coldInFlight
+	frozen := coldAfter > 0
+	s.mu.Unlock()
+	if frozen {
+		t.Fatalf("cold charge survived the reap: %d tokens — the queue freezes", coldAfter)
+	}
+	// the newcomer can now seat and dispatch
+	end := later.Add(time.Second)
+	if j := s.PickFromHeads([]Head{big}, end); j < 0 {
+		t.Fatal("queue still frozen after reap: the big newcomer could not dispatch")
+	}
+	if !s.Seated("big") {
+		t.Fatal("the big newcomer was not seated after the freeze cleared")
 	}
 }

@@ -70,6 +70,13 @@ type Config struct {
 	// IdleSeconds — MANDATORY under root-session identity, where fan-out
 	// within one id is real and a fixed window undercounts).
 	WindowMode string `json:"windowMode"`
+	// PriorityHeader (V3, valve-off deployments): "off" (default) |
+	// "engine" — PreRequest sets X-Vllm-Priority on every tracked
+	// request: 0 (high) for a seated member's turn, 10 (low) for an
+	// entry (newcomer) request. Requires the Phase-2 engine config
+	// (--scheduling-policy priority); without it, cold prefills block
+	// resident turns in vLLM's waiting loop (the D14 damage).
+	PriorityHeader string `json:"priorityHeader"`
 	// GateMode: "detector" (legacy: the stack's saturation detector
 	// gates dispatch at ~0.80 running KV) | "size-aware" (the plugin
 	// gates each dispatch: NE + pending + this request's new blocks ≤
@@ -100,6 +107,7 @@ func defaultConfig() Config {
 		VictimOrder:         "legacy",
 		WindowMode:          "last4",
 		GateMode:            "detector",
+		PriorityHeader:      "off",
 		InflightReapSeconds: 3700,
 	}
 }
@@ -109,6 +117,33 @@ func (c Config) nMax() int {
 		return c.NMax
 	}
 	return 2 * c.Rho
+}
+
+// effective fills the knob defaults (the zero value of each string
+// knob means "default") so the startup echo and Snapshot.Config show
+// EFFECTIVE values (S2 — validate()'s value receiver made its fills
+// dead code).
+func (c Config) effective() Config {
+	def := defaultConfig()
+	if c.RotationMode == "" {
+		c.RotationMode = def.RotationMode
+	}
+	if c.ValveMode == "" {
+		c.ValveMode = def.ValveMode
+	}
+	if c.VictimOrder == "" {
+		c.VictimOrder = def.VictimOrder
+	}
+	if c.WindowMode == "" {
+		c.WindowMode = def.WindowMode
+	}
+	if c.GateMode == "" {
+		c.GateMode = def.GateMode
+	}
+	if c.InflightReapSeconds == 0 {
+		c.InflightReapSeconds = def.InflightReapSeconds
+	}
+	return c
 }
 
 // quantum is the effective Q (rotationMode "quantum").
@@ -178,6 +213,11 @@ func (c Config) validate() error {
 	default:
 		return fmt.Errorf("gateMode: invalid value %q (detector|size-aware)", c.GateMode)
 	}
+	switch c.PriorityHeader {
+	case "", "off", "engine":
+	default:
+		return fmt.Errorf("priorityHeader: invalid value %q (off|engine)", c.PriorityHeader)
+	}
 	if c.InflightReapSeconds != 0 && c.InflightReapSeconds < 60 {
 		return fmt.Errorf("inflightReapSeconds must be >= 60 (the harness request timeout is 3600s; got %v)", c.InflightReapSeconds)
 	}
@@ -224,9 +264,14 @@ type member struct {
 	// PreRequest) ids are reaped after 30s; confirmed ids after
 	// InflightReapSeconds. m.inflight = len(inflightIDs).
 	inflightIDs map[string]inflightRec
-	// busyPeriods counts completed busy periods (inflight 0→>0→0) —
-	// the quantum's unit (rotationMode "quantum").
+	// busyPeriods counts completed MAIN-CHAIN busy periods (V1: the
+	// main chain draining to zero — under root identity a busy root
+	// with overlapping sub-agent threads never fully drains, which
+	// would make it de-facto Q=∞).
 	busyPeriods int
+	// mainInflight is the in-flight count on the MAIN chain (the
+	// busy-period unit's input).
+	mainInflight int
 	// lastCompletion is the last time inflight returned to zero (the
 	// spec victim order's tie-break: oldest last completion first).
 	lastCompletion time.Time
@@ -257,6 +302,14 @@ type member struct {
 type inflightRec struct {
 	since     time.Time // Pick time (provisional) / PreRequest time (confirmed)
 	confirmed bool
+	main      bool // landed on the session's main chain (V1)
+}
+
+// estEntry is one cached admission estimate (M2): blocks for a given
+// head size; recomputed when the index version or the size changes.
+type estEntry struct {
+	sizeBytes int64
+	blocks    int64
 }
 
 type waiter struct {
@@ -300,6 +353,13 @@ type Scheduler struct {
 	// pendingTotal is the sum of seated members' pendingBlocks (the
 	// budget's estimate component).
 	pendingTotal int64
+	// pickSeq synthesizes request ids for heads that lack one (M1).
+	pickSeq int64
+	// estCache/estVersion cache waiter admission estimates keyed on the
+	// index's mutation version (M2: Picks run at ~1kHz; unchanged state
+	// must not recompute ~150 × ~1k-block history scans).
+	estCache   map[string]estEntry
+	estVersion uint64
 
 	counters struct {
 		exits        map[string]int64
@@ -320,6 +380,7 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	cfg = cfg.effective()
 	idx, err := NewBlockIndex(cfg.BlockSizeTokens)
 	if err != nil {
 		return nil, err
@@ -327,7 +388,8 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 	idx.SetWindowMode(cfg.WindowMode)
 	s := &Scheduler{cfg: cfg, index: idx, blockSize: cfg.BlockSizeTokens,
 		members: map[string]*member{}, waiters: map[string]*waiter{},
-		everSeated: map[string]struct{}{}, lastSeen: map[string]time.Time{}}
+		everSeated: map[string]struct{}{}, lastSeen: map[string]time.Time{},
+		estCache: map[string]estEntry{}}
 	s.counters.exits = map[string]int64{}
 	return s, nil
 }
@@ -441,13 +503,18 @@ func (s *Scheduler) PickFromHeads(heads []Head, now time.Time) int {
 	}
 	if best >= 0 {
 		m := s.members[heads[best].Session]
-		m.inflight++
+		// M1: a dispatch is NEVER counted without an id — synthesize one
+		// when the head lacks ReqID (the counter follows the map).
+		rid := bestHead.ReqID
+		if rid == "" {
+			s.pickSeq++
+			rid = fmt.Sprintf("synthetic-%d", s.pickSeq)
+		}
 		if m.inflightIDs == nil {
 			m.inflightIDs = map[string]inflightRec{}
 		}
-		if bestHead.ReqID != "" {
-			m.inflightIDs[bestHead.ReqID] = inflightRec{since: now} // provisional (C3): confirmed at Dispatched
-		}
+		m.inflightIDs[rid] = inflightRec{since: now} // provisional (C3): confirmed at Dispatched
+		m.inflight = len(m.inflightIDs)
 		m.lastActivity = now
 		s.counters.served++
 		if s.onServe != nil {
@@ -480,12 +547,14 @@ func (s *Scheduler) gateAllowsLocked(h Head) bool {
 	if s.budgetBlocks <= 0 {
 		return true
 	}
-	est := s.estimateCostLocked(h.Session, h.SizeBytes)
+	est := s.estimateCostCachedLocked(h.Session, h.SizeBytes)
 	if m, ok := s.members[h.Session]; ok && m.pendingBlocks > 0 {
 		est = max(est-m.pendingBlocks, 0)
 	}
-	ne := int64(s.index.UniqueBlocksNELocked()) + s.pendingTotal
-	return ne+est <= int64(s.budgetBlocks)
+	// M4: ALL seated blocks (exiting members' blocks stay pinned until
+	// they drain) + pending estimates + this request's new blocks.
+	all := int64(s.index.UniqueBlocksLocked()) + s.pendingTotal
+	return all+est <= int64(s.budgetBlocks)
 }
 
 // FCFSPick returns the oldest head (the pre-capacity pass-through, A5).
@@ -536,7 +605,7 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 			w.since = h.Arrival
 		}
 		w.sizeBytes = h.SizeBytes
-		w.coldTokens = s.estimateCostLocked(h.Session, h.SizeBytes) * int64(s.blockSize) // tokens (R1)
+		w.coldTokens = s.estimateCostCachedLocked(h.Session, h.SizeBytes) * int64(s.blockSize) // tokens (R1)
 	}
 	// vanished: members clear their waiting marker; waiters leave
 	for id, m := range s.members {
@@ -549,6 +618,22 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 			delete(s.waiters, id)
 		}
 	}
+}
+
+// estimateCostCachedLocked is estimateCostLocked behind the M2 cache:
+// valid while the index version is unchanged and the head size matches.
+func (s *Scheduler) estimateCostCachedLocked(id string, sizeBytes int64) int64 {
+	v := s.index.VersionLocked()
+	if s.estVersion != v {
+		s.estCache = map[string]estEntry{}
+		s.estVersion = v
+	}
+	if e, ok := s.estCache[id]; ok && e.sizeBytes == sizeBytes {
+		return e.blocks
+	}
+	b := s.estimateCostLocked(id, sizeBytes)
+	s.estCache[id] = estEntry{sizeBytes: sizeBytes, blocks: b}
+	return b
 }
 
 // estimateCostLocked is the conservative admission cost of a QUEUED
@@ -588,22 +673,26 @@ func (s *Scheduler) Dispatched(id, reqID string, keys []Hash, sizeBytes int64, n
 		return
 	}
 	s.index.SetSizeLocked(id, sizeBytes) // the estimate baseline
-	s.index.SettleDispatchedAtLocked(id, reqID, keys, now)
+	onMain := s.index.SettleDispatchedAtLocked(id, reqID, keys, now)
 	if m, ok := s.members[id]; ok {
 		m.lastActivity = now
 		m.lastSizeBytes = sizeBytes
-		// C3: reconcile the in-flight id — confirm a provisional one
+		// C3/M1: reconcile the in-flight id — confirm a provisional one
 		// (Pick already counted it), or record a dispatch that never
-		// passed PickFromHeads (pre-capacity FCFS pass-through).
-		if reqID != "" {
-			if m.inflightIDs == nil {
-				m.inflightIDs = map[string]inflightRec{}
-			}
-			if _, had := m.inflightIDs[reqID]; !had {
-				m.inflight++
-			}
-			m.inflightIDs[reqID] = inflightRec{since: now, confirmed: true}
+		// passed PickFromHeads (pre-capacity FCFS pass-through). The
+		// counter is DERIVED from the map, always.
+		if reqID == "" {
+			s.pickSeq++
+			reqID = fmt.Sprintf("synthetic-%d", s.pickSeq)
 		}
+		if m.inflightIDs == nil {
+			m.inflightIDs = map[string]inflightRec{}
+		}
+		m.inflightIDs[reqID] = inflightRec{since: now, confirmed: true, main: onMain}
+		if onMain {
+			m.mainInflight++
+		}
+		m.inflight = len(m.inflightIDs)
 		if m.pendingBlocks > 0 {
 			s.pendingTotal -= m.pendingBlocks
 			m.pendingBlocks = 0 // the exact keys are in NE now (D13 reconciles)
@@ -646,21 +735,36 @@ func (s *Scheduler) Settle(id, reqID string, usage struct{ Prompt, Cached int },
 	s.lastSeen[id] = now
 	m, seated := s.members[id]
 	if seated {
-		// C3: remove the in-flight record; the counter follows the map
-		// (derive-don't-accumulate — a leaked increment cannot persist).
-		if reqID != "" && m.inflightIDs != nil {
-			if _, had := m.inflightIDs[reqID]; had {
-				delete(m.inflightIDs, reqID)
-				m.inflight = max(m.inflight-1, 0)
+		// C3/M1: remove the in-flight record; the counter follows the
+		// map (derive-don't-accumulate). A missing reqID removes the
+		// OLDEST record (defensive legacy path — never blind).
+		removed := false
+		if m.inflightIDs != nil && len(m.inflightIDs) > 0 {
+			key := reqID
+			if _, had := m.inflightIDs[key]; !had {
+				key = ""
+				oldest := time.Time{}
+				for rid, rec := range m.inflightIDs {
+					if key == "" || rec.since.Before(oldest) {
+						key, oldest = rid, rec.since
+					}
+				}
 			}
-		} else {
-			m.inflight = max(m.inflight-1, 0)
+			if rec, had := m.inflightIDs[key]; had {
+				delete(m.inflightIDs, key)
+				removed = true
+				if rec.main && m.mainInflight > 0 {
+					m.mainInflight--
+				}
+			}
+			m.inflight = len(m.inflightIDs)
 		}
 		m.lastActivity = now
 		s.releaseColdLocked(id) // S0-2: any termination releases the charge
-		// the busy period closes when inflight returns to zero
-		// (inflight 0→>0→0 = one busy period; the quantum's unit).
-		if m.inflight == 0 {
+		// S4/V1: the busy period closes when the MAIN chain drains to
+		// zero — and only on a REAL removal (a stray settle after a
+		// reap must not fabricate a busy period).
+		if removed && m.mainInflight == 0 {
 			m.busyPeriods++
 			m.lastCompletion = now
 		}
@@ -763,6 +867,7 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 		if len(m.inflightIDs) == 0 {
 			continue
 		}
+		reaped := false
 		for rid, rec := range m.inflightIDs {
 			limit := 30 * time.Second
 			if rec.confirmed {
@@ -770,10 +875,20 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 			}
 			if now.Sub(rec.since) > limit {
 				delete(m.inflightIDs, rid)
-				m.inflight = max(m.inflight-1, 0)
-				if m.inflight == 0 {
-					m.lastCompletion = now
+				reaped = true
+				if rec.main && m.mainInflight > 0 {
+					m.mainInflight--
 				}
+			}
+		}
+		if reaped {
+			m.inflight = len(m.inflightIDs)
+			if m.inflight == 0 {
+				m.lastCompletion = now
+				// M3(a): the member's requests are all dead — release
+				// its cold charge or the valve freezes the queue until
+				// the reap bound (the whistle scenario).
+				s.releaseColdLocked(m.id)
 			}
 		}
 	}
@@ -953,7 +1068,7 @@ func (s *Scheduler) budgetVictimLocked(now time.Time) (string, *member) {
 			}
 		}
 		if best != nil {
-			return "budget-done", best
+			return "budget-noqueue", best
 		}
 		// class (3): mid-quantum idle — the safety valve on GENUINE growth
 		// pressure only (admissions were budget-checked; under Q=∞ the
@@ -1210,13 +1325,29 @@ type Snapshot struct {
 	RecentEvents []Event
 }
 
+// SnapshotLite is Snapshot without the event ring and config echo —
+// the metrics Refresh path (S5: Refresh runs every second and must not
+// copy the 2048-event ring).
+func (s *Scheduler) SnapshotLite() Snapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snapshotLocked(false)
+}
+
 func (s *Scheduler) Snapshot() Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.snapshotLocked(true)
+}
+
+func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 	snap := Snapshot{Seats: len(s.members), Waiters: len(s.waiters),
 		Exits: map[string]int64{}, BudgetBlocks: s.budgetBlocks,
-		Served: s.counters.served, FCFSServed: s.counters.fcfsServed,
-		Config: s.cfg, RecentEvents: append([]Event(nil), s.events...)}
+		Served: s.counters.served, FCFSServed: s.counters.fcfsServed}
+	if full {
+		snap.Config = s.cfg
+		snap.RecentEvents = append([]Event(nil), s.events...)
+	}
 	for k, v := range s.counters.exits {
 		snap.Exits[k] = v
 	}

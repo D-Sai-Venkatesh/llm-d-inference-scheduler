@@ -286,6 +286,10 @@ type member struct {
 	// (R4: a fully warm entry has uncached 0, which the old
 	// entryCost==0&&earned==0 test misread as "still the entry turn").
 	entryRecorded bool
+	// entryDispatched marks that this residency's FIRST dispatch has
+	// happened (R6: the priority header's entry/resident split — the
+	// entry request gets low engine priority, resident turns high).
+	entryDispatched bool
 	// lastSizeBytes is the last known wire size (the estimate delta's
 	// baseline; updated at PreRequest with the exact size).
 	lastSizeBytes int64
@@ -365,6 +369,10 @@ type Scheduler struct {
 		exits        map[string]int64
 		entryWaits   []float64
 		reentryWaits []float64
+		// R1/R2 diagnostics: both must read 0 with the gateway (every
+		// request carries a real id end to end).
+		emptyReqIDs  int64
+		straySettles int64
 		resTurns     []int
 		refillShare  float64
 		uncachedTok  int64
@@ -677,22 +685,41 @@ func (s *Scheduler) Dispatched(id, reqID string, keys []Hash, sizeBytes int64, n
 	if m, ok := s.members[id]; ok {
 		m.lastActivity = now
 		m.lastSizeBytes = sizeBytes
-		// C3/M1: reconcile the in-flight id — confirm a provisional one
-		// (Pick already counted it), or record a dispatch that never
-		// passed PickFromHeads (pre-capacity FCFS pass-through). The
-		// counter is DERIVED from the map, always.
+		// C3/M1/R1: reconcile the in-flight id. A non-empty reqID
+		// confirms-or-adds. An EMPTY reqID must not mint a second id
+		// (Pick already recorded a provisional one — two records for
+		// one request leak past the reap): confirm the OLDEST
+		// PROVISIONAL record, and synthesize only when none exists.
 		if reqID == "" {
-			s.pickSeq++
-			reqID = fmt.Sprintf("synthetic-%d", s.pickSeq)
+			s.counters.emptyReqIDs++
+			reqID = ""
+			oldestKey, oldestTime := "", time.Time{}
+			for rid, rec := range m.inflightIDs {
+				if rec.confirmed {
+					continue
+				}
+				if oldestKey == "" || rec.since.Before(oldestTime) {
+					oldestKey, oldestTime = rid, rec.since
+				}
+			}
+			if oldestKey != "" {
+				reqID = oldestKey
+			} else {
+				s.pickSeq++
+				reqID = fmt.Sprintf("synthetic-%d", s.pickSeq)
+			}
 		}
 		if m.inflightIDs == nil {
 			m.inflightIDs = map[string]inflightRec{}
 		}
 		m.inflightIDs[reqID] = inflightRec{since: now, confirmed: true, main: onMain}
-		if onMain {
-			m.mainInflight++
-		}
 		m.inflight = len(m.inflightIDs)
+		m.mainInflight = 0
+		for _, rec := range m.inflightIDs {
+			if rec.main {
+				m.mainInflight++
+			}
+		}
 		if m.pendingBlocks > 0 {
 			s.pendingTotal -= m.pendingBlocks
 			m.pendingBlocks = 0 // the exact keys are in NE now (D13 reconciles)
@@ -739,32 +766,48 @@ func (s *Scheduler) Settle(id, reqID string, usage struct{ Prompt, Cached int },
 		// map (derive-don't-accumulate). A missing reqID removes the
 		// OLDEST record (defensive legacy path — never blind).
 		removed := false
-		if m.inflightIDs != nil && len(m.inflightIDs) > 0 {
-			key := reqID
-			if _, had := m.inflightIDs[key]; !had {
-				key = ""
-				oldest := time.Time{}
-				for rid, rec := range m.inflightIDs {
-					if key == "" || rec.since.Before(oldest) {
-						key, oldest = rid, rec.since
-					}
+		removedMain := false
+		if reqID != "" {
+			// R2: a known id removes itself; an UNKNOWN non-empty id
+			// removes NOTHING (the oldest-fallback would delete a
+			// different live request's record after a late reap or a
+			// duplicate settle — the member would undercount and evict
+			// mid-flight). Counted as a stray.
+			if rec, had := m.inflightIDs[reqID]; had {
+				delete(m.inflightIDs, reqID)
+				removed, removedMain = true, rec.main
+			} else {
+				s.counters.straySettles++
+			}
+		} else if len(m.inflightIDs) > 0 {
+			// empty reqID (defensive legacy path): remove the OLDEST
+			key, oldest := "", time.Time{}
+			for rid, rec := range m.inflightIDs {
+				if key == "" || rec.since.Before(oldest) {
+					key, oldest = rid, rec.since
 				}
 			}
 			if rec, had := m.inflightIDs[key]; had {
 				delete(m.inflightIDs, key)
-				removed = true
-				if rec.main && m.mainInflight > 0 {
-					m.mainInflight--
+				removed, removedMain = true, rec.main
+			}
+		}
+		if removed {
+			m.inflight = len(m.inflightIDs)
+			m.mainInflight = 0
+			for _, rec := range m.inflightIDs {
+				if rec.main {
+					m.mainInflight++
 				}
 			}
-			m.inflight = len(m.inflightIDs)
 		}
 		m.lastActivity = now
 		s.releaseColdLocked(id) // S0-2: any termination releases the charge
-		// S4/V1: the busy period closes when the MAIN chain drains to
-		// zero — and only on a REAL removal (a stray settle after a
-		// reap must not fabricate a busy period).
-		if removed && m.mainInflight == 0 {
+		// S4/V1/R3a: the busy period closes only when a MAIN-chain
+		// request was removed AND the main chain drained to zero — a
+		// sub-agent request settling while the main chain is idle must
+		// not burn a quantum unit.
+		if removed && removedMain && m.mainInflight == 0 {
 			m.busyPeriods++
 			m.lastCompletion = now
 		}
@@ -876,13 +919,16 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 			if now.Sub(rec.since) > limit {
 				delete(m.inflightIDs, rid)
 				reaped = true
-				if rec.main && m.mainInflight > 0 {
-					m.mainInflight--
-				}
 			}
 		}
 		if reaped {
 			m.inflight = len(m.inflightIDs)
+			m.mainInflight = 0
+			for _, rec := range m.inflightIDs {
+				if rec.main {
+					m.mainInflight++
+				}
+			}
 			if m.inflight == 0 {
 				m.lastCompletion = now
 				// M3(a): the member's requests are all dead — release
@@ -1297,6 +1343,23 @@ func (s *Scheduler) recordEvent(kind, id, detail string, now time.Time) {
 	if s.onEvent != nil {
 		s.onEvent(ev)
 	}
+}
+
+// EntryTurn reports whether this dispatch is the member's ENTRY (the
+// residency's first dispatch) and marks it — the priority header's
+// input (R6). Unseated/unknown sessions are entries by definition.
+func (s *Scheduler) EntryTurn(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.members[id]
+	if !ok {
+		return true
+	}
+	if m.entryDispatched {
+		return false
+	}
+	m.entryDispatched = true
+	return true
 }
 
 // Events returns the recent event ring (newest last).

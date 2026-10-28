@@ -24,6 +24,7 @@ package groupsched
 
 import (
 	"fmt"
+	"math/rand"
 	"testing"
 	"time"
 )
@@ -421,5 +422,125 @@ func TestWhistleReplayNoFreeze(t *testing.T) {
 	}
 	if !s.Seated("big") {
 		t.Fatal("the big newcomer was not seated after the freeze cleared")
+	}
+}
+
+// ---- R1/R2: the id-path accounting (empty and unknown ids) ----
+
+func TestR1EmptyReqIDRoundTripEndsAtZero(t *testing.T) {
+	s := newSched(t)
+	now := time.Now()
+	// Pick with an EMPTY ReqID, Dispatched with an EMPTY ReqID, Settle
+	// with an EMPTY ReqID: exactly one record, ending at inflight 0
+	// (the old path minted two ids and leaked one past the 3,700s reap).
+	if j := s.PickFromHeads([]Head{{Session: "a", Arrival: now, SizeBytes: bytesFor(10)}}, now); j < 0 {
+		t.Fatal("pick failed")
+	}
+	s.Dispatched("a", "", keys(10, 1), bytesFor(10), now)
+	s.mu.Lock()
+	n := len(s.members["a"].inflightIDs)
+	inflight := s.members["a"].inflight
+	emptyCount := s.counters.emptyReqIDs
+	s.mu.Unlock()
+	if n != 1 || inflight != 1 {
+		t.Fatalf("after dispatch: records=%d inflight=%d, want 1/1 (no second id minted)", n, inflight)
+	}
+	if emptyCount == 0 {
+		t.Fatal("the empty-reqID counter must record the diagnostics (should read 0 with the gateway)")
+	}
+	s.Chunk("a")
+	s.Settle("a", "", struct{ Prompt, Cached int }{10, 8}, true, now.Add(time.Second))
+	s.mu.Lock()
+	n = len(s.members["a"].inflightIDs)
+	inflight = s.members["a"].inflight
+	s.mu.Unlock()
+	if n != 0 || inflight != 0 {
+		t.Fatalf("after settle: records=%d inflight=%d, want 0/0 — the round trip must fully drain", n, inflight)
+	}
+}
+
+func TestR2UnknownSettleRemovesNothing(t *testing.T) {
+	s := newSched(t)
+	now := time.Now()
+	// two real in-flight requests
+	for _, id := range []string{"a", "b"} {
+		if j := s.PickFromHeads([]Head{{Session: id, ReqID: "r-" + id, Arrival: now, SizeBytes: bytesFor(10)}}, now); j < 0 {
+			t.Fatalf("pick failed for %s", id)
+		}
+		s.Dispatched(id, "r-"+id, keys(10, Hash(id[0])), bytesFor(10), now)
+	}
+	// a settle with an UNKNOWN non-empty id must remove NOTHING (the
+	// oldest-fallback would delete a different live request's record)
+	s.Settle("a", "never-existed", struct{ Prompt, Cached int }{}, false, now.Add(time.Second))
+	s.mu.Lock()
+	n := len(s.members["a"].inflightIDs)
+	stray := s.counters.straySettles
+	s.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("unknown-id settle removed a record: %d left, want 1", n)
+	}
+	if stray != 1 {
+		t.Fatalf("stray-settle counter = %d, want 1", stray)
+	}
+	// and the member is NOT evictable as idle while the real record lives
+	s.mu.Lock()
+	_, eligible := s.eligibleLocked(s.members["a"], now.Add(2*time.Second))
+	s.mu.Unlock()
+	if eligible {
+		t.Fatal("member with a live in-flight record became rotation-eligible")
+	}
+}
+
+// ---- R4: the estimate-cache property (cached == uncached after every op) ----
+
+func TestR4CacheMatchesUncachedUnderRandomOps(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WindowMode = "derived"
+	s, err := NewScheduler(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNumBlocks(64, 5000); err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(42))
+	now := time.Now()
+	ids := []string{"s0", "s1", "s2", "s3"}
+	// a rich op mix: picks, dispatches, settles, ticks, expiries
+	for op := 0; op < 2000; op++ {
+		id := ids[rng.Intn(len(ids))]
+		switch rng.Intn(6) {
+		case 0, 1:
+			s.PickFromHeads([]Head{{Session: id, ReqID: fmt.Sprintf("r%d", op), Arrival: now, SizeBytes: bytesFor(20 + rng.Intn(60))}}, now)
+		case 2:
+			s.Dispatched(id, fmt.Sprintf("r%d", rng.Intn(op+1)), keys(20+rng.Intn(60), Hash(op)), bytesFor(50), now)
+		case 3:
+			s.Chunk(id)
+			s.Settle(id, fmt.Sprintf("r%d", rng.Intn(op+1)), struct{ Prompt, Cached int }{50, 40}, true, now)
+		case 4:
+			s.Tick(now.Add(time.Duration(op) * time.Second))
+		case 5:
+			s.mu.Lock()
+			s.index.ExpireChainsLocked(20*time.Second, now.Add(time.Duration(op)*time.Second))
+			s.mu.Unlock()
+		}
+		now = now.Add(time.Duration(rng.Intn(3)) * time.Second)
+		// after EVERY op: the cached estimate must equal a fresh
+		// recomputation for every id (the cache can only be stale, never
+		// wrong)
+		s.mu.Lock()
+		for _, probe := range ids {
+			size := bytesFor(30 + rng.Intn(50))
+			cached := s.estimateCostCachedLocked(probe, size)
+			// force a cold recompute by bypassing the cache
+			v := s.estVersion
+			s.estVersion = 0 // invalidates; recompute path
+			fresh := s.estimateCostCachedLocked(probe, size)
+			s.estVersion = v
+			if cached != fresh {
+				t.Fatalf("op %d: cached estimate %d != fresh %d for %s", op, cached, fresh, probe)
+			}
+		}
+		s.mu.Unlock()
 	}
 }

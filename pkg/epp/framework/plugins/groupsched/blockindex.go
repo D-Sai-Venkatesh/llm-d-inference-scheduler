@@ -211,15 +211,25 @@ func (b *BlockIndex) ExpireChainsLocked(maxAge time.Duration, now time.Time) {
 	if !b.useChains {
 		return
 	}
-	b.version++
+	// R5: bump only on an actual change — a per-Tick bump would flush
+	// the estimate cache every second.
+	changed := false
 	for id, s := range b.sessions {
 		if _, isSeated := b.seated[id]; !isSeated {
-			continue // unseated records are private; no counters to fix
+			// unseated records still feed waiter estimates (SetBlocks)
+			if s.expireChains(maxAge, now) {
+				changed = true
+			}
+			continue
 		}
 		old := s.set()
 		if s.expireChains(maxAge, now) {
+			changed = true
 			b.applyDeltaLocked(s, old)
 		}
+	}
+	if changed {
+		b.version++
 	}
 }
 
@@ -345,6 +355,7 @@ func (b *BlockIndex) TrySeat(id string, budgetBlocks int) (bool, int) {
 	if len(b.blocksNE)+cost > budgetBlocks {
 		return false, cost
 	}
+	b.version++ // R4: the seated write
 	b.seated[id] = struct{}{}
 	s.exiting = false // a fresh residency is non-exiting
 	set := s.set()
@@ -360,6 +371,7 @@ func (b *BlockIndex) TrackLocked(id string, window int) *sessionBlocks {
 	if s, ok := b.sessions[id]; ok {
 		return s
 	}
+	b.version++ // R4: record creation changes SetBlocks
 	if window <= 0 {
 		window = DefaultDispatchWindow
 	}
@@ -391,6 +403,7 @@ func (b *BlockIndex) Unseat(id string) {
 // countNE) from the budget counter. Refcount underflow is a programming
 // error and panics (the first draft's `c > 0` guards masked real bugs).
 func (b *BlockIndex) releaseLocked(s *sessionBlocks, countNE bool) {
+	b.version++ // R4: every mutation path bumps at its primitive
 	for h := range s.set() {
 		b.dec(b.blocks, h)
 		if countNE {
@@ -423,6 +436,7 @@ func (b *BlockIndex) MarkExiting(id string) {
 	if _, isSeated := b.seated[id]; !isSeated {
 		return // an unseated session is not exiting
 	}
+	b.version++ // R4: the exiting write
 	s.exiting = true
 	for h := range s.set() {
 		b.dec(b.blocksNE, h)
@@ -509,6 +523,7 @@ func (b *BlockIndex) Cancel(id, reqID string) error {
 // for gone blocks. The budget (non-exiting) counter participates only
 // while the session is seated and non-exiting.
 func (b *BlockIndex) applyDeltaLocked(s *sessionBlocks, old map[Hash]struct{}) {
+	b.version++ // R4: bumps even when unseated (SetBlocks feeds estimates)
 	_, isSeated := b.seated[s.id]
 	if !isSeated {
 		return // unseated sessions' records are private
@@ -775,7 +790,6 @@ func sameHashes(a, b []Hash) bool {
 // UpdateWaitingLocked is UpdateWaiting under an already-held lock, with
 // the arrival time recorded for the entry-order queries.
 func (b *BlockIndex) UpdateWaitingLocked(id, reqID string, hashes []Hash) {
-	b.version++
 	s := b.TrackLocked(id, 0)
 	old := s.set()
 	if _, ok := s.waiting[reqID]; ok {
@@ -798,7 +812,6 @@ func (b *BlockIndex) UpdateWaitingLocked(id, reqID string, hashes []Hash) {
 // overlapping sub-agent threads never fully drains, which would make it
 // de-facto Q=∞). In the fixed-window mode every dispatch is main.
 func (b *BlockIndex) SettleDispatchedAtLocked(id, reqID string, hashes []Hash, now time.Time) bool {
-	b.version++
 	s := b.TrackLocked(id, 0)
 	old := s.set()
 	if _, ok := s.waiting[reqID]; ok {
@@ -835,7 +848,6 @@ func (b *BlockIndex) SettleDispatchedLocked(id, reqID string, hashes []Hash) {
 
 // CancelLocked is Cancel under an already-held lock.
 func (b *BlockIndex) CancelLocked(id, reqID string) error {
-	b.version++
 	s, ok := b.sessions[id]
 	if !ok {
 		return ErrNotTracked
@@ -900,7 +912,6 @@ func (b *BlockIndex) ExitingLocked(id string) bool {
 
 // MarkExitingLocked is MarkExiting under an already-held lock.
 func (b *BlockIndex) MarkExitingLocked(id string) {
-	b.version++
 	s, ok := b.sessions[id]
 	if !ok || s.exiting {
 		return
@@ -908,6 +919,7 @@ func (b *BlockIndex) MarkExitingLocked(id string) {
 	if _, isSeated := b.seated[id]; !isSeated {
 		return
 	}
+	b.version++ // R4: the exiting write
 	s.exiting = true
 	for h := range s.set() {
 		b.dec(b.blocksNE, h)
@@ -916,7 +928,6 @@ func (b *BlockIndex) MarkExitingLocked(id string) {
 
 // UnseatLocked is Unseat under an already-held lock.
 func (b *BlockIndex) UnseatLocked(id string) {
-	b.version++
 	s, ok := b.sessions[id]
 	if !ok {
 		return
@@ -930,7 +941,6 @@ func (b *BlockIndex) UnseatLocked(id string) {
 
 // ForgetLocked is Forget under an already-held lock.
 func (b *BlockIndex) ForgetLocked(id string) {
-	b.version++
 	s, ok := b.sessions[id]
 	if !ok {
 		return
@@ -944,7 +954,6 @@ func (b *BlockIndex) ForgetLocked(id string) {
 
 // TrySeatLocked is TrySeat under an already-held lock.
 func (b *BlockIndex) TrySeatLocked(id string, budgetBlocks int) (bool, int) {
-	b.version++
 	s := b.TrackLocked(id, 0)
 	if _, isSeated := b.seated[id]; isSeated {
 		return true, 0
@@ -958,6 +967,7 @@ func (b *BlockIndex) TrySeatLocked(id string, budgetBlocks int) (bool, int) {
 	if len(b.blocksNE)+cost > budgetBlocks {
 		return false, cost
 	}
+	b.version++ // R4: the seated write
 	b.seated[id] = struct{}{}
 	s.exiting = false
 	set := s.set()
@@ -1034,7 +1044,7 @@ func (b *BlockIndex) HasNELocked(h Hash) bool {
 // delta's baseline). Stored on the session record so it persists across
 // residencies with the block set.
 func (b *BlockIndex) SetSizeLocked(id string, sizeBytes int64) int64 {
-	b.version++
+	b.version++ // R4: the lastSizeBytes write feeds the estimate delta
 	s := b.TrackLocked(id, 0)
 	old := s.lastSizeBytes
 	s.lastSizeBytes = sizeBytes

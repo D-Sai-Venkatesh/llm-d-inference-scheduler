@@ -292,14 +292,18 @@ func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.Inferen
 			}
 		}
 	}
-	// V3: the engine-side stagger — seated turns get priority over cold
-	// entry prefills in vLLM's waiting loop (Phase-2 deployments with
-	// --scheduling-policy priority; lower value = higher priority).
+	// V3/R6: the engine-side stagger — RESIDENT turns get priority over
+	// cold ENTRY prefills in vLLM's waiting loop (Phase-2 deployments
+	// with --scheduling-policy priority; lower value = higher
+	// priority). The split is entry-vs-resident, not seated-vs-not:
+	// seating happens in Pick BEFORE PreRequest, so a seated test would
+	// mark every tracked request high. EntryTurn marks this residency's
+	// first dispatch (the entry) low; every later turn is high.
 	if r.cfg.PriorityHeader == "engine" && request.Headers != nil {
-		if r.sched.Seated(id) {
-			request.Headers["X-Vllm-Priority"] = "0"
-		} else {
+		if r.sched.EntryTurn(id) {
 			request.Headers["X-Vllm-Priority"] = "10"
+		} else {
+			request.Headers["X-Vllm-Priority"] = "0"
 		}
 	}
 	keys := r.blockKeysFor(request)

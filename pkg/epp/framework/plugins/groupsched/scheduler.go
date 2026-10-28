@@ -136,6 +136,8 @@ type waiter struct {
 	id        string
 	since     time.Time // the OLDEST arrival (B5)
 	newcomer  bool
+	// sizeBytes is the last seen head's wire size (the C4 refresh input).
+	sizeBytes int64
 	// coldTokens is the entry's cold-prefill estimate in TOKENS
 	// (R1: one unit everywhere — blocks x blockSize).
 	coldTokens int64
@@ -363,6 +365,7 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 		if w.since.IsZero() || h.Arrival.Before(w.since) {
 			w.since = h.Arrival
 		}
+		w.sizeBytes = h.SizeBytes
 		w.coldTokens = s.estimateCostLocked(h.Session, h.SizeBytes) * int64(s.blockSize) // tokens (R1)
 	}
 	// vanished: members clear their waiting marker; waiters leave
@@ -529,7 +532,16 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 		ne := int64(s.index.UniqueBlocksNELocked()) + s.pendingTotal
 		estBlocks := head.coldTokens / int64(s.blockSize)
 		if ne+estBlocks <= int64(s.budgetBlocks) && s.coldAllows(head) {
-			s.seatLocked(head, now)
+			if !s.seatLocked(head, now) {
+				// C4 (always-on): TrySeat failed although the estimate
+				// passed — refresh the head's estimate from the
+				// authoritative index state and RETURN. Continuing with
+				// the stale estimate spins this loop forever under s.mu
+				// (the 13:00 deadlock class, reproduced by the golden
+				// scenario at sim≈1114).
+				head.coldTokens = s.estimateCostLocked(head.id, head.sizeBytes) * int64(s.blockSize)
+				return
+			}
 			continue
 		}
 		if reason, victim := s.rotationVictimLocked(now); victim != nil {
@@ -596,7 +608,8 @@ func (s *Scheduler) rotationVictimLocked(now time.Time) (string, *member) {
 		hasWaiting := !m.waitingSince.IsZero()
 		if best == nil ||
 			(hasWaiting && !bestHasWaiting) ||
-			(hasWaiting == bestHasWaiting && m.seatTime.Before(best.seatTime)) {
+			(hasWaiting == bestHasWaiting && m.seatTime.Before(best.seatTime)) ||
+			(hasWaiting == bestHasWaiting && m.seatTime.Equal(best.seatTime) && m.id < best.id) {
 			best, bestReason, bestHasWaiting = m, reason, hasWaiting
 		}
 	}
@@ -617,7 +630,8 @@ func (s *Scheduler) rotationVictimLocked(now time.Time) (string, *member) {
 			if s.index.ExitingLocked(m.id) {
 				continue
 			}
-			if best == nil || m.lastActivity.Before(best.lastActivity) {
+			if best == nil || m.lastActivity.Before(best.lastActivity) ||
+				(m.lastActivity.Equal(best.lastActivity) && m.id < best.id) {
 				best, bestReason = m, "engine-idle"
 			}
 		}
@@ -639,7 +653,8 @@ func (s *Scheduler) budgetVictimLocked(now time.Time) (string, *member) {
 		if s.index.ExitingLocked(m.id) || m.inflight > 0 {
 			continue
 		}
-		if best == nil || m.seatTime.Before(best.seatTime) {
+		if best == nil || m.seatTime.Before(best.seatTime) ||
+			(m.seatTime.Equal(best.seatTime) && m.id < best.id) {
 			best = m
 		}
 	}
@@ -651,7 +666,8 @@ func (s *Scheduler) budgetVictimLocked(now time.Time) (string, *member) {
 		if s.index.ExitingLocked(m.id) {
 			continue
 		}
-		if best == nil || m.seatTime.Before(best.seatTime) {
+		if best == nil || m.seatTime.Before(best.seatTime) ||
+			(m.seatTime.Equal(best.seatTime) && m.id < best.id) {
 			best = m
 		}
 	}
@@ -679,11 +695,13 @@ func (s *Scheduler) exitLocked(m *member, reason string, now time.Time) {
 	}
 }
 
-func (s *Scheduler) seatLocked(w *waiter, now time.Time) {
+func (s *Scheduler) seatLocked(w *waiter, now time.Time) bool {
 	// seat in the index first (history-based cost; the estimate-based
-	// budget check already ran in rotate — D13 reconciles the difference)
+	// budget check already ran in rotate — D13 reconciles the difference).
+	// Returns false when TrySeat rejects (the caller must refresh and
+	// return — C4).
 	if ok, _ := s.index.TrySeatLocked(w.id, s.budgetBlocks); !ok {
-		return
+		return false
 	}
 	s.everSeated[w.id] = struct{}{}
 	s.waitersdelete(w.id)
@@ -714,6 +732,7 @@ func (s *Scheduler) seatLocked(w *waiter, now time.Time) {
 		}
 	}
 	s.members[w.id] = m
+	return true
 }
 
 func (s *Scheduler) waitersdelete(id string) { delete(s.waiters, id) }

@@ -82,7 +82,7 @@ func (g *groupMetrics) Refresh() {
 	if g.seats == nil {
 		return
 	}
-	snap := g.sched.Snapshot()
+	snap := g.sched.SnapshotLite()
 	g.seats.Set(float64(snap.Seats))
 	g.uniqueBlocks.Set(float64(snap.UniqueBlocks))
 	g.neBlocks.Set(float64(snap.NEBlocks))

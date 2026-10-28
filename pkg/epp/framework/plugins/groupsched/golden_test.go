@@ -150,6 +150,17 @@ diff:
 
 // runGoldenScenario drives the scheduler and returns the trace.
 func runGoldenScenario(t *testing.T) string {
+	return runGoldenScenarioEnd(t, 2600)
+}
+
+// runGoldenScenarioEnd drives the scenario truncated at simEnd (the
+// legacy-c57e92ed comparison uses 489 — the pre-C4 code stalls on this
+// scenario shortly after ~500, AND at t=490 the always-on C8 fix
+// deliberately diverges from legacy (a member with a queued head is no
+// longer idle-evicted — the reviewer's predicted A0 caveat). The 489s
+// prefix is byte-identical; the divergence point is documented, not
+// hidden; S1).
+func runGoldenScenarioEnd(t *testing.T, simEnd int) string {
 	t.Helper()
 	s, err := NewScheduler(defaultConfig())
 	if err != nil {
@@ -215,7 +226,6 @@ func runGoldenScenario(t *testing.T) string {
 		return hs
 	}
 
-	const simEnd = 2600
 	for sim := 0; sim <= simEnd; sim++ {
 		now := goldenT0.Add(time.Duration(sim) * time.Second)
 
@@ -363,5 +373,37 @@ func TestGoldenDeterministic(t *testing.T) {
 	b := runGoldenScenario(t)
 	if a != b {
 		t.Fatal("scenario is not deterministic across runs")
+	}
+}
+
+// TestGoldenLegacyC57e92ed closes the golden's circularity (S1): the
+// committed testdata/golden-legacy.txt was generated from the RAW
+// pre-change code (c57e92ed) on this scenario truncated at sim 500
+// (the legacy TrySeat spin — C4 — stalls it shortly after). The current
+// build's default config must reproduce that prefix byte-identically,
+// pinning default == legacy on code that predates every change in this
+// branch, not just on itself.
+func TestGoldenLegacyC57e92ed(t *testing.T) {
+	got := runGoldenScenarioEnd(t, 489)
+	want, err := os.ReadFile(filepath.Join("testdata", "golden-legacy.txt"))
+	if err != nil {
+		t.Fatalf("legacy golden missing: %v", err)
+	}
+	if got != string(want) {
+		gotL := strings.Split(got, "\n")
+		wantL := strings.Split(string(want), "\n")
+		for i := 0; i < len(gotL) || i < len(wantL); i++ {
+			var a, b string
+			if i < len(gotL) {
+				a = gotL[i]
+			}
+			if i < len(wantL) {
+				b = wantL[i]
+			}
+			if a != b {
+				t.Fatalf("legacy golden divergence at line %d:\n  got:  %s\n  want: %s", i+1, a, b)
+			}
+		}
+		t.Fatal("legacy golden divergence (length)")
 	}
 }

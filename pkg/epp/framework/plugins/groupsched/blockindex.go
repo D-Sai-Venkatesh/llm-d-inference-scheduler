@@ -109,6 +109,9 @@ type BlockIndex struct {
 	chunkBytes      int
 	// useChains selects the derived dispatch window (SetWindowMode).
 	useChains bool
+	// version bumps on EVERY mutation (the scheduler's estimate cache
+	// key — M2: Picks run at ~1kHz; unchanged state must not recompute).
+	version uint64
 
 	blocks   map[Hash]int // refcount over seated members' sets
 	blocksNE map[Hash]int // refcount over seated, non-exiting members
@@ -208,6 +211,7 @@ func (b *BlockIndex) ExpireChainsLocked(maxAge time.Duration, now time.Time) {
 	if !b.useChains {
 		return
 	}
+	b.version++
 	for id, s := range b.sessions {
 		if _, isSeated := b.seated[id]; !isSeated {
 			continue // unseated records are private; no counters to fix
@@ -543,27 +547,58 @@ func (s *sessionBlocks) pushDispatched(hashes []Hash) {
 
 // pushChain records a dispatch on the derived window: if the request
 // extends an existing chain's prefix (chain growth, or an identical
-// retry), the entry is replaced; otherwise it starts a new chain. When
-// the cap is hit the least-recently-dispatched chain is dropped.
-func (s *sessionBlocks) pushChain(hashes []Hash, now time.Time) {
+// retry), the entry is replaced; otherwise it starts a new chain.
+// Returns whether the touched chain is the session's MAIN (largest)
+// chain. When the cap is hit the SMALLEST chain is dropped (V2: never
+// the main chain — its blocks are the ones the next turn needs).
+func (s *sessionBlocks) pushChain(hashes []Hash, now time.Time) bool {
+	touched := -1
 	for i := range s.chains {
 		if isPrefix(s.chains[i].hashes, hashes) {
 			s.chains[i] = chainEntry{hashes: hashes, last: now}
-			s.rebuildDispSet()
-			return
+			touched = i
+			break
 		}
 	}
-	s.chains = append(s.chains, chainEntry{hashes: hashes, last: now})
+	if touched < 0 {
+		s.chains = append(s.chains, chainEntry{hashes: hashes, last: now})
+		touched = len(s.chains) - 1
+	}
 	if len(s.chains) > maxChains {
-		oldest := 0
+		victim := -1
+		main := s.mainChainLocked()
 		for i := range s.chains {
-			if s.chains[i].last.Before(s.chains[oldest].last) {
-				oldest = i
+			if i == main {
+				continue
+			}
+			if victim < 0 || len(s.chains[i].hashes) < len(s.chains[victim].hashes) ||
+				(len(s.chains[i].hashes) == len(s.chains[victim].hashes) && s.chains[i].last.Before(s.chains[victim].last)) {
+				victim = i
 			}
 		}
-		s.chains = append(s.chains[:oldest], s.chains[oldest+1:]...)
+		if victim >= 0 {
+			s.chains = append(s.chains[:victim], s.chains[victim+1:]...)
+			if victim < touched {
+				touched--
+			}
+		}
 	}
 	s.rebuildDispSet()
+	// the dispatch is MAIN iff it landed on the (now-)largest chain; the
+	// touched entry's `last` is `now`, so it wins recency ties
+	return touched == s.mainChainLocked()
+}
+
+// mainChainLocked is the index of the largest chain (ties: latest last).
+func (s *sessionBlocks) mainChainLocked() int {
+	best := 0
+	for i := range s.chains {
+		if len(s.chains[i].hashes) > len(s.chains[best].hashes) ||
+			(len(s.chains[i].hashes) == len(s.chains[best].hashes) && s.chains[i].last.After(s.chains[best].last)) {
+			best = i
+		}
+	}
+	return best
 }
 
 // isPrefix reports whether a is a hash-prefix of b (chained hashes:
@@ -581,15 +616,19 @@ func isPrefix(a, b []Hash) bool {
 }
 
 // expireChains drops chains with no dispatch for longer than maxAge and
-// rebuilds the set. Returns true if anything changed.
+// rebuilds the set — EXCEPT the main (largest) chain, which is never
+// expired (V2: the main thread may wait on its sub-agents for minutes;
+// dropping its chain would unreserve the very blocks its next turn
+// needs). Returns true if anything changed.
 func (s *sessionBlocks) expireChains(maxAge time.Duration, now time.Time) bool {
 	if !s.useChains || len(s.chains) == 0 {
 		return false
 	}
+	main := s.mainChainLocked()
 	kept := s.chains[:0]
 	changed := false
-	for _, c := range s.chains {
-		if now.Sub(c.last) > maxAge {
+	for i, c := range s.chains {
+		if i != main && now.Sub(c.last) > maxAge {
 			changed = true
 			continue
 		}
@@ -736,6 +775,7 @@ func sameHashes(a, b []Hash) bool {
 // UpdateWaitingLocked is UpdateWaiting under an already-held lock, with
 // the arrival time recorded for the entry-order queries.
 func (b *BlockIndex) UpdateWaitingLocked(id, reqID string, hashes []Hash) {
+	b.version++
 	s := b.TrackLocked(id, 0)
 	old := s.set()
 	if _, ok := s.waiting[reqID]; ok {
@@ -752,7 +792,13 @@ func (b *BlockIndex) UpdateWaitingLocked(id, reqID string, hashes []Hash) {
 
 // SettleDispatchedAtLocked is SettleDispatchedLocked with an explicit
 // time (the derived window's chain timestamps — deterministic tests).
-func (b *BlockIndex) SettleDispatchedAtLocked(id, reqID string, hashes []Hash, now time.Time) {
+// Returns whether the dispatch landed on the session's MAIN chain —
+// the largest chain of the derived window (V1: the quantum counts busy
+// periods on the main chain; under root identity a busy root with
+// overlapping sub-agent threads never fully drains, which would make it
+// de-facto Q=∞). In the fixed-window mode every dispatch is main.
+func (b *BlockIndex) SettleDispatchedAtLocked(id, reqID string, hashes []Hash, now time.Time) bool {
+	b.version++
 	s := b.TrackLocked(id, 0)
 	old := s.set()
 	if _, ok := s.waiting[reqID]; ok {
@@ -760,14 +806,16 @@ func (b *BlockIndex) SettleDispatchedAtLocked(id, reqID string, hashes []Hash, n
 		delete(s.waitSince, reqID)
 		s.rebuildWaitSet()
 	}
+	main := true
 	if hashes != nil {
 		if s.useChains {
-			s.pushChain(hashes, now)
+			main = s.pushChain(hashes, now)
 		} else {
 			s.pushDispatched(hashes)
 		}
 	}
 	b.applyDeltaLocked(s, old)
+	return main
 }
 
 // SettleDispatchedLocked is SettleDispatched under an already-held lock.
@@ -787,6 +835,7 @@ func (b *BlockIndex) SettleDispatchedLocked(id, reqID string, hashes []Hash) {
 
 // CancelLocked is Cancel under an already-held lock.
 func (b *BlockIndex) CancelLocked(id, reqID string) error {
+	b.version++
 	s, ok := b.sessions[id]
 	if !ok {
 		return ErrNotTracked
@@ -851,6 +900,7 @@ func (b *BlockIndex) ExitingLocked(id string) bool {
 
 // MarkExitingLocked is MarkExiting under an already-held lock.
 func (b *BlockIndex) MarkExitingLocked(id string) {
+	b.version++
 	s, ok := b.sessions[id]
 	if !ok || s.exiting {
 		return
@@ -866,6 +916,7 @@ func (b *BlockIndex) MarkExitingLocked(id string) {
 
 // UnseatLocked is Unseat under an already-held lock.
 func (b *BlockIndex) UnseatLocked(id string) {
+	b.version++
 	s, ok := b.sessions[id]
 	if !ok {
 		return
@@ -879,6 +930,7 @@ func (b *BlockIndex) UnseatLocked(id string) {
 
 // ForgetLocked is Forget under an already-held lock.
 func (b *BlockIndex) ForgetLocked(id string) {
+	b.version++
 	s, ok := b.sessions[id]
 	if !ok {
 		return
@@ -892,6 +944,7 @@ func (b *BlockIndex) ForgetLocked(id string) {
 
 // TrySeatLocked is TrySeat under an already-held lock.
 func (b *BlockIndex) TrySeatLocked(id string, budgetBlocks int) (bool, int) {
+	b.version++
 	s := b.TrackLocked(id, 0)
 	if _, isSeated := b.seated[id]; isSeated {
 		return true, 0
@@ -928,6 +981,15 @@ func (b *BlockIndex) FitBlocksLocked(hashes []Hash) int {
 
 // UniqueBlocksNELocked is UniqueBlocksNE under an already-held lock.
 func (b *BlockIndex) UniqueBlocksNELocked() int { return len(b.blocksNE) }
+
+// UniqueBlocksLocked is UniqueBlocks under an already-held lock (ALL
+// seated members, including exiting — their blocks stay pinned until
+// they drain; the size-aware gate's usage term, M4).
+func (b *BlockIndex) UniqueBlocksLocked() int { return len(b.blocks) }
+
+// VersionLocked is the mutation counter under an already-held lock (the
+// estimate-cache key).
+func (b *BlockIndex) VersionLocked() uint64 { return b.version }
 
 // SetBlocks returns the session's full block set (the fit input).
 func (b *BlockIndex) SetBlocks(id string) []Hash {
@@ -972,6 +1034,7 @@ func (b *BlockIndex) HasNELocked(h Hash) bool {
 // delta's baseline). Stored on the session record so it persists across
 // residencies with the block set.
 func (b *BlockIndex) SetSizeLocked(id string, sizeBytes int64) int64 {
+	b.version++
 	s := b.TrackLocked(id, 0)
 	old := s.lastSizeBytes
 	s.lastSizeBytes = sizeBytes

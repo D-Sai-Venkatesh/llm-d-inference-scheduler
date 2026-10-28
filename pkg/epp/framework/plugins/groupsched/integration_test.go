@@ -59,22 +59,22 @@ func (d *unsaturatedDetector) TypedName() fwkplugin.TypedName {
 // intRequest is a request carrying an agent-identity InferenceRequest
 // (the session) and a wire size (the estimate input).
 type intRequest struct {
-	id      string
-	key     flowcontrol.FlowKey
-	size    uint64
-	infReq  *fwksched.InferenceRequest
+	id     string
+	key    flowcontrol.FlowKey
+	size   uint64
+	infReq *fwksched.InferenceRequest
 }
 
-func (r *intRequest) FlowKey() flowcontrol.FlowKey       { return r.key }
-func (r *intRequest) ByteSize() uint64                   { return r.size }
-func (r *intRequest) InitialEffectiveTTL() time.Duration { return 5 * time.Minute }
-func (r *intRequest) ID() string                         { return r.id }
-func (r *intRequest) GetMetadata() map[string]any        { return nil }
-func (r *intRequest) InferencePoolName() string          { return "test-pool" }
-func (r *intRequest) ModelName() string                  { return "test-model" }
-func (r *intRequest) TargetModelName() string            { return "test-target" }
+func (r *intRequest) FlowKey() flowcontrol.FlowKey                 { return r.key }
+func (r *intRequest) ByteSize() uint64                             { return r.size }
+func (r *intRequest) InitialEffectiveTTL() time.Duration           { return 5 * time.Minute }
+func (r *intRequest) ID() string                                   { return r.id }
+func (r *intRequest) GetMetadata() map[string]any                  { return nil }
+func (r *intRequest) InferencePoolName() string                    { return "test-pool" }
+func (r *intRequest) ModelName() string                            { return "test-model" }
+func (r *intRequest) TargetModelName() string                      { return "test-target" }
 func (r *intRequest) InferenceRequest() *fwksched.InferenceRequest { return r.infReq }
-func (r *intRequest) ReceivedTimestamp() time.Time       { return time.Now() }
+func (r *intRequest) ReceivedTimestamp() time.Time                 { return time.Now() }
 
 func newIntRequest(session, id string, size uint64) *intRequest {
 	ir := &fwksched.InferenceRequest{RequestID: id, RequestSizeBytes: int(size)}
@@ -105,9 +105,9 @@ func newIntegrationHarness(t *testing.T, plugin fwkplugin.Plugin) (*controller.F
 
 	fc := controller.NewFlowController(ctx, "groupsched-integration-test",
 		&controller.Config{
-			DefaultRequestTTL:       5 * time.Minute,
-			NoEndpointRequestTTL:    5 * time.Minute,
-			ExpiryCleanupInterval:   10 * time.Millisecond,
+			DefaultRequestTTL:        5 * time.Minute,
+			NoEndpointRequestTTL:     5 * time.Minute,
+			ExpiryCleanupInterval:    10 * time.Millisecond,
 			EnqueueChannelBufferSize: 100,
 		},
 		controller.Deps{

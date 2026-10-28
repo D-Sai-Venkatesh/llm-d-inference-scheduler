@@ -107,6 +107,8 @@ type BlockIndex struct {
 	salt            Hash
 	blockSizeTokens int
 	chunkBytes      int
+	// useChains selects the derived dispatch window (SetWindowMode).
+	useChains bool
 
 	blocks   map[Hash]int // refcount over seated members' sets
 	blocksNE map[Hash]int // refcount over seated, non-exiting members
@@ -118,17 +120,40 @@ type BlockIndex struct {
 // sessionBlocks is one session's rolling block set: the union of its
 // waiting requests and its last-window dispatched requests, plus the
 // seating state.
+//
+// The dispatch window has two modes (BUILD-PLAN §1, windowMode):
+//   - last4 (legacy): the fixed N-request window (dispHist/dispSet).
+//   - derived: one entry per LIVE prefix-chain (chains) — the last
+//     request of each chain, expiring after S of no dispatch on that
+//     chain. MANDATORY under root-session identity, where fan-out
+//     within one id is real and a fixed window undercounts.
 type sessionBlocks struct {
-	id      string
-	window  int
-	waiting map[string][]Hash      // reqID -> chained hashes
-	waitSince map[string]time.Time // reqID -> arrival (the entry-order input)
-	lastSizeBytes int64            // last-known wire size (the estimate baseline)
-	dispHist [][]Hash
-	dispSet map[Hash]struct{}
-	waitSet map[Hash]struct{}
-	exiting bool
+	id            string
+	window        int
+	waiting       map[string][]Hash    // reqID -> chained hashes
+	waitSince     map[string]time.Time // reqID -> arrival (the entry-order input)
+	lastSizeBytes int64                // last-known wire size (the estimate baseline)
+	dispHist      [][]Hash
+	dispSet       map[Hash]struct{}
+	waitSet       map[Hash]struct{}
+	exiting       bool
+	// chains is the derived-window state (useChains selects the mode).
+	useChains bool
+	chains    []chainEntry
 }
+
+// chainEntry is the derived window's unit: the latest request of one
+// prefix-chain (a chain = a sequence of requests where each extends the
+// previous one's hash prefix — conversation growth; a divergent or
+// shorter request starts a new chain, e.g. a sub-agent leaf sharing
+// only the preamble).
+type chainEntry struct {
+	hashes []Hash
+	last   time.Time // last dispatch on this chain (the expiry input)
+}
+
+// maxChains bounds the derived window per session (fan-out safety).
+const maxChains = 64
 
 // NewBlockIndex returns an index for an engine whose KV blocks hold
 // blockSizeTokens tokens (from cache_config_info / the endpoint metrics).
@@ -166,6 +191,33 @@ func (b *BlockIndex) ChunkBytes() int { return b.chunkBytes }
 
 // BlockSizeTokens is the measured engine block size in tokens.
 func (b *BlockIndex) BlockSizeTokens() int { return b.blockSizeTokens }
+
+// SetWindowMode selects the dispatch window mode BEFORE any tracking:
+// "last4" (legacy fixed window) or "derived" (per-live-chain). Must be
+// called at construction (the scheduler does), not mid-flight.
+func (b *BlockIndex) SetWindowMode(mode string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.useChains = mode == "derived"
+}
+
+// ExpireChainsLocked expires the derived window's idle chains (window
+// mode "derived"; the scheduler's Tick calls it with S). Under the
+// scheduler's lock.
+func (b *BlockIndex) ExpireChainsLocked(maxAge time.Duration, now time.Time) {
+	if !b.useChains {
+		return
+	}
+	for id, s := range b.sessions {
+		if _, isSeated := b.seated[id]; !isSeated {
+			continue // unseated records are private; no counters to fix
+		}
+		old := s.set()
+		if s.expireChains(maxAge, now) {
+			b.applyDeltaLocked(s, old)
+		}
+	}
+}
 
 // HashBody chunks a serialized request body and returns the CHAINED hash
 // of each chunk: h_i = H(salt ‖ h_{i−1} ‖ chunk_i). Position-sensitive:
@@ -220,7 +272,7 @@ func (b *BlockIndex) Track(id string, window int) *sessionBlocks {
 	if window <= 0 {
 		window = DefaultDispatchWindow
 	}
-	s := &sessionBlocks{id: id, window: window,
+	s := &sessionBlocks{id: id, window: window, useChains: b.useChains,
 		waiting: make(map[string][]Hash), waitSince: make(map[string]time.Time),
 		dispSet: make(map[Hash]struct{}), waitSet: make(map[Hash]struct{})}
 	b.sessions[id] = s
@@ -307,7 +359,7 @@ func (b *BlockIndex) TrackLocked(id string, window int) *sessionBlocks {
 	if window <= 0 {
 		window = DefaultDispatchWindow
 	}
-	s := &sessionBlocks{id: id, window: window,
+	s := &sessionBlocks{id: id, window: window, useChains: b.useChains,
 		waiting: make(map[string][]Hash), waitSince: make(map[string]time.Time),
 		dispSet: make(map[Hash]struct{}), waitSet: make(map[Hash]struct{})}
 	b.sessions[id] = s
@@ -414,7 +466,7 @@ func (b *BlockIndex) SettleDispatched(id, reqID string, body []byte) error {
 	hashes, ok := s.waiting[reqID]
 	if !ok {
 		// never waited (dispatched directly): hash the body now
-	 hashes = b.HashBodyLocked(body)
+		hashes = b.HashBodyLocked(body)
 	} else {
 		delete(s.waiting, reqID)
 		s.rebuildWaitSet()
@@ -478,6 +530,10 @@ func (b *BlockIndex) applyDeltaLocked(s *sessionBlocks, old map[Hash]struct{}) {
 }
 
 func (s *sessionBlocks) pushDispatched(hashes []Hash) {
+	if s.useChains {
+		s.pushChain(hashes, time.Now())
+		return
+	}
 	s.dispHist = append(s.dispHist, hashes)
 	if len(s.dispHist) > s.window {
 		s.dispHist = s.dispHist[len(s.dispHist)-s.window:]
@@ -485,8 +541,77 @@ func (s *sessionBlocks) pushDispatched(hashes []Hash) {
 	s.rebuildDispSet()
 }
 
+// pushChain records a dispatch on the derived window: if the request
+// extends an existing chain's prefix (chain growth, or an identical
+// retry), the entry is replaced; otherwise it starts a new chain. When
+// the cap is hit the least-recently-dispatched chain is dropped.
+func (s *sessionBlocks) pushChain(hashes []Hash, now time.Time) {
+	for i := range s.chains {
+		if isPrefix(s.chains[i].hashes, hashes) {
+			s.chains[i] = chainEntry{hashes: hashes, last: now}
+			s.rebuildDispSet()
+			return
+		}
+	}
+	s.chains = append(s.chains, chainEntry{hashes: hashes, last: now})
+	if len(s.chains) > maxChains {
+		oldest := 0
+		for i := range s.chains {
+			if s.chains[i].last.Before(s.chains[oldest].last) {
+				oldest = i
+			}
+		}
+		s.chains = append(s.chains[:oldest], s.chains[oldest+1:]...)
+	}
+	s.rebuildDispSet()
+}
+
+// isPrefix reports whether a is a hash-prefix of b (chained hashes:
+// extension of the same conversation prefix).
+func isPrefix(a, b []Hash) bool {
+	if len(a) == 0 || len(a) > len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// expireChains drops chains with no dispatch for longer than maxAge and
+// rebuilds the set. Returns true if anything changed.
+func (s *sessionBlocks) expireChains(maxAge time.Duration, now time.Time) bool {
+	if !s.useChains || len(s.chains) == 0 {
+		return false
+	}
+	kept := s.chains[:0]
+	changed := false
+	for _, c := range s.chains {
+		if now.Sub(c.last) > maxAge {
+			changed = true
+			continue
+		}
+		kept = append(kept, c)
+	}
+	if changed {
+		s.chains = kept
+		s.rebuildDispSet()
+	}
+	return changed
+}
+
 func (s *sessionBlocks) rebuildDispSet() {
 	s.dispSet = make(map[Hash]struct{})
+	if s.useChains {
+		for _, c := range s.chains {
+			for _, h := range c.hashes {
+				s.dispSet[h] = struct{}{}
+			}
+		}
+		return
+	}
 	for _, w := range s.dispHist {
 		for _, h := range w {
 			s.dispSet[h] = struct{}{}
@@ -621,6 +746,26 @@ func (b *BlockIndex) UpdateWaitingLocked(id, reqID string, hashes []Hash) {
 	s.waitSince[reqID] = time.Now()
 	for _, h := range hashes {
 		s.waitSet[h] = struct{}{}
+	}
+	b.applyDeltaLocked(s, old)
+}
+
+// SettleDispatchedAtLocked is SettleDispatchedLocked with an explicit
+// time (the derived window's chain timestamps — deterministic tests).
+func (b *BlockIndex) SettleDispatchedAtLocked(id, reqID string, hashes []Hash, now time.Time) {
+	s := b.TrackLocked(id, 0)
+	old := s.set()
+	if _, ok := s.waiting[reqID]; ok {
+		delete(s.waiting, reqID)
+		delete(s.waitSince, reqID)
+		s.rebuildWaitSet()
+	}
+	if hashes != nil {
+		if s.useChains {
+			s.pushChain(hashes, now)
+		} else {
+			s.pushDispatched(hashes)
+		}
 	}
 	b.applyDeltaLocked(s, old)
 }

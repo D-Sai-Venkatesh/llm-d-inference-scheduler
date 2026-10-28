@@ -98,6 +98,12 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		handle: handle,
 	}
 	r.metrics = newGroupMetrics(r.sched)
+	// BUILD-PLAN §1(ii): echo EVERY knob at startup — each arm's config
+	// is verifiable afterwards from the run artifacts (also carried in
+	// DumpState/Snapshot.Config).
+	if echo, err := json.Marshal(cfg); err == nil {
+		fmt.Printf("group-scheduler: effective config %s\n", echo)
+	}
 	if handle != nil {
 		if reg := handle.Metrics(); reg != nil {
 			if err := r.metrics.register(reg); err != nil {
@@ -107,6 +113,12 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		r.sched.onExit = r.metrics.ObserveExit
 		r.sched.onEntry = r.metrics.ObserveEntry
 		r.sched.onServe = r.metrics.ObserveServed
+		// the per-id SEAT/EXIT event log (one debug line each; the
+		// campaign's spans could not see seat membership).
+		r.sched.onEvent = func(ev Event) {
+			fmt.Printf("group-scheduler event t=%s kind=%s id=%s %s\n",
+				ev.T.UTC().Format(time.RFC3339Nano), ev.Kind, ev.ID, ev.Detail)
+		}
 		go r.runTicker(handle.Context())
 	}
 	return r, nil
@@ -327,7 +339,7 @@ func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.Infer
 	if response.Usage.PromptTokenDetails != nil {
 		usage.Cached = response.Usage.PromptTokenDetails.CachedTokens
 	}
-	r.sched.Settle(id, usage, response.TerminationCause == fwkrc.TerminationCauseNatural, time.Now())
+	r.sched.Settle(id, request.RequestID, usage, response.TerminationCause == fwkrc.TerminationCauseNatural, time.Now())
 }
 
 // DumpState reports the group snapshot (§13).

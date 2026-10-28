@@ -60,7 +60,7 @@ func dispatch(t *testing.T, s *Scheduler, session string, k []Hash, size int64) 
 
 func settle(s *Scheduler, session string, prompt, cached int) {
 	s.Chunk(session)
-	s.Settle(session, struct{ Prompt, Cached int }{prompt, cached}, true, time.Now())
+	s.Settle(session, "", struct{ Prompt, Cached int }{prompt, cached}, true, time.Now())
 }
 
 func TestMemberServedImmediately(t *testing.T) {
@@ -245,7 +245,7 @@ func TestColdCapReleasedAtChunkNotDecodeEnd(t *testing.T) {
 		t.Fatal("b seats after the release")
 	}
 	// non-natural termination releases as well (settle without Chunk)
-	s.Settle("b", struct{ Prompt, Cached int }{}, false, now)
+	s.Settle("b", "", struct{ Prompt, Cached int }{}, false, now)
 	s.mu.Lock()
 	cold = s.coldInFlight
 	s.mu.Unlock()
@@ -266,7 +266,7 @@ func TestEveryTurnCountsTowardNMax(t *testing.T) {
 		s.PickFromHeads([]Head{head("a", time.Second, bytesFor(10))}, now)
 		dispatch(t, s, "a", keys(10, 1), bytesFor(10))
 		// NON-natural terminations (errors): no payback ledger, but turns count
-		s.Settle("a", struct{ Prompt, Cached int }{}, false, now)
+		s.Settle("a", "", struct{ Prompt, Cached int }{}, false, now)
 	}
 	// resTurns = 8 = n_max: eligible even though earned == 0
 	s.mu.Lock()

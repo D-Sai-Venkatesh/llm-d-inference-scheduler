@@ -48,7 +48,7 @@ func reproSeat(t *testing.T, idx *BlockIndex, id string, body []byte) {
 	if err := idx.UpdateWaiting(id, "r", body); err != nil {
 		t.Fatal(err)
 	}
-	if ok, _ := idx.TrySeat(id, 1 << 20); !ok {
+	if ok, _ := idx.TrySeat(id, 1<<20); !ok {
 		t.Fatalf("seat %s rejected", id)
 	}
 }

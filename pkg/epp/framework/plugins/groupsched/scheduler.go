@@ -43,6 +43,45 @@ type Config struct {
 	// BlockSizeTokens is the engine's KV block size in tokens (the token
 	// processor's value; 64 on the campaign stacks, M4). Required > 0.
 	BlockSizeTokens int `json:"blockSizeTokens"`
+
+	// ---- v2 knobs (BUILD-PLAN §1; the defaults reproduce the legacy
+	// decision path exactly — pinned by the golden replay test) ----
+
+	// RotationMode selects the exit-eligibility model:
+	//   "ledger"  — the legacy payback ledger (rho, nMax). DEFAULT.
+	//   "quantum" — the busy-period quantum: a member is rotation-
+	//               eligible when it has completed QuantumBusyPeriods
+	//               busy periods (inflight 0→>0→0) or is silent > S.
+	RotationMode string `json:"rotationMode"`
+	// QuantumBusyPeriods is Q (rotationMode "quantum" only):
+	// 0 → 4; -1 → ∞ (the pause arm P∞: no member is ever
+	// quantum-complete, so the waiting excess never displaces residents).
+	QuantumBusyPeriods int `json:"quantumBusyPeriods"`
+	// ValveMode: "on" (legacy cold-entry stagger) | "off" (the stagger
+	// moves to the engine: --scheduling-policy priority +
+	// long_prefill_token_threshold + X-Vllm-Priority; Phase-2 deployment).
+	ValveMode string `json:"valveMode"`
+	// VictimOrder: "legacy" (earliest-seated, prefers members WITH a
+	// queued turn — C2) | "spec" (prefers members with NO queued turn,
+	// then oldest last completion — ALGORITHM §7).
+	VictimOrder string `json:"victimOrder"`
+	// WindowMode: "last4" (legacy fixed 4-request dispatch window) |
+	// "derived" (one entry per live prefix-chain, expiring after
+	// IdleSeconds — MANDATORY under root-session identity, where fan-out
+	// within one id is real and a fixed window undercounts).
+	WindowMode string `json:"windowMode"`
+	// GateMode: "detector" (legacy: the stack's saturation detector
+	// gates dispatch at ~0.80 running KV) | "size-aware" (the plugin
+	// gates each dispatch: NE + pending + this request's new blocks ≤
+	// GroupBudgetFraction × HBM, from the EPP's own accounting; deploy
+	// with the detector raised to ~0.95 so it no longer binds first).
+	GateMode string `json:"gateMode"`
+	// InflightReapSeconds bounds the age of a CONFIRMED in-flight
+	// request id before reconciliation drops it (C3: requests whose
+	// termination is never observed — the harness request timeout is
+	// 3600s, so 3700 reaps only true leaks). Provisional ids (chosen at
+	// Pick but never reaching PreRequest) are reaped after 30s.
+	InflightReapSeconds float64 `json:"inflightReapSeconds"`
 }
 
 func defaultConfig() Config {
@@ -55,6 +94,13 @@ func defaultConfig() Config {
 		ColdEntryCapTokens:  131072,
 		InFlightCap:         64,
 		BlockSizeTokens:     64,
+		RotationMode:        "ledger",
+		QuantumBusyPeriods:  0, // -> 4
+		ValveMode:           "on",
+		VictimOrder:         "legacy",
+		WindowMode:          "last4",
+		GateMode:            "detector",
+		InflightReapSeconds: 3700,
 	}
 }
 
@@ -64,6 +110,17 @@ func (c Config) nMax() int {
 	}
 	return 2 * c.Rho
 }
+
+// quantum is the effective Q (rotationMode "quantum").
+func (c Config) quantum() int {
+	if c.QuantumBusyPeriods != 0 {
+		return c.QuantumBusyPeriods
+	}
+	return 4
+}
+
+// quantumFinite reports whether Q is finite (false = the pause arm P∞).
+func (c Config) quantumFinite() bool { return c.quantum() >= 0 }
 
 func (c Config) validate() error {
 	if c.GroupBudgetFraction <= 0 || c.GroupBudgetFraction > 1 {
@@ -81,7 +138,58 @@ func (c Config) validate() error {
 	if c.BlockSizeTokens <= 0 {
 		return fmt.Errorf("blockSizeTokens is required (the token processor's block size; got %d)", c.BlockSizeTokens)
 	}
+	if c.RotationMode == "" {
+		c.RotationMode = "ledger"
+	}
+	switch c.RotationMode {
+	case "ledger", "quantum":
+	default:
+		return fmt.Errorf("rotationMode: invalid value %q (ledger|quantum)", c.RotationMode)
+	}
+	if c.ValveMode == "" {
+		c.ValveMode = "on"
+	}
+	switch c.ValveMode {
+	case "on", "off":
+	default:
+		return fmt.Errorf("valveMode: invalid value %q (on|off)", c.ValveMode)
+	}
+	if c.VictimOrder == "" {
+		c.VictimOrder = "legacy"
+	}
+	switch c.VictimOrder {
+	case "legacy", "spec":
+	default:
+		return fmt.Errorf("victimOrder: invalid value %q (legacy|spec)", c.VictimOrder)
+	}
+	if c.WindowMode == "" {
+		c.WindowMode = "last4"
+	}
+	switch c.WindowMode {
+	case "last4", "derived":
+	default:
+		return fmt.Errorf("windowMode: invalid value %q (last4|derived)", c.WindowMode)
+	}
+	if c.GateMode == "" {
+		c.GateMode = "detector"
+	}
+	switch c.GateMode {
+	case "detector", "size-aware":
+	default:
+		return fmt.Errorf("gateMode: invalid value %q (detector|size-aware)", c.GateMode)
+	}
+	if c.InflightReapSeconds != 0 && c.InflightReapSeconds < 60 {
+		return fmt.Errorf("inflightReapSeconds must be >= 60 (the harness request timeout is 3600s; got %v)", c.InflightReapSeconds)
+	}
 	return nil
+}
+
+// reapSeconds is the effective confirmed-id reap bound (0 → default).
+func (c Config) reapSeconds() float64 {
+	if c.InflightReapSeconds > 0 {
+		return c.InflightReapSeconds
+	}
+	return 3700
 }
 
 // ---- the queue-head snapshot (S0-1: waiting state comes from the
@@ -107,8 +215,21 @@ type member struct {
 	entryCost int64
 	earned    int64
 	resTurns  int
-	// inflight counts dispatched, unsettled requests.
+	// inflight is DERIVED each decision point from inflightIDs
+	// (derive-don't-accumulate, BUILD-PLAN §1): a leaked increment
+	// cannot persist past a reconciliation.
 	inflight int
+	// inflightIDs tracks the member's in-flight request ids with their
+	// confirmation state (C3): provisional (chosen at Pick, not yet at
+	// PreRequest) ids are reaped after 30s; confirmed ids after
+	// InflightReapSeconds. m.inflight = len(inflightIDs).
+	inflightIDs map[string]inflightRec
+	// busyPeriods counts completed busy periods (inflight 0→>0→0) —
+	// the quantum's unit (rotationMode "quantum").
+	busyPeriods int
+	// lastCompletion is the last time inflight returned to zero (the
+	// spec victim order's tie-break: oldest last completion first).
+	lastCompletion time.Time
 	// lastActivity is the last arrival, dispatch or completion.
 	lastActivity time.Time
 	// coldEntry is this member's outstanding cold-entry charge in TOKENS
@@ -132,10 +253,16 @@ type member struct {
 	waitingSince time.Time
 }
 
+// inflightRec is one in-flight request's reconciliation record (C3).
+type inflightRec struct {
+	since     time.Time // Pick time (provisional) / PreRequest time (confirmed)
+	confirmed bool
+}
+
 type waiter struct {
-	id        string
-	since     time.Time // the OLDEST arrival (B5)
-	newcomer  bool
+	id       string
+	since    time.Time // the OLDEST arrival (B5)
+	newcomer bool
 	// sizeBytes is the last seen head's wire size (the C4 refresh input).
 	sizeBytes int64
 	// coldTokens is the entry's cold-prefill estimate in TOKENS
@@ -152,15 +279,17 @@ type Scheduler struct {
 	onExit  func(reason string, resTurns int)
 	onEntry func(waitSeconds float64)
 	onServe func()
+	onEvent func(Event)
 
-	index        *BlockIndex // attached at startup (block size from config)
-	budgetBlocks int         // 0 until num_gpu_blocks arrives (metrics)
-	numBlocks    int
-	blockSize    int
+	index             *BlockIndex // attached at startup (block size from config)
+	budgetBlocks      int         // 0 until num_gpu_blocks arrives (metrics)
+	numBlocks         int
+	blockSize         int
 	blockSizeMismatch error
 
-	members   map[string]*member
-	waiters   map[string]*waiter
+	members    map[string]*member
+	waiters    map[string]*waiter
+	events     []Event
 	everSeated map[string]struct{}
 	// lastSeen is the per-record activity time for the silence GC (R2):
 	// updated at Dispatched and Settle; a headless, unseated record
@@ -173,14 +302,15 @@ type Scheduler struct {
 	pendingTotal int64
 
 	counters struct {
-		exits      map[string]int64
-		entryWaits []float64
-		resTurns   []int
-		refillShare float64
-		uncachedTok int64
-		totalTok    int64
-		served      int64
-		fcfsServed  int64
+		exits        map[string]int64
+		entryWaits   []float64
+		reentryWaits []float64
+		resTurns     []int
+		refillShare  float64
+		uncachedTok  int64
+		totalTok     int64
+		served       int64
+		fcfsServed   int64
 	}
 }
 
@@ -194,6 +324,7 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 	if err != nil {
 		return nil, err
 	}
+	idx.SetWindowMode(cfg.WindowMode)
 	s := &Scheduler{cfg: cfg, index: idx, blockSize: cfg.BlockSizeTokens,
 		members: map[string]*member{}, waiters: map[string]*waiter{},
 		everSeated: map[string]struct{}{}, lastSeen: map[string]time.Time{}}
@@ -277,12 +408,15 @@ func (s *Scheduler) PickFromHeads(heads []Head, now time.Time) int {
 	if s.index == nil {
 		return -1
 	}
+	s.deriveLocked() // derive-don't-accumulate: recomputed, never trusted across paths
+	s.reapInflightLocked(now)
 	s.syncWaitersLocked(heads, now)
 	s.enforceBudgetLocked(now)
 	s.rotateLocked(now)
 
 	best := -1
 	var bestArrival time.Time
+	var bestHead Head
 	for i, h := range heads {
 		if h.Session == "" {
 			continue // anonymous traffic is not tracked (passes through last)
@@ -295,12 +429,26 @@ func (s *Scheduler) PickFromHeads(heads []Head, now time.Time) int {
 			continue
 		}
 		if best < 0 || h.Arrival.Before(bestArrival) {
-			best, bestArrival = i, h.Arrival
+			best, bestArrival, bestHead = i, h.Arrival, h
 		}
 	}
+	// the size-aware dispatch gate (v2): dispatch only if the EPP's own
+	// accounting says the request's new blocks fit the HBM budget. The
+	// stack's saturation detector is deployed at ~0.95 so it no longer
+	// binds first; THIS is the gate (BUILD-PLAN §1).
+	if best >= 0 && s.cfg.GateMode == "size-aware" && !s.gateAllowsLocked(bestHead) {
+		best = -1
+	}
 	if best >= 0 {
-		s.members[heads[best].Session].inflight++
-		s.members[heads[best].Session].lastActivity = now
+		m := s.members[heads[best].Session]
+		m.inflight++
+		if m.inflightIDs == nil {
+			m.inflightIDs = map[string]inflightRec{}
+		}
+		if bestHead.ReqID != "" {
+			m.inflightIDs[bestHead.ReqID] = inflightRec{since: now} // provisional (C3): confirmed at Dispatched
+		}
+		m.lastActivity = now
 		s.counters.served++
 		if s.onServe != nil {
 			s.onServe()
@@ -312,10 +460,32 @@ func (s *Scheduler) PickFromHeads(heads []Head, now time.Time) int {
 	// traffic is never tracked, never seated, never starved).
 	for i, h := range heads {
 		if h.Session == "" {
+			if s.cfg.GateMode == "size-aware" && !s.gateAllowsLocked(h) {
+				continue
+			}
 			return i
 		}
 	}
 	return -1
+}
+
+// gateAllowsLocked is the size-aware dispatch gate: current usage (NE
+// + pending estimates) plus this request's new blocks must fit the
+// budget. Computed from the EPP's OWN accounting — never the scraped
+// kv_cache_usage (stale by a scrape interval; kept as a cross-check
+// gauge only). A member's own admission estimate (pendingBlocks) is
+// NOT double-counted: its new blocks are est minus what its pending
+// already reserves.
+func (s *Scheduler) gateAllowsLocked(h Head) bool {
+	if s.budgetBlocks <= 0 {
+		return true
+	}
+	est := s.estimateCostLocked(h.Session, h.SizeBytes)
+	if m, ok := s.members[h.Session]; ok && m.pendingBlocks > 0 {
+		est = max(est-m.pendingBlocks, 0)
+	}
+	ne := int64(s.index.UniqueBlocksNELocked()) + s.pendingTotal
+	return ne+est <= int64(s.budgetBlocks)
 }
 
 // FCFSPick returns the oldest head (the pre-capacity pass-through, A5).
@@ -418,10 +588,22 @@ func (s *Scheduler) Dispatched(id, reqID string, keys []Hash, sizeBytes int64, n
 		return
 	}
 	s.index.SetSizeLocked(id, sizeBytes) // the estimate baseline
-	s.index.SettleDispatchedLocked(id, reqID, keys)
+	s.index.SettleDispatchedAtLocked(id, reqID, keys, now)
 	if m, ok := s.members[id]; ok {
 		m.lastActivity = now
 		m.lastSizeBytes = sizeBytes
+		// C3: reconcile the in-flight id — confirm a provisional one
+		// (Pick already counted it), or record a dispatch that never
+		// passed PickFromHeads (pre-capacity FCFS pass-through).
+		if reqID != "" {
+			if m.inflightIDs == nil {
+				m.inflightIDs = map[string]inflightRec{}
+			}
+			if _, had := m.inflightIDs[reqID]; !had {
+				m.inflight++
+			}
+			m.inflightIDs[reqID] = inflightRec{since: now, confirmed: true}
+		}
 		if m.pendingBlocks > 0 {
 			s.pendingTotal -= m.pendingBlocks
 			m.pendingBlocks = 0 // the exact keys are in NE now (D13 reconciles)
@@ -458,15 +640,30 @@ func (s *Scheduler) releaseColdLocked(id string) {
 // Settle records a terminated dispatched request: the in-flight
 // decrement for EVERY cause; n_max counts every settled turn (A8); the
 // payback ledger only on natural completion.
-func (s *Scheduler) Settle(id string, usage struct{ Prompt, Cached int }, natural bool, now time.Time) {
+func (s *Scheduler) Settle(id, reqID string, usage struct{ Prompt, Cached int }, natural bool, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastSeen[id] = now
 	m, seated := s.members[id]
 	if seated {
-		m.inflight = max(m.inflight-1, 0)
+		// C3: remove the in-flight record; the counter follows the map
+		// (derive-don't-accumulate — a leaked increment cannot persist).
+		if reqID != "" && m.inflightIDs != nil {
+			if _, had := m.inflightIDs[reqID]; had {
+				delete(m.inflightIDs, reqID)
+				m.inflight = max(m.inflight-1, 0)
+			}
+		} else {
+			m.inflight = max(m.inflight-1, 0)
+		}
 		m.lastActivity = now
 		s.releaseColdLocked(id) // S0-2: any termination releases the charge
+		// the busy period closes when inflight returns to zero
+		// (inflight 0→>0→0 = one busy period; the quantum's unit).
+		if m.inflight == 0 {
+			m.busyPeriods++
+			m.lastCompletion = now
+		}
 	}
 	if !seated {
 		return
@@ -504,20 +701,82 @@ func (s *Scheduler) Settle(id string, usage struct{ Prompt, Cached int }, natura
 
 // ---- rotation (§7) ----
 
+// eligibleLocked is the LEGACY ledger rule (rotationMode "ledger"):
+// paid / idle / nmax. The C8 fix is always-on: a member with a live
+// queued head is never idle (its lastActivity cannot be refreshed when
+// Picks stop — gate closure used to manufacture idle exits).
 func (s *Scheduler) eligibleLocked(m *member, now time.Time) (string, bool) {
 	if m.inflight > 0 {
+		return "", false
+	}
+	if s.cfg.RotationMode == "quantum" {
+		// the busy-period quantum: eligible when Q busy periods are
+		// complete (never, under Q=∞ — the pause arm) or on silence.
+		if s.cfg.quantumFinite() && m.busyPeriods >= s.cfg.quantum() {
+			return "quantum-complete", true
+		}
+		if s.silentLocked(m, now) {
+			return "idle", true
+		}
 		return "", false
 	}
 	if m.resTurns >= 1 && m.earned >= int64(s.cfg.Rho)*max(m.entryCost, 1) {
 		return "paid", true
 	}
-	if now.Sub(m.lastActivity) > time.Duration(s.cfg.IdleSeconds*float64(time.Second)) {
+	if s.silentLocked(m, now) {
 		return "idle", true
 	}
 	if m.resTurns >= s.cfg.nMax() {
 		return "nmax", true
 	}
 	return "", false
+}
+
+// silentLocked is the idle test with the C8 fix: silent means no
+// activity AND no queued head (a waiting member wants to run).
+func (s *Scheduler) silentLocked(m *member, now time.Time) bool {
+	if !m.waitingSince.IsZero() {
+		return false
+	}
+	return now.Sub(m.lastActivity) > time.Duration(s.cfg.IdleSeconds*float64(time.Second))
+}
+
+// deriveLocked recomputes the derived aggregates from member records
+// (derive-don't-accumulate, BUILD-PLAN §1): a leaked or missed increment
+// anywhere cannot persist past the next decision point.
+func (s *Scheduler) deriveLocked() {
+	var cold, pend int64
+	for _, m := range s.members {
+		cold += m.coldEntry
+		pend += m.pendingBlocks
+	}
+	s.coldInFlight = cold
+	s.pendingTotal = pend
+}
+
+// reapInflightLocked drops in-flight ids whose termination was never
+// observed (C3): provisional ids (chosen at Pick, never reaching
+// PreRequest) after 30s; confirmed ids after InflightReapSeconds (the
+// harness request timeout is 3600s — anything older is a leak).
+func (s *Scheduler) reapInflightLocked(now time.Time) {
+	for _, m := range s.members {
+		if len(m.inflightIDs) == 0 {
+			continue
+		}
+		for rid, rec := range m.inflightIDs {
+			limit := 30 * time.Second
+			if rec.confirmed {
+				limit = time.Duration(s.cfg.reapSeconds() * float64(time.Second))
+			}
+			if now.Sub(rec.since) > limit {
+				delete(m.inflightIDs, rid)
+				m.inflight = max(m.inflight-1, 0)
+				if m.inflight == 0 {
+					m.lastCompletion = now
+				}
+			}
+		}
+	}
 }
 
 func (s *Scheduler) rotateLocked(now time.Time) {
@@ -586,13 +845,17 @@ func (s *Scheduler) entryHeadLocked() *waiter {
 // when nothing cold is in flight, or newcomers-first + hold-the-line
 // deadlocks the queue on it forever.
 func (s *Scheduler) coldAllows(w *waiter) bool {
+	if s.cfg.ValveMode == "off" {
+		return true // the stagger moved to the engine (Phase-2 deployment)
+	}
 	return s.coldInFlight == 0 || s.coldInFlight+w.coldTokens <= s.cfg.ColdEntryCapTokens
 }
 
-// rotationVictimLocked (§7 demand-driven exit, B4: no-waiting is a
-// PREFERENCE not an exclusion — paid members with queued next turns
-// must remain evictable): eligible members, sorted by (has-waiting,
-// seatTime); the engine-idle rule as the liveness fallback.
+// rotationVictimLocked (§7 demand-driven exit). LEGACY order (B4,
+// C2-as-shipped): eligible members sorted by (has-waiting, seatTime) —
+// inverted vs ALGORITHM §7, kept as the default. SPEC order
+// (victimOrder "spec"): no-queued-turn members first, then oldest
+// last completion. The engine-idle rule stays the liveness fallback.
 func (s *Scheduler) rotationVictimLocked(now time.Time) (string, *member) {
 	var best *member
 	var bestReason string
@@ -606,10 +869,20 @@ func (s *Scheduler) rotationVictimLocked(now time.Time) (string, *member) {
 			continue
 		}
 		hasWaiting := !m.waitingSince.IsZero()
-		if best == nil ||
-			(hasWaiting && !bestHasWaiting) ||
-			(hasWaiting == bestHasWaiting && m.seatTime.Before(best.seatTime)) ||
-			(hasWaiting == bestHasWaiting && m.seatTime.Equal(best.seatTime) && m.id < best.id) {
+		var better bool
+		if s.cfg.VictimOrder == "spec" {
+			// spec: prefer NO queued turn, then oldest last completion
+			better = best == nil ||
+				(!hasWaiting && bestHasWaiting) ||
+				(hasWaiting == bestHasWaiting && olderCompletion(m, best))
+		} else {
+			// legacy: prefer members WITH a queued turn, earliest-seated
+			better = best == nil ||
+				(hasWaiting && !bestHasWaiting) ||
+				(hasWaiting == bestHasWaiting && m.seatTime.Before(best.seatTime)) ||
+				(hasWaiting == bestHasWaiting && m.seatTime.Equal(best.seatTime) && m.id < best.id)
+		}
+		if better {
 			best, bestReason, bestHasWaiting = m, reason, hasWaiting
 		}
 	}
@@ -639,14 +912,77 @@ func (s *Scheduler) rotationVictimLocked(now time.Time) (string, *member) {
 	return bestReason, best
 }
 
-// budgetVictimLocked is the §6 growth order: eligible, then idle
-// (nothing in flight), then the exiting class — the earliest-seated
-// member EVEN MID-FLIGHT (the caller marks it exiting, which drops its
-// NE contribution immediately; it leaves when its requests drain, §6.3).
-// Budget enforcement only — rotation never evicts an un-eligible member.
+// olderCompletion is the spec order's tie-break: oldest last
+// completion first (a member that finished seconds ago is the LAST
+// candidate, not the first).
+func olderCompletion(a, b *member) bool {
+	if a.lastCompletion.IsZero() {
+		return false
+	}
+	if b.lastCompletion.IsZero() {
+		return true
+	}
+	return a.lastCompletion.Before(b.lastCompletion) ||
+		(a.lastCompletion.Equal(b.lastCompletion) && a.id < b.id)
+}
+
+// budgetVictimLocked is the §6 growth order. LEGACY: eligible, then
+// idle (nothing in flight), then the exiting class — earliest-seated
+// EVEN MID-FLIGHT (the caller marks it exiting, which drops its NE
+// contribution immediately; it leaves when its requests drain, §6.3).
+// QUANTUM mode replaces the whole ladder with the BUILD-PLAN §1 order:
+// (1) quantum-complete idle; (2) done or silent > S; (3) mid-quantum
+// idle, oldest last completion first; (4) the exiting class,
+// mid-flight. Budget enforcement only — rotation never evicts an
+// un-eligible member.
 func (s *Scheduler) budgetVictimLocked(now time.Time) (string, *member) {
 	if reason, m := s.rotationVictimLocked(now); m != nil {
 		return reason, m
+	}
+	if s.cfg.RotationMode == "quantum" {
+		// class (2): done (no queued head) or silent > S
+		var best *member
+		for _, m := range s.members {
+			if s.index.ExitingLocked(m.id) || m.inflight > 0 {
+				continue
+			}
+			if m.waitingSince.IsZero() || s.silentLocked(m, now) {
+				if best == nil || olderCompletion(m, best) {
+					best = m
+				}
+			}
+		}
+		if best != nil {
+			return "budget-done", best
+		}
+		// class (3): mid-quantum idle — the safety valve on GENUINE growth
+		// pressure only (admissions were budget-checked; under Q=∞ the
+		// waiting excess never reaches here — it waits without
+		// displacing residents, the bounded rotation set).
+		for _, m := range s.members {
+			if s.index.ExitingLocked(m.id) || m.inflight > 0 {
+				continue
+			}
+			if best == nil || olderCompletion(m, best) {
+				best = m
+			}
+		}
+		if best != nil {
+			return "budget-idle", best
+		}
+		// class (4): the exiting class, mid-flight
+		for _, m := range s.members {
+			if s.index.ExitingLocked(m.id) {
+				continue
+			}
+			if best == nil || olderCompletion(m, best) {
+				best = m
+			}
+		}
+		if best != nil {
+			return "budget-exiting", best
+		}
+		return "", nil
 	}
 	var best *member
 	for _, m := range s.members {
@@ -684,6 +1020,7 @@ func (s *Scheduler) exitLocked(m *member, reason string, now time.Time) {
 	s.index.UnseatLocked(m.id)
 	delete(s.members, m.id)
 	s.counters.exits[reason]++
+	s.recordEvent("EXIT", m.id, fmt.Sprintf("reason=%s turns=%d", reason, m.resTurns), now)
 	if s.onExit != nil {
 		s.onExit(reason, m.resTurns)
 	}
@@ -691,6 +1028,7 @@ func (s *Scheduler) exitLocked(m *member, reason string, now time.Time) {
 	// waiting-since (FIFO survives the exit)
 	if !m.waitingSince.IsZero() {
 		s.waiters[m.id] = &waiter{id: m.id, since: m.waitingSince,
+			sizeBytes:  m.lastSizeBytes,
 			coldTokens: s.estimateCostLocked(m.id, m.lastSizeBytes) * int64(s.blockSize)}
 	}
 }
@@ -706,9 +1044,9 @@ func (s *Scheduler) seatLocked(w *waiter, now time.Time) bool {
 	s.everSeated[w.id] = struct{}{}
 	s.waitersdelete(w.id)
 	m := &member{
-		id:        w.id,
-		seatTime:  now,
-		lastActivity: now,
+		id:            w.id,
+		seatTime:      now,
+		lastActivity:  now,
 		lastSizeBytes: s.index.LastSizeBytesLocked(w.id),
 		// the head that triggered this seating is still queued (the
 		// serve happens after rotate): inherit its presence so the
@@ -724,13 +1062,21 @@ func (s *Scheduler) seatLocked(w *waiter, now time.Time) bool {
 	// keys land at PreRequest
 	m.pendingBlocks = w.coldTokens / int64(s.blockSize)
 	s.pendingTotal += m.pendingBlocks
+	// C7: record ALL seat waits (newcomers AND re-entries — the last
+	// campaign's re-entry waits were invisible); the newcomer counter
+	// and the onEntry hook keep their legacy semantics (golden trace).
+	kind := "re-entry"
 	if w.newcomer {
+		kind = "newcomer"
 		wait := now.Sub(w.since).Seconds()
 		s.counters.entryWaits = append(s.counters.entryWaits, wait)
 		if s.onEntry != nil {
 			s.onEntry(wait)
 		}
+	} else {
+		s.counters.reentryWaits = append(s.counters.reentryWaits, now.Sub(w.since).Seconds())
 	}
+	s.recordEvent("SEAT", w.id, fmt.Sprintf("kind=%s wait=%.3f", kind, now.Sub(w.since).Seconds()), now)
 	s.members[w.id] = m
 	return true
 }
@@ -762,6 +1108,13 @@ func (s *Scheduler) enforceBudgetLocked(now time.Time) {
 func (s *Scheduler) Tick(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.deriveLocked() // derive-don't-accumulate, every decision point
+	s.reapInflightLocked(now)
+	// the derived window's chain expiry (windowMode "derived"):
+	// chains with no dispatch for > S leave the session's set.
+	if s.cfg.WindowMode == "derived" {
+		s.index.ExpireChainsLocked(time.Duration(s.cfg.IdleSeconds*float64(time.Second)), now)
+	}
 	s.enforceBudgetLocked(now)
 	for id, m := range s.members {
 		if now.Sub(m.lastActivity) > time.Duration(s.cfg.TTLSeconds*float64(time.Second)) &&
@@ -805,18 +1158,56 @@ func (s *Scheduler) isNewcomerLocked(id string) bool {
 
 // ---- introspection ----
 
+// ---- the seat/exit event log (BUILD-PLAN §1 instrumentation: spans
+// cannot see seats — every future run needs this) ----
+
+// Event is one seat/exit/exiting decision, per id, with reason and
+// timestamp. Kept as a bounded ring (dumped in DumpState) and emitted
+// to the onEvent hook (the plugin logs one line per event).
+type Event struct {
+	T      time.Time `json:"t"`
+	Kind   string    `json:"kind"`   // SEAT | EXIT | EXITING
+	ID     string    `json:"id"`     // the session id
+	Detail string    `json:"detail"` // reason=... turns=... / kind=... wait=...
+}
+
+const eventRingSize = 2048
+
+func (s *Scheduler) recordEvent(kind, id, detail string, now time.Time) {
+	ev := Event{T: now, Kind: kind, ID: id, Detail: detail}
+	s.events = append(s.events, ev)
+	if len(s.events) > eventRingSize {
+		s.events = s.events[len(s.events)-eventRingSize:]
+	}
+	if s.onEvent != nil {
+		s.onEvent(ev)
+	}
+}
+
+// Events returns the recent event ring (newest last).
+func (s *Scheduler) Events() []Event {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Event(nil), s.events...)
+}
+
 type Snapshot struct {
-	Seats        int
-	UniqueBlocks int
-	NEBlocks     int
-	BudgetBlocks int
-	Waiters      int
-	Exits        map[string]int64
-	MeanResTurns float64
-	EntryWaitP50 float64
-	RefillShare  float64
-	Served       int64
-	FCFSServed   int64
+	Seats          int
+	UniqueBlocks   int
+	NEBlocks       int
+	BudgetBlocks   int
+	Waiters        int
+	Exits          map[string]int64
+	MeanResTurns   float64
+	EntryWaitP50   float64
+	ReentryWaitP50 float64
+	RefillShare    float64
+	Served         int64
+	FCFSServed     int64
+	// Config echoes the effective knob values (auditable runs).
+	Config Config
+	// RecentEvents is the tail of the seat/exit ring.
+	RecentEvents []Event
 }
 
 func (s *Scheduler) Snapshot() Snapshot {
@@ -824,7 +1215,8 @@ func (s *Scheduler) Snapshot() Snapshot {
 	defer s.mu.Unlock()
 	snap := Snapshot{Seats: len(s.members), Waiters: len(s.waiters),
 		Exits: map[string]int64{}, BudgetBlocks: s.budgetBlocks,
-		Served: s.counters.served, FCFSServed: s.counters.fcfsServed}
+		Served: s.counters.served, FCFSServed: s.counters.fcfsServed,
+		Config: s.cfg, RecentEvents: append([]Event(nil), s.events...)}
 	for k, v := range s.counters.exits {
 		snap.Exits[k] = v
 	}
@@ -843,6 +1235,11 @@ func (s *Scheduler) Snapshot() Snapshot {
 		w := append([]float64(nil), s.counters.entryWaits...)
 		sort.Float64s(w)
 		snap.EntryWaitP50 = w[n/2]
+	}
+	if n := len(s.counters.reentryWaits); n > 0 {
+		w := append([]float64(nil), s.counters.reentryWaits...)
+		sort.Float64s(w)
+		snap.ReentryWaitP50 = w[n/2]
 	}
 	snap.RefillShare = s.counters.refillShare
 	return snap

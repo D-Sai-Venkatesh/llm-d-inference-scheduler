@@ -190,12 +190,12 @@ func runGoldenScenario(t *testing.T) string {
 	// inFlight: reqID -> (session, arrivalSim, sizeBytes) — the requests
 	// dispatched and not yet settled; settle after a decode period.
 	type flight struct {
-		sess  *gsSession
-		reqID string
-		arr   int
-		blocks int
+		sess     *gsSession
+		reqID    string
+		arr      int
+		blocks   int
 		settleAt int
-		natural bool
+		natural  bool
 	}
 	var flying []*flight
 
@@ -232,7 +232,7 @@ func runGoldenScenario(t *testing.T) string {
 					}
 				}
 				s.Chunk(g.id)
-				s.Settle(g.id, usage, f.natural, goldenT0.Add(time.Duration(f.settleAt)*time.Second))
+				s.Settle(g.id, f.reqID, usage, f.natural, goldenT0.Add(time.Duration(f.settleAt)*time.Second))
 				tr.line("t=%d SETTLE %s req=%s natural=%v", f.settleAt, g.id, f.reqID, f.natural)
 				for _, l := range exitLog {
 					tr.line("t=%d %s", f.settleAt, l)

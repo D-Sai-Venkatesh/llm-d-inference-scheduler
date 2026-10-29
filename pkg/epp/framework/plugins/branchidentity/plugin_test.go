@@ -510,3 +510,73 @@ func TestLogRequests(t *testing.T) {
 	out = capture(t, func() { branchOf(t, off, req()) })
 	assert.Empty(t, out, "logRequests=false must print nothing")
 }
+
+// TestLogHeadersKeepResolveOutcomeIdentical (stage-1 P1): the logHeaders instrument
+// copies the client's x-correlation-id / x-request-id into the per-request line so an
+// UNSCOPED arm (no session header → empty scope) can still score the derived-vs-thread
+// confusion matrix per request. It must be a pure OBSERVER: the same request sequence
+// fed to a plugin with the instrument on and one with it off must resolve to the same
+// derived ids, the same outcomes and the same fairness ids.
+func TestLogHeadersKeepResolveOutcomeIdentical(t *testing.T) {
+	build := func(t *testing.T, logHeaders bool) *Plugin {
+		t.Helper()
+		p, err := Factory("branch", json.NewDecoder(strings.NewReader(
+			`{"logRequests":true,"logHeaders":`+fmt.Sprint(logHeaders)+`}`)),
+			testutils.NewTestHandle(t.Context()))
+		require.NoError(t, err)
+		return p.(*Plugin)
+	}
+
+	// Three turns of one thread plus a sibling extending the same prefix: the
+	// sequence exercises a "new", a "matched" and a fork decision.
+	seq := func() []*fwksched.InferenceRequest {
+		mk := func(turn int) *fwksched.InferenceRequest {
+			msgs := []fwkrh.Message{user('a', 600)}
+			for i := 1; i < turn; i++ {
+				msgs = append(msgs, assistant('b', 300), user('c', 300))
+			}
+			r := chatReq(msgs...)
+			r.Headers["x-correlation-id"] = "thread-42"
+			r.Headers["x-request-id"] = fmt.Sprintf("req-%d", turn)
+			return r
+		}
+		return []*fwksched.InferenceRequest{mk(1), mk(2), mk(3), mk(2)}
+	}
+
+	run := func(t *testing.T, logHeaders bool) (ids, fids []string, logged string) {
+		t.Helper()
+		r, w, err := os.Pipe()
+		require.NoError(t, err)
+		orig := os.Stdout
+		os.Stdout = w
+		defer func() { os.Stdout = orig }()
+		done := make(chan string, 1)
+		go func() {
+			b, _ := io.ReadAll(r)
+			done <- string(b)
+		}()
+		p := build(t, logHeaders)
+		for _, req := range seq() {
+			id, fid := branchOf(t, p, req)
+			ids = append(ids, id)
+			fids = append(fids, fid)
+			// clear the arrival marker so the next turn sees a free tip
+			p.idx.Settle(id, markerOf(req), p.now())
+		}
+		require.NoError(t, w.Close())
+		return ids, fids, <-done
+	}
+
+	offIDs, offFIDs, offOut := run(t, false)
+	onIDs, onFIDs, onOut := run(t, true)
+
+	assert.Equal(t, offIDs, onIDs, "derived ids must not depend on the instrument")
+	assert.Equal(t, offFIDs, onFIDs, "fairness ids must not depend on the instrument")
+	// the derived id IS the fairness id in an arm with no explicit header
+	for i := range onIDs {
+		assert.Equal(t, onIDs[i], onFIDs[i], "unscoped run: derived id is the queue key")
+	}
+	assert.NotContains(t, offOut, "\"headers\"", "logHeaders=false must not copy headers")
+	assert.Contains(t, onOut, `"x-correlation-id":"thread-42"`)
+	assert.Contains(t, onOut, `"x-request-id":"req-1"`)
+}

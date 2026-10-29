@@ -145,7 +145,27 @@ type Parameters struct {
 	// lines to its records by (scope, arrival order). It changes no state and no
 	// decision; with it off the plugin is byte-for-byte the same code path.
 	LogRequests bool `json:"logRequests,omitempty"`
+	// LogHeaders adds the client's own identity headers to that line:
+	//
+	//	"headers":{"x-correlation-id":"…","x-request-id":"…"}
+	//
+	// It exists for the UNSCOPED stage-1 arm, where no session header is sent and
+	// `scope` is therefore empty: the census (StateDumper) cannot attribute a
+	// branch to a client thread there, but the harness's thread id still travels
+	// on a NON-fairness header, so copying it makes the per-request
+	// derived-vs-thread confusion matrix exact. A FIXED whitelist of two headers,
+	// read-only: it is gated on LogRequests and touches neither the identity nor
+	// any decision (`TestLogHeadersKeepResolveOutcomeIdentical` pins that).
+	LogHeaders bool `json:"logHeaders,omitempty"`
 }
+
+// loggedHeaderNames is the logHeaders whitelist: the client's correlation id (the
+// thread ground truth a harness reports in its records) and its request id.
+var loggedHeaderNames = []string{"x-correlation-id", "x-request-id"}
+
+// maxLoggedHeaderLen truncates a copied header value so one malformed client
+// cannot blow up a log line.
+const maxLoggedHeaderLen = 128
 
 // validate resolves defaults in place and rejects impossible values.
 func (p *Parameters) validate() error {
@@ -204,6 +224,7 @@ type Plugin struct {
 	sticky      bool
 	retry       bool
 	logRequests bool
+	logHeaders  bool
 	sessions    []string
 	// now is the clock seam: the replay validation (stage 0c) drives recorded
 	// arrival/dispatch/settle times through the real hooks, so every time
@@ -237,6 +258,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		sticky:      params.StickyBusyGuard == nil || *params.StickyBusyGuard,
 		retry:       params.RetryRule == nil || *params.RetryRule,
 		logRequests: params.LogRequests,
+		logHeaders:  params.LogRequests && params.LogHeaders,
 		sessions:    sessionHeaders(params.SessionHeaders),
 		now:         time.Now,
 	}
@@ -342,26 +364,60 @@ func (p *Plugin) logRequest(request *fwksched.InferenceRequest, res ResolveResul
 		return
 	}
 	line, err := json.Marshal(struct {
-		Seq      uint64 `json:"seq"`
-		TS       string `json:"ts"`
-		Scope    string `json:"scope"`
-		Derived  string `json:"derived"`
-		Outcome  string `json:"outcome"`
-		Retry    bool   `json:"retry,omitempty"`
-		Sticky   bool   `json:"sticky,omitempty"`
-		Explicit bool   `json:"explicit"`
-		Blocks   int    `json:"blocks"`
-		Bytes    int    `json:"bytes"`
-		Marker   string `json:"marker"`
+		Seq      uint64            `json:"seq"`
+		TS       string            `json:"ts"`
+		Scope    string            `json:"scope"`
+		Derived  string            `json:"derived"`
+		Outcome  string            `json:"outcome"`
+		Retry    bool              `json:"retry,omitempty"`
+		Sticky   bool              `json:"sticky,omitempty"`
+		Explicit bool              `json:"explicit"`
+		Blocks   int               `json:"blocks"`
+		Bytes    int               `json:"bytes"`
+		Marker   string            `json:"marker"`
+		Headers  map[string]string `json:"headers,omitempty"`
 	}{
 		Seq: p.logSeq.Add(1), TS: p.now().UTC().Format(time.RFC3339Nano), Scope: scope,
 		Derived: res.ID, Outcome: string(res.Outcome), Retry: res.Retry, Sticky: res.StickyBusy,
 		Explicit: explicit, Blocks: blocks, Bytes: bytes, Marker: markerOf(request),
+		Headers: p.loggedHeaders(request),
 	})
 	if err != nil {
 		return
 	}
 	fmt.Printf("branch-identity: request %s\n", line)
+}
+
+// loggedHeaders copies the whitelisted client headers from the request (lowercase
+// keys, as the handler stores them; a case-insensitive scan covers a client that
+// framed them otherwise). Pure read — no attribute, no id, no decision.
+func (p *Plugin) loggedHeaders(request *fwksched.InferenceRequest) map[string]string {
+	if !p.logHeaders || request == nil || len(request.Headers) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(loggedHeaderNames))
+	for _, name := range loggedHeaderNames {
+		v := request.Headers[name]
+		if v == "" {
+			for k, cand := range request.Headers {
+				if strings.EqualFold(k, name) {
+					v = cand
+					break
+				}
+			}
+		}
+		if v == "" {
+			continue
+		}
+		if len(v) > maxLoggedHeaderLen {
+			v = v[:maxLoggedHeaderLen]
+		}
+		out[name] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // PreRequest records the DISPATCH transition (admitted → on its way to an

@@ -373,12 +373,15 @@ type Scheduler struct {
 		// request carries a real id end to end).
 		emptyReqIDs  int64
 		straySettles int64
-		resTurns     []int
-		refillShare  float64
-		uncachedTok  int64
-		totalTok     int64
-		served       int64
-		fcfsServed   int64
+		// gateSkipped counts heads the size-aware gate turned away
+		// (first-fit skips; the v2-freeze diagnostic).
+		gateSkipped int64
+		resTurns    []int
+		refillShare float64
+		uncachedTok int64
+		totalTok    int64
+		served      int64
+		fcfsServed  int64
 	}
 }
 
@@ -484,9 +487,20 @@ func (s *Scheduler) PickFromHeads(heads []Head, now time.Time) int {
 	s.enforceBudgetLocked(now)
 	s.rotateLocked(now)
 
-	best := -1
-	var bestArrival time.Time
-	var bestHead Head
+	// member heads, OLDEST-FIRST. The size-aware dispatch gate (v2) is
+	// FIRST-FIT: dispatch the first head that fits, SKIP the ones that
+	// don't (they stay queued). The first deployed v2 checked only the
+	// single oldest head and returned -1 when it didn't fit — with the
+	// budget near-full the oldest head NEVER fit, nothing else could
+	// dispatch, no busy period ever completed (no quantum-complete
+	// victims), and the C8 fix kept the waiting members from being
+	// idle-evicted: a self-sustaining head-of-line freeze (the 02:13Z
+	// v2 incident; dump banked as v2-freeze-goroutines.txt).
+	type cand struct {
+		i int
+		h Head
+	}
+	var cands []cand
 	for i, h := range heads {
 		if h.Session == "" {
 			continue // anonymous traffic is not tracked (passes through last)
@@ -498,16 +512,18 @@ func (s *Scheduler) PickFromHeads(heads []Head, now time.Time) int {
 		if m.inflight >= s.cfg.InFlightCap {
 			continue
 		}
-		if best < 0 || h.Arrival.Before(bestArrival) {
-			best, bestArrival, bestHead = i, h.Arrival, h
-		}
+		cands = append(cands, cand{i, h})
 	}
-	// the size-aware dispatch gate (v2): dispatch only if the EPP's own
-	// accounting says the request's new blocks fit the HBM budget. The
-	// stack's saturation detector is deployed at ~0.95 so it no longer
-	// binds first; THIS is the gate (BUILD-PLAN §1).
-	if best >= 0 && s.cfg.GateMode == "size-aware" && !s.gateAllowsLocked(bestHead) {
-		best = -1
+	sort.SliceStable(cands, func(x, y int) bool { return cands[x].h.Arrival.Before(cands[y].h.Arrival) })
+	best := -1
+	var bestHead Head
+	for _, c := range cands {
+		if s.cfg.GateMode == "size-aware" && !s.gateAllowsLocked(c.h) {
+			s.counters.gateSkipped++ // diagnostic: heads the gate turned away
+			continue
+		}
+		best, bestHead = c.i, c.h
+		break
 	}
 	if best >= 0 {
 		m := s.members[heads[best].Session]

@@ -58,8 +58,13 @@ Nothing in the scheduler changes: the policy seats whatever id it is given.
      `msgCount` in the request the first message past the tip.
    - **S2 retry rule**: a request **byte-identical** to the tip while the branch has nothing IN
      FLIGHT (only arrival markers) is a client retry of a still-queued turn, not a sibling →
-     continue (`retryRule`, on by default; counted as `retry_total`). Two identical prompts that
-     are genuinely both in flight reach `PreRequest` and fork there;
+     continue (`retryRule`, on by default; counted as `retry_total`). Two identical prompts are
+     indistinguishable by body, and the flow-control queue key is fixed at arrival: when both
+     arrive while the tip is still queued they MERGE into one queue entry, and nothing re-keys
+     them at `PreRequest`. That is the cheaper error (identical bodies share their whole prefix,
+     so the merge costs no cache) against forking a queue on what may be a pure retry. An
+     identical prompt arriving after the first one was DISPATCHED is decided by the busy flag and
+     forks normally;
    - tip outstanding → **fork** a new branch. The usual case is a sub-agent inheriting the
      parent's context.
 5. **Opaque stable ids**: 10 hex chars derived from the creating stream's tip commitment, the fork

@@ -36,6 +36,13 @@ package branchidentity
 //	STAGE0C_UNSCOPED=1   send no session header (the no-session-header floor, and
 //	                     the S4 "unscoped" variant: what a corpus of look-alike
 //	                     sessions costs when nothing scopes the index)
+//	STAGE0C_RETRY_RULE=0 configure the arm with retryRule=false (the campaign
+//	                     setting: both a0 firings of S2 turned out to be
+//	                     CROSS-thread, i.e. no client retries in the corpus at all)
+//	STAGE0C_SCOPE=thread scope the index by the request's own thread id
+//	                     (x_correlation_id) instead of its session root — the shape
+//	                     the shadow arm has, where the only session header the client
+//	                     sends IS the thread id. Root is the stage-0c default.
 //
 // Nothing here touches the cluster, a GPU, or the network: it is a local replay of
 // recorded bodies.
@@ -84,11 +91,18 @@ type stage0cLine struct {
 }
 
 // stage0cResult is one request's outcome, keyed by the window index.
+//
+// Outcome/Retry/Sticky come from the plugin's own counters, diffed around the one
+// RequestHeader call, so a scoring pass can name WHICH requests a rule fired on
+// (the S2 retry total alone says how many, never which).
 type stage0cResult struct {
-	I     int    `json:"i"`
-	Req   string `json:"req"`
-	ID    string `json:"id"`
-	Parse bool   `json:"parseError"`
+	I       int    `json:"i"`
+	Req     string `json:"req"`
+	ID      string `json:"id"`
+	Parse   bool   `json:"parseError"`
+	Outcome string `json:"outcome,omitempty"`
+	Retry   bool   `json:"retry,omitempty"`
+	Sticky  bool   `json:"sticky,omitempty"`
 }
 
 func TestStage0CReplay(t *testing.T) {
@@ -163,10 +177,15 @@ func TestStage0CReplay(t *testing.T) {
 	})
 
 	// The plugin, configured as the stage-1 arm will be, except that the session
-	// header is the replay's own scope header.
+	// header is the replay's own scope header. STAGE0C_RETRY_RULE=0 reproduces the
+	// CAMPAIGN setting (retryRule off — see the C3 labelling of the two a0 firings).
 	handle := testutils.NewTestHandle(ctx)
+	retryRule := "true"
+	if os.Getenv("STAGE0C_RETRY_RULE") == "0" {
+		retryRule = "false"
+	}
 	built, err := Factory("stage0c", json.NewDecoder(bytes.NewReader(
-		[]byte(`{"sessionHeaders":["`+stage0cScopeHeader+`"]}`))), handle)
+		[]byte(`{"sessionHeaders":["`+stage0cScopeHeader+`"],"retryRule":`+retryRule+`}`))), handle)
 	if err != nil {
 		t.Fatalf("build plugin: %v", err)
 	}
@@ -201,7 +220,11 @@ func TestStage0CReplay(t *testing.T) {
 			}
 			headers := map[string]string{":path": "/v1/chat/completions"}
 			if !unscoped {
-				headers[stage0cScopeHeader] = l.GTRoot
+				if os.Getenv("STAGE0C_SCOPE") == "thread" {
+					headers[stage0cScopeHeader] = l.GT
+				} else {
+					headers[stage0cScopeHeader] = l.GTRoot
+				}
 			}
 			req := &fwksched.InferenceRequest{RequestID: l.Req, Headers: headers}
 			parsed, err := parser.ParseRequest(ctx, wire.Body, headers)
@@ -212,9 +235,23 @@ func TestStage0CReplay(t *testing.T) {
 				req.Body = parsed.Body
 			}
 			reqs[ev.idx] = req
+			matched0, forked0, new0 := counterValue(p.metrics.matched), counterValue(p.metrics.forked), counterValue(p.metrics.fresh)
+			sticky0, retry0 := counterValue(p.metrics.sticky), counterValue(p.metrics.retried)
 			if err := p.RequestHeader(ctx, req); err != nil {
 				t.Fatalf("RequestHeader %d: %v", l.I, err)
 			}
+			switch {
+			case counterValue(p.metrics.matched) > matched0:
+				results[ev.idx].Outcome = "matched"
+			case counterValue(p.metrics.forked) > forked0:
+				results[ev.idx].Outcome = "forked"
+			case counterValue(p.metrics.fresh) > new0:
+				results[ev.idx].Outcome = "new"
+			default:
+				results[ev.idx].Outcome = "unflattened"
+			}
+			results[ev.idx].Retry = counterValue(p.metrics.retried) > retry0
+			results[ev.idx].Sticky = counterValue(p.metrics.sticky) > sticky0
 			id, _ := fwksched.ReadRequestAttribute[string](req, BranchIdentityKey)
 			if id == "" {
 				noID++

@@ -325,6 +325,15 @@ func (b estimateBackend) chatCompletionsBytes(chat *fwkrh.ChatCompletionsRequest
 // stream, recording multimodal placeholders on aligned boundaries. Assistant
 // tool_calls follow the content, matching tool_use blocks in messagesBytes and
 // function_call items in appendResponsesItem.
+//
+// Tool calls are part of the message's content, not a per-request field: an
+// assistant turn that only calls a tool has empty content, so flattening role
+// alone would make every tool-calling loop iteration of a conversation produce
+// the same bytes at that point (two different tool calls, identical results →
+// one stream). That is a FALSE MERGE for any consumer that treats the stream as
+// a conversation prefix key (branch identity), so the function name and its
+// arguments are folded in here. Bodies without tool calls are byte-identical to
+// before.
 func (b estimateBackend) appendChatMessage(out []byte, features []fwkrh.MultiModalFeature, msg fwkrh.Message, meta mmMetadata) ([]byte, []fwkrh.MultiModalFeature) {
 	if msg.Role != "" {
 		out = append(out, []byte(msg.Role)...)

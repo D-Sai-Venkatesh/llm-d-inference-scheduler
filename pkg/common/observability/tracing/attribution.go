@@ -34,6 +34,9 @@ const (
 	AttributionSourceHeader = "header"
 	// AttributionSourceAgentIdentity means the fairness identity came from agent identity.
 	AttributionSourceAgentIdentity = "agent_identity"
+	// AttributionSourceBranchIdentity means the fairness identity came from the
+	// request body's conversation-branch identity (the flow-control queue key).
+	AttributionSourceBranchIdentity = "branch_identity"
 	// AttributionSourceDefault means no fairness identity resolved.
 	AttributionSourceDefault = "default"
 )
@@ -70,7 +73,7 @@ func normalizeAttribution(id, source string) (string, string) {
 	}
 
 	switch source {
-	case AttributionSourceHeader, AttributionSourceAgentIdentity, AttributionSourceDefault:
+	case AttributionSourceHeader, AttributionSourceAgentIdentity, AttributionSourceBranchIdentity, AttributionSourceDefault:
 		return id, source
 	default:
 		return id, AttributionSourceDefault

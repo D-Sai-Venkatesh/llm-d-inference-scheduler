@@ -67,6 +67,7 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/arcwindow"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/branchidentity"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	attrgpu "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/gpu"
 	attrlatency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/latency"
@@ -857,6 +858,7 @@ func (r *Runner) registerInTreePlugins() {
 	// register request header processor plugins
 	// Alpha
 	fwkplugin.Register(agentidentity.PluginType, fwkplugin.StabilityAlpha, agentidentity.PluginFactory)
+	fwkplugin.Register(branchidentity.PluginType, fwkplugin.StabilityAlpha, branchidentity.Factory)
 	fwkplugin.Register(ringwindow.PluginType, fwkplugin.StabilityAlpha, ringwindow.Factory)
 	fwkplugin.Register(arcwindow.PluginType, fwkplugin.StabilityAlpha, arcwindow.Factory)
 	fwkplugin.Register(groupsched.PluginType, fwkplugin.StabilityAlpha, groupsched.Factory)

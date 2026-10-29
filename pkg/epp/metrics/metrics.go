@@ -223,7 +223,7 @@ func RecordRequestErrCounter(ctx context.Context, modelName, targetModelName str
 // InitFairnessIDResolutionMetrics creates the overflow series at 0 for every source, so a
 // rate or increase over the first overflow is not lost.
 func InitFairnessIDResolutionMetrics(inferencePool string) {
-	for _, source := range []string{tracing.AttributionSourceHeader, tracing.AttributionSourceAgentIdentity, tracing.AttributionSourceDefault} {
+	for _, source := range []string{tracing.AttributionSourceHeader, tracing.AttributionSourceAgentIdentity, tracing.AttributionSourceBranchIdentity, tracing.AttributionSourceDefault} {
 		llmdFairnessIDOverflowCounter.WithLabelValues(source, inferencePool)
 	}
 }

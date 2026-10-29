@@ -20,6 +20,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -441,4 +443,70 @@ func TestRetryIsContainedAndCounted(t *testing.T) {
 	assert.Equal(t, id1, id2, "a byte-identical duplicate of a queued turn is a retry")
 	require.NotNil(t, p.metrics.retried)
 	assert.EqualValues(t, 1, testutil.ToFloat64(p.metrics.retried))
+}
+
+// TestLogRequests (the shadow/stage-1 instrument): with logRequests on, ONE JSON
+// line per request is printed, carrying the scope (the client session header), the
+// DERIVED id and the outcome — the per-request pair a shadow arm cannot get from a
+// span, because there the span's fairness id is the client's explicit header. With
+// the parameter off (the default) nothing is printed, so a production build is
+// untouched.
+func TestLogRequests(t *testing.T) {
+	build := func(t *testing.T, logOn bool) *Plugin {
+		t.Helper()
+		p, err := Factory("branch", json.NewDecoder(strings.NewReader(
+			`{"sessionHeaders":["x-session-scope"],"logRequests":`+fmt.Sprint(logOn)+`}`)),
+			testutils.NewTestHandle(t.Context()))
+		require.NoError(t, err)
+		return p.(*Plugin)
+	}
+
+	capture := func(t *testing.T, fn func()) string {
+		t.Helper()
+		r, w, err := os.Pipe()
+		require.NoError(t, err)
+		orig := os.Stdout
+		os.Stdout = w
+		defer func() { os.Stdout = orig }()
+		done := make(chan string, 1)
+		go func() {
+			b, _ := io.ReadAll(r)
+			done <- string(b)
+		}()
+		fn()
+		require.NoError(t, w.Close())
+		return <-done
+	}
+
+	req := func() *fwksched.InferenceRequest {
+		r := chatReq(user('a', 600))
+		r.Headers["x-session-scope"] = "thread-7"
+		return r
+	}
+
+	on := build(t, true)
+	var id string
+	out := capture(t, func() {
+		id, _ = branchOf(t, on, req())
+	})
+	require.Contains(t, out, "branch-identity: request ")
+	line := strings.TrimPrefix(strings.TrimSpace(out), "branch-identity: request ")
+	var rec struct {
+		Seq      uint64 `json:"seq"`
+		Scope    string `json:"scope"`
+		Derived  string `json:"derived"`
+		Outcome  string `json:"outcome"`
+		Explicit bool   `json:"explicit"`
+		Blocks   int    `json:"blocks"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(line), &rec), "the instrument line must be one JSON object: %q", line)
+	assert.Equal(t, "thread-7", rec.Scope)
+	assert.Equal(t, id, rec.Derived, "the logged derived id is the one the plugin resolved")
+	assert.Equal(t, "new", rec.Outcome)
+	assert.False(t, rec.Explicit)
+	assert.EqualValues(t, 1, rec.Seq)
+
+	off := build(t, false)
+	out = capture(t, func() { branchOf(t, off, req()) })
+	assert.Empty(t, out, "logRequests=false must print nothing")
 }

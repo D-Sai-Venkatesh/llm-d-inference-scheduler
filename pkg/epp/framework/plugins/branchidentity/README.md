@@ -134,6 +134,7 @@ plugins:
       # forkOnBusy: true                  # false = every match continues (measurement arm only)
       # stickyBusyGuard: true             # H1 reply guard
       # retryRule: true                   # S2: an exact duplicate of a still-queued tip is a retry
+      # logRequests: false                # INSTRUMENT: one JSON line per request (see below)
 ```
 
 Built-in session headers (priority order): `x-claude-code-session-id`, `x-session-affinity`,
@@ -158,6 +159,24 @@ sees is the session the rest of the system sees.
 
 `DumpState` returns the branch table (block count, message count, in-flight/queued, forks, turns,
 idle/age; newest 200 rows).
+
+## The `logRequests` instrument (off by default)
+
+A **shadow arm** — the plugin armed on a stack whose client still sends the fairness header — keeps
+the client's explicit id as the queue key, so the derived id reaches no span: the span's fairness id
+is the explicit header, and the EPP's request id (`x-request-id`) lives in an id space no harness
+records share. `logRequests: true` closes that gap with one stdout line per request:
+
+```
+branch-identity: request {"seq":1,"ts":"…","scope":"<session header>","derived":"8f21c0aa93",
+                          "outcome":"matched","explicit":true,"blocks":12,"bytes":347895,"marker":"…"}
+```
+
+`scope` is the client session header the arm configured (with `sessionHeaders:
+[x-llm-d-inference-fairness-id]` that IS the client's thread id), `seq` is arrival order, and
+`outcome` is matched/forked/new. A scoring pass joins those three to the harness's records by
+(scope, arrival order) and scores the derived-vs-thread confusion matrix per request. It is
+behaviour-neutral — no state, no decision — and with it off the code path is unchanged.
 
 Keep ids short: they can become metric label values, and fairness-id label cardinality is capped
 (`--fairness-id-metric-label-limit` / `BoundFairnessID`).

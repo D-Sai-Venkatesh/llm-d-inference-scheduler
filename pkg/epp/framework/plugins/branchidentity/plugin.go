@@ -133,6 +133,18 @@ type Parameters struct {
 	// IN FLIGHT (only arrival markers) is a client retry, not a sibling, and
 	// continues the branch. Default true.
 	RetryRule *bool `json:"retryRule,omitempty"`
+	// LogRequests emits one JSON line per request on stdout:
+	//
+	//	branch-identity: request {"seq":…,"scope":…,"derived":…,"outcome":…}
+	//
+	// Default FALSE — it is an INSTRUMENT, not a feature, and it exists because in
+	// shadow mode the derived id reaches no span: the span's fairness id is the
+	// client's explicit header (that is what keeps the arm an anchor), and the
+	// EPP's request id does not join to a harness's records. A run that needs the
+	// per-request derived-vs-thread confusion matrix turns this on and joins these
+	// lines to its records by (scope, arrival order). It changes no state and no
+	// decision; with it off the plugin is byte-for-byte the same code path.
+	LogRequests bool `json:"logRequests,omitempty"`
 }
 
 // validate resolves defaults in place and rejects impossible values.
@@ -186,18 +198,23 @@ type Plugin struct {
 	idx     *branchIndex
 	metrics *branchMetrics
 
-	markerTTL  time.Duration
-	sweep      time.Duration
-	forkOnBusy bool
-	sticky     bool
-	retry      bool
-	sessions   []string
+	markerTTL   time.Duration
+	sweep       time.Duration
+	forkOnBusy  bool
+	sticky      bool
+	retry       bool
+	logRequests bool
+	sessions    []string
 	// now is the clock seam: the replay validation (stage 0c) drives recorded
 	// arrival/dispatch/settle times through the real hooks, so every time
 	// observation the table makes must come from here rather than time.Now.
 	now func() time.Time
 
 	anonSeq atomic.Uint64
+	// logSeq orders the LogRequests instrument's lines (arrival order, so a scoring
+	// pass can align a scope's lines with its records' turns without a request-id
+	// join).
+	logSeq atomic.Uint64
 }
 
 // Factory builds the branch-identity plugin.
@@ -213,14 +230,15 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	}
 
 	p := &Plugin{
-		typedName:  fwkplugin.TypedName{Type: PluginType, Name: name},
-		markerTTL:  time.Duration(params.MarkerTTLSeconds * float64(time.Second)),
-		sweep:      time.Duration(params.SweepSeconds * float64(time.Second)),
-		forkOnBusy: params.ForkOnBusy == nil || *params.ForkOnBusy,
-		sticky:     params.StickyBusyGuard == nil || *params.StickyBusyGuard,
-		retry:      params.RetryRule == nil || *params.RetryRule,
-		sessions:   sessionHeaders(params.SessionHeaders),
-		now:        time.Now,
+		typedName:   fwkplugin.TypedName{Type: PluginType, Name: name},
+		markerTTL:   time.Duration(params.MarkerTTLSeconds * float64(time.Second)),
+		sweep:       time.Duration(params.SweepSeconds * float64(time.Second)),
+		forkOnBusy:  params.ForkOnBusy == nil || *params.ForkOnBusy,
+		sticky:      params.StickyBusyGuard == nil || *params.StickyBusyGuard,
+		retry:       params.RetryRule == nil || *params.RetryRule,
+		logRequests: params.LogRequests,
+		sessions:    sessionHeaders(params.SessionHeaders),
+		now:         time.Now,
 	}
 	p.idx = newBranchIndex(params.BlockSizeTokens, params.Salt, p.markerTTL, params.MaxBranches)
 	p.metrics = newBranchMetrics()
@@ -310,7 +328,40 @@ func (p *Plugin) RequestHeader(_ context.Context, request *fwksched.InferenceReq
 	if scope != "" {
 		request.PutAttribute(BranchSessionKey, scope)
 	}
+	p.logRequest(request, res, scope, explicit, len(chain), len(identity))
 	return nil
+}
+
+// logRequest emits the per-request instrument line when Parameters.LogRequests is
+// on (off by default). One write per line, in arrival order, carrying exactly what
+// a scoring pass needs and nothing that requires a join into a harness's private
+// id space: the client SCOPE (the session header, which for a shadow arm is the
+// thread id), the DERIVED branch, the outcome, and the identity size.
+func (p *Plugin) logRequest(request *fwksched.InferenceRequest, res ResolveResult, scope string, explicit bool, blocks, bytes int) {
+	if !p.logRequests {
+		return
+	}
+	line, err := json.Marshal(struct {
+		Seq      uint64 `json:"seq"`
+		TS       string `json:"ts"`
+		Scope    string `json:"scope"`
+		Derived  string `json:"derived"`
+		Outcome  string `json:"outcome"`
+		Retry    bool   `json:"retry,omitempty"`
+		Sticky   bool   `json:"sticky,omitempty"`
+		Explicit bool   `json:"explicit"`
+		Blocks   int    `json:"blocks"`
+		Bytes    int    `json:"bytes"`
+		Marker   string `json:"marker"`
+	}{
+		Seq: p.logSeq.Add(1), TS: p.now().UTC().Format(time.RFC3339Nano), Scope: scope,
+		Derived: res.ID, Outcome: string(res.Outcome), Retry: res.Retry, Sticky: res.StickyBusy,
+		Explicit: explicit, Blocks: blocks, Bytes: bytes, Marker: markerOf(request),
+	})
+	if err != nil {
+		return
+	}
+	fmt.Printf("branch-identity: request %s\n", line)
 }
 
 // PreRequest records the DISPATCH transition (admitted → on its way to an

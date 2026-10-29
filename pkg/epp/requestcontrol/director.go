@@ -49,6 +49,7 @@ import (
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/branchidentity"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 	"github.com/llm-d/llm-d-router/pkg/epp/handlers"
@@ -238,6 +239,16 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 
 	if err := d.runRequestHeaderProcessors(ctx, reqCtx.SchedulingRequest); err != nil {
 		return reqCtx, err
+	}
+	// Derive FairnessID from the branch identity (the request-derived queue key)
+	// if not already set by explicit header. The branch is preferred over the
+	// agent identity because the queue key must be the BRANCH: one id = one FIFO
+	// queue, so a session-wide id would serialise a session's siblings behind
+	// each other. The session stays a separate attribute (branch-session).
+	if reqCtx.SchedulingRequest.FairnessID == "" {
+		if branchID, ok := fwksched.ReadRequestAttribute[string](reqCtx.SchedulingRequest, branchidentity.BranchIdentityKey); ok && branchID != "" {
+			reqCtx.SchedulingRequest.FairnessID = branchID
+		}
 	}
 	// Derive FairnessID from agent-identity attribute if not already set by explicit header.
 	if reqCtx.SchedulingRequest.FairnessID == "" {

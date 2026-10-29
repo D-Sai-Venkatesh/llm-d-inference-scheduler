@@ -54,6 +54,7 @@ import (
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/branchidentity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/anthropic"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/openai"
@@ -642,6 +643,45 @@ func TestDirector_HandleRequest(t *testing.T) {
 				name:           "agent-identity",
 				attributeKey:   agentidentity.AgentIdentityKey,
 				attributeValue: "session-abc",
+			},
+			wantFairnessID: "explicit-id",
+		},
+		{
+			name: "fairness ID derived from branch-identity attribute",
+			reqBodyMap: map[string]any{
+				"model":  model,
+				"prompt": "critical prompt",
+			},
+			mockAdmissionController: &mockAdmissionController{admitErr: nil},
+			schedulerMockSetup: func(m *mockScheduler) {
+				m.scheduleResults = defaultSuccessfulScheduleResults
+			},
+			initialTargetModelName: model,
+			inferenceObjectiveName: objectiveName,
+			requestHeaderPlugin: &mockRequestHeaderPlugin{
+				name:           "branch-identity",
+				attributeKey:   branchidentity.BranchIdentityKey,
+				attributeValue: "4f2a9c1b7e",
+			},
+			wantFairnessID: "4f2a9c1b7e",
+		},
+		{
+			name: "explicit fairness header takes precedence over the derived branch",
+			reqBodyMap: map[string]any{
+				"model":  model,
+				"prompt": "critical prompt",
+			},
+			mockAdmissionController: &mockAdmissionController{admitErr: nil},
+			schedulerMockSetup: func(m *mockScheduler) {
+				m.scheduleResults = defaultSuccessfulScheduleResults
+			},
+			initialTargetModelName: model,
+			inferenceObjectiveName: objectiveName,
+			fairnessIDHeader:       "explicit-id",
+			requestHeaderPlugin: &mockRequestHeaderPlugin{
+				name:           "branch-identity",
+				attributeKey:   branchidentity.BranchIdentityKey,
+				attributeValue: "4f2a9c1b7e",
 			},
 			wantFairnessID: "explicit-id",
 		},

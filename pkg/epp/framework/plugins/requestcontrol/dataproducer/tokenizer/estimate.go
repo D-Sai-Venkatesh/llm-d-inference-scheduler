@@ -307,27 +307,41 @@ func (b estimateBackend) chatCompletionsBytes(chat *fwkrh.ChatCompletionsRequest
 
 // appendChatMessage flattens a single chat-completions message into the byte
 // stream, recording multimodal placeholders on aligned boundaries.
+//
+// Tool calls are part of the message's content, not a per-request field: an
+// assistant turn that only calls a tool has empty content, so flattening role
+// alone would make every tool-calling loop iteration of a conversation produce
+// the same bytes at that point (two different tool calls, identical results →
+// one stream). That is a FALSE MERGE for any consumer that treats the stream as
+// a conversation prefix key (branch identity), so the arguments are folded in
+// here, deterministically (json.Marshal sorts map keys). Bodies without tool
+// calls are byte-identical to before.
 func (b estimateBackend) appendChatMessage(out []byte, features []fwkrh.MultiModalFeature, msg fwkrh.Message, meta mmMetadata) ([]byte, []fwkrh.MultiModalFeature) {
 	if msg.Role != "" {
 		out = append(out, []byte(msg.Role)...)
 	}
 	if msg.Content.Raw != "" {
 		out = append(out, []byte(msg.Content.Raw)...)
-		return out, features
+	} else {
+		for _, block := range msg.Content.Structured {
+			switch block.Type {
+			case blockTypeText:
+				out = append(out, []byte(block.Text)...)
+			case "image_url":
+				out, features = appendMMAsset(out, features, fwkrh.ModalityImage, block.ImageURL.URL, b.img.placeholderCount(block.ImageURL.URL))
+			case "video_url":
+				out, features = appendMMAsset(out, features, fwkrh.ModalityVideo, block.VideoURL.URL, b.vid.placeholderCount(meta.video))
+			case "audio_url":
+				out, features = appendMMAsset(out, features, fwkrh.ModalityAudio, block.AudioURL.URL, b.aud.placeholderCount(false, meta.audio))
+			case "input_audio":
+				data := block.InputAudio.Data + block.InputAudio.Format
+				out, features = appendMMAsset(out, features, fwkrh.ModalityAudio, data, b.aud.placeholderCount(true, meta.audio))
+			}
+		}
 	}
-	for _, block := range msg.Content.Structured {
-		switch block.Type {
-		case blockTypeText:
-			out = append(out, []byte(block.Text)...)
-		case "image_url":
-			out, features = appendMMAsset(out, features, fwkrh.ModalityImage, block.ImageURL.URL, b.img.placeholderCount(block.ImageURL.URL))
-		case "video_url":
-			out, features = appendMMAsset(out, features, fwkrh.ModalityVideo, block.VideoURL.URL, b.vid.placeholderCount(meta.video))
-		case "audio_url":
-			out, features = appendMMAsset(out, features, fwkrh.ModalityAudio, block.AudioURL.URL, b.aud.placeholderCount(false, meta.audio))
-		case "input_audio":
-			data := block.InputAudio.Data + block.InputAudio.Format
-			out, features = appendMMAsset(out, features, fwkrh.ModalityAudio, data, b.aud.placeholderCount(true, meta.audio))
+	if len(msg.ToolCalls) > 0 {
+		if raw, err := json.Marshal(msg.ToolCalls); err == nil {
+			out = append(out, raw...)
 		}
 	}
 	return out, features

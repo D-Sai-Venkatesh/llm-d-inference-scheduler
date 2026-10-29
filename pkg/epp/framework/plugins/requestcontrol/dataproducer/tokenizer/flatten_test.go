@@ -225,3 +225,194 @@ func TestFlattenCanonicalBytes_PrefixProperty_Randomized(t *testing.T) {
 		}
 	}
 }
+
+// TestFlattenIdentityBytes_RoleContentToolCalls: the identity stream is role +
+// content + tool_calls per message and NOTHING else — no tools block (a tool-set
+// change must not break the prefix), no thinking.
+func TestFlattenIdentityBytes_RoleContentToolCalls(t *testing.T) {
+	raw, err := FlattenIdentityBytes(flattenBody(
+		flattenMsg("user", "hello"),
+		flattenMsg("assistant", "hi there"),
+	))
+	require.NoError(t, err)
+	assert.Equal(t, "userhelloassistanthi there", string(raw))
+
+	// Tool DEFINITIONS are excluded for identity (they are content for sizing).
+	withTools := flattenBody(flattenMsg("user", "hello"))
+	withTools.ChatCompletions.Tools = []any{map[string]any{"type": "function"}}
+	idRaw, err := FlattenIdentityBytes(withTools)
+	require.NoError(t, err)
+	assert.Equal(t, "userhello", string(idRaw))
+	canonRaw, err := FlattenCanonicalBytes(withTools)
+	require.NoError(t, err)
+	assert.NotEqual(t, string(idRaw), string(canonRaw), "the sizing view keeps the tools block")
+}
+
+// TestFlattenIdentityBytes_ToolSetChurnKeepsThePrefix is B4(a): an agent that swaps
+// its tool set mid-thread (claude_code's main agent → `Task` sub-agent) keeps a
+// prefix-continuous identity stream, so the turn continues its branch. A tool-set
+// equality GATE would make this a non-match — the same false-new branch the change
+// is meant to remove.
+func TestFlattenIdentityBytes_ToolSetChurnKeepsThePrefix(t *testing.T) {
+	msgs := []fwkrh.Message{
+		flattenMsg("user", "list the files"),
+		flattenMsg("assistant", "ok"),
+	}
+	turn1 := flattenBody(msgs...)
+	turn1.ChatCompletions.Tools = []any{map[string]any{"type": "function", "function": map[string]any{"name": "read"}}}
+
+	turn2 := flattenBody(append(append([]fwkrh.Message{}, msgs...), flattenMsg("user", "now the second one"))...)
+	// A completely different tool set, as a sub-agent handoff produces.
+	turn2.ChatCompletions.Tools = []any{map[string]any{"type": "function", "function": map[string]any{"name": "Task"}}}
+
+	a, err := FlattenIdentityBytes(turn1)
+	require.NoError(t, err)
+	b, err := FlattenIdentityBytes(turn2)
+	require.NoError(t, err)
+	assert.Equal(t, string(a), string(b[:len(a)]), "a tool-set change must not break the identity prefix")
+
+	// The sizing view does break there — which is why the two views are separate.
+	ca, err := FlattenCanonicalBytes(turn1)
+	require.NoError(t, err)
+	cb, err := FlattenCanonicalBytes(turn2)
+	require.NoError(t, err)
+	assert.NotEqual(t, string(ca), string(cb[:len(ca)]))
+}
+
+// TestFlattenIdentityBytes_DroppedThinkingKeepsThePrefix is B4(b): the Anthropic
+// API only preserves the last assistant turn's signed thinking, so clients drop
+// earlier turns' thinking blocks. That must not break the identity prefix.
+func TestFlattenIdentityBytes_DroppedThinkingKeepsThePrefix(t *testing.T) {
+	turn1 := &fwkrh.InferenceRequestBody{Messages: &fwkrh.MessagesRequest{
+		System: fwkrh.AnthropicContent{Raw: "be terse"},
+		Messages: []fwkrh.AnthropicMessage{
+			{Role: "user", Content: fwkrh.AnthropicContent{Raw: "hello"}},
+			{Role: "assistant", Content: fwkrh.AnthropicContent{Structured: []fwkrh.AnthropicContentBlock{
+				{Type: "thinking", Thinking: "the earlier reasoning, which the next turn drops"},
+				{Type: "text", Text: "hi"},
+			}}},
+		},
+	}}
+	turn2 := &fwkrh.InferenceRequestBody{Messages: &fwkrh.MessagesRequest{
+		System: fwkrh.AnthropicContent{Raw: "be terse"},
+		Messages: []fwkrh.AnthropicMessage{
+			{Role: "user", Content: fwkrh.AnthropicContent{Raw: "hello"}},
+			{Role: "assistant", Content: fwkrh.AnthropicContent{Structured: []fwkrh.AnthropicContentBlock{
+				{Type: "text", Text: "hi"},
+			}}},
+			{Role: "user", Content: fwkrh.AnthropicContent{Raw: "again"}},
+		},
+	}}
+	a, err := FlattenIdentityBytes(turn1)
+	require.NoError(t, err)
+	b, err := FlattenIdentityBytes(turn2)
+	require.NoError(t, err)
+	require.Greater(t, len(b), len(a))
+	assert.Equal(t, string(a), string(b[:len(a)]), "dropped thinking must not break the identity prefix")
+
+	// Thinking is still content for the sizing view.
+	ca, err := FlattenCanonicalBytes(turn1)
+	require.NoError(t, err)
+	assert.Contains(t, string(ca), "the earlier reasoning")
+}
+
+// TestFlattenIdentityBytes_NoStream: the identity view reports the same sentinel.
+func TestFlattenIdentityBytes_NoStream(t *testing.T) {
+	for name, body := range map[string]*fwkrh.InferenceRequestBody{
+		"nil":       nil,
+		"empty":     {},
+		"emptyChat": {ChatCompletions: &fwkrh.ChatCompletionsRequest{}},
+	} {
+		_, err := FlattenIdentityBytes(body)
+		assert.ErrorIs(t, err, ErrNoCanonicalStream, name)
+	}
+}
+
+// TestFlattenIdentityBytes_PrefixProperty_Randomized is B4(c): the same 200-
+// conversation randomized prefix property, on the IDENTITY view, with the tool set
+// and the assistant's thinking changing between turns (the two mid-thread churns
+// real clients produce). A violation would mint a false new branch on every turn of
+// such a conversation — the unsafe direction of the pre-registration.
+func TestFlattenIdentityBytes_PrefixProperty_Randomized(t *testing.T) {
+	const (
+		conversations = 200
+		maxMessages   = 8
+	)
+	rng := rand.New(rand.NewSource(42))
+
+	roles := []string{"system", "user", "assistant", "tool", ""}
+	texts := []string{
+		"", "ok", "read the file", `{"path":"/tmp/a.go"}`,
+		strings.Repeat("padding ", 40), // crosses several 256-byte chunks
+		"ünïcode ✓",
+	}
+	// The tool DEFINITION set, as a single name so it can be swapped between turns.
+	toolSets := []string{"", "run", "read"}
+
+	randomMessage := func() fwkrh.Message {
+		msg := fwkrh.Message{Role: roles[rng.Intn(len(roles))]}
+		switch rng.Intn(3) {
+		case 0:
+			msg.Content = fwkrh.Content{Raw: texts[rng.Intn(len(texts))]}
+		case 1:
+			parts := make([]fwkrh.ContentBlock, rng.Intn(3)+1)
+			for i := range parts {
+				parts[i] = fwkrh.ContentBlock{Type: "text", Text: texts[rng.Intn(len(texts))]}
+			}
+			msg.Content = fwkrh.Content{Structured: parts}
+		case 2:
+			msg.Content = fwkrh.Content{Raw: texts[rng.Intn(len(texts))]}
+			msg.Content.Structured = []fwkrh.ContentBlock{{Type: "text", Text: "ignored when raw is set"}}
+		}
+		if rng.Intn(3) == 0 {
+			var call any
+			err := json.Unmarshal([]byte(`{"id":"call_`+strconv.Itoa(rng.Intn(5))+`","type":"function","function":{"name":"run","arguments":"{\"n\":`+strconv.Itoa(rng.Intn(100))+`}"}}`), &call)
+			require.NoError(t, err)
+			msg.ToolCalls = []any{call}
+		}
+		return msg
+	}
+
+	// view renders one turn of a conversation in the given mode.
+	view := func(msgs []fwkrh.Message, tool string, thinking bool) string {
+		anthropic := make([]fwkrh.AnthropicMessage, len(msgs))
+		for i, m := range msgs {
+			blocks := []fwkrh.AnthropicContentBlock{}
+			if thinking && m.Role == "assistant" && i%2 == 0 {
+				blocks = append(blocks, fwkrh.AnthropicContentBlock{Type: "thinking", Thinking: "reasoning-" + strconv.Itoa(i)})
+			}
+			blocks = append(blocks, fwkrh.AnthropicContentBlock{Type: "text", Text: m.Content.Raw})
+			anthropic[i] = fwkrh.AnthropicMessage{Role: m.Role, Content: fwkrh.AnthropicContent{Structured: blocks}}
+		}
+		body := &fwkrh.InferenceRequestBody{Messages: &fwkrh.MessagesRequest{
+			System:   fwkrh.AnthropicContent{Raw: "system"},
+			Messages: anthropic,
+		}}
+		if tool != "" {
+			body.Messages.Tools = []fwkrh.AnthropicTool{{Name: tool}}
+		}
+		raw, err := FlattenIdentityBytes(body)
+		if err != nil {
+			require.ErrorIs(t, err, ErrNoCanonicalStream)
+			return ""
+		}
+		return string(raw)
+	}
+
+	for c := 0; c < conversations; c++ {
+		count := rng.Intn(maxMessages) + 1
+		msgs := make([]fwkrh.Message, count)
+		for i := range msgs {
+			msgs[i] = randomMessage()
+		}
+		whole := view(msgs, toolSets[rng.Intn(len(toolSets))], false)
+
+		for j := 0; j <= count; j++ {
+			// Between turns the tool set and the earlier turns' thinking churn.
+			prefix := view(msgs[:j], toolSets[rng.Intn(len(toolSets))], rng.Intn(2) == 0)
+			require.LessOrEqual(t, len(prefix), len(whole), "conversation %d prefix %d is longer than the whole", c, j)
+			assert.Equal(t, whole[:len(prefix)], prefix,
+				"conversation %d: the identity stream must be append-only at message boundary %d", c, j)
+		}
+	}
+}

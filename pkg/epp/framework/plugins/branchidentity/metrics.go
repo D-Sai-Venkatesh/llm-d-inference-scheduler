@@ -25,17 +25,21 @@ import (
 const metricsSubsystem = "llm_d_epp_branch"
 
 // branchMetrics is the legibility set for the derivation: how often a request
-// continued a branch, forked one, or found nothing, how big the table is, and
-// how much the flattening costs on the (untimed, pre-admission) request path.
+// continued a branch, forked one, or found nothing, how big the table is, how
+// much the flattening and the resolve cost on the (untimed, pre-admission)
+// request path, and how often the derivation was bypassed.
 type branchMetrics struct {
-	matched   prometheus.Counter
-	forked    prometheus.Counter
-	fresh     prometheus.Counter
-	sticky    prometheus.Counter
-	evicted   prometheus.Counter
-	unflatten prometheus.Counter
-	records   prometheus.Gauge
-	flattenNs prometheus.Histogram
+	matched    prometheus.Counter
+	forked     prometheus.Counter
+	fresh      prometheus.Counter
+	sticky     prometheus.Counter
+	retried    prometheus.Counter
+	evicted    prometheus.Counter
+	unflatten  prometheus.Counter
+	overridden prometheus.Counter
+	records    prometheus.Gauge
+	flattenNs  prometheus.Histogram
+	resolveNs  prometheus.Histogram
 }
 
 func newBranchMetrics() *branchMetrics { return &branchMetrics{} }
@@ -49,16 +53,26 @@ func (m *branchMetrics) register(reg prometheus.Registerer) error {
 		Help: "requests that matched no branch tip and started an unrelated branch"})
 	m.sticky = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "sticky_busy_total",
 		Help: "requests whose continuation was proven by content (H1 reply guard) despite a busy branch"})
+	m.retried = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "retry_total",
+		Help: "requests byte-identical to a tip with nothing in flight, treated as a client retry of a still-queued turn (S2)"})
 	m.evicted = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "evicted_total",
-		Help: "branches removed by the idle GC"})
+		Help: "branches removed by the table cap (the only eviction path; there is no idle GC)"})
 	m.unflatten = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "unflattened_total",
 		Help: "requests whose body has no canonical stream; the fairness id falls back to the header/agent identity"})
+	m.overridden = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "explicit_override_total",
+		Help: "requests that carried an explicit fairness id, so the derived branch did not become the queue key (a run whose whole point is the derivation must keep this at 0)"})
 	m.records = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: metricsSubsystem, Name: "records",
 		Help: "live branches in the table"})
 	m.flattenNs = prometheus.NewHistogram(prometheus.HistogramOpts{Subsystem: metricsSubsystem, Name: "flatten_ns",
-		Help:    "canonical flattening + block chaining time per request (the pre-admission cost of derivation)",
+		Help:    "identity flattening + block chaining time per request (the pre-admission cost of derivation)",
 		Buckets: prometheus.ExponentialBuckets(2000, 4, 8)})
-	for _, c := range []prometheus.Collector{m.matched, m.forked, m.fresh, m.sticky, m.evicted, m.unflatten, m.records, m.flattenNs} {
+	m.resolveNs = prometheus.NewHistogram(prometheus.HistogramOpts{Subsystem: metricsSubsystem, Name: "resolve_ns",
+		Help:    "branch table resolve time per request (under the table lock: match + mint)",
+		Buckets: prometheus.ExponentialBuckets(500, 4, 8)})
+	for _, c := range []prometheus.Collector{
+		m.matched, m.forked, m.fresh, m.sticky, m.retried, m.evicted, m.unflatten,
+		m.overridden, m.records, m.flattenNs, m.resolveNs,
+	} {
 		if err := reg.Register(c); err != nil {
 			return err
 		}
@@ -69,6 +83,12 @@ func (m *branchMetrics) register(reg prometheus.Registerer) error {
 func (m *branchMetrics) observeFlatten(d time.Duration) {
 	if m.flattenNs != nil {
 		m.flattenNs.Observe(float64(d.Nanoseconds()))
+	}
+}
+
+func (m *branchMetrics) observeResolveLatency(d time.Duration) {
+	if m.resolveNs != nil && d >= 0 {
+		m.resolveNs.Observe(float64(d.Nanoseconds()))
 	}
 }
 
@@ -90,11 +110,20 @@ func (m *branchMetrics) observeResolve(res ResolveResult) {
 	if res.StickyBusy && m.sticky != nil {
 		m.sticky.Inc()
 	}
+	if res.Retry && m.retried != nil {
+		m.retried.Inc()
+	}
 }
 
 func (m *branchMetrics) observeUnflattened() {
 	if m.unflatten != nil {
 		m.unflatten.Inc()
+	}
+}
+
+func (m *branchMetrics) observeExplicitOverride() {
+	if m.overridden != nil {
+		m.overridden.Inc()
 	}
 }
 

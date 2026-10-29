@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
@@ -49,21 +50,33 @@ var BranchIdentityKey = fwkplugin.NewDataKey("branch-identity", "")
 // for stage 2 — neither overwrites the other").
 var BranchSessionKey = fwkplugin.NewDataKey("branch-session", "")
 
+// branchMarkerKey is the request-attribute key carrying the request's internal
+// marker id — the handle all three hooks use to move this request between its
+// branch's pending and in-flight sets. It equals the request id when the client
+// supplied one and a per-request synthetic id otherwise, so a body-less request
+// id cannot collapse two arrivals into one marker.
+var branchMarkerKey = fwkplugin.NewDataKey("branch-marker", "")
+
 const (
 	// defaultBlockSizeTokens is the identity chunk length in pseudo-tokens
 	// (4 canonical bytes each, so 256-byte chunks — the survey's convention).
 	// Independent of the engine's KV block size: identity only needs a stable
-	// chunking of the canonical stream.
+	// chunking of the identity stream.
 	defaultBlockSizeTokens = 64
-	// defaultQueuedTTLSeconds bounds how long an arrival marker keeps its branch
-	// outstanding when the request never reports an end of stream. That happens
-	// only to requests REJECTED before dispatch (admission TTL/capacity): the
-	// response hook is forced on the abort path for every request that picked a
-	// pod, but a rejected request never gets one. The horizon is deliberately
-	// above the flow-control queue's own GC (5 minutes) and the design's "LONG
-	// waits run 600s+" observation. Pruning an arrival errs toward CONTINUATION,
-	// the safe direction.
-	defaultQueuedTTLSeconds = 600
+	// defaultMarkerTTLSeconds bounds how long an arrival/in-flight marker keeps
+	// its branch outstanding when the request never reports an end of stream.
+	// That happens only to requests REJECTED before dispatch (admission
+	// TTL/capacity): the response hook is forced on the abort path for every
+	// request that picked a pod, but a rejected request never gets one.
+	//
+	// The horizon is the CLIENT's request timeout (the harness runs 3600s), NOT
+	// the flow-control queue's 5-minute idle GC: those are different clocks, and
+	// on A0 16% of requests waited more than 600s for admission, so a 600s marker
+	// TTL would expire markers of requests that are still legitimately queued and
+	// hand their branch to a concurrent sibling as if it were free. Pruning an
+	// arrival errs toward CONTINUATION, the safe direction, which is why the TTL
+	// is generous rather than tight.
+	defaultMarkerTTLSeconds = 3600
 	// defaultSweepSeconds is the cap-enforcement tick.
 	defaultSweepSeconds = 60
 	// defaultMaxBranches is the table cap (the ONLY eviction path; there is no
@@ -88,10 +101,15 @@ type Parameters struct {
 	// BlockSizeTokens is the identity chunk length in pseudo-tokens (4 bytes
 	// each). Zero selects the default (64 → 256-byte chunks).
 	BlockSizeTokens int `json:"blockSizeTokens,omitempty"`
-	// QueuedTTLSeconds bounds how long an arrival that never dispatched keeps
-	// its branch outstanding. There is no idle/branch TTL: branches are retained
-	// (stage 0 measured a p99.9 inter-turn gap of 3,036s, so any silence timeout
-	// would mint false new branches when dormant threads return).
+	// MarkerTTLSeconds bounds how long an outstanding marker (arrival or in
+	// flight) that never settles keeps its branch busy. It must be at least the
+	// client's request timeout — a marker that expires while its request is still
+	// queued makes a live branch look free. There is no idle/branch TTL: branches
+	// are retained (stage 0 measured a p99.9 inter-turn gap of 3,036s, so any
+	// silence timeout would mint false new branches when dormant threads return).
+	MarkerTTLSeconds float64 `json:"markerTtlSeconds,omitempty"`
+	// QueuedTTLSeconds is the deprecated name of MarkerTTLSeconds, accepted so an
+	// older arm's config still parses.
 	QueuedTTLSeconds float64 `json:"queuedTtlSeconds,omitempty"`
 	// SweepSeconds is the cap-enforcement tick.
 	SweepSeconds float64 `json:"sweepSeconds,omitempty"`
@@ -111,6 +129,10 @@ type Parameters struct {
 	// with the tip's assistant reply is a proven continuation even when the
 	// branch looks busy. Default true.
 	StickyBusyGuard *bool `json:"stickyBusyGuard,omitempty"`
+	// RetryRule is S2: a request byte-identical to a tip whose branch has nothing
+	// IN FLIGHT (only arrival markers) is a client retry, not a sibling, and
+	// continues the branch. Default true.
+	RetryRule *bool `json:"retryRule,omitempty"`
 }
 
 // validate resolves defaults in place and rejects impossible values.
@@ -121,11 +143,14 @@ func (p *Parameters) validate() error {
 	if p.BlockSizeTokens < 0 {
 		return fmt.Errorf("blockSizeTokens must be > 0, got %d", p.BlockSizeTokens)
 	}
-	if p.QueuedTTLSeconds == 0 {
-		p.QueuedTTLSeconds = defaultQueuedTTLSeconds
+	if p.MarkerTTLSeconds == 0 {
+		p.MarkerTTLSeconds = p.QueuedTTLSeconds
 	}
-	if p.QueuedTTLSeconds < 0 {
-		return fmt.Errorf("queuedTtlSeconds must be >= 0, got %v", p.QueuedTTLSeconds)
+	if p.MarkerTTLSeconds == 0 {
+		p.MarkerTTLSeconds = defaultMarkerTTLSeconds
+	}
+	if p.MarkerTTLSeconds < 0 {
+		return fmt.Errorf("markerTtlSeconds must be >= 0, got %v", p.MarkerTTLSeconds)
 	}
 	if p.SweepSeconds == 0 {
 		p.SweepSeconds = defaultSweepSeconds
@@ -161,11 +186,18 @@ type Plugin struct {
 	idx     *branchIndex
 	metrics *branchMetrics
 
-	queuedTTL  time.Duration
+	markerTTL  time.Duration
 	sweep      time.Duration
 	forkOnBusy bool
 	sticky     bool
+	retry      bool
 	sessions   []string
+	// now is the clock seam: the replay validation (stage 0c) drives recorded
+	// arrival/dispatch/settle times through the real hooks, so every time
+	// observation the table makes must come from here rather than time.Now.
+	now func() time.Time
+
+	anonSeq atomic.Uint64
 }
 
 // Factory builds the branch-identity plugin.
@@ -182,13 +214,15 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 
 	p := &Plugin{
 		typedName:  fwkplugin.TypedName{Type: PluginType, Name: name},
-		queuedTTL:  time.Duration(params.QueuedTTLSeconds * float64(time.Second)),
+		markerTTL:  time.Duration(params.MarkerTTLSeconds * float64(time.Second)),
 		sweep:      time.Duration(params.SweepSeconds * float64(time.Second)),
 		forkOnBusy: params.ForkOnBusy == nil || *params.ForkOnBusy,
 		sticky:     params.StickyBusyGuard == nil || *params.StickyBusyGuard,
+		retry:      params.RetryRule == nil || *params.RetryRule,
 		sessions:   sessionHeaders(params.SessionHeaders),
+		now:        time.Now,
 	}
-	p.idx = newBranchIndex(params.BlockSizeTokens, params.Salt, p.queuedTTL, params.MaxBranches)
+	p.idx = newBranchIndex(params.BlockSizeTokens, params.Salt, p.markerTTL, params.MaxBranches)
 	p.metrics = newBranchMetrics()
 
 	// The effective config is echoed at startup so a run's arm is verifiable
@@ -218,6 +252,7 @@ func (p *Plugin) Produces() map[fwkplugin.DataKey]any {
 	return map[fwkplugin.DataKey]any{
 		BranchIdentityKey: "",
 		BranchSessionKey:  "",
+		branchMarkerKey:   "",
 	}
 }
 
@@ -237,31 +272,39 @@ func (p *Plugin) RequestHeader(_ context.Context, request *fwksched.InferenceReq
 	if request == nil || request.Body == nil {
 		return nil
 	}
-	start := time.Now()
-	canonical, err := tokenizer.FlattenCanonicalBytes(request.Body)
+	// An explicit x-llm-d-inference-fairness-id header wins (operators keep a
+	// manual override). It is counted, because a harness that sets it turns the
+	// whole derivation into a no-op without any other visible signal — the
+	// stage-1 harness fix (no --session-header=x-llm-d-inference-fairness-id) is
+	// deployment config, and this counter is how a run proves it was applied.
+	explicit := request.FairnessID != ""
+
+	start := p.now()
+	identity, err := tokenizer.FlattenIdentityBytes(request.Body)
 	if err != nil {
 		p.metrics.observeUnflattened()
 		return nil
 	}
-	chain := p.idx.Chain(canonical)
+	chain := p.idx.Chain(identity)
 	roles := messageRoles(request.Body)
 	scope := p.sessionID(request)
-	// A stream shorter than one block has no chain to match on; its id comes
-	// from the whole-stream hash instead (computed only in that case).
-	var bodyKey Hash
-	if len(chain) == 0 {
-		bodyKey = StreamHash(canonical)
-	}
-	elapsed := time.Since(start)
+	marker := p.markerID(request)
+	flattened := p.now()
 
-	res := p.idx.Resolve(time.Now(), chain, bodyKey, scope, roles, p.forkOnBusy, p.sticky)
-	p.metrics.observeFlatten(elapsed)
+	res := p.idx.Resolve(p.now(), Arrival{
+		Stream: identity, Chain: chain, Scope: scope, Roles: roles, Marker: marker,
+	}, p.forkOnBusy, p.sticky, p.retry)
+
+	p.metrics.observeFlatten(flattened.Sub(start))
+	p.metrics.observeResolveLatency(res.Elapsed)
 	p.metrics.observeResolve(res)
 
 	request.PutAttribute(BranchIdentityKey, res.ID)
-	if request.FairnessID == "" {
-		// An explicit x-llm-d-inference-fairness-id header wins (operators keep a
-		// manual override); otherwise the derived branch IS the queue key.
+	request.PutAttribute(branchMarkerKey, marker)
+	if explicit {
+		p.metrics.observeExplicitOverride()
+	} else {
+		// Otherwise the derived branch IS the queue key.
 		request.FairnessID = res.ID
 	}
 	if scope != "" {
@@ -271,29 +314,32 @@ func (p *Plugin) RequestHeader(_ context.Context, request *fwksched.InferenceReq
 }
 
 // PreRequest records the DISPATCH transition (admitted → on its way to an
-// engine). The branch is already busy from ARRIVAL — RequestHeader marks it — so
-// nothing about identity depends on this hook; it only keeps the in-flight
-// counter (and the debug dump) accurate. Marking busy here instead would leave the
-// queueing interval unprotected, and under load that is most of the busy period.
+// engine), moving this request's marker from its branch's pending set to its
+// in-flight set. The branch is already busy from ARRIVAL — RequestHeader marks
+// it — so nothing about identity depends on this hook; it exists so the
+// outstanding set names WHICH requests are running. Marking busy only here would
+// leave the queueing interval unprotected, and under load that is most of the
+// busy period.
 func (p *Plugin) PreRequest(_ context.Context, request *fwksched.InferenceRequest, _ *fwksched.SchedulingResult) error {
 	if request == nil {
 		return nil
 	}
 	if id, ok := fwksched.ReadRequestAttribute[string](request, BranchIdentityKey); ok && id != "" {
-		p.idx.Dispatch(id, time.Now())
+		p.idx.Dispatch(id, markerOf(request), p.now())
 	}
 	return nil
 }
 
-// ResponseBody settles the branch on the end of the response lifecycle. The
-// director forces this call on abort/disconnect for every dispatched request,
-// so the busy flag cannot wedge.
+// ResponseBody settles the branch on the end of the response lifecycle, removing
+// this request's marker from its branch's in-flight set. The director forces this
+// call on abort/disconnect for every dispatched request, so the busy flag cannot
+// wedge.
 func (p *Plugin) ResponseBody(_ context.Context, request *fwksched.InferenceRequest, response *fwkrc.Response, _ *fwkdl.EndpointMetadata) {
 	if request == nil || response == nil || !response.EndOfStream {
 		return
 	}
 	if id, ok := fwksched.ReadRequestAttribute[string](request, BranchIdentityKey); ok && id != "" {
-		p.idx.Settle(id, time.Now())
+		p.idx.Settle(id, markerOf(request), p.now())
 	}
 }
 
@@ -339,6 +385,27 @@ func (p *Plugin) sweepOnce(now time.Time) {
 		p.metrics.addEvicted(removed)
 	}
 	p.metrics.setRecords(p.idx.Len())
+}
+
+// markerID returns the request's marker handle for the branch's outstanding set:
+// its request id when the client/framework supplied one, a per-request synthetic
+// id otherwise. The value is published as a request attribute so every hook of
+// the same request agrees on it.
+func (p *Plugin) markerID(request *fwksched.InferenceRequest) string {
+	if id := strings.TrimSpace(request.RequestID); id != "" {
+		return id
+	}
+	return fmt.Sprintf("anon-%d", p.anonSeq.Add(1))
+}
+
+// markerOf reads the marker an earlier hook published, falling back to the
+// request id (and, if even that is absent, to a constant so the operations stay
+// no-ops rather than corrupting another request's marker).
+func markerOf(request *fwksched.InferenceRequest) string {
+	if marker, ok := fwksched.ReadRequestAttribute[string](request, branchMarkerKey); ok && marker != "" {
+		return marker
+	}
+	return request.RequestID
 }
 
 // sessionHeaders returns the operator's extras followed by the defaults, lower-

@@ -544,3 +544,44 @@ func TestR4CacheMatchesUncachedUnderRandomOps(t *testing.T) {
 		s.mu.Unlock()
 	}
 }
+
+// ---- the v2-freeze regression: head-of-line blocking in the gate ----
+
+func TestSizeAwareGateFirstFitNotHeadOfLine(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.GateMode = "size-aware"
+	s, err := NewScheduler(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNumBlocks(64, 1000); err != nil { // budget 950
+		t.Fatal(err)
+	}
+	now := time.Now()
+	// "big" seats and fills most of the budget; "small" seats with room to spare
+	for _, id := range []string{"big", "small"} {
+		if j := s.PickFromHeads([]Head{{Session: id, ReqID: "r1-" + id, Arrival: now, SizeBytes: bytesFor(400)}}, now); j < 0 {
+			t.Fatalf("seat pick failed for %s", id)
+		}
+		s.Dispatched(id, "r1-"+id, keys(400, Hash(id[0])), bytesFor(400), now)
+		s.Chunk(id)
+		s.Settle(id, "r1-"+id, struct{ Prompt, Cached int }{400, 398}, true, now.Add(time.Second))
+	}
+	// big's next turn needs 300 new blocks (does NOT fit: ~800 used + 300 > 950);
+	// small's needs 50 (fits). big is OLDER — the freeze bug returned -1 for both.
+	heads := []Head{
+		{Session: "big", ReqID: "r2-big", Arrival: now.Add(2 * time.Second), SizeBytes: bytesFor(1100)},
+		{Session: "small", ReqID: "r2-small", Arrival: now.Add(3 * time.Second), SizeBytes: bytesFor(450)},
+	}
+	i := s.PickFromHeads(heads, now.Add(4*time.Second))
+	if i != 1 {
+		t.Fatalf("pick = %d, want 1 (small's head — first-fit must SKIP the oversized oldest head, not block on it)", i)
+	}
+	// and the skipped head is counted
+	s.mu.Lock()
+	skipped := s.counters.gateSkipped
+	s.mu.Unlock()
+	if skipped == 0 {
+		t.Fatal("the gate must count skipped heads (the freeze diagnostic)")
+	}
+}

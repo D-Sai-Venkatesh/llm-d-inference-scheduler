@@ -161,6 +161,60 @@ func (p *OpenAIParser) ParseRequest(ctx context.Context, body []byte, headers ma
 	return &fwkrh.ParseResult{Body: extractedBody, SkipResponseProcessing: false}, nil
 }
 
+// decodeChatCompletionsRequest decodes a /v1/chat/completions body into the
+// structured view the scheduler reads.
+//
+// It tolerates ONE wire shape the strict unmarshal rejects: `tools` delivered as a
+// JSON STRING that itself holds the tool array. Agent frameworks and trace replays
+// do send that (inference-perf's Exgentic replay, whose trace stores
+// `gen_ai.tool.definitions` textually, failed 76% of its requests on it), and until
+// now such a body failed the WHOLE parse: the EPP dropped a request the engine could
+// have served. Only a string that decodes to a JSON array is accepted; every other
+// shape keeps the strict error, and the decoded array lives in the PARSED view only —
+// RawBody is what gets forwarded, untouched, so the EPP never silently rewrites a
+// client's body.
+func decodeChatCompletionsRequest(rawBody []byte) (fwkrh.ChatCompletionsRequest, error) {
+	var chatCompletions fwkrh.ChatCompletionsRequest
+	strictErr := json.Unmarshal(rawBody, &chatCompletions)
+	if strictErr == nil {
+		return chatCompletions, nil
+	}
+
+	// Slow path: only a stringified `tools` is repairable. Rebuild the body with
+	// the decoded array in place and let the strict decoder say the final word, so
+	// a body that is broken in any other field still fails.
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(rawBody, &envelope); err != nil {
+		return chatCompletions, strictErr
+	}
+	rawTools, ok := envelope["tools"]
+	if !ok {
+		return chatCompletions, strictErr
+	}
+	var toolsText string
+	if err := json.Unmarshal(rawTools, &toolsText); err != nil {
+		return chatCompletions, strictErr
+	}
+	var tools []any
+	if err := json.Unmarshal([]byte(toolsText), &tools); err != nil {
+		return chatCompletions, strictErr
+	}
+	decoded, err := json.Marshal(tools)
+	if err != nil {
+		return chatCompletions, strictErr
+	}
+	envelope["tools"] = decoded
+	repaired, err := json.Marshal(envelope)
+	if err != nil {
+		return chatCompletions, strictErr
+	}
+	chatCompletions = fwkrh.ChatCompletionsRequest{}
+	if err := json.Unmarshal(repaired, &chatCompletions); err != nil {
+		return fwkrh.ChatCompletionsRequest{}, strictErr
+	}
+	return chatCompletions, nil
+}
+
 func isStreamingRequest(apiType string, bodyMap map[string]any) bool {
 	if stream, ok := bodyMap["stream"].(bool); ok && stream {
 		return true
@@ -392,8 +446,8 @@ func extractRequestBody(apiType string, rawBody []byte) (*fwkrh.InferenceRequest
 
 	case chatCompletionsAPI:
 		validationErr := errors.New("invalid chat completions request: must have valid messages field")
-		var chatCompletions fwkrh.ChatCompletionsRequest
-		if err := json.Unmarshal(rawBody, &chatCompletions); err != nil {
+		chatCompletions, err := decodeChatCompletionsRequest(rawBody)
+		if err != nil {
 			return nil, requestBodyDecodeError(err, validationErr)
 		}
 		if err := validateChatCompletionsMessages(chatCompletions.Messages); err != nil {

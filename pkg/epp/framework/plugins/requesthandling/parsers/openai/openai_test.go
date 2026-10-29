@@ -651,6 +651,32 @@ func TestOpenAIParser_ParseRequest(t *testing.T) {
 			},
 		},
 		{
+			name:    "stringified tools (the shape agent trace replays send)",
+			headers: map[string]string{":path": "/v1/chat/completions"},
+			body: map[string]any{
+				"model":    "test",
+				"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+				// A JSON STRING holding the tool array, not the array. Strict
+				// decoding rejects the whole body over this, so the parsed view
+				// decodes it; the forwarded Payload keeps the client's bytes.
+				"tools": `[{"type":"function","function":{"name":"read_file"}}]`,
+			},
+			want: &fwkrh.InferenceRequestBody{
+				ChatCompletions: &fwkrh.ChatCompletionsRequest{
+					Messages: []fwkrh.Message{{Role: "user", Content: fwkrh.Content{Raw: "hello"}}},
+					Tools: []any{map[string]any{
+						"type":     "function",
+						"function": map[string]any{"name": "read_file"},
+					}},
+				},
+				Payload: fwkrh.PayloadMap{
+					"model":    "test",
+					"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+					"tools":    `[{"type":"function","function":{"name":"read_file"}}]`,
+				},
+			},
+		},
+		{
 			name:    "nil body",
 			headers: map[string]string{":path": "/v1/completions"},
 			body:    nil,

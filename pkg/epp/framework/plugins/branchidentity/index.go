@@ -462,10 +462,19 @@ func ChainStream(stream []byte, salt string, blockSize int) []Hash {
 //  3. sticky-busy guard (when enabled): the first message past the tip is an
 //     assistant message → the request contains the tip's reply → continue.
 //  4. retry rule (when enabled): the request is byte-identical to the tip and the
-//     tip has nothing IN FLIGHT (only arrival markers) → continue.
-//  5. tip outstanding and unproven (unless forkOnBusy is off) → fork: an
-//     identical prompt in flight is a parallel sibling, an extension is context
-//     inheritance. Both need their own queue.
+//     tip has nothing IN FLIGHT (only arrival markers) → continue. Two identical
+//     prompts are indistinguishable by body, so a retry of a still-queued turn
+//     and a genuinely parallel duplicate of it take the same path; nothing later
+//     can tell them apart either, because the fairness id (the flow-control queue
+//     key) is fixed HERE, at arrival — the two MERGE into one queue entry and no
+//     hook re-keys them. The alternative — fork every duplicate — pays a queue on
+//     a request that may be a pure retry; the errors are named, not hidden:
+//     identical queued bodies merge (a false merge that costs nothing for a cache,
+//     since identical bodies share the whole prefix).
+//  5. tip outstanding and unproven (unless forkOnBusy is off) → fork: a request
+//     already IN FLIGHT is dispatched under its own id, so a duplicate arriving
+//     now is a parallel sibling and an extension is context inheritance. Both
+//     need their own queue.
 //  6. no matching tip → new branch.
 func (ix *branchIndex) Resolve(now time.Time, a Arrival, forkOnBusy, stickyGuard, retryRule bool) ResolveResult {
 	// Chaining is the expensive part, so a caller may pass the chain precomputed;
@@ -498,9 +507,10 @@ func (ix *branchIndex) Resolve(now time.Time, a Arrival, forkOnBusy, stickyGuard
 			sticky, cont = true, true
 		case retryRule && exact && len(rec.inflight) == 0:
 			// Byte-identical to the tip, and nothing of the branch has actually
-			// started: this is a client retry of a request still sitting in the
-			// admission queue, not a parallel sibling. (Two identical prompts
-			// genuinely in flight both reach PreRequest and fork there.)
+			// started: treat it as a client retry of a request still sitting in
+			// the admission queue. The queue key was already fixed at ARRIVAL, so
+			// the two merge in the flow-control queue — nothing re-keys at
+			// PreRequest, and a second identical prompt cannot be forked later.
 			retry, cont = true, true
 		default:
 			cont = !forkOnBusy

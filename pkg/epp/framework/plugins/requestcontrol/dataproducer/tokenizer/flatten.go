@@ -28,6 +28,38 @@ import (
 // cover (there is nothing to derive a prefix from).
 var ErrNoCanonicalStream = errors.New("tokenizer: no canonical byte stream for this request body")
 
+// flattenMode selects which parts of a body are IDENTITY-bearing. The two modes
+// differ on exactly the two things measured to break the prefix property of a
+// conversation under real clients, and they differ deliberately:
+//
+//   - tools (tool DEFINITIONS, the top-level `tools` block): excluded from the
+//     identity stream. An agent that changes its tool set mid-thread (claude_code
+//     switches the main agent's tools for the sub-agent's `Task` tool) breaks the
+//     byte prefix at the tools block while the entire message history is intact —
+//     a tool-set change must cost a cache miss, not an identity change. Measured:
+//     stage 0B §5.3, 32 of 33 Exgentic mid-thread "splits" are this class, and a
+//     per-step tool shortlist would make it unbounded.
+//   - thinking (Anthropic `thinking` blocks): excluded from the identity stream.
+//     Clients legitimately drop earlier turns' reasoning (the API only keeps the
+//     last assistant turn's signed thinking), so including it would false-new a
+//     conversation on the very next turn.
+//
+// The canonical (sizing) mode keeps both: the estimate backend's byte stream
+// mirrors what the engine will prefill, so it must include everything the model
+// reads. Identity is a different question with a different answer — hence two
+// functions, not one.
+type flattenMode struct {
+	tools    bool
+	thinking bool
+}
+
+var (
+	// canonicalMode is the sizing view: everything the engine reads.
+	canonicalMode = flattenMode{tools: true, thinking: true}
+	// identityMode is the prefix-key view: message content only.
+	identityMode = flattenMode{tools: false, thinking: false}
+)
+
 // FlattenCanonicalBytes returns the canonical byte stream of a request body:
 // the stable rendering that prefix identity (branch identity, conversation
 // prefix keys) can be chained over.
@@ -47,22 +79,53 @@ var ErrNoCanonicalStream = errors.New("tokenizer: no canonical byte stream for t
 // backend's; a placeholder is derived from the asset's content hash, so it is
 // stable across turns either way. The output is a pure function of the body.
 //
+// This is the SIZING view: tools and thinking blocks are part of it. For the
+// identity view (branch identity's queue key) use FlattenIdentityBytes.
+//
 // Bodies without a text/chat shape (none of chat, messages, completions,
 // embeddings, responses, conversations, generate) return ErrNoCanonicalStream.
 func FlattenCanonicalBytes(body *fwkrh.InferenceRequestBody) ([]byte, error) {
+	return flattenBytes(body, canonicalMode)
+}
+
+// FlattenIdentityBytes returns the byte stream that BRANCH IDENTITY is derived
+// from: the conversation as the client means it, with the two things that
+// legitimately churn mid-thread left out (see flattenMode).
+//
+//   - chat completions: role + content + tool_calls per message, no top-level
+//     tools block.
+//   - Anthropic messages: the system prompt + role/content per message, no tools
+//     block, no thinking blocks. Tool calls and tool results are content (they
+//     are what the model said and read), so they stay.
+//
+// Tool-set equality is deliberately NOT part of the decision: a set-equality
+// gate would make a mid-thread tool change a NON-match, which is the very
+// false-new-branch class it is meant to remove. (The tool-set hash is available
+// to a caller as a tie-break between otherwise identical candidates — never as a
+// gate.)
+//
+// Like FlattenCanonicalBytes, the output is a pure function of the body and is
+// append-only over an append-only conversation: turn N is a byte prefix of turn
+// N+1.
+func FlattenIdentityBytes(body *fwkrh.InferenceRequestBody) ([]byte, error) {
+	return flattenBytes(body, identityMode)
+}
+
+// flattenBytes is the shared body-shape dispatch behind the two views.
+func flattenBytes(body *fwkrh.InferenceRequestBody, mode flattenMode) ([]byte, error) {
 	if body == nil {
 		return nil, ErrNoCanonicalStream
 	}
 	b := estimateBackend{}
 	switch {
 	case body.ChatCompletions != nil:
-		raw, _ := b.chatCompletionsBytes(body.ChatCompletions, mmMetadata{})
+		raw, _ := b.chatCompletionsBytes(body.ChatCompletions, mmMetadata{}, mode)
 		if len(raw) == 0 {
 			return nil, ErrNoCanonicalStream
 		}
 		return raw, nil
 	case body.Messages != nil:
-		raw, _ := b.messagesBytes(body.Messages)
+		raw, _ := b.messagesBytes(body.Messages, mode)
 		if len(raw) == 0 {
 			return nil, ErrNoCanonicalStream
 		}
@@ -73,7 +136,7 @@ func FlattenCanonicalBytes(body *fwkrh.InferenceRequestBody) ([]byte, error) {
 		}
 		return packTokenBytes(body.Generate.TokenIDs), nil
 	}
-	raw, err := estimateBytes(body)
+	raw, err := estimateBytesMode(body, mode)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrNoCanonicalStream, err)
 	}

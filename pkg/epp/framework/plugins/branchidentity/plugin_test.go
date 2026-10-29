@@ -19,11 +19,14 @@ package branchidentity
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -45,9 +48,18 @@ func assistant(seed byte, n int) fwkrh.Message {
 	return fwkrh.Message{Role: "assistant", Content: fwkrh.Content{Raw: filler(seed, n)}}
 }
 
+// reqSeq makes every test request a distinct request id, because the branch's
+// outstanding set is keyed by request id (two hooks of one request share a marker;
+// two requests never do).
+var reqSeq atomic.Uint64
+
 func chatReq(msgs ...fwkrh.Message) *fwksched.InferenceRequest {
+	return chatReqID(fmt.Sprintf("req-%d", reqSeq.Add(1)), msgs...)
+}
+
+func chatReqID(id string, msgs ...fwkrh.Message) *fwksched.InferenceRequest {
 	return &fwksched.InferenceRequest{
-		RequestID: "req",
+		RequestID: id,
 		Headers:   map[string]string{},
 		Body:      &fwkrh.InferenceRequestBody{ChatCompletions: &fwkrh.ChatCompletionsRequest{Messages: msgs}},
 	}
@@ -121,9 +133,15 @@ func TestLifecycle_ContinuationIsTheSameID(t *testing.T) {
 	assert.Equal(t, id1, id2)
 	assert.Equal(t, id1, fairness2)
 
-	// Determinism: the same body derives the same chain and the same id.
-	idAgain, _ := branchOf(t, p, chatReq(user('a', 600)))
-	assert.Equal(t, id1, idAgain)
+	// A re-send of the CURRENT tip (a retry) stays on the branch.
+	idAgain, _ := branchOf(t, p, chatReq(user('a', 600), assistant('b', 400), user('c', 300)))
+	assert.Equal(t, id1, idAgain, "a retry of the tip continues the branch")
+
+	// A re-send of an EARLIER turn does not: the tip has moved past it, and an id
+	// held by a live branch is never reused (it used to overwrite and ghost it).
+	idOld, _ := branchOf(t, p, chatReq(user('a', 600)))
+	assert.NotEqual(t, id1, idOld)
+	assert.Contains(t, idsOf(p), id1, "the original branch is still live")
 }
 
 // TestLifecycle_ForkWhileBusy: a sibling that extends a BUSY branch's tip (a
@@ -254,6 +272,17 @@ func TestDumpState(t *testing.T) {
 	require.Len(t, rows, 1)
 }
 
+// idsOf lists the live branch ids (test helper).
+func idsOf(p *Plugin) []string {
+	p.idx.mu.Lock()
+	defer p.idx.mu.Unlock()
+	ids := make([]string, 0, len(p.idx.branches))
+	for id := range p.idx.branches {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // TestFactory_Config: defaults resolve, invalid values fail closed.
 func TestFactory_Config(t *testing.T) {
 	p := newTestPlugin(t)
@@ -261,6 +290,15 @@ func TestFactory_Config(t *testing.T) {
 	assert.True(t, p.forkOnBusy)
 	assert.True(t, p.sticky)
 	assert.Equal(t, defaultMaxBranches, p.idx.maxBranches)
+	assert.Equal(t, time.Duration(defaultMarkerTTLSeconds)*time.Second, p.markerTTL,
+		"the marker TTL is the client request timeout, not the flow queue's 5-minute GC")
+	assert.True(t, p.retry, "the S2 retry rule is on by default")
+
+	// The deprecated arm name still parses (an older deployment key).
+	dec := json.NewDecoder(strings.NewReader(`{"queuedTtlSeconds":900}`))
+	built, err := Factory("legacy", dec, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 900*time.Second, built.(*Plugin).markerTTL)
 	assert.Equal(t, []string{
 		"x-claude-code-session-id", "x-session-affinity", "session-id", "session_id",
 	}, p.sessions)
@@ -302,8 +340,105 @@ func TestFactory_MetricsRegistered(t *testing.T) {
 		"llm_d_epp_branch_forks_total",
 		"llm_d_epp_branch_records",
 		"llm_d_epp_branch_flatten_ns",
+		"llm_d_epp_branch_resolve_ns",
 		"llm_d_epp_branch_sticky_busy_total",
+		"llm_d_epp_branch_retry_total",
+		"llm_d_epp_branch_explicit_override_total",
 	} {
 		assert.Contains(t, names, want)
 	}
+}
+
+// TestIdentity_ToolSetChurnMidThreadContinues (B4): the identity stream excludes
+// the tool DEFINITIONS, so an agent that swaps its tool set between turns (claude_code
+// does exactly this when it hands a sub-task to a `Task` tool) still continues its
+// branch. Stage 0B measured 32 of 33 Exgentic mid-thread "splits" to be this class,
+// and a per-step tool shortlist would make it unbounded — the unsafe direction.
+func TestIdentity_ToolSetChurnMidThreadContinues(t *testing.T) {
+	p := newTestPlugin(t)
+
+	turn1 := chatReq(user('a', 600))
+	turn1.Body.ChatCompletions.Tools = []any{map[string]any{"type": "function", "function": map[string]any{"name": "read"}}}
+	id1, _ := branchOf(t, p, turn1)
+	dispatchAndComplete(t, p, turn1)
+
+	// Same conversation, a completely different tool set.
+	turn2 := chatReq(user('a', 600), assistant('b', 400), user('c', 300))
+	turn2.Body.ChatCompletions.Tools = []any{map[string]any{"type": "function", "function": map[string]any{"name": "Task"}}}
+	id2, _ := branchOf(t, p, turn2)
+	assert.Equal(t, id1, id2, "a tool-set change must cost a cache miss, never an identity change")
+
+	// And with the tool set REMOVED entirely.
+	turn3 := chatReq(user('a', 600), assistant('b', 400), user('c', 300), assistant('d', 100), user('e', 100))
+	id3, _ := branchOf(t, p, turn3)
+	assert.Equal(t, id1, id3)
+}
+
+// TestIdentity_DroppedThinkingContinues (B4): Anthropic clients only keep the LAST
+// assistant turn's signed thinking — earlier turns drop theirs — so thinking blocks
+// must not be part of the identity stream, or every turn would look like a new
+// conversation.
+func TestIdentity_DroppedThinkingContinues(t *testing.T) {
+	p := newTestPlugin(t)
+	filler600 := filler('a', 600)
+
+	withThinking := &fwkrh.InferenceRequestBody{Messages: &fwkrh.MessagesRequest{
+		System: fwkrh.AnthropicContent{Raw: "be terse"},
+		Messages: []fwkrh.AnthropicMessage{
+			{Role: "user", Content: fwkrh.AnthropicContent{Raw: filler600}},
+			{Role: "assistant", Content: fwkrh.AnthropicContent{Structured: []fwkrh.AnthropicContentBlock{
+				{Type: "thinking", Thinking: "let me think about this at length"},
+				{Type: "text", Text: filler('b', 400)},
+			}}},
+		},
+	}}
+	turn1 := &fwksched.InferenceRequest{RequestID: "m1", Headers: map[string]string{}, Body: withThinking}
+	id1, _ := branchOf(t, p, turn1)
+	dispatchAndComplete(t, p, turn1)
+
+	// The next turn drops the earlier assistant's thinking block, as the API does.
+	next := &fwkrh.InferenceRequestBody{Messages: &fwkrh.MessagesRequest{
+		System: fwkrh.AnthropicContent{Raw: "be terse"},
+		Messages: []fwkrh.AnthropicMessage{
+			{Role: "user", Content: fwkrh.AnthropicContent{Raw: filler600}},
+			{Role: "assistant", Content: fwkrh.AnthropicContent{Structured: []fwkrh.AnthropicContentBlock{
+				{Type: "text", Text: filler('b', 400)},
+			}}},
+			{Role: "user", Content: fwkrh.AnthropicContent{Raw: filler('c', 300)}},
+		},
+	}}
+	id2, _ := branchOf(t, p, &fwksched.InferenceRequest{RequestID: "m2", Headers: map[string]string{}, Body: next})
+	assert.Equal(t, id1, id2, "dropped thinking must not fragment the conversation")
+}
+
+// TestExplicitFairnessOverrideIsCounted (B1): the derivation is silently bypassed
+// when a client (or a harness flag) sets the fairness id, so the bypass is counted —
+// it is how a run proves the stage-1 harness did not send one.
+func TestExplicitFairnessOverrideIsCounted(t *testing.T) {
+	p := newTestPlugin(t)
+	req := chatReq(user('a', 600))
+	req.FairnessID = "client-thread-1"
+	branchOf(t, p, req)
+	require.NotNil(t, p.metrics.overridden)
+	assert.EqualValues(t, 1, testutil.ToFloat64(p.metrics.overridden))
+
+	plain := chatReq(user('b', 600))
+	branchOf(t, p, plain)
+	assert.EqualValues(t, 1, testutil.ToFloat64(p.metrics.overridden), "no override, no count")
+}
+
+// TestRetryIsCounted (S2): a retry of a still-queued turn continues the branch and
+// is visible as its own counter (stage 1 reads it to see how much of the fork rate
+// was retries).
+func TestRetryIsContainedAndCounted(t *testing.T) {
+	p := newTestPlugin(t)
+
+	turn1 := chatReqID("dup", user('a', 600))
+	id1, _ := branchOf(t, p, turn1) // arrival only: still queued
+
+	retry := chatReqID("dup-2", user('a', 600))
+	id2, _ := branchOf(t, p, retry)
+	assert.Equal(t, id1, id2, "a byte-identical duplicate of a queued turn is a retry")
+	require.NotNil(t, p.metrics.retried)
+	assert.EqualValues(t, 1, testutil.ToFloat64(p.metrics.retried))
 }

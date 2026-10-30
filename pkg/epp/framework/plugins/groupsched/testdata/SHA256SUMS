@@ -1,0 +1,17 @@
+# The trace files every behaviour claim about this package rests on. Pinned here
+# so a later audit can verify the SAME bytes were the ones asserted (audit item 4:
+# the hashes belong in the manifest, not only in a test's passing green).
+#
+#   golden.txt          the single-engine golden: 2600 virtual seconds of the
+#                       default config, generated from PRE-CHANGE code and
+#                       reproduced byte-for-byte by engineGroups=single AND by
+#                       engineGroups=per-engine with one engine
+#                       (TestGoldenReplay / TestPerEngineGoldenEquality)
+#   golden-legacy.txt   the pre-branch raw code (c57e92ed) prefix, 489 s —
+#                       closes the golden's circularity (TestGoldenLegacyC57e92ed)
+#   golden-multipod.txt the two-engine scenario: homing split, per-engine budgets,
+#                       a deliberate affinity violation + rebind, an engine
+#                       teardown and re-homing (TestMultiPodGolden)
+31051d4ddc7b3ac22d248e1e50ac435c17e27d953c5d6ffef8abfa8b50addcf1  golden.txt
+5671d20c6052cd26147fe96f974cd65ad18935baf680c5c55c42a44ee77324f3  golden-legacy.txt
+111db7841881426de37a187ae4edbb37aa27ce496a8457625c46295bf2c00d73  golden-multipod.txt

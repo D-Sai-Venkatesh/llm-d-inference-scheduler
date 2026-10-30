@@ -32,6 +32,7 @@ package groupsched
 //	go test ./pkg/epp/framework/plugins/groupsched/ -run TestGolden -update-golden
 
 import (
+	"crypto/sha256"
 	"flag"
 	"fmt"
 	"os"
@@ -428,5 +429,42 @@ func TestGoldenLegacyC57e92ed(t *testing.T) {
 			}
 		}
 		t.Fatal("legacy golden divergence (length)")
+	}
+}
+
+// TestGoldenHashesPinned closes the loop between "the test passes" and "the bytes
+// that passed are the bytes an auditor can check" (audit item 4): testdata/
+// SHA256SUMS pins the sha256 of every committed trace, and this test FAILS if a
+// golden file changes without its hash being updated — a silent `-update-golden`
+// regeneration can no longer ride along unnoticed.
+func TestGoldenHashesPinned(t *testing.T) {
+	sums, err := os.ReadFile(filepath.Join("testdata", "SHA256SUMS"))
+	if err != nil {
+		t.Fatalf("testdata/SHA256SUMS missing: %v", err)
+	}
+	want := map[string]string{}
+	for _, line := range strings.Split(string(sums), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		want[f[1]] = f[0]
+	}
+	if len(want) < 3 {
+		t.Fatalf("SHA256SUMS lists %d files, want at least the three trace files", len(want))
+	}
+	for name, h := range want {
+		b, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		got := fmt.Sprintf("%x", sha256.Sum256(b))
+		if got != h {
+			t.Fatalf("%s: sha256 %s != pinned %s — if the change is intended, update both the trace and testdata/SHA256SUMS (and say why in the commit)", name, got, h)
+		}
 	}
 }

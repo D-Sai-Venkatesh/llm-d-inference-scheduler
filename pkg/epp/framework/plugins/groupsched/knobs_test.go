@@ -51,7 +51,7 @@ func newSchedCfg(t *testing.T, cfg Config) *Scheduler {
 // drive one full turn: pick, dispatch, chunk, settle.
 func turn(t *testing.T, s *Scheduler, id string, k []Hash, now time.Time, natural bool) {
 	t.Helper()
-	i := s.PickFromHeads([]Head{{Session: id, ReqID: "r-" + id, Arrival: now, SizeBytes: bytesFor(len(k))}}, now)
+	i := s.PickFromHeads([]Head{{Member: id, ReqID: "r-" + id, Arrival: now, SizeBytes: bytesFor(len(k))}}, now)
 	if i < 0 {
 		t.Fatalf("pick rejected for %s", id)
 	}
@@ -86,7 +86,7 @@ func TestQuantumMidQuantumMemberProtectedFromRotation(t *testing.T) {
 	turn(t, s, "a", keys(10, 1), now, true)
 	// a waiter arrives; rotation must NOT evict the mid-quantum member
 	s.Tick(now.Add(2 * time.Second))
-	i := s.PickFromHeads([]Head{{Session: "b", ReqID: "r-b", Arrival: now.Add(2 * time.Second), SizeBytes: bytesFor(500)}}, now.Add(2*time.Second))
+	i := s.PickFromHeads([]Head{{Member: "b", ReqID: "r-b", Arrival: now.Add(2 * time.Second), SizeBytes: bytesFor(500)}}, now.Add(2*time.Second))
 	_ = i
 	if s.Seated("a") {
 		// a stays seated (no eligible victim: not quantum-complete, not silent)
@@ -177,7 +177,7 @@ func TestValveOffAllowsConcurrentColdEntries(t *testing.T) {
 	s := newSchedCfg(t, cfg)
 	now := time.Now()
 	// "a" seats with a big cold charge in flight
-	s.PickFromHeads([]Head{{Session: "a", ReqID: "r-a", Arrival: now, SizeBytes: bytesFor(90)}}, now)
+	s.PickFromHeads([]Head{{Member: "a", ReqID: "r-a", Arrival: now, SizeBytes: bytesFor(90)}}, now)
 	s.mu.Lock()
 	cold := s.coldInFlight
 	s.mu.Unlock()
@@ -203,14 +203,14 @@ func TestSizeAwareGateBlocksOversizedDispatch(t *testing.T) {
 	// seat "a" small, fill most of the budget
 	turn(t, s, "a", keys(900, 1), now, true)
 	// "a"'s next turn would add ~50 new blocks: 900+50 <= 950 fits
-	i := s.PickFromHeads([]Head{{Session: "a", ReqID: "r-a2", Arrival: now, SizeBytes: bytesFor(950)}}, now.Add(time.Second))
+	i := s.PickFromHeads([]Head{{Member: "a", ReqID: "r-a2", Arrival: now, SizeBytes: bytesFor(950)}}, now.Add(time.Second))
 	if i < 0 {
 		t.Log("gate blocked the 950-block turn (conservative estimate) — acceptable")
 	} else {
 		t.Log("gate allowed the 950-block turn")
 	}
 	// a request that cannot fit is blocked even for a seated member
-	blocked := s.PickFromHeads([]Head{{Session: "a", ReqID: "r-a3", Arrival: now, SizeBytes: bytesFor(40000)}}, now.Add(2*time.Second))
+	blocked := s.PickFromHeads([]Head{{Member: "a", ReqID: "r-a3", Arrival: now, SizeBytes: bytesFor(40000)}}, now.Add(2*time.Second))
 	if blocked >= 0 {
 		t.Fatal("size-aware gate dispatched a request whose new blocks exceed the budget")
 	}
@@ -257,7 +257,7 @@ func TestC3ProvisionalInflightReaped(t *testing.T) {
 	now := time.Now()
 	// seat "a" and pick a head that NEVER reaches PreRequest
 	turn(t, s, "a", keys(10, 1), now, true)
-	s.PickFromHeads([]Head{{Session: "a", ReqID: "ghost", Arrival: now, SizeBytes: bytesFor(10)}}, now.Add(time.Second))
+	s.PickFromHeads([]Head{{Member: "a", ReqID: "ghost", Arrival: now, SizeBytes: bytesFor(10)}}, now.Add(time.Second))
 	s.mu.Lock()
 	if s.members["a"].inflight != 1 {
 		t.Fatalf("inflight = %d, want 1 (the ghost)", s.members["a"].inflight)
@@ -345,7 +345,7 @@ func BenchmarkPickFromHeads(b *testing.B) {
 	for i := 0; i < 32; i++ {
 		id := fmt.Sprintf("m%02d", i)
 		k := keys(1000, Hash(i+1))
-		if j := s.PickFromHeads([]Head{{Session: id, ReqID: "r1", Arrival: now, SizeBytes: bytesFor(1000)}}, now); j < 0 {
+		if j := s.PickFromHeads([]Head{{Member: id, ReqID: "r1", Arrival: now, SizeBytes: bytesFor(1000)}}, now); j < 0 {
 			b.Fatalf("seat pick failed for %s", id)
 		}
 		s.Dispatched(id, "r1", k, bytesFor(1000), now)
@@ -355,10 +355,10 @@ func BenchmarkPickFromHeads(b *testing.B) {
 	// 150 waiting heads (118 non-members + members' next turns)
 	var heads []Head
 	for i := 0; i < 118; i++ {
-		heads = append(heads, Head{Session: fmt.Sprintf("w%03d", i), ReqID: "r", Arrival: now, SizeBytes: bytesFor(800)})
+		heads = append(heads, Head{Member: fmt.Sprintf("w%03d", i), ReqID: "r", Arrival: now, SizeBytes: bytesFor(800)})
 	}
 	for i := 0; i < 32; i++ {
-		heads = append(heads, Head{Session: fmt.Sprintf("m%02d", i), ReqID: "r2", Arrival: now, SizeBytes: bytesFor(1100)})
+		heads = append(heads, Head{Member: fmt.Sprintf("m%02d", i), ReqID: "r2", Arrival: now, SizeBytes: bytesFor(1100)})
 	}
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
@@ -386,14 +386,14 @@ func TestWhistleReplayNoFreeze(t *testing.T) {
 	// without-EOS class)
 	for i, id := range []string{"a", "b", "c"} {
 		k := keys(10, Hash(i+1))
-		if j := s.PickFromHeads([]Head{{Session: id, ReqID: "r-" + id, Arrival: now, SizeBytes: bytesFor(10)}}, now); j < 0 {
+		if j := s.PickFromHeads([]Head{{Member: id, ReqID: "r-" + id, Arrival: now, SizeBytes: bytesFor(10)}}, now); j < 0 {
 			t.Fatalf("pick failed for %s", id)
 		}
 		s.Dispatched(id, "r-"+id, k, bytesFor(10), now)
 	}
 	// fresh load arrives: a big newcomer the valve would block while
 	// the dead cold charges linger
-	big := Head{Session: "big", ReqID: "r-big", Arrival: now.Add(time.Second), SizeBytes: bytesFor(100)}
+	big := Head{Member: "big", ReqID: "r-big", Arrival: now.Add(time.Second), SizeBytes: bytesFor(100)}
 	// before the reap bound: the dead charges hold the valve
 	s.mu.Lock()
 	coldBefore := s.coldInFlight
@@ -433,7 +433,7 @@ func TestR1EmptyReqIDRoundTripEndsAtZero(t *testing.T) {
 	// Pick with an EMPTY ReqID, Dispatched with an EMPTY ReqID, Settle
 	// with an EMPTY ReqID: exactly one record, ending at inflight 0
 	// (the old path minted two ids and leaked one past the 3,700s reap).
-	if j := s.PickFromHeads([]Head{{Session: "a", Arrival: now, SizeBytes: bytesFor(10)}}, now); j < 0 {
+	if j := s.PickFromHeads([]Head{{Member: "a", Arrival: now, SizeBytes: bytesFor(10)}}, now); j < 0 {
 		t.Fatal("pick failed")
 	}
 	s.Dispatched("a", "", keys(10, 1), bytesFor(10), now)
@@ -464,7 +464,7 @@ func TestR2UnknownSettleRemovesNothing(t *testing.T) {
 	now := time.Now()
 	// two real in-flight requests
 	for _, id := range []string{"a", "b"} {
-		if j := s.PickFromHeads([]Head{{Session: id, ReqID: "r-" + id, Arrival: now, SizeBytes: bytesFor(10)}}, now); j < 0 {
+		if j := s.PickFromHeads([]Head{{Member: id, ReqID: "r-" + id, Arrival: now, SizeBytes: bytesFor(10)}}, now); j < 0 {
 			t.Fatalf("pick failed for %s", id)
 		}
 		s.Dispatched(id, "r-"+id, keys(10, Hash(id[0])), bytesFor(10), now)
@@ -511,7 +511,7 @@ func TestR4CacheMatchesUncachedUnderRandomOps(t *testing.T) {
 		id := ids[rng.Intn(len(ids))]
 		switch rng.Intn(6) {
 		case 0, 1:
-			s.PickFromHeads([]Head{{Session: id, ReqID: fmt.Sprintf("r%d", op), Arrival: now, SizeBytes: bytesFor(20 + rng.Intn(60))}}, now)
+			s.PickFromHeads([]Head{{Member: id, ReqID: fmt.Sprintf("r%d", op), Arrival: now, SizeBytes: bytesFor(20 + rng.Intn(60))}}, now)
 		case 2:
 			s.Dispatched(id, fmt.Sprintf("r%d", rng.Intn(op+1)), keys(20+rng.Intn(60), Hash(op)), bytesFor(50), now)
 		case 3:
@@ -560,7 +560,7 @@ func TestSizeAwareGateFirstFitNotHeadOfLine(t *testing.T) {
 	now := time.Now()
 	// "big" seats and fills most of the budget; "small" seats with room to spare
 	for _, id := range []string{"big", "small"} {
-		if j := s.PickFromHeads([]Head{{Session: id, ReqID: "r1-" + id, Arrival: now, SizeBytes: bytesFor(400)}}, now); j < 0 {
+		if j := s.PickFromHeads([]Head{{Member: id, ReqID: "r1-" + id, Arrival: now, SizeBytes: bytesFor(400)}}, now); j < 0 {
 			t.Fatalf("seat pick failed for %s", id)
 		}
 		s.Dispatched(id, "r1-"+id, keys(400, Hash(id[0])), bytesFor(400), now)
@@ -570,8 +570,8 @@ func TestSizeAwareGateFirstFitNotHeadOfLine(t *testing.T) {
 	// big's next turn needs 300 new blocks (does NOT fit: ~800 used + 300 > 950);
 	// small's needs 50 (fits). big is OLDER — the freeze bug returned -1 for both.
 	heads := []Head{
-		{Session: "big", ReqID: "r2-big", Arrival: now.Add(2 * time.Second), SizeBytes: bytesFor(1100)},
-		{Session: "small", ReqID: "r2-small", Arrival: now.Add(3 * time.Second), SizeBytes: bytesFor(450)},
+		{Member: "big", ReqID: "r2-big", Arrival: now.Add(2 * time.Second), SizeBytes: bytesFor(1100)},
+		{Member: "small", ReqID: "r2-small", Arrival: now.Add(3 * time.Second), SizeBytes: bytesFor(450)},
 	}
 	i := s.PickFromHeads(heads, now.Add(4*time.Second))
 	if i != 1 {

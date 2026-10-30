@@ -48,7 +48,7 @@ func newSched(t *testing.T) *Scheduler {
 }
 
 func head(session string, ago time.Duration, sizeBytes int64) Head {
-	return Head{Session: session, ReqID: "r-" + session, Arrival: time.Now().Add(-ago), SizeBytes: sizeBytes}
+	return Head{Member: session, ReqID: "r-" + session, Arrival: time.Now().Add(-ago), SizeBytes: sizeBytes}
 }
 
 // dispatch drives the released-request path: Pick chose the head, the

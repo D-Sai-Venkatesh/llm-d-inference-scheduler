@@ -41,6 +41,7 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/branchidentity"
 	sourcenotifications "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/notifications"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
@@ -69,6 +70,22 @@ type GroupScheduler struct {
 	handle  fwkplugin.Handle
 
 	fcfsOnce sync.Once
+
+	// ---- capacity acquisition (WAVE-1 item 1: the capacity race) ----
+	//
+	// num_gpu_blocks arrives on the endpoint's METRICS, and an endpoint's
+	// creation event fires BEFORE the first scrape has populated them, so
+	// the event path alone can miss the capacity for the whole process
+	// lifetime (measured twice: capacity was only recovered by a metadata
+	// nudge). The plugin therefore keeps the endpoint HANDLES it has seen
+	// and re-reads their metrics on the ticker: the datalayer refreshes a
+	// ModelServer's metrics IN PLACE (atomic pointer swap inside the same
+	// endpoint object), so a stored handle is a live poll target.
+	capMu     sync.Mutex
+	endpoints map[string]metricsSource // endpoint id -> handle (shared, refreshed in place)
+	firstSeen time.Time                // first decode-endpoint observation
+	capWarned bool                     // the liveness warning is one-shot
+	capFrom   string                   // how the capacity was learned (audit)
 }
 
 // Factory builds a GroupScheduler. FAILS CLOSED without the
@@ -90,6 +107,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		typedName: fwkplugin.TypedName{Type: PluginType, Name: name},
 		cfg:       cfg,
 		sched:     sched,
+		endpoints: map[string]metricsSource{},
 		// the handle is held for the RegisterDependencies-time gate: plugin
 		// construction order is NOT the config order (the runner may build
 		// the fairness policy first), so the token-producer check cannot
@@ -104,6 +122,12 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	if echo, err := json.Marshal(cfg); err == nil {
 		fmt.Printf("group-scheduler: effective config %s\n", echo)
 	}
+	// WAVE-1 item 2: the member-key mode is the one knob whose EFFECT is
+	// invisible in the config text ("auto" resolves per request), so state
+	// the resolution rule in words at startup and log the first resolution
+	// at runtime.
+	fmt.Printf("group-scheduler: member key source: %s (%s); session ordering: %s\n",
+		cfg.MemberKey, memberKeyRule(cfg.MemberKey), cfg.SessionOrder)
 	if handle != nil {
 		if reg := handle.Metrics(); reg != nil {
 			if err := r.metrics.register(reg); err != nil {
@@ -113,6 +137,9 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		r.sched.onExit = r.metrics.ObserveExit
 		r.sched.onEntry = r.metrics.ObserveEntry
 		r.sched.onServe = r.metrics.ObserveServed
+		r.sched.onMemberSource = func(source string) {
+			fmt.Printf("group-scheduler: member source in effect at dispatch: %s\n", source)
+		}
 		// the per-id SEAT/EXIT event log (one debug line each; the
 		// campaign's spans could not see seat membership).
 		r.sched.onEvent = func(ev Event) {
@@ -132,25 +159,49 @@ func (r *GroupScheduler) runTicker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			r.sched.Tick(time.Now())
+			now := time.Now()
+			r.pollCapacity(now)
+			r.sched.Tick(now)
 			r.metrics.Refresh()
 		}
 	}
 }
 
+// memberKeyRule states the resolution rule of a memberKey value in words (the
+// startup echo).
+func memberKeyRule(memberKey string) string {
+	switch memberKey {
+	case "branch":
+		return "base mode: the derived branch is member AND queue key"
+	case "session":
+		return "the agent-identity session attribute is the member"
+	default:
+		return "branch when present, else the session, else anonymous (R9)"
+	}
+}
+
 func (r *GroupScheduler) TypedName() fwkplugin.TypedName { return r.typedName }
 
-// Consumes requires agent identity. The tokenizer's output is enforced
-// at RUNTIME instead: the data layer forbids a FairnessPolicy (flow
-// control layer) from declaring a DataProducer's key in Consumes (the
-// layer order is request-control before flow-control), so the fail-closed
-// gate is PreRequest's error on a missing TokenizedRequest — without the
-// token-producer EVERY request fails loudly at dispatch; nothing ever
-// falls back to tier B (CP2's M3 verdict).
+// Consumes declares the attribute keys the policy READS. Both identity keys
+// are OPTIONAL at the data layer because which one is the member depends on
+// Config.MemberKey (and on which identity plugin the arm deployed); the
+// fail-closed check is validateMemberProducer at startup, which requires the
+// producer of the configured member source to EXIST. Making the keys required
+// unconditionally would have made base mode (no session header, branch
+// identity only) a startup failure.
+//
+// The tokenizer's output is enforced at RUNTIME instead: the data layer
+// forbids a FairnessPolicy (flow control layer) from declaring a
+// DataProducer's key in Consumes (the layer order is request-control before
+// flow-control), so the fail-closed gate is PreRequest's error on a missing
+// TokenizedRequest — without the token-producer EVERY request fails loudly at
+// dispatch; nothing ever falls back to tier B (CP2's M3 verdict).
 func (r *GroupScheduler) Consumes() fwkplugin.DataDependencies {
 	return fwkplugin.DataDependencies{
-		Required: map[fwkplugin.DataKey]any{
-			agentidentity.AgentIdentityKey: "",
+		Optional: map[fwkplugin.DataKey]any{
+			agentidentity.AgentIdentityKey:   "",
+			branchidentity.BranchIdentityKey: "",
+			branchidentity.BranchSessionKey:  "",
 		},
 	}
 }
@@ -164,12 +215,66 @@ func (r *GroupScheduler) Produces() map[fwkplugin.DataKey]any {
 
 var requestKeysKey = fwkplugin.NewDataKey("group-keys", PluginType)
 
-func sessionID(request *fwksched.InferenceRequest) string {
+// readID is the non-empty string attribute at key ("" when absent).
+func readID(request *fwksched.InferenceRequest, key fwkplugin.DataKey) string {
 	if request == nil {
 		return ""
 	}
-	id, _ := fwksched.ReadRequestAttribute[string](request, agentidentity.AgentIdentityKey)
+	id, _ := fwksched.ReadRequestAttribute[string](request, key)
 	return id
+}
+
+// memberOf resolves the request's MEMBER id, its SESSION attribute, and which
+// source produced the member (Config.MemberKey):
+//
+//	branch  -> the derived branch id (branch-identity)
+//	session -> the agent-identity session attribute (pre-WAVE-1 behaviour)
+//	(none)  -> nothing resolvable: anonymous traffic, R9 FCFS pass-through
+//
+// It is a PURE READ. The branch id is never written into the agent-identity
+// slot (in session mode that slot must hold the real session), and the session
+// attribute is never derived from the branch here — the session layer applies
+// its own "session := member when absent" rule, in ONE place, in the
+// scheduler.
+func (r *GroupScheduler) memberOf(request *fwksched.InferenceRequest) (member, session, source string) {
+	if request == nil {
+		return "", "", ""
+	}
+	// reads are lazy: the hot Pick path pays at most two attribute loads (the
+	// branch, and the session only when it is the member source). At most two
+	// per head is the ceiling — attribute loads are a sync.Map read.
+	branch := readID(request, branchidentity.BranchIdentityKey)
+	session = r.sessionAttr(request)
+	switch r.cfg.MemberKey {
+	case "branch":
+		if branch != "" {
+			return branch, session, "branch"
+		}
+		return "", session, ""
+	case "session":
+		if session != "" {
+			return session, session, "session"
+		}
+		return "", session, ""
+	default: // "auto": branch when present, else the session, else R9
+		if branch != "" {
+			return branch, session, "branch"
+		}
+		if session != "" {
+			return session, session, "session"
+		}
+		return "", "", ""
+	}
+}
+
+// sessionAttr is the request's SESSION attribute: the system's agent-identity
+// session first (the session the rest of the stack sees), else the branch
+// plugin's copy of the same client header. Read-only.
+func (r *GroupScheduler) sessionAttr(request *fwksched.InferenceRequest) string {
+	if s := readID(request, agentidentity.AgentIdentityKey); s != "" {
+		return s
+	}
+	return readID(request, branchidentity.BranchSessionKey)
 }
 
 // validateTokenProducer is the gate body (testable without a registrar).
@@ -187,6 +292,48 @@ func (r *GroupScheduler) validateTokenProducer() error {
 		PluginType)
 }
 
+// validateMemberProducer is the fail-closed MEMBER-SOURCE gate: the configured
+// memberKey needs its identity plugin in the same config. Without it every
+// request is anonymous and Pick degrades to R9 FCFS pass-through — the worst
+// arm of the campaign, and a failure that is silent in the outcome metrics
+// (Amendment 4 measured it twice), so it must fail at startup.
+func (r *GroupScheduler) validateMemberProducer() error {
+	if r.handle == nil {
+		return nil // unit/test mode
+	}
+	b, s := false, false
+	for _, p := range r.handle.GetAllPlugins() {
+		if p == nil {
+			continue
+		}
+		switch p.TypedName().Type {
+		case branchidentity.PluginType:
+			b = true
+		case agentidentity.PluginType:
+			s = true
+		}
+	}
+	switch r.cfg.MemberKey {
+	case "branch":
+		if !b {
+			return fmt.Errorf("memberKey=\"branch\" requires the '%s' plugin in the same config (the member id comes from its derived branch)", branchidentity.PluginType)
+		}
+	case "session":
+		if !s {
+			return fmt.Errorf("memberKey=\"session\" requires the '%s' plugin in the same config (the member id comes from the session attribute)", agentidentity.PluginType)
+		}
+	default:
+		if !b && !s {
+			return fmt.Errorf("memberKey=%q needs at least one identity plugin ('%s' or '%s'); with neither, every request is anonymous and the group policy degrades to R9 FCFS",
+				"auto", branchidentity.PluginType, agentidentity.PluginType)
+		}
+	}
+	if b && !s {
+		fmt.Printf("group-scheduler: no '%s' plugin in the config — the SESSION attribute is absent, so the session layer runs with session := member (base mode)\n", agentidentity.PluginType)
+	}
+	return nil
+}
+
 // RegisterDependencies runs after every plugin is constructed — the
 // STARTUP fail-closed gate lives here: a missing token-producer is a
 // full-outage misconfiguration (every request would error at PreRequest,
@@ -196,6 +343,9 @@ func (r *GroupScheduler) validateTokenProducer() error {
 // the config author's responsibility, guarded by the config comment).
 func (r *GroupScheduler) RegisterDependencies(reg fwkdl.Registrar) error {
 	if err := r.validateTokenProducer(); err != nil {
+		return err
+	}
+	if err := r.validateMemberProducer(); err != nil {
 		return err
 	}
 	return reg.Register(fwkdl.PendingRegistration{
@@ -210,15 +360,144 @@ func (r *GroupScheduler) RegisterDependencies(reg fwkdl.Registrar) error {
 }
 
 // Extract learns num_gpu_blocks (and checks the block size matches the
-// config — a mismatch fails loudly).
+// config — a mismatch fails loudly) from the endpoint lifecycle EVENTS, and
+// remembers the endpoint HANDLE so the ticker can poll its metrics (the
+// event carries them before the first scrape has populated them — the
+// capacity race).
 func (r *GroupScheduler) Extract(_ context.Context, event fwkdl.EndpointEvent) error {
-	if event.Type != fwkdl.EventAddOrUpdate || event.Endpoint == nil {
+	if event.Endpoint == nil {
 		return nil
 	}
-	if m := event.Endpoint.GetMetrics(); m != nil && m.CacheBlockSize > 0 && m.CacheNumBlocks > 0 {
-		return r.sched.SetNumBlocks(m.CacheBlockSize, m.CacheNumBlocks)
+	switch event.Type {
+	case fwkdl.EventDelete:
+		r.forgetEndpoint(event.Endpoint)
+		return nil
+	case fwkdl.EventAddOrUpdate:
+		r.rememberEndpoint(event.Endpoint)
+		return r.learnCapacity(event.Endpoint.GetMetrics(), "endpoint-event")
 	}
 	return nil
+}
+
+// learnCapacity takes the measured capacity from a metrics snapshot, once.
+// Shared by every acquisition path (endpoint event, metrics poll, PreRequest)
+// so the block-size match check and the "first capacity wins" rule are
+// identical everywhere.
+func (r *GroupScheduler) learnCapacity(m *fwkdl.Metrics, via string) error {
+	if m == nil || m.CacheBlockSize <= 0 || m.CacheNumBlocks <= 0 {
+		return nil
+	}
+	if r.sched.HasCapacity() {
+		return nil
+	}
+	if err := r.sched.SetNumBlocks(m.CacheBlockSize, m.CacheNumBlocks); err != nil {
+		return err // the loud mismatch failure
+	}
+	if r.sched.HasCapacity() {
+		r.capMu.Lock()
+		r.capFrom = via
+		wait := time.Duration(0)
+		if !r.firstSeen.IsZero() {
+			wait = time.Since(r.firstSeen)
+		}
+		r.capMu.Unlock()
+		snap := r.sched.SnapshotLite()
+		fmt.Printf("group-scheduler: capacity learned via %s after %.1fs: cacheBlockSize=%d numGpuBlocks=%d budgetBlocks=%d\n",
+			via, wait.Seconds(), m.CacheBlockSize, m.CacheNumBlocks, snap.BudgetBlocks)
+		r.metrics.ObserveCapacityLearned(via)
+		r.metrics.SetCapacityMissing(false)
+	}
+	return nil
+}
+
+// metricsSource is the narrow poll target: anything whose metrics can be
+// re-read. Both the datalayer endpoint (whose metrics are swapped in place by
+// the collector) and the scheduler's endpoint snapshot satisfy it; polling a
+// snapshot is harmless (it is simply never fresher).
+type metricsSource interface {
+	GetMetrics() *fwkdl.Metrics
+	GetMetadata() *fwkdl.EndpointMetadata
+}
+
+func (r *GroupScheduler) rememberEndpoint(ep metricsSource) {
+	if ep == nil {
+		return
+	}
+	key := endpointKey(ep)
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+	if r.endpoints == nil {
+		r.endpoints = map[string]metricsSource{}
+	}
+	r.endpoints[key] = ep
+	if r.firstSeen.IsZero() {
+		r.firstSeen = time.Now()
+	}
+}
+
+func (r *GroupScheduler) forgetEndpoint(ep metricsSource) {
+	if ep == nil {
+		return
+	}
+	r.capMu.Lock()
+	defer r.capMu.Unlock()
+	delete(r.endpoints, endpointKey(ep))
+}
+
+func endpointKey(ep metricsSource) string {
+	if ep == nil {
+		return ""
+	}
+	if md := ep.GetMetadata(); md != nil && md.ID.Name != "" {
+		return md.ID.String()
+	}
+	return fmt.Sprint(ep)
+}
+
+// pollCapacity is the METRICS-POLL FALLBACK (WAVE-1 item 1), run on the
+// ticker while the capacity is unknown: re-read every remembered endpoint's
+// metrics (the datalayer refreshes them in place on the same object) and take
+// the first one that carries the cache geometry. It also carries the STARTUP
+// LIVENESS check: once a decode endpoint has been observed, the capacity must
+// arrive within capacityLivenessSeconds, else the FCFS pass-through (A5) is
+// being served silently — log loudly and raise the missing gauge.
+func (r *GroupScheduler) pollCapacity(now time.Time) {
+	if r.sched.HasCapacity() {
+		return
+	}
+	r.capMu.Lock()
+	eps := make([]metricsSource, 0, len(r.endpoints))
+	for _, ep := range r.endpoints {
+		eps = append(eps, ep)
+	}
+	seen := r.firstSeen
+	warned := r.capWarned
+	r.capMu.Unlock()
+
+	for _, ep := range eps {
+		if err := r.learnCapacity(ep.GetMetrics(), "metrics-poll"); err != nil {
+			// a block-size mismatch is loud and permanent: keep it in the
+			// log, don't spin the ticker on it
+			if !warned {
+				fmt.Printf("group-scheduler: CAPACITY REJECTED from metrics-poll: %v\n", err)
+			}
+		}
+		if r.sched.HasCapacity() {
+			return
+		}
+	}
+	if seen.IsZero() || warned || r.cfg.CapacityLivenessSeconds <= 0 {
+		return
+	}
+	if now.Sub(seen) < time.Duration(r.cfg.CapacityLivenessSeconds*float64(time.Second)) {
+		return
+	}
+	r.capMu.Lock()
+	r.capWarned = true
+	r.capMu.Unlock()
+	r.metrics.SetCapacityMissing(true)
+	fmt.Printf("group-scheduler: CAPACITY MISSING — num_gpu_blocks still unknown %.0fs after the decode endpoint was observed (%d endpoint(s) polled): serving FCFS pass-through (A5). Check that the endpoint metrics carry cache block size/num blocks (--refresh-metrics-interval), and that the EPP was rolled AFTER decode readiness.\n",
+		now.Sub(seen).Seconds(), len(eps))
 }
 
 // Pick is the dispatch decision (§5). The waiting set is the queue-head
@@ -238,10 +517,11 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 		if h == nil {
 			return true
 		}
-		session, reqID, size := "", "", int64(0)
+		member, scope, source := "", "", ""
+		reqID, size := "", int64(0)
 		if req := h.OriginalRequest(); req != nil {
 			if ir := req.InferenceRequest(); ir != nil {
-				session = sessionID(ir)
+				member, scope, source = r.memberOf(ir)
 				reqID = ir.RequestID
 				size = int64(ir.RequestSizeBytes)
 				if size <= 0 {
@@ -250,7 +530,7 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 			}
 		}
 		queues = append(queues, q)
-		heads = append(heads, Head{Session: session, ReqID: reqID, Arrival: h.EnqueueTime(), SizeBytes: size})
+		heads = append(heads, Head{Member: member, Session: scope, Source: source, ReqID: reqID, Arrival: h.EnqueueTime(), SizeBytes: size})
 		return true
 	})
 	if len(heads) == 0 {
@@ -281,16 +561,18 @@ func (r *GroupScheduler) NewState(_ context.Context) any { return nil }
 // exact tier-A keys from the TokenizedRequest correct the estimate
 // (S0-1 d), the in-flight charge was already taken at Pick.
 func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) error {
-	id := sessionID(request)
+	// capacity first (belt-and-braces, third acquisition path): it must not
+	// depend on the request being trackable — anonymous traffic used to
+	// return before ever teaching the budget.
+	if endpoint := pickedEndpoint(schedulingResult); endpoint != nil {
+		r.rememberEndpoint(endpoint)
+		if err := r.learnCapacity(endpoint.GetMetrics(), "pre-request"); err != nil {
+			return err // the loud mismatch failure
+		}
+	}
+	id, _, _ := r.memberOf(request)
 	if id == "" {
 		return nil
-	}
-	if endpoint := pickedEndpoint(schedulingResult); endpoint != nil {
-		if m := endpoint.GetMetrics(); m != nil && m.Updated() && m.CacheBlockSize > 0 && m.CacheNumBlocks > 0 {
-			if err := r.sched.SetNumBlocks(m.CacheBlockSize, m.CacheNumBlocks); err != nil {
-				return err // the loud mismatch failure
-			}
-		}
 	}
 	// V3/R6: the engine-side stagger — RESIDENT turns get priority over
 	// cold ENTRY prefills in vLLM's waiting loop (Phase-2 deployments
@@ -339,7 +621,7 @@ func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.Infer
 	if request == nil || response == nil {
 		return
 	}
-	id := sessionID(request)
+	id, _, _ := r.memberOf(request)
 	if id == "" {
 		return
 	}

@@ -34,6 +34,13 @@ type groupMetrics struct {
 	entryWait    prometheus.Histogram
 	refillShare  prometheus.Gauge
 	served       prometheus.Counter
+	// capacityMissing is 1 while the measured capacity (num_gpu_blocks) is
+	// unknown past CapacityLivenessSeconds — the pre-capacity FCFS
+	// pass-through (A5) is otherwise invisible in the outcome metrics.
+	capacityMissing prometheus.Gauge
+	// capacityLearned counts how the capacity arrived (endpoint-event |
+	// metrics-poll | pre-request) — the acquisition audit.
+	capacityLearned *prometheus.CounterVec
 
 	sched *Scheduler
 }
@@ -64,10 +71,15 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "uncached share of settled prompt tokens (the refill cost)"})
 	g.served = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "dispatches_total",
 		Help: "requests dispatched to members"})
+	g.capacityMissing = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "capacity_missing",
+		Help: "1 while num_gpu_blocks is unknown past capacityLivenessSeconds (FCFS pass-through in effect)"})
+	g.capacityLearned = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "capacity_learned_total",
+		Help: "capacity acquisition by path (endpoint-event | metrics-poll | pre-request)"}, []string{"via"})
 	fcfsCounter = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: "llm_d_epp_group", Name: "fcfs_dispatches_total",
 		Help: "pre-capacity FCFS pass-through dispatches"})
 	for _, c := range []prometheus.Collector{g.seats, g.uniqueBlocks, g.neBlocks, g.budgetBlocks,
-		g.waiters, g.exits, g.residency, g.entryWait, g.refillShare, g.served, fcfsCounter} {
+		g.waiters, g.exits, g.residency, g.entryWait, g.refillShare, g.served, fcfsCounter,
+		g.capacityMissing, g.capacityLearned} {
 		if err := reg.Register(c); err != nil {
 			return err
 		}
@@ -114,6 +126,26 @@ func (g *groupMetrics) ObserveServed() {
 	if g.served != nil {
 		g.served.Inc()
 	}
+}
+
+// ObserveCapacityLearned records the capacity acquisition path.
+func (g *groupMetrics) ObserveCapacityLearned(via string) {
+	if g.capacityLearned == nil {
+		return
+	}
+	g.capacityLearned.WithLabelValues(via).Inc()
+}
+
+// SetCapacityMissing raises/clears the capacity-liveness gauge.
+func (g *groupMetrics) SetCapacityMissing(missing bool) {
+	if g.capacityMissing == nil {
+		return
+	}
+	v := 0.0
+	if missing {
+		v = 1
+	}
+	g.capacityMissing.Set(v)
 }
 
 // fcfsCounter is the pre-capacity pass-through counter.

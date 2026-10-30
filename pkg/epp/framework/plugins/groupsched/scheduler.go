@@ -89,26 +89,74 @@ type Config struct {
 	// 3600s, so 3700 reaps only true leaks). Provisional ids (chosen at
 	// Pick but never reaching PreRequest) are reaped after 30s.
 	InflightReapSeconds float64 `json:"inflightReapSeconds"`
+
+	// ---- WAVE-1 knobs (branch identity: base mode + the session layer) ----
+
+	// MemberKey selects which request attribute the policy treats as the
+	// MEMBER — the fairness unit (seats, budget accounting, rotation,
+	// newcomer status, in-flight and waiting accounting):
+	//
+	//	"session" — the agent-identity SESSION attribute. This is the
+	//	            behaviour of every arm before WAVE-1.
+	//	"branch"  — the derived BRANCH id (branch-identity's
+	//	            BranchIdentityKey). BASE MODE: one implicit id is
+	//	            queue key AND member AND fairness unit, which is what
+	//	            moves a headerless client off R9 FCFS pass-through
+	//	            (BRANCH-IDENTITY-DESIGN §V2 BASE-MODE FRAMING).
+	//	"auto"    — branch when present, else the session, else
+	//	            anonymous (→ R9). DEFAULT: base mode and session mode
+	//	            are the same build; attribute presence picks the mode.
+	//
+	// The branch id is NEVER written into the agent-identity slot: the
+	// session attribute keeps meaning "the client's session" in every
+	// mode (the session layer reads it as such; nothing here writes it).
+	MemberKey string `json:"memberKey"`
+	// SessionOrder selects the SESSION ordering layer at D1 — the entry
+	// head ONLY (victim choice D2 and dispatch order D3 are untouched):
+	//
+	//	"off"      — no session layer: newcomers first, oldest within the
+	//	             class, then id (today's behaviour). DEFAULT.
+	//	"newcomer" — NEWCOMER STATUS becomes session-level: only a NEW
+	//	             session's head is newcomers-first; later branches of
+	//	             an already-served session queue FIFO (the anti
+	//	             newcomer-jumping rule).
+	//	"lsf"      — least-seats-first: entry key = (session seats held ↑,
+	//	             session-is-new first, oldest arrival, id).
+	//
+	// The session unit is the request's session ATTRIBUTE when it carries
+	// one and the MEMBER key otherwise, so with session := branch (base
+	// mode) every mode reduces EXACTLY to today's order — pinned by
+	// TestSessionOrderGoldenEquality.
+	SessionOrder string `json:"sessionOrder"`
+	// CapacityLivenessSeconds bounds how long the measured capacity
+	// (num_gpu_blocks) may stay unknown after a decode endpoint is first
+	// observed. Past it the plugin logs loudly and raises
+	// llm_d_epp_group_capacity_missing: the pre-capacity FCFS pass-through
+	// (A5) is otherwise invisible in the outcome metrics.
+	CapacityLivenessSeconds float64 `json:"capacityLivenessSeconds"`
 }
 
 func defaultConfig() Config {
 	return Config{
-		GroupBudgetFraction: 0.95,
-		Rho:                 4,
-		NMax:                0, // -> 2ρ
-		IdleSeconds:         20,
-		TTLSeconds:          30,
-		ColdEntryCapTokens:  131072,
-		InFlightCap:         64,
-		BlockSizeTokens:     64,
-		RotationMode:        "ledger",
-		QuantumBusyPeriods:  0, // -> 4
-		ValveMode:           "on",
-		VictimOrder:         "legacy",
-		WindowMode:          "last4",
-		GateMode:            "detector",
-		PriorityHeader:      "off",
-		InflightReapSeconds: 3700,
+		GroupBudgetFraction:     0.95,
+		Rho:                     4,
+		NMax:                    0, // -> 2ρ
+		IdleSeconds:             20,
+		TTLSeconds:              30,
+		ColdEntryCapTokens:      131072,
+		InFlightCap:             64,
+		BlockSizeTokens:         64,
+		RotationMode:            "ledger",
+		QuantumBusyPeriods:      0, // -> 4
+		ValveMode:               "on",
+		VictimOrder:             "legacy",
+		WindowMode:              "last4",
+		GateMode:                "detector",
+		PriorityHeader:          "off",
+		InflightReapSeconds:     3700,
+		MemberKey:               "auto",
+		SessionOrder:            "off",
+		CapacityLivenessSeconds: 120,
 	}
 }
 
@@ -142,6 +190,15 @@ func (c Config) effective() Config {
 	}
 	if c.InflightReapSeconds == 0 {
 		c.InflightReapSeconds = def.InflightReapSeconds
+	}
+	if c.MemberKey == "" {
+		c.MemberKey = def.MemberKey
+	}
+	if c.SessionOrder == "" {
+		c.SessionOrder = def.SessionOrder
+	}
+	if c.CapacityLivenessSeconds == 0 {
+		c.CapacityLivenessSeconds = def.CapacityLivenessSeconds
 	}
 	return c
 }
@@ -221,6 +278,19 @@ func (c Config) validate() error {
 	if c.InflightReapSeconds != 0 && c.InflightReapSeconds < 60 {
 		return fmt.Errorf("inflightReapSeconds must be >= 60 (the harness request timeout is 3600s; got %v)", c.InflightReapSeconds)
 	}
+	switch c.MemberKey {
+	case "", "auto", "branch", "session":
+	default:
+		return fmt.Errorf("memberKey: invalid value %q (auto|branch|session)", c.MemberKey)
+	}
+	switch c.SessionOrder {
+	case "", "off", "newcomer", "lsf":
+	default:
+		return fmt.Errorf("sessionOrder: invalid value %q (off|newcomer|lsf)", c.SessionOrder)
+	}
+	if c.CapacityLivenessSeconds < 0 {
+		return fmt.Errorf("capacityLivenessSeconds must be >= 0 (0 = default; got %v)", c.CapacityLivenessSeconds)
+	}
 	return nil
 }
 
@@ -235,20 +305,36 @@ func (c Config) reapSeconds() float64 {
 // ---- the queue-head snapshot (S0-1: waiting state comes from the
 // flow-control queues at Pick time, not from PreRequest) ----
 
-// Head is one waiting queue head as seen at Pick: the session (agent
-// identity), the request id, the enqueue time, and the wire size (the
-// conservative-cost input).
+// Head is one waiting queue head as seen at Pick: the MEMBER id (the
+// fairness unit — see Config.MemberKey), the request's SESSION attribute
+// when it carried one, the request id, the enqueue time, and the wire
+// size (the conservative-cost input).
 type Head struct {
+	// Member is the group policy's unit: the branch id, the session, or
+	// "" for anonymous traffic (never tracked, never seated, R9).
+	Member string
+	// Session is the request's session ATTRIBUTE (read-only here). Empty
+	// means the request carried none — base mode — and the session layer
+	// then treats the member key as the session (session := branch), which
+	// is what makes every sessionOrder mode reduce to today's order.
 	Session   string
 	ReqID     string
 	Arrival   time.Time
 	SizeBytes int64
+	// Source names the attribute the member id came from ("branch" |
+	// "session" | ""). Counted per dispatch (the run is auditable from the
+	// artifacts without re-deriving it from the config).
+	Source string
 }
 
 // ---- per-session scheduling state (§3) ----
 
 type member struct {
 	id string
+	// session is the ordering layer's unit for this member (the session
+	// attribute at seat time, or the member id when the request carried
+	// none). Fixed at seat; read only by entryHeadLocked.
+	session string
 	// seatTime orders exits: earliest-seated leaves first.
 	seatTime time.Time
 	// residency payback ledger (§7, tokens from usage reports)
@@ -317,7 +403,11 @@ type estEntry struct {
 }
 
 type waiter struct {
-	id       string
+	id string
+	// session is the ordering layer's unit for this waiter (the session
+	// attribute, or the member id when the request carried none). Refreshed
+	// with the head at sync time.
+	session  string
 	since    time.Time // the OLDEST arrival (B5)
 	newcomer bool
 	// sizeBytes is the last seen head's wire size (the C4 refresh input).
@@ -337,6 +427,10 @@ type Scheduler struct {
 	onEntry func(waitSeconds float64)
 	onServe func()
 	onEvent func(Event)
+	// onMemberSource fires ONCE per distinct member-key source seen at
+	// dispatch ("branch" | "session" | "none") — the runtime half of the
+	// config echo (which mode the run actually ran in).
+	onMemberSource func(source string)
 
 	index             *BlockIndex // attached at startup (block size from config)
 	budgetBlocks      int         // 0 until num_gpu_blocks arrives (metrics)
@@ -348,6 +442,20 @@ type Scheduler struct {
 	waiters    map[string]*waiter
 	events     []Event
 	everSeated map[string]struct{}
+	// everSeatedSession is the SESSION-level mirror of everSeated — the
+	// ordering layer's "session-is-new" test ("new" == never seated within
+	// the session's lifetime, the same everSeated semantics the member
+	// newcomer flag has, and forgotten with the records themselves via
+	// gcSilentRecordsLocked). It is kept EXACTLY in step by
+	// markEverSeatedLocked/forgetEverSeatedLocked: with session := member
+	// (no session attribute) the mirror is one-to-one, so the session keys
+	// below reduce to today's newcomer test byte-for-byte.
+	everSeatedSession map[string]struct{}
+	// recordSession maps an everSeated record to its session unit, and
+	// sessionRefs counts the live everSeated records per session (that
+	// count IS what "session := member" degenerates to the member flag).
+	recordSession map[string]string
+	sessionRefs   map[string]int
 	// lastSeen is the per-record activity time for the silence GC (R2):
 	// updated at Dispatched and Settle; a headless, unseated record
 	// older than TTL is forgotten.
@@ -382,6 +490,9 @@ type Scheduler struct {
 		totalTok    int64
 		served      int64
 		fcfsServed  int64
+		// memberSources counts dispatches by the attribute the member id
+		// came from (the run's effective-member-source echo).
+		memberSources map[string]int64
 	}
 }
 
@@ -400,8 +511,11 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 	s := &Scheduler{cfg: cfg, index: idx, blockSize: cfg.BlockSizeTokens,
 		members: map[string]*member{}, waiters: map[string]*waiter{},
 		everSeated: map[string]struct{}{}, lastSeen: map[string]time.Time{},
-		estCache: map[string]estEntry{}}
+		everSeatedSession: map[string]struct{}{}, recordSession: map[string]string{},
+		sessionRefs: map[string]int{},
+		estCache:    map[string]estEntry{}}
 	s.counters.exits = map[string]int64{}
+	s.counters.memberSources = map[string]int64{}
 	return s, nil
 }
 
@@ -502,11 +616,11 @@ func (s *Scheduler) PickFromHeads(heads []Head, now time.Time) int {
 	}
 	var cands []cand
 	for i, h := range heads {
-		if h.Session == "" {
+		if h.Member == "" {
 			continue // anonymous traffic is not tracked (passes through last)
 		}
-		m, seated := s.members[h.Session]
-		if !seated || s.index.ExitingLocked(h.Session) {
+		m, seated := s.members[h.Member]
+		if !seated || s.index.ExitingLocked(h.Member) {
 			continue
 		}
 		if m.inflight >= s.cfg.InFlightCap {
@@ -526,7 +640,8 @@ func (s *Scheduler) PickFromHeads(heads []Head, now time.Time) int {
 		break
 	}
 	if best >= 0 {
-		m := s.members[heads[best].Session]
+		m := s.members[heads[best].Member]
+		s.observeMemberSourceLocked(bestHead.Source)
 		// M1: a dispatch is NEVER counted without an id — synthesize one
 		// when the head lacks ReqID (the counter follows the map).
 		rid := bestHead.ReqID
@@ -550,7 +665,7 @@ func (s *Scheduler) PickFromHeads(heads []Head, now time.Time) int {
 	// head (FCFS pass-through, the siblings' behaviour; anonymous
 	// traffic is never tracked, never seated, never starved).
 	for i, h := range heads {
-		if h.Session == "" {
+		if h.Member == "" {
 			if s.cfg.GateMode == "size-aware" && !s.gateAllowsLocked(h) {
 				continue
 			}
@@ -571,8 +686,8 @@ func (s *Scheduler) gateAllowsLocked(h Head) bool {
 	if s.budgetBlocks <= 0 {
 		return true
 	}
-	est := s.estimateCostCachedLocked(h.Session, h.SizeBytes)
-	if m, ok := s.members[h.Session]; ok && m.pendingBlocks > 0 {
+	est := s.estimateCostCachedLocked(h.Member, h.SizeBytes)
+	if m, ok := s.members[h.Member]; ok && m.pendingBlocks > 0 {
 		est = max(est-m.pendingBlocks, 0)
 	}
 	// M4: ALL seated blocks (exiting members' blocks stay pinned until
@@ -608,28 +723,31 @@ func (s *Scheduler) FCFSServed() int64 {
 func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 	present := map[string]time.Time{}
 	for _, h := range heads {
-		if h.Session == "" {
+		if h.Member == "" {
 			continue
 		}
-		present[h.Session] = h.Arrival
-		if m, seated := s.members[h.Session]; seated {
+		present[h.Member] = h.Arrival
+		if m, seated := s.members[h.Member]; seated {
 			if m.waitingSince.IsZero() || h.Arrival.Before(m.waitingSince) {
 				m.waitingSince = h.Arrival
 			}
 			m.lastActivity = now
 			continue
 		}
-		w, ok := s.waiters[h.Session]
+		w, ok := s.waiters[h.Member]
 		if !ok {
-			w = &waiter{id: h.Session, newcomer: s.isNewcomerLocked(h.Session)}
-			s.waiters[h.Session] = w
+			w = &waiter{id: h.Member, newcomer: s.isNewcomerLocked(h.Member)}
+			s.waiters[h.Member] = w
 		}
+		// the ordering layer's unit follows the head (session attribute,
+		// else the member key — base mode)
+		w.session = sessionUnitOf(h.Session, h.Member)
 		// B5: keep the OLDEST arrival across fan-out re-arrivals
 		if w.since.IsZero() || h.Arrival.Before(w.since) {
 			w.since = h.Arrival
 		}
 		w.sizeBytes = h.SizeBytes
-		w.coldTokens = s.estimateCostCachedLocked(h.Session, h.SizeBytes) * int64(s.blockSize) // tokens (R1)
+		w.coldTokens = s.estimateCostCachedLocked(h.Member, h.SizeBytes) * int64(s.blockSize) // tokens (R1)
 	}
 	// vanished: members clear their waiting marker; waiters leave
 	for id, m := range s.members {
@@ -960,14 +1078,23 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 	if len(s.waiters) == 0 {
 		return
 	}
+	// the LSF key's seat component is computed ONCE per rotate and kept
+	// current as this loop seats (and re-computed after an exit): the
+	// per-waiter cost stays O(1) instead of O(members) — with base mode's
+	// ~+29% members and a deep waiter list the naive form is quadratic.
+	var seats map[string]int
+	if s.cfg.SessionOrder == "lsf" {
+		seats = s.sessionSeatCountsLocked()
+	}
 	for {
-		head := s.entryHeadLocked()
+		head := s.entryHeadLocked(seats)
 		if head == nil {
 			return
 		}
 		ne := int64(s.index.UniqueBlocksNELocked()) + s.pendingTotal
 		estBlocks := head.coldTokens / int64(s.blockSize)
 		if ne+estBlocks <= int64(s.budgetBlocks) && s.coldAllows(head) {
+			seatedSession := sessionUnitOf(head.session, head.id)
 			if !s.seatLocked(head, now) {
 				// C4 (always-on): TrySeat failed although the estimate
 				// passed — refresh the head's estimate from the
@@ -978,6 +1105,9 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 				head.coldTokens = s.estimateCostLocked(head.id, head.sizeBytes) * int64(s.blockSize)
 				return
 			}
+			if seats != nil {
+				seats[seatedSession]++
+			}
 			continue
 		}
 		if reason, victim := s.rotationVictimLocked(now); victim != nil {
@@ -987,33 +1117,117 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 				return
 			}
 			s.exitLocked(victim, reason, now)
+			if seats != nil {
+				seats = s.sessionSeatCountsLocked() // an exit frees a seat
+			}
 			continue
 		}
 		return
 	}
 }
 
-// entryHeadLocked: newcomers first (D7; oldest within the class), then
-// oldest waiting (A4/A7: re-entrants keep their original since).
-func (s *Scheduler) entryHeadLocked() *waiter {
+// entryHeadLocked is D1 — the ONLY place the session ordering layer acts.
+// Victim choice (D2) and dispatch order (D3) are untouched by it.
+//
+//	"off"      — newcomers first (D7), oldest within the class then id,
+//	             else oldest waiting (A4/A7: re-entrants keep their
+//	             original since). Today's order.
+//	"newcomer" — the newcomer CLASS is the session's: a branch of an
+//	             already-served session queues FIFO instead of jumping.
+//	"lsf"      — (session seats held ↑, session-is-new first, oldest, id):
+//	             least-seats-first. At c128 the fair share is 0.25 seats
+//	             per session, so the work-conserving cap IS this order
+//	             (WAVE-1 pre-registration: one rule, not two).
+//
+// With session := member (no session attribute — base mode) all three modes
+// reduce EXACTLY to "off": a waiter's session holds no seat (all zero) and
+// the session mirror of everSeated is one-to-one with the member flag. That
+// equality is structural here and pinned end-to-end by
+// TestSessionOrderGoldenEquality.
+func (s *Scheduler) entryHeadLocked(seats map[string]int) *waiter {
+	if seats == nil && s.cfg.SessionOrder == "lsf" {
+		seats = s.sessionSeatCountsLocked() // a direct caller (tests) gets a fresh count
+	}
 	var head *waiter
+	var headKey entryKey
 	for _, w := range s.waiters {
-		if !w.newcomer {
-			continue
-		}
-		if head == nil || w.since.Before(head.since) || (w.since.Equal(head.since) && w.id < head.id) {
-			head = w
-		}
-	}
-	if head != nil {
-		return head
-	}
-	for _, w := range s.waiters {
-		if head == nil || w.since.Before(head.since) || (w.since.Equal(head.since) && w.id < head.id) {
-			head = w
+		k := s.entryKeyLocked(w, seats)
+		// the key is a TOTAL order (id breaks every tie), so the map's
+		// iteration order cannot leak into the decision.
+		if head == nil || k.less(headKey) {
+			head, headKey = w, k
 		}
 	}
 	return head
+}
+
+// entryKey is the D1 ordering key. seats/isNew are 0-or-1 ranks (lower =
+// first) so the comparison is plain lexicographic.
+type entryKey struct {
+	seats int
+	isNew int
+	since time.Time
+	id    string
+}
+
+func (k entryKey) less(o entryKey) bool {
+	if k.seats != o.seats {
+		return k.seats < o.seats
+	}
+	if k.isNew != o.isNew {
+		return k.isNew < o.isNew
+	}
+	if !k.since.Equal(o.since) {
+		return k.since.Before(o.since)
+	}
+	return k.id < o.id
+}
+
+func (s *Scheduler) entryKeyLocked(w *waiter, seats map[string]int) entryKey {
+	k := entryKey{since: w.since, id: w.id}
+	switch s.cfg.SessionOrder {
+	case "lsf":
+		sess := sessionUnitOf(w.session, w.id)
+		k.seats = seats[sess]
+		k.isNew = s.sessionNewRankLocked(sess)
+	case "newcomer":
+		k.isNew = s.sessionNewRankLocked(sessionUnitOf(w.session, w.id))
+	default: // "off"
+		if !w.newcomer {
+			k.isNew = 1
+		}
+	}
+	return k
+}
+
+// sessionUnitOf is the ordering layer's unit: the request's session ATTRIBUTE
+// when it carried one, else the member key (base mode: session := branch).
+// This single line is what makes base mode and session mode the same code.
+func sessionUnitOf(sessionAttr, member string) string {
+	if sessionAttr != "" {
+		return sessionAttr
+	}
+	return member
+}
+
+// sessionNewRankLocked is 0 for a session that has never been seated, 1 for a
+// served one — the session-level counterpart of the member newcomer flag.
+func (s *Scheduler) sessionNewRankLocked(sess string) int {
+	if _, served := s.everSeatedSession[sess]; served {
+		return 1
+	}
+	return 0
+}
+
+// sessionSeatCountsLocked counts the seats held per session, in one O(members)
+// pass. rotateLocked builds it once and keeps it current (increment on a seat,
+// recompute after an exit) so the entry key stays O(1) per waiter.
+func (s *Scheduler) sessionSeatCountsLocked() map[string]int {
+	counts := make(map[string]int, len(s.members))
+	for _, m := range s.members {
+		counts[sessionUnitOf(m.session, m.id)]++
+	}
+	return counts
 }
 
 // coldAllows staggers ALL cold entries (B6: re-entries too — WEKA
@@ -1204,7 +1418,7 @@ func (s *Scheduler) exitLocked(m *member, reason string, now time.Time) {
 	// A7: a session with a queued head re-enters at its ORIGINAL
 	// waiting-since (FIFO survives the exit)
 	if !m.waitingSince.IsZero() {
-		s.waiters[m.id] = &waiter{id: m.id, since: m.waitingSince,
+		s.waiters[m.id] = &waiter{id: m.id, session: m.session, since: m.waitingSince,
 			sizeBytes:  m.lastSizeBytes,
 			coldTokens: s.estimateCostLocked(m.id, m.lastSizeBytes) * int64(s.blockSize)}
 	}
@@ -1218,10 +1432,12 @@ func (s *Scheduler) seatLocked(w *waiter, now time.Time) bool {
 	if ok, _ := s.index.TrySeatLocked(w.id, s.budgetBlocks); !ok {
 		return false
 	}
-	s.everSeated[w.id] = struct{}{}
+	sess := sessionUnitOf(w.session, w.id)
+	s.markEverSeatedLocked(w.id, sess)
 	s.waitersdelete(w.id)
 	m := &member{
 		id:            w.id,
+		session:       sess,
 		seatTime:      now,
 		lastActivity:  now,
 		lastSizeBytes: s.index.LastSizeBytesLocked(w.id),
@@ -1298,7 +1514,7 @@ func (s *Scheduler) Tick(now time.Time) {
 			m.inflight == 0 && m.waitingSince.IsZero() {
 			s.exitLocked(m, "ttl", now)
 			s.index.ForgetLocked(id)
-			delete(s.everSeated, id) // B7: prune consistently with the waiter path
+			s.forgetEverSeatedLocked(id) // B7: prune consistently with the waiter path
 		}
 	}
 	// R2: NO TTL on waiters — a waiter exists because its head was
@@ -1322,7 +1538,7 @@ func (s *Scheduler) gcSilentRecordsLocked(now time.Time) {
 		}
 		if now.Sub(seen) > ttl {
 			s.index.ForgetLocked(id)
-			delete(s.everSeated, id)
+			s.forgetEverSeatedLocked(id)
 			delete(s.lastSeen, id)
 		}
 	}
@@ -1331,6 +1547,51 @@ func (s *Scheduler) gcSilentRecordsLocked(now time.Time) {
 func (s *Scheduler) isNewcomerLocked(id string) bool {
 	_, seen := s.everSeated[id]
 	return !seen
+}
+
+// markEverSeatedLocked records that a record has been seated and mirrors the
+// mark on its SESSION (the ordering layer's is-new test). The refcount makes
+// the mirror exact: with session := member the ref is 1:1 with the record
+// flag, so everSeatedSession[s] exists iff everSeated[s] does — at every
+// instant, independent of GC timing.
+func (s *Scheduler) markEverSeatedLocked(id, sess string) {
+	s.everSeated[id] = struct{}{}
+	if _, had := s.recordSession[id]; had {
+		return // a re-seat of a still-marked record already holds its session ref
+	}
+	s.recordSession[id] = sess
+	s.sessionRefs[sess]++
+	s.everSeatedSession[sess] = struct{}{}
+}
+
+// forgetEverSeatedLocked drops a record's "was served" mark and the session
+// mirror with it: a session is forgotten exactly when the LAST record that
+// carried it is forgotten (the same TTL/GC semantics as the record itself).
+func (s *Scheduler) forgetEverSeatedLocked(id string) {
+	delete(s.everSeated, id)
+	sess, ok := s.recordSession[id]
+	if !ok {
+		return
+	}
+	delete(s.recordSession, id)
+	s.sessionRefs[sess]--
+	if s.sessionRefs[sess] <= 0 {
+		delete(s.sessionRefs, sess)
+		delete(s.everSeatedSession, sess)
+	}
+}
+
+// observeMemberSourceLocked counts a dispatch by its member-key source and
+// fires the once-per-source hook (the run's effective-member-source echo).
+func (s *Scheduler) observeMemberSourceLocked(source string) {
+	if source == "" {
+		source = "none"
+	}
+	first := s.counters.memberSources[source] == 0
+	s.counters.memberSources[source]++
+	if first && s.onMemberSource != nil {
+		s.onMemberSource(source)
+	}
 }
 
 // ---- introspection ----
@@ -1402,6 +1663,9 @@ type Snapshot struct {
 	Config Config
 	// RecentEvents is the tail of the seat/exit ring.
 	RecentEvents []Event
+	// MemberSources counts dispatches by the member-key source that resolved
+	// them ("branch" | "session" | "none") — the effective-member echo.
+	MemberSources map[string]int64
 }
 
 // SnapshotLite is Snapshot without the event ring and config echo —
@@ -1429,6 +1693,10 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 	}
 	for k, v := range s.counters.exits {
 		snap.Exits[k] = v
+	}
+	snap.MemberSources = map[string]int64{}
+	for k, v := range s.counters.memberSources {
+		snap.MemberSources[k] = v
 	}
 	if s.index != nil {
 		snap.UniqueBlocks = s.index.UniqueBlocks()

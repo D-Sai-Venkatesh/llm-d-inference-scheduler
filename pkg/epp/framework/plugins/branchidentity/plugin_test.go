@@ -580,3 +580,48 @@ func TestLogHeadersKeepResolveOutcomeIdentical(t *testing.T) {
 	assert.Contains(t, onOut, `"x-correlation-id":"thread-42"`)
 	assert.Contains(t, onOut, `"x-request-id":"req-1"`)
 }
+
+// TestLogHeaderNamesConfigured (WAVE-1 item 4): logHeaderNames EXTENDS the
+// whitelist with a harness's own markers without touching anything else — the
+// extras are only ever read by the log line, never by the identity, the scope or
+// a matching decision.
+func TestLogHeaderNamesConfigured(t *testing.T) {
+	build := func(t *testing.T) *Plugin {
+		t.Helper()
+		p, err := Factory("branch", json.NewDecoder(strings.NewReader(
+			`{"logRequests":true,"logHeaders":true,"logHeaderNames":["X-Turn-Id","x-correlation-id",""]}`)),
+			testutils.NewTestHandle(t.Context()))
+		require.NoError(t, err)
+		return p.(*Plugin)
+	}
+	require.Equal(t, []string{"x-correlation-id", "x-request-id", "x-turn-id"},
+		build(t).logHeadersList, "extras must be lowercased, de-duplicated and appended")
+
+	p := build(t) // build BEFORE the capture: Factory echoes its config to stdout
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	orig := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	req := chatReq(user('a', 600))
+	req.Headers["x-correlation-id"] = "thread-9"
+	req.Headers["x-turn-id"] = "turn-3"
+	id, _ := branchOf(t, p, req)
+	require.NoError(t, w.Close())
+	out := <-done
+
+	line := strings.TrimPrefix(strings.TrimSpace(out), "branch-identity: request ")
+	var rec struct {
+		Derived string            `json:"derived"`
+		Headers map[string]string `json:"headers"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(line), &rec))
+	assert.Equal(t, id, rec.Derived)
+	assert.Equal(t, "thread-9", rec.Headers["x-correlation-id"])
+	assert.Equal(t, "turn-3", rec.Headers["x-turn-id"], "the configured extra must be copied")
+}

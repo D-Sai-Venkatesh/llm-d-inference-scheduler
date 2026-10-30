@@ -137,6 +137,17 @@ type Config struct {
 
 	// ---- MULTI-POD knob (PREREG-multipod-offload task 1) ----
 
+	// BindingTTLSeconds bounds the member→engine HOMING independently of the
+	// member RECORD's lifetime. The two must not share a clock: the record is a
+	// residency (TTLSeconds of silence forgets it), while the binding models
+	// where the member's BLOCKS are — and the placement authority (the
+	// session-affinity filter) pins for 3600 s. Tying the binding to the record
+	// GC made every silent-then-returning member re-home by least backlog while
+	// the filter still pinned it elsewhere: measured on the first live multi-pod
+	// stack (e1, 2026-10-30 19:00Z) at 11 % of dispatches off-binding in steady
+	// state. 0 → max(20 x TTLSeconds, 3600).
+	BindingTTLSeconds float64 `json:"bindingTtlSeconds"`
+
 	// EngineGroups selects the fairness state's scope:
 	//
 	//	"single"     — ONE group for the whole policy: every engine an
@@ -229,6 +240,12 @@ func (c Config) effective() Config {
 	if c.EngineGroups == "" {
 		c.EngineGroups = def.EngineGroups
 	}
+	if c.BindingTTLSeconds == 0 {
+		c.BindingTTLSeconds = 20 * c.TTLSeconds
+		if c.BindingTTLSeconds < 3600 {
+			c.BindingTTLSeconds = 3600
+		}
+	}
 	return c
 }
 
@@ -316,6 +333,9 @@ func (c Config) validate() error {
 	case "", "off", "newcomer", "lsf":
 	default:
 		return fmt.Errorf("sessionOrder: invalid value %q (off|newcomer|lsf)", c.SessionOrder)
+	}
+	if c.BindingTTLSeconds < 0 {
+		return fmt.Errorf("bindingTtlSeconds must be >= 0 (0 = max(20 x ttlSeconds, 3600); got %v)", c.BindingTTLSeconds)
 	}
 	if c.CapacityLivenessSeconds < 0 {
 		return fmt.Errorf("capacityLivenessSeconds must be >= 0 (0 = default; got %v)", c.CapacityLivenessSeconds)
@@ -594,6 +614,11 @@ type Scheduler struct {
 	// member's record is forgotten (TTL/GC — a silent member may then be
 	// re-homed) or when its engine disappears.
 	bindings map[string]string
+	// bindingSeen is the homing's own last-activity clock (see
+	// Config.BindingTTLSeconds): the binding outlives the member RECORD, so it
+	// needs a lifetime of its own or every silent return re-homes off the
+	// placement filter's pin.
+	bindingSeen map[string]time.Time
 
 	// pickSeq synthesizes request ids for heads that lack one (M1).
 	pickSeq int64
@@ -646,7 +671,8 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 		groups:     map[string]*engineGroup{},
 		everSeated: map[string]struct{}{}, lastSeen: map[string]time.Time{},
 		everSeatedSession: map[string]struct{}{}, recordSession: map[string]string{},
-		sessionRefs: map[string]int{}, bindings: map[string]string{}}
+		sessionRefs: map[string]int{}, bindings: map[string]string{},
+		bindingSeen: map[string]time.Time{}}
 	s.counters.exits = map[string]int64{}
 	s.counters.memberSources = map[string]int64{}
 	if _, err := s.groupForLocked(""); err != nil {
@@ -1151,7 +1177,7 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 				continue
 			}
 		}
-		g := s.homeEngineLocked(h.Member)
+		g := s.homeEngineLocked(h.Member, now)
 		if g == nil {
 			continue
 		}
@@ -1194,9 +1220,11 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 // the scheduler pins at ~0.95 by construction (F3). Ties break round-robin
 // so a burst of newcomers splits across the engines instead of racing to
 // one (and so every multi-engine run stays reproducible).
-func (s *Scheduler) homeEngineLocked(member string) *engineGroup {
+func (s *Scheduler) homeEngineLocked(member string, now time.Time) *engineGroup {
 	if id, ok := s.bindings[member]; ok {
 		if g, ok := s.groups[id]; ok {
+			s.bindingSeen[member] = now // the homing is alive (virtual clock: never time.Now — a
+			// golden replay must be reproducible and a wall clock here breaks that)
 			return g
 		}
 		// the bound engine is gone: re-home on a live one below
@@ -1235,6 +1263,7 @@ func (s *Scheduler) homeEngineLocked(member string) *engineGroup {
 		s.homeSeq++
 	}
 	s.bindings[member] = g.id
+	s.bindingSeen[member] = now
 	g.counters.homings++
 	return g
 }
@@ -1256,9 +1285,12 @@ func (s *Scheduler) reconcileEngineLocked(id, observed string, now time.Time) *e
 			return nil
 		}
 		s.bindings[id] = g.id
+		s.bindingSeen[id] = now
+		g.counters.homings++ // a binding created here is still a homing
 		return g
 	}
 	if from.id == observed {
+		s.bindingSeen[id] = now
 		return from
 	}
 	to, err := s.groupForLocked(observed)
@@ -1268,6 +1300,8 @@ func (s *Scheduler) reconcileEngineLocked(id, observed string, now time.Time) *e
 	m := from.members[id]
 	if m == nil {
 		s.bindings[id] = to.id
+		s.bindingSeen[id] = now
+		to.counters.homings++
 		return to
 	}
 	s.counters.affinityViolations++
@@ -1279,6 +1313,8 @@ func (s *Scheduler) reconcileEngineLocked(id, observed string, now time.Time) *e
 	to.members[id] = m
 	m.engine = to.id
 	s.bindings[id] = to.id
+	s.bindingSeen[id] = now
+	to.counters.homings++
 	to.pendingTotal += m.pendingBlocks
 	to.coldInFlight += m.coldEntry
 	if ok, _ := to.index.TrySeatLocked(id, to.budgetBlocks); !ok {
@@ -2192,7 +2228,18 @@ func (s *Scheduler) gcSilentRecordsLocked(now time.Time) {
 			}
 			s.forgetEverSeatedLocked(id)
 			delete(s.lastSeen, id)
-			delete(s.bindings, id) // the silent member may be re-homed on return
+		}
+	}
+	// The HOMING has its own clock: it is forgotten only after
+	// BindingTTLSeconds of silence, so a member that is evicted (or simply
+	// quiet for longer than the 30 s record TTL) returns to the engine that
+	// still holds its blocks — and to the engine the placement filter pinned.
+	bttl := time.Duration(s.cfg.BindingTTLSeconds * float64(time.Second))
+	for id, seen := range s.bindingSeen {
+		if now.Sub(seen) > bttl {
+			delete(s.bindingSeen, id)
+			delete(s.bindings, id)
+			s.counters.rehomes++ // silent-member rehoming: the binding is released
 		}
 	}
 }

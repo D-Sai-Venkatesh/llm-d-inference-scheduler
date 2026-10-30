@@ -692,3 +692,40 @@ func newTestGroupScheduler(t *testing.T, params string) *GroupScheduler {
 	require.NoError(t, err)
 	return p.(*GroupScheduler)
 }
+
+// ---- 6. THE PLUGIN-GRAPH PIN (why Consumes lists the agent-identity key only) ----
+//
+// Measured live on 2026-10-30 (wave-1 build 5e851b18): declaring the BRANCH keys
+// in Consumes made the EPP refuse to start on every branch arm —
+//
+//	"failed to load the configuration - invalid plugin layer execution order:
+//	 producer branch-identity/branch-identity needs to be executed before
+//	 consumer group/group-scheduler"
+//
+// The data layer derives a plugin's layer from the interfaces it implements and
+// only accepts a declared dependency when the producer's layer is <= the
+// consumer's (FlowControlLayer=0 < RequestControlLayer=1). branch-identity
+// implements PreRequest (it clears the busy flag at dispatch) and is therefore
+// layer 1, while this policy is a FairnessPolicy (layer 0) — so ANY declaration
+// of a branch-identity key in Consumes is a startup failure, independent of the
+// memberKey value. agent-identity implements only RequestHeader (layer -1) and is
+// safe to declare.
+//
+// The unit tests could not catch it because they construct the policy directly;
+// the graph is built by the config loader. This test pins the declaration so the
+// dependency is not re-added by someone reading the policy's reads.
+func TestConsumesDeclaresNoBranchKeys(t *testing.T) {
+	gs := newTestGroupScheduler(t, `{"memberKey":"auto"}`)
+	deps := gs.Consumes()
+
+	for _, key := range []fwkplugin.DataKey{branchidentity.BranchIdentityKey, branchidentity.BranchSessionKey} {
+		_, inReq := deps.Required[key]
+		_, inOpt := deps.Optional[key]
+		require.False(t, inReq || inOpt,
+			"Consumes declares %q, whose producer (branch-identity) is in a LATER layer than this policy — "+
+				"the EPP will refuse to start with 'invalid plugin layer execution order'. "+
+				"The attributes are still readable: they are produced by branch-identity's RequestHeader hook.", key.String())
+	}
+	_, ok := deps.Optional[agentidentity.AgentIdentityKey]
+	require.True(t, ok, "the agent-identity key stays declared (its producer is layer -1, harmless)")
+}

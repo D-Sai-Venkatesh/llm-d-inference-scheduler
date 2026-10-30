@@ -182,9 +182,34 @@ func memberKeyRule(memberKey string) string {
 
 func (r *GroupScheduler) TypedName() fwkplugin.TypedName { return r.typedName }
 
-// Consumes declares the attribute keys the policy READS. Both identity keys
-// are OPTIONAL at the data layer because which one is the member depends on
-// Config.MemberKey (and on which identity plugin the arm deployed); the
+// Consumes declares the attribute keys the policy READS. Only the agent-identity
+// key is declared here; the BRANCH keys are read the same way but are NOT
+// declared, and that is deliberate (WAVE-1 build fix, 2026-10-30):
+//
+//   the data layer's DAG validator rejects a dependency whose PRODUCER sits in a
+//   later layer than its CONSUMER, with the layer of a plugin derived from the
+//   interfaces it implements (FlowControlLayer=0 < RequestControlLayer=1). The
+//   group scheduler is a FairnessPolicy (layer 0); branch-identity implements
+//   PreRequest (it clears the busy flag at dispatch) and is therefore layer 1, so
+//   declaring branchidentity.BranchIdentityKey here made the EPP refuse to start:
+//   "invalid plugin layer execution order: producer branch-identity/branch-identity
+//   needs to be executed before consumer group/group-scheduler" (measured live,
+//   wave-1 build 5e851b18, 2026-10-30T03:54Z, the three branch arms only; the
+//   group-scheduler unit tests construct the policy directly and never build the
+//   plugin DAG, which is why 75 green tests missed it).
+//
+//   Nothing is lost by omitting them: the attributes are produced by
+//   branch-identity's RequestHeader hook, which the request path always runs
+//   before admission and therefore before this policy; stage 1 ran exactly this
+//   way (its Consumes listed the agent-identity key only) and the values were
+//   present on every request. agentidentity.AgentIdentityKey stays because its
+//   plugin implements only RequestHeader (layer -1) and the declaration is
+//   harmless. The real fix belongs upstream in the layer model (flow control listed
+//   before request control while the code comments assume the opposite order) —
+//   filed as a draft note for the human, never opened by an agent.
+//
+// Both identity keys are OPTIONAL at the data layer because which one is the member
+// depends on Config.MemberKey (and on which identity plugin the arm deployed); the
 // fail-closed check is validateMemberProducer at startup, which requires the
 // producer of the configured member source to EXIST. Making the keys required
 // unconditionally would have made base mode (no session header, branch
@@ -199,9 +224,7 @@ func (r *GroupScheduler) TypedName() fwkplugin.TypedName { return r.typedName }
 func (r *GroupScheduler) Consumes() fwkplugin.DataDependencies {
 	return fwkplugin.DataDependencies{
 		Optional: map[fwkplugin.DataKey]any{
-			agentidentity.AgentIdentityKey:   "",
-			branchidentity.BranchIdentityKey: "",
-			branchidentity.BranchSessionKey:  "",
+			agentidentity.AgentIdentityKey: "",
 		},
 	}
 }

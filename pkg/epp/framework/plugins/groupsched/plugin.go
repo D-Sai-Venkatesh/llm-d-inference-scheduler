@@ -91,6 +91,9 @@ type GroupScheduler struct {
 	capMu     sync.Mutex
 	endpoints map[string]*endpointState // endpoint id -> handle + acquisition state
 	hetero    map[string]struct{}       // engines already reported as capacity-heterogeneous
+	// pooledWarned is the one-shot AUDIT-N1 alarm: engineGroups=single with
+	// more than one discovered endpoint (the knob's default fails OPEN).
+	pooledWarned bool
 }
 
 // endpointState is one discovered endpoint's capacity-acquisition state.
@@ -542,6 +545,22 @@ func (r *GroupScheduler) rememberEndpoint(ep metricsSource) {
 		r.endpoints[key] = st
 	}
 	st.ep = ep // the handle is refreshed: the datalayer swaps metrics in place
+	n := len(r.endpoints)
+	pooled := !r.cfg.perEngine()
+	warn := pooled && n > 1 && !r.pooledWarned
+	if warn {
+		r.pooledWarned = true
+	}
+	if pooled {
+		// AUDIT N1: engineGroups=single is the default and it fails OPEN, so a
+		// multi-endpoint pool is reported as a SERIES (not just a log line).
+		r.metrics.SetPooledEndpoints(n)
+	} else {
+		r.metrics.SetPooledEndpoints(0)
+	}
+	if warn {
+		fmt.Printf("group-scheduler: WARNING engineGroups=single with %d discovered endpoints — the policy is POOLING independent engines into ONE group: one BlockIndex (a block on A counted as if B held it), one budget, one seat set, and the capacity comes from whichever engine reported first. That is correct only for a single-engine stack: set engineGroups=per-engine for a multi-engine stack. llm_d_epp_group_pooled_endpoints reports the pool size.\n", n)
+	}
 }
 
 func (r *GroupScheduler) forgetEndpoint(ep metricsSource) {

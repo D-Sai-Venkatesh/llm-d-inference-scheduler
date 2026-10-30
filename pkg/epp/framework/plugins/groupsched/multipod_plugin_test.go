@@ -34,8 +34,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
-	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
+	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 )
@@ -229,4 +229,39 @@ func TestPluginSettleCarriesEndpoint(t *testing.T) {
 func mpDecoder(t *testing.T, params string) *json.Decoder {
 	t.Helper()
 	return json.NewDecoder(strings.NewReader(params))
+}
+
+// TestPluginPooledEndpointsAlarm is AUDIT N1: engineGroups defaults to "single",
+// which fails OPEN — a second discovered endpoint silently pools independent
+// engines into one budget/index. The state must be visible as a SERIES for every
+// arm (0/absent when per-engine), because a startup log line scrolls away.
+func TestPluginPooledEndpointsAlarm(t *testing.T) {
+	p, err := Factory("gs", mpDecoder(t, `{}`), nil) // engineGroups defaults to single
+	require.NoError(t, err)
+	gs := p.(*GroupScheduler)
+	require.NoError(t, gs.metrics.register(prometheus.NewRegistry()))
+
+	a := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{ID: types.NamespacedName{Name: "engine-a"}},
+		&fwkdl.Metrics{CacheBlockSize: 64, CacheNumBlocks: 1000})
+	require.NoError(t, gs.Extract(t.Context(), fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: a}))
+	require.EqualValues(t, 1, promtestutil.ToFloat64(gs.metrics.pooledEndpoints),
+		"one endpoint pooled: expected, and the series must exist so the field is never ambiguous")
+	b := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{ID: types.NamespacedName{Name: "engine-b"}},
+		&fwkdl.Metrics{CacheBlockSize: 64, CacheNumBlocks: 1000})
+	require.NoError(t, gs.Extract(t.Context(), fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: b}))
+	require.EqualValues(t, 2, promtestutil.ToFloat64(gs.metrics.pooledEndpoints),
+		"two endpoints pooled under engineGroups=single — the fail-open state is now a series")
+	require.Len(t, gs.sched.EngineGroupIDs(), 1, "and it really is ONE group")
+	require.Equal(t, 950, gs.sched.SnapshotLite().BudgetBlocks,
+		"the pooled budget is first-wins, i.e. engine-b's 1000 blocks are invisible")
+
+	// per-engine mode reports 0 (no pooling at all)
+	p2, err := Factory("gs", mpDecoder(t, `{"engineGroups":"per-engine"}`), nil)
+	require.NoError(t, err)
+	gs2 := p2.(*GroupScheduler)
+	require.NoError(t, gs2.metrics.register(prometheus.NewRegistry()))
+	require.NoError(t, gs2.Extract(t.Context(), fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: a}))
+	require.NoError(t, gs2.Extract(t.Context(), fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: b}))
+	require.EqualValues(t, 0, promtestutil.ToFloat64(gs2.metrics.pooledEndpoints))
+	require.Len(t, gs2.sched.EngineGroupIDs(), 2)
 }

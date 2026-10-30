@@ -130,7 +130,7 @@ func TestQuantumBudgetLadderDoneBeforeMidQuantum(t *testing.T) {
 	// force budget pressure: both idle, "mid" has a waiting head
 	s.mu.Lock()
 	s.eng().members["mid"].waitingSince = now.Add(-time.Second)
-	reason, victim := s.budgetVictimLocked(s.eng(), now.Add(2*time.Second))
+	reason, victim := s.budgetVictimLocked(s.eng(), now.Add(2 * time.Second))
 	s.mu.Unlock()
 	if victim == nil {
 		t.Fatal("no budget victim under pressure")

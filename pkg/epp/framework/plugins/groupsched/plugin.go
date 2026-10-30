@@ -36,6 +36,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
@@ -91,9 +92,12 @@ type GroupScheduler struct {
 	capMu     sync.Mutex
 	endpoints map[string]*endpointState // endpoint id -> handle + acquisition state
 	hetero    map[string]struct{}       // engines already reported as capacity-heterogeneous
-	// pooledWarned is the one-shot AUDIT-N1 alarm: engineGroups=single with
-	// more than one discovered endpoint (the knob's default fails OPEN).
-	pooledWarned bool
+	// pooledCount is the number of endpoints the pooled (engineGroups=single)
+	// group is summing, kept as an ATOMIC so the hot path costs one load and a
+	// no-change swap; pooledOnce LATCHES the AUDIT-N1 warning so it is emitted
+	// exactly once without a lock-guarded comparison per request.
+	pooledCount atomic.Int64
+	pooledOnce  sync.Once
 }
 
 // endpointState is one discovered endpoint's capacity-acquisition state.
@@ -545,21 +549,24 @@ func (r *GroupScheduler) rememberEndpoint(ep metricsSource) {
 		r.endpoints[key] = st
 	}
 	st.ep = ep // the handle is refreshed: the datalayer swaps metrics in place
-	n := len(r.endpoints)
+	n := int64(len(r.endpoints))
 	pooled := !r.cfg.perEngine()
-	warn := pooled && n > 1 && !r.pooledWarned
-	if warn {
-		r.pooledWarned = true
-	}
+	want := int64(0)
 	if pooled {
-		// AUDIT N1: engineGroups=single is the default and it fails OPEN, so a
-		// multi-endpoint pool is reported as a SERIES (not just a log line).
-		r.metrics.SetPooledEndpoints(n)
-	} else {
-		r.metrics.SetPooledEndpoints(0)
+		want = n
 	}
-	if warn {
-		fmt.Printf("group-scheduler: WARNING engineGroups=single with %d discovered endpoints — the policy is POOLING independent engines into ONE group: one BlockIndex (a block on A counted as if B held it), one budget, one seat set, and the capacity comes from whichever engine reported first. That is correct only for a single-engine stack: set engineGroups=per-engine for a multi-engine stack. llm_d_epp_group_pooled_endpoints reports the pool size.\n", n)
+	// One atomic swap: the gauge is touched only when the pool size CHANGES, so
+	// rememberEndpoint (called on every PreRequest) costs a load + a swap.
+	if r.pooledCount.Swap(want) != want {
+		r.metrics.SetPooledEndpoints(int(want))
+	}
+	if pooled && n > 1 {
+		// AUDIT N1: the knob's default fails OPEN, so a multi-endpoint pool is
+		// announced ONCE (sync.Once — latched, never re-tested per request) and
+		// reported forever as llm_d_epp_group_pooled_endpoints.
+		r.pooledOnce.Do(func() {
+			fmt.Printf("group-scheduler: WARNING engineGroups=single with %d discovered endpoints — the policy is POOLING independent engines into ONE group: one BlockIndex (a block on A counted as if B held it), one budget, one seat set, and the capacity comes from whichever engine reported first. That is correct only for a single-engine stack: set engineGroups=per-engine for a multi-engine stack. llm_d_epp_group_pooled_endpoints reports the pool size.\n", n)
+		})
 	}
 }
 

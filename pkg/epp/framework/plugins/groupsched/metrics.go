@@ -68,6 +68,12 @@ type groupMetrics struct {
 	// capacityLearned counts how each engine's capacity arrived (endpoint-
 	// event | metrics-poll | pre-request) — the acquisition audit.
 	capacityLearned *prometheus.CounterVec
+	// pooledEndpoints is the number of endpoints the policy has DISCOVERED
+	// while engineGroups=single: 1 is normal, >1 means the pooled group is
+	// summing independent engines into one budget/index (AUDIT N1 — the knob's
+	// default fails OPEN, so the state must be visible as a series, not only as
+	// a startup log line). Always 0/absent when engineGroups=per-engine.
+	pooledEndpoints prometheus.Gauge
 	// capacityHeterogeneous is 1 when a measured num_gpu_blocks deviates >1%
 	// from the first engine's: a heterogeneous pool must never silently
 	// inherit another engine's budget.
@@ -129,6 +135,8 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "1 while this engine's num_gpu_blocks is unknown past capacityLivenessSeconds (FCFS pass-through in effect)"}, engineLabels)
 	g.capacityLearned = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "capacity_learned_total",
 		Help: "capacity acquisition by path (endpoint-event | metrics-poll | pre-request) and engine"}, []string{"via", "engine"})
+	g.pooledEndpoints = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "pooled_endpoints",
+		Help: "endpoints pooled into the ONE group while engineGroups=single (>1 means independent engines are summed: wrong budget, wrong dedup)"})
 	g.capacityHeterogeneous = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "capacity_heterogeneous",
 		Help: "1 when a measured num_gpu_blocks deviates >1% from the first engine's (a pool that must NOT share a budget)"})
 	g.affinityViolations = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "affinity_violations_total",
@@ -146,7 +154,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	for _, c := range []prometheus.Collector{g.seats, g.members, g.sessions, g.boundMembers,
 		g.coldInFlight, g.uniqueBlocks, g.neBlocks, g.budgetBlocks, g.capacity,
 		g.waiters, g.exits, g.residency, g.entryWait, g.refillShare, g.served, fcfsCounter,
-		g.capacityMissing, g.capacityLearned, g.capacityHeterogeneous,
+		g.capacityMissing, g.capacityLearned, g.pooledEndpoints, g.capacityHeterogeneous,
 		g.affinityViolations, g.rebinds, g.homings, g.rehomes, g.engineGone} {
 		if err := reg.Register(c); err != nil {
 			return err
@@ -252,6 +260,16 @@ func (g *groupMetrics) ObserveEngineGone() {
 	if g.engineGone != nil {
 		g.engineGone.Inc()
 	}
+}
+
+// SetPooledEndpoints reports how many endpoints the single group is pooling
+// (AUDIT N1: engineGroups=single is the default and it fails OPEN, so a
+// multi-endpoint pool must be visible as a series).
+func (g *groupMetrics) SetPooledEndpoints(n int) {
+	if g.pooledEndpoints == nil {
+		return
+	}
+	g.pooledEndpoints.Set(float64(n))
 }
 
 // ObserveCapacityLearned records the capacity acquisition path.

@@ -108,3 +108,107 @@ func TestE2SourceMatchesBranchIdentityKey(t *testing.T) {
 			"the E2 chain must not carry the prefix-cache-affinity filter (its TTFT escape breaks stickiness)")
 	}
 }
+
+// mpArmConfig is the subset of an EndpointPickerConfig the arm-discipline tests
+// read (plugin types in order, the profile list, the flow-control wiring).
+type mpArmConfig struct {
+	Plugins []struct {
+		Type       string `json:"type"`
+		Name       string `json:"name"`
+		Parameters struct {
+			EngineGroups string `json:"engineGroups"`
+		} `json:"parameters"`
+	} `json:"plugins"`
+	SchedulingProfiles []struct {
+		Name    string `json:"name"`
+		Plugins []struct {
+			PluginRef string `json:"pluginRef"`
+		} `json:"plugins"`
+	} `json:"schedulingProfiles"`
+	FlowControl struct {
+		PriorityBands []struct {
+			FairnessPolicyRef string `json:"fairnessPolicyRef"`
+		} `json:"priorityBands"`
+	} `json:"flowControl"`
+}
+
+func readArm(t *testing.T, name string) mpArmConfig {
+	t.Helper()
+	raw, err := os.ReadFile(mpArmDir + "/" + name)
+	require.NoError(t, err)
+	var cfg mpArmConfig
+	require.NoError(t, sigsyaml.Unmarshal(raw, &cfg))
+	return cfg
+}
+
+// TestE2E3OneVariableDelta is the ARM DISCIPLINE guard: E2 and E3 must differ by
+// exactly one variable — the group scheduler (plus the fairnessPolicyRef that
+// binds it into flow control). Two audit blockers are pinned here:
+//
+//	B1  E3 must carry the SAME branch-homing filter as E2 (in both `plugins:`
+//	    and the scheduling profile, BEFORE the scorer). Without it E3's
+//	    placement is argmax(token-load) per request, seated members ping-pong
+//	    between engines, every turn unseats + force-seats + re-prefills cold,
+//	    and "multi-pod gsch is dominated" would be a false negative.
+//	B2  E2 must carry the SAME token-producer as E3, or the two arms compute
+//	    their placement inputs from different numbers (auto-created estimate
+//	    backend vs the render sidecar).
+func TestE2E3OneVariableDelta(t *testing.T) {
+	e2 := readArm(t, "e2-affinity-plugins.yaml")
+	e3 := readArm(t, "e3-gsch-perengine-plugins.yaml")
+
+	types := func(c mpArmConfig) []string {
+		out := make([]string, 0, len(c.Plugins))
+		for _, p := range c.Plugins {
+			out = append(out, p.Type)
+		}
+		return out
+	}
+	t2, t3 := types(e2), types(e3)
+	extra := map[string]int{}
+	for _, ty := range t3 {
+		extra[ty]++
+	}
+	for _, ty := range t2 {
+		extra[ty]--
+	}
+	for ty, n := range extra {
+		if n == 0 {
+			continue
+		}
+		require.Equal(t, 1, n, "plugin %q: E3 has %d more instance(s) than E2 (the arms must differ by ONE variable)", ty, n)
+		require.Equal(t, "group-scheduler", ty, "the ONLY plugin E3 may add is the group scheduler")
+	}
+	// nothing E2-only may exist (the filter must be in BOTH — blocker B1)
+	for ty, n := range extra {
+		require.GreaterOrEqual(t, n, 0, "plugin %q exists only in E2 — E3 must carry the same identity/homing chain", ty)
+	}
+
+	// B1: the homing filter, in `plugins:` AND in the profile, BEFORE the scorer
+	profiles := func(c mpArmConfig) []string {
+		var out []string
+		for _, p := range c.SchedulingProfiles {
+			for _, r := range p.Plugins {
+				out = append(out, r.PluginRef)
+			}
+		}
+		return out
+	}
+	require.Equal(t, profiles(e2), profiles(e3),
+		"E2 and E3 must run the SAME scheduling profile (filter before scorer)")
+	require.Equal(t, []string{"branch-homing", "token-load-scorer"}, profiles(e3),
+		"the homing filter must be FIRST in the profile (it narrows the candidate set; the scorer orders the rest)")
+
+	// the fairnessPolicyRef is the ONE flow-control difference
+	require.Empty(t, e2.FlowControl.PriorityBands, "E2 runs flow control's default FCFS: no fairness policy")
+	require.Len(t, e3.FlowControl.PriorityBands, 1)
+	require.Equal(t, "group", e3.FlowControl.PriorityBands[0].FairnessPolicyRef)
+
+	// E3's engine scope
+	for _, p := range e3.Plugins {
+		if p.Type == "group-scheduler" {
+			require.Equal(t, "per-engine", p.Parameters.EngineGroups,
+				"E3 is a 2-pod arm: a pooled (single) group would silently measure the wrong thing")
+		}
+	}
+}

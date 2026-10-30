@@ -92,10 +92,17 @@ type groupMetrics struct {
 	// can zero the gauges of an engine that disappeared (a stale series
 	// reads as "engine alive" forever otherwise).
 	known map[string]struct{}
+	// lastHomings mirrors the scheduler's per-engine homing count into the
+	// Prometheus counter as a DELTA on each Refresh. Without it
+	// llm_d_epp_group_homings_total stayed at its pre-instantiated 0 while the
+	// snapshot carried the real number (measured on live arm e1: 203 homings in
+	// the dump, 0 in the series) — a metric that silently disagrees with the
+	// state dump is worse than no metric.
+	lastHomings map[string]int64
 }
 
 func newGroupMetrics(sched *Scheduler) *groupMetrics {
-	return &groupMetrics{sched: sched, known: map[string]struct{}{}}
+	return &groupMetrics{sched: sched, known: map[string]struct{}{}, lastHomings: map[string]int64{}}
 }
 
 func (g *groupMetrics) register(reg prometheus.Registerer) error {
@@ -192,7 +199,13 @@ func (g *groupMetrics) Refresh() {
 		g.capacity.WithLabelValues(label).Set(float64(es.NumBlocks))
 		g.waiters.WithLabelValues(label).Set(float64(es.Waiters))
 		g.served.WithLabelValues(label).Add(0)
-		g.homings.WithLabelValues(label).Add(0)
+		if prev, ok := g.lastHomings[label]; !ok || es.Homings != prev {
+			delta := es.Homings - prev
+			if delta > 0 {
+				g.homings.WithLabelValues(label).Add(float64(delta))
+			}
+			g.lastHomings[label] = es.Homings
+		}
 		if fcfsCounter != nil {
 			fcfsCounter.WithLabelValues(label).Add(0)
 		}
@@ -208,6 +221,7 @@ func (g *groupMetrics) Refresh() {
 			continue
 		}
 		delete(g.known, label)
+		delete(g.lastHomings, label)
 		for _, vec := range []*prometheus.GaugeVec{g.seats, g.members, g.sessions, g.boundMembers,
 			g.coldInFlight, g.uniqueBlocks, g.neBlocks, g.budgetBlocks, g.capacity, g.waiters} {
 			vec.DeleteLabelValues(label)

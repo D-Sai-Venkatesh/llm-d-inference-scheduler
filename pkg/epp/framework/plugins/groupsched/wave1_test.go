@@ -129,7 +129,7 @@ func entryOf(t *testing.T, s *Scheduler, heads []Head, now time.Time) string {
 	s.PickFromHeads(heads, now) // sync the waiter view (no seat possible)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	w := s.entryHeadLocked(nil)
+	w := s.entryHeadLocked(s.eng(), nil)
 	if w == nil {
 		return ""
 	}
@@ -196,7 +196,7 @@ func TestSessionOrderLSFLadder(t *testing.T) {
 	_ = entryOf(t, s, heads, now)
 	s.mu.Lock()
 	_, served := s.everSeatedSession["sE"]
-	_, e2Seat := s.members["e1"]
+	_, e2Seat := s.eng().members["e1"]
 	s.mu.Unlock()
 	require.True(t, served, "sE must still count as served (its record keeps the session mark)")
 	require.False(t, e2Seat, "e1 must have rotated out for this rung")
@@ -500,20 +500,20 @@ func TestCapacityPollFallback(t *testing.T) {
 	require.False(t, gs.sched.HasCapacity(), "the creation event must not invent a capacity")
 
 	// inside the liveness window nothing is flagged
-	firstSeen := gs.firstSeen
+	firstSeen := epState(t, gs, ep).firstSeen
 	require.False(t, firstSeen.IsZero(), "the endpoint observation must be recorded")
 	gs.pollCapacity(firstSeen.Add(30 * time.Second))
 	require.False(t, gs.sched.HasCapacity())
-	require.False(t, gs.capWarned, "no liveness warning inside capacityLivenessSeconds")
-	require.Equal(t, 0.0, promtestutil.ToFloat64(gs.metrics.capacityMissing))
+	require.False(t, epState(t, gs, ep).warned, "no liveness warning inside capacityLivenessSeconds")
+	require.Equal(t, 0.0, promtestutil.ToFloat64(gs.metrics.capacityMissing.WithLabelValues(engineLabel(""))))
 
 	// the scrape lands (the collector swaps the pointer on the SAME object)
 	ep.UpdateMetrics(&fwkdl.Metrics{CacheBlockSize: 64, CacheNumBlocks: 1000})
 	gs.pollCapacity(firstSeen.Add(31 * time.Second))
 	require.True(t, gs.sched.HasCapacity(), "the metrics poll must recover the capacity")
 	require.Equal(t, 950, gs.sched.SnapshotLite().BudgetBlocks, "budget = 0.95 x num_gpu_blocks")
-	require.Equal(t, "metrics-poll", gs.capFrom)
-	require.Equal(t, 1.0, promtestutil.ToFloat64(gs.metrics.capacityLearned.WithLabelValues("metrics-poll")))
+	require.Equal(t, "metrics-poll", epState(t, gs, ep).via)
+	require.Equal(t, 1.0, promtestutil.ToFloat64(gs.metrics.capacityLearned.WithLabelValues("metrics-poll", engineLabel(""))))
 }
 
 // TestCapacityLivenessAlarm: the budget stays unknown past the bound ⇒ the
@@ -525,19 +525,20 @@ func TestCapacityLivenessAlarm(t *testing.T) {
 	ep := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{ID: types.NamespacedName{Name: "decode-0"}}, nil)
 	require.NoError(t, gs.Extract(t.Context(), fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: ep}))
 
-	gs.pollCapacity(gs.firstSeen.Add(121 * time.Second))
-	require.True(t, gs.capWarned, "the liveness bound must fire the alarm")
-	require.Equal(t, 1.0, promtestutil.ToFloat64(gs.metrics.capacityMissing))
+	firstSeen := epState(t, gs, ep).firstSeen
+	gs.pollCapacity(firstSeen.Add(121 * time.Second))
+	require.True(t, epState(t, gs, ep).warned, "the liveness bound must fire the alarm")
+	require.Equal(t, 1.0, promtestutil.ToFloat64(gs.metrics.capacityMissing.WithLabelValues(engineLabel(""))))
 
 	// the alarm is one-shot: the gauge stays up until the capacity arrives
-	gs.pollCapacity(gs.firstSeen.Add(600 * time.Second))
-	require.Equal(t, 1.0, promtestutil.ToFloat64(gs.metrics.capacityMissing))
+	gs.pollCapacity(firstSeen.Add(600 * time.Second))
+	require.Equal(t, 1.0, promtestutil.ToFloat64(gs.metrics.capacityMissing.WithLabelValues(engineLabel(""))))
 
 	// a late metric clears it
 	ep.UpdateMetrics(&fwkdl.Metrics{CacheBlockSize: 64, CacheNumBlocks: 512})
-	gs.pollCapacity(gs.firstSeen.Add(601 * time.Second))
+	gs.pollCapacity(firstSeen.Add(601 * time.Second))
 	require.True(t, gs.sched.HasCapacity())
-	require.Equal(t, 0.0, promtestutil.ToFloat64(gs.metrics.capacityMissing))
+	require.Equal(t, 0.0, promtestutil.ToFloat64(gs.metrics.capacityMissing.WithLabelValues(engineLabel(""))))
 }
 
 // TestCapacityMismatchStaysLoud: a measured block size that disagrees with the
@@ -563,7 +564,7 @@ func TestCapacityEventPathStillLearns(t *testing.T) {
 	require.NoError(t, gs.Extract(t.Context(), fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: ep}))
 	require.True(t, gs.sched.HasCapacity())
 	require.Equal(t, 1900, gs.sched.SnapshotLite().BudgetBlocks)
-	require.Equal(t, "endpoint-event", gs.capFrom)
+	require.Equal(t, "endpoint-event", epState(t, gs, ep).via)
 }
 
 // ---- 7. +29% MEMBERS: do the per-member structures hold? ----
@@ -612,12 +613,12 @@ func checkPerMemberStructures(t *testing.T, order string) {
 	require.NotEmpty(t, snap.MemberSources, "the effective member source must be counted")
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.index.mu.Lock()
-	for id, rec := range s.index.sessions {
+	s.eng().index.mu.Lock()
+	for id, rec := range s.eng().index.sessions {
 		require.LessOrEqual(t, len(rec.chains), maxChains, "record %s exceeded the chain cap", id)
 	}
-	s.index.mu.Unlock()
-	for id, m := range s.members {
+	s.eng().index.mu.Unlock()
+	for id, m := range s.eng().members {
 		require.LessOrEqual(t, m.inflight, cfg.InFlightCap, "member %s exceeded the in-flight cap", id)
 	}
 	// the session mirror is exact: every everSeated record contributes exactly
@@ -670,7 +671,7 @@ func TestIntegrationMemberIsBranchSessionIsAttribute(t *testing.T) {
 	require.True(t, gs.sched.Seated("br-7"), "the BRANCH must be the seated member")
 	require.False(t, gs.sched.Seated("sess-7"), "the session must never be seated as a member")
 	gs.sched.mu.Lock()
-	sess := gs.sched.members["br-7"].session
+	sess := gs.sched.eng().members["br-7"].session
 	gs.sched.mu.Unlock()
 	require.Equal(t, "sess-7", sess, "the member must carry the session ATTRIBUTE for the ordering layer")
 	// and the attribute itself is untouched (nothing writes the branch there)
@@ -728,4 +729,17 @@ func TestConsumesDeclaresNoBranchKeys(t *testing.T) {
 	}
 	_, ok := deps.Optional[agentidentity.AgentIdentityKey]
 	require.True(t, ok, "the agent-identity key stays declared (its producer is layer -1, harmless)")
+}
+
+
+// epState is the per-endpoint capacity-acquisition record for ep (the
+// per-endpoint replacement for the old single firstSeen/capWarned/capFrom
+// fields).
+func epState(t *testing.T, gs *GroupScheduler, ep metricsSource) *endpointState {
+	t.Helper()
+	gs.capMu.Lock()
+	defer gs.capMu.Unlock()
+	st, ok := gs.endpoints[endpointKey(ep)]
+	require.True(t, ok, "endpoint %s is not remembered", endpointKey(ep))
+	return st
 }

@@ -978,6 +978,25 @@ func (b *BlockIndex) TrySeatLocked(id string, budgetBlocks int) (bool, int) {
 	return true, cost
 }
 
+// SeatForceLocked seats a session WITHOUT the budget check: the block set
+// is taken as present on this engine (an affinity reconciliation observed
+// it there — the engine, not our estimate, is authoritative about what it
+// holds). The next enforce pass evicts to fit; an over-budget counter is
+// recoverable, a member absent from the engine serving it is not.
+func (b *BlockIndex) SeatForceLocked(id string) {
+	s := b.TrackLocked(id, 0)
+	if _, isSeated := b.seated[id]; isSeated {
+		return
+	}
+	b.version++ // R4: the seated write
+	b.seated[id] = struct{}{}
+	s.exiting = false
+	for h := range s.set() {
+		b.blocks[h]++
+		b.blocksNE[h]++
+	}
+}
+
 // FitBlocksLocked is FitBlocks under an already-held lock.
 func (b *BlockIndex) FitBlocksLocked(hashes []Hash) int {
 	n := 0

@@ -33,6 +33,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,11 +83,26 @@ type GroupScheduler struct {
 	// and re-reads their metrics on the ticker: the datalayer refreshes a
 	// ModelServer's metrics IN PLACE (atomic pointer swap inside the same
 	// endpoint object), so a stored handle is a live poll target.
+	//
+	// MULTI-POD: capacity, the liveness deadline and the acquisition audit
+	// are PER ENDPOINT. "First capacity wins" was a single-pool assumption;
+	// an engine whose metrics never arrive must not look healthy just
+	// because its sibling learned its own num_gpu_blocks.
 	capMu     sync.Mutex
-	endpoints map[string]metricsSource // endpoint id -> handle (shared, refreshed in place)
-	firstSeen time.Time                // first decode-endpoint observation
-	capWarned bool                     // the liveness warning is one-shot
-	capFrom   string                   // how the capacity was learned (audit)
+	endpoints map[string]*endpointState // endpoint id -> handle + acquisition state
+	hetero    map[string]struct{}       // engines already reported as capacity-heterogeneous
+}
+
+// endpointState is one discovered endpoint's capacity-acquisition state.
+type endpointState struct {
+	ep metricsSource
+	// firstSeen is this endpoint's first observation (its OWN liveness
+	// deadline starts here, not the process's).
+	firstSeen time.Time
+	// warned is the one-shot per-endpoint liveness warning.
+	warned bool
+	// via records how this engine's capacity was learned (audit).
+	via string
 }
 
 // Factory builds a GroupScheduler. FAILS CLOSED without the
@@ -107,7 +124,8 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		typedName: fwkplugin.TypedName{Type: PluginType, Name: name},
 		cfg:       cfg,
 		sched:     sched,
-		endpoints: map[string]metricsSource{},
+		endpoints: map[string]*endpointState{},
+		hetero:    map[string]struct{}{},
 		// the handle is held for the RegisterDependencies-time gate: plugin
 		// construction order is NOT the config order (the runner may build
 		// the fairness policy first), so the token-producer check cannot
@@ -128,23 +146,52 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// at runtime.
 	fmt.Printf("group-scheduler: member key source: %s (%s); session ordering: %s\n",
 		cfg.MemberKey, memberKeyRule(cfg.MemberKey), cfg.SessionOrder)
+	// The engine scope is the one knob whose EFFECT is a discovered set, so
+	// state it in words: a run whose config says per-engine but whose EPP
+	// sees one endpoint is numerically a single-engine run.
+	if cfg.perEngine() {
+		fmt.Printf("group-scheduler: engine groups: PER-ENGINE — one fairness group per DISCOVERED endpoint (own index, own 95%% budget, own cold-entry cap, own rotation loop); identity stays global; members are homed at first seat and never migrate while active. Groups are created on endpoint add and torn down on endpoint delete.\n")
+	} else {
+		fmt.Printf("group-scheduler: engine groups: SINGLE — one group sums every endpoint into one pool (correct only for one engine; the multi-pod arms set engineGroups=per-engine)\n")
+	}
+	// The observation hooks are installed UNCONDITIONALLY: the metrics they
+	// feed are nil-safe, and a unit-mode run (no handle) must record the same
+	// accounting as a live one — the affinity-violation and engine-gone
+	// counters are CORRECTNESS signals, not decoration.
+	r.sched.onExit = r.metrics.ObserveExit
+	r.sched.onEntry = r.metrics.ObserveEntry
+	r.sched.onServe = r.metrics.ObserveServed
+	r.sched.onRehome = func(member, from, to string) {
+		r.metrics.ObserveAffinityViolation(engineLabel(from), engineLabel(to))
+		fmt.Printf("group-scheduler: AFFINITY VIOLATION member=%s charged=%s observed=%s — rebound (the observed endpoint wins)\n",
+			member, engineLabel(from), engineLabel(to))
+	}
+	r.sched.onEngineGone = func(engine string, members int) {
+		r.metrics.ObserveEngineGone()
+		fmt.Printf("group-scheduler: ENGINE GONE %s — exited %d member(s) and dropped the group; their homing is released for re-placement\n",
+			engineLabel(engine), members)
+	}
 	if handle != nil {
 		if reg := handle.Metrics(); reg != nil {
 			if err := r.metrics.register(reg); err != nil {
 				return nil, fmt.Errorf("failed to register metrics of the '%s' plugin: %w", PluginType, err)
 			}
 		}
-		r.sched.onExit = r.metrics.ObserveExit
-		r.sched.onEntry = r.metrics.ObserveEntry
-		r.sched.onServe = r.metrics.ObserveServed
 		r.sched.onMemberSource = func(source string) {
 			fmt.Printf("group-scheduler: member source in effect at dispatch: %s\n", source)
 		}
 		// the per-id SEAT/EXIT event log (one debug line each; the
 		// campaign's spans could not see seat membership).
+		//
+		// The engine label is appended to the DETAIL, never inserted before
+		// it: the pre-multi-pod reducer regex
+		// (`t=<ts> kind=<KIND> id=<id> <detail>`) and the detail keys
+		// (kind=/wait=/reason=) keep matching unchanged, so a wave-1 parser
+		// reads a multi-pod log without modification.
 		r.sched.onEvent = func(ev Event) {
-			fmt.Printf("group-scheduler event t=%s kind=%s id=%s %s\n",
-				ev.T.UTC().Format(time.RFC3339Nano), ev.Kind, ev.ID, ev.Detail)
+			fmt.Printf("group-scheduler event t=%s kind=%s id=%s %s engine=%s member=%s\n",
+				ev.T.UTC().Format(time.RFC3339Nano), ev.Kind, ev.ID, ev.Detail,
+				ev.Engine, ev.Member)
 		}
 		go r.runTicker(handle.Context())
 	}
@@ -186,27 +233,27 @@ func (r *GroupScheduler) TypedName() fwkplugin.TypedName { return r.typedName }
 // key is declared here; the BRANCH keys are read the same way but are NOT
 // declared, and that is deliberate (WAVE-1 build fix, 2026-10-30):
 //
-//   the data layer's DAG validator rejects a dependency whose PRODUCER sits in a
-//   later layer than its CONSUMER, with the layer of a plugin derived from the
-//   interfaces it implements (FlowControlLayer=0 < RequestControlLayer=1). The
-//   group scheduler is a FairnessPolicy (layer 0); branch-identity implements
-//   PreRequest (it clears the busy flag at dispatch) and is therefore layer 1, so
-//   declaring branchidentity.BranchIdentityKey here made the EPP refuse to start:
-//   "invalid plugin layer execution order: producer branch-identity/branch-identity
-//   needs to be executed before consumer group/group-scheduler" (measured live,
-//   wave-1 build 5e851b18, 2026-10-30T03:54Z, the three branch arms only; the
-//   group-scheduler unit tests construct the policy directly and never build the
-//   plugin DAG, which is why 75 green tests missed it).
+//	the data layer's DAG validator rejects a dependency whose PRODUCER sits in a
+//	later layer than its CONSUMER, with the layer of a plugin derived from the
+//	interfaces it implements (FlowControlLayer=0 < RequestControlLayer=1). The
+//	group scheduler is a FairnessPolicy (layer 0); branch-identity implements
+//	PreRequest (it clears the busy flag at dispatch) and is therefore layer 1, so
+//	declaring branchidentity.BranchIdentityKey here made the EPP refuse to start:
+//	"invalid plugin layer execution order: producer branch-identity/branch-identity
+//	needs to be executed before consumer group/group-scheduler" (measured live,
+//	wave-1 build 5e851b18, 2026-10-30T03:54Z, the three branch arms only; the
+//	group-scheduler unit tests construct the policy directly and never build the
+//	plugin DAG, which is why 75 green tests missed it).
 //
-//   Nothing is lost by omitting them: the attributes are produced by
-//   branch-identity's RequestHeader hook, which the request path always runs
-//   before admission and therefore before this policy; stage 1 ran exactly this
-//   way (its Consumes listed the agent-identity key only) and the values were
-//   present on every request. agentidentity.AgentIdentityKey stays because its
-//   plugin implements only RequestHeader (layer -1) and the declaration is
-//   harmless. The real fix belongs upstream in the layer model (flow control listed
-//   before request control while the code comments assume the opposite order) —
-//   filed as a draft note for the human, never opened by an agent.
+//	Nothing is lost by omitting them: the attributes are produced by
+//	branch-identity's RequestHeader hook, which the request path always runs
+//	before admission and therefore before this policy; stage 1 ran exactly this
+//	way (its Consumes listed the agent-identity key only) and the values were
+//	present on every request. agentidentity.AgentIdentityKey stays because its
+//	plugin implements only RequestHeader (layer -1) and the declaration is
+//	harmless. The real fix belongs upstream in the layer model (flow control listed
+//	before request control while the code comments assume the opposite order) —
+//	filed as a draft note for the human, never opened by an agent.
 //
 // Both identity keys are OPTIONAL at the data layer because which one is the member
 // depends on Config.MemberKey (and on which identity plugin the arm deployed); the
@@ -387,6 +434,12 @@ func (r *GroupScheduler) RegisterDependencies(reg fwkdl.Registrar) error {
 // remembers the endpoint HANDLE so the ticker can poll its metrics (the
 // event carries them before the first scrape has populated them — the
 // capacity race).
+//
+// The engine SET is DISCOVERED here, never configured: an add-or-update
+// creates (or refreshes) that endpoint's engine group, and a delete tears it
+// down. The campaign's wave protocol rotates nodes every arm, so the
+// scale-down path is exercised constantly and must not leave charges on a
+// dead engine.
 func (r *GroupScheduler) Extract(_ context.Context, event fwkdl.EndpointEvent) error {
 	if event.Endpoint == nil {
 		return nil
@@ -397,40 +450,71 @@ func (r *GroupScheduler) Extract(_ context.Context, event fwkdl.EndpointEvent) e
 		return nil
 	case fwkdl.EventAddOrUpdate:
 		r.rememberEndpoint(event.Endpoint)
-		return r.learnCapacity(event.Endpoint.GetMetrics(), "endpoint-event")
+		return r.learnCapacity(endpointKey(event.Endpoint), event.Endpoint.GetMetrics(), "endpoint-event")
 	}
 	return nil
 }
 
-// learnCapacity takes the measured capacity from a metrics snapshot, once.
-// Shared by every acquisition path (endpoint event, metrics poll, PreRequest)
-// so the block-size match check and the "first capacity wins" rule are
-// identical everywhere.
-func (r *GroupScheduler) learnCapacity(m *fwkdl.Metrics, via string) error {
+// learnCapacity takes ONE engine's measured capacity from a metrics snapshot,
+// once per engine. Shared by every acquisition path (endpoint event, metrics
+// poll, PreRequest) so the block-size match check and the "first capacity
+// wins" rule are identical everywhere — and per engine, never pooled.
+func (r *GroupScheduler) learnCapacity(engine string, m *fwkdl.Metrics, via string) error {
 	if m == nil || m.CacheBlockSize <= 0 || m.CacheNumBlocks <= 0 {
 		return nil
 	}
-	if r.sched.HasCapacity() {
+	if r.sched.HasCapacityFor(engine) {
 		return nil
 	}
-	if err := r.sched.SetNumBlocks(m.CacheBlockSize, m.CacheNumBlocks); err != nil {
+	if err := r.sched.SetNumBlocksFor(engine, m.CacheBlockSize, m.CacheNumBlocks); err != nil {
 		return err // the loud mismatch failure
 	}
-	if r.sched.HasCapacity() {
-		r.capMu.Lock()
-		r.capFrom = via
-		wait := time.Duration(0)
-		if !r.firstSeen.IsZero() {
-			wait = time.Since(r.firstSeen)
-		}
-		r.capMu.Unlock()
-		snap := r.sched.SnapshotLite()
-		fmt.Printf("group-scheduler: capacity learned via %s after %.1fs: cacheBlockSize=%d numGpuBlocks=%d budgetBlocks=%d\n",
-			via, wait.Seconds(), m.CacheBlockSize, m.CacheNumBlocks, snap.BudgetBlocks)
-		r.metrics.ObserveCapacityLearned(via)
-		r.metrics.SetCapacityMissing(false)
+	if !r.sched.HasCapacityFor(engine) {
+		return nil
 	}
+	r.capMu.Lock()
+	wait := time.Duration(0)
+	if st, ok := r.endpoints[engine]; ok && !st.firstSeen.IsZero() {
+		wait = time.Since(st.firstSeen)
+		st.via = via
+	}
+	r.capMu.Unlock()
+	label := r.sched.GroupLabel(engine)
+	fmt.Printf("group-scheduler: capacity learned via %s engine=%s after %.1fs: cacheBlockSize=%d numGpuBlocks=%d budgetBlocks=%d (that engine's 95%%)\n",
+		via, label, wait.Seconds(), m.CacheBlockSize, m.CacheNumBlocks,
+		int(r.cfg.GroupBudgetFraction*float64(m.CacheNumBlocks)))
+	r.metrics.ObserveCapacityLearned(via, label)
+	r.metrics.SetCapacityMissing(label, false)
+	r.reportHeterogeneousCapacity()
 	return nil
+}
+
+// reportHeterogeneousCapacity fails LOUDLY when a newly measured engine's
+// num_gpu_blocks deviates from the first engine's by more than 1%: per-engine
+// budgets are only sound while the engines are interchangeable, and a
+// heterogeneous pool must never silently inherit another engine's budget
+// (log + gauge; the policy keeps running on each engine's own measurement).
+func (r *GroupScheduler) reportHeterogeneousCapacity() {
+	hetero := r.sched.HeterogeneousEngines(0.01)
+	if len(hetero) == 0 {
+		return
+	}
+	r.capMu.Lock()
+	var fresh []string
+	for id, blocks := range hetero {
+		if _, seen := r.hetero[id]; seen {
+			continue
+		}
+		r.hetero[id] = struct{}{}
+		fresh = append(fresh, fmt.Sprintf("%s=%d", r.sched.GroupLabel(id), blocks))
+	}
+	r.capMu.Unlock()
+	if len(fresh) == 0 {
+		return
+	}
+	sort.Strings(fresh)
+	fmt.Printf("group-scheduler: CAPACITY HETEROGENEOUS — engine(s) %s deviate >1%% from the first measured engine. Per-engine budgets are taking each engine's OWN num_gpu_blocks, but a heterogeneous pool means the stack is not the homogeneous replica set the experiment assumes (a half-ready or differently-configured engine).\n",
+		strings.Join(fresh, ", "))
 }
 
 // metricsSource is the narrow poll target: anything whose metrics can be
@@ -450,21 +534,30 @@ func (r *GroupScheduler) rememberEndpoint(ep metricsSource) {
 	r.capMu.Lock()
 	defer r.capMu.Unlock()
 	if r.endpoints == nil {
-		r.endpoints = map[string]metricsSource{}
+		r.endpoints = map[string]*endpointState{}
 	}
-	r.endpoints[key] = ep
-	if r.firstSeen.IsZero() {
-		r.firstSeen = time.Now()
+	st, ok := r.endpoints[key]
+	if !ok {
+		st = &endpointState{firstSeen: time.Now()}
+		r.endpoints[key] = st
 	}
+	st.ep = ep // the handle is refreshed: the datalayer swaps metrics in place
 }
 
 func (r *GroupScheduler) forgetEndpoint(ep metricsSource) {
 	if ep == nil {
 		return
 	}
+	key := endpointKey(ep)
 	r.capMu.Lock()
-	defer r.capMu.Unlock()
-	delete(r.endpoints, endpointKey(ep))
+	delete(r.endpoints, key)
+	delete(r.hetero, key)
+	r.capMu.Unlock()
+	// tear the engine's group down: its members are exited, their homing
+	// released, its budget/index dropped (leaving charges on a dead engine
+	// poisons every later budget decision on a scale-down).
+	r.sched.RemoveEngine(key, time.Now())
+	r.metrics.SetCapacityMissing(r.sched.GroupLabel(key), false)
 }
 
 func endpointKey(ep metricsSource) string {
@@ -485,42 +578,55 @@ func endpointKey(ep metricsSource) string {
 // arrive within capacityLivenessSeconds, else the FCFS pass-through (A5) is
 // being served silently — log loudly and raise the missing gauge.
 func (r *GroupScheduler) pollCapacity(now time.Time) {
-	if r.sched.HasCapacity() {
-		return
-	}
 	r.capMu.Lock()
-	eps := make([]metricsSource, 0, len(r.endpoints))
-	for _, ep := range r.endpoints {
-		eps = append(eps, ep)
+	type pollTarget struct {
+		key       string
+		ep        metricsSource
+		firstSeen time.Time
+		warned    bool
 	}
-	seen := r.firstSeen
-	warned := r.capWarned
+	targets := make([]pollTarget, 0, len(r.endpoints))
+	for key, st := range r.endpoints {
+		if st == nil || st.ep == nil {
+			continue
+		}
+		targets = append(targets, pollTarget{key: key, ep: st.ep, firstSeen: st.firstSeen, warned: st.warned})
+	}
 	r.capMu.Unlock()
 
-	for _, ep := range eps {
-		if err := r.learnCapacity(ep.GetMetrics(), "metrics-poll"); err != nil {
+	// sort for a deterministic log/poll order (the map is not)
+	sort.Slice(targets, func(i, j int) bool { return targets[i].key < targets[j].key })
+
+	for _, t := range targets {
+		if r.sched.HasCapacityFor(t.key) {
+			continue
+		}
+		if err := r.learnCapacity(t.key, t.ep.GetMetrics(), "metrics-poll"); err != nil {
 			// a block-size mismatch is loud and permanent: keep it in the
 			// log, don't spin the ticker on it
-			if !warned {
-				fmt.Printf("group-scheduler: CAPACITY REJECTED from metrics-poll: %v\n", err)
+			if !t.warned {
+				fmt.Printf("group-scheduler: CAPACITY REJECTED from metrics-poll engine=%s: %v\n", r.sched.GroupLabel(t.key), err)
 			}
 		}
-		if r.sched.HasCapacity() {
-			return
+		if r.sched.HasCapacityFor(t.key) {
+			continue
 		}
+		// PER-ENGINE liveness: this endpoint's own clock, one warning each.
+		if t.firstSeen.IsZero() || t.warned || r.cfg.CapacityLivenessSeconds <= 0 {
+			continue
+		}
+		if now.Sub(t.firstSeen) < time.Duration(r.cfg.CapacityLivenessSeconds*float64(time.Second)) {
+			continue
+		}
+		r.capMu.Lock()
+		if st, ok := r.endpoints[t.key]; ok {
+			st.warned = true
+		}
+		r.capMu.Unlock()
+		r.metrics.SetCapacityMissing(r.sched.GroupLabel(t.key), true)
+		fmt.Printf("group-scheduler: CAPACITY MISSING engine=%s — its num_gpu_blocks is still unknown %.0fs after the endpoint was observed (%d endpoint(s) polled): that engine seats nothing while the policy looks healthy, and any dispatch it takes is FCFS pass-through (A5). Check that the endpoint metrics carry cache block size/num blocks (--refresh-metrics-interval), and that the EPP was rolled AFTER decode readiness.\n",
+			engineLabel(t.key), now.Sub(t.firstSeen).Seconds(), len(targets))
 	}
-	if seen.IsZero() || warned || r.cfg.CapacityLivenessSeconds <= 0 {
-		return
-	}
-	if now.Sub(seen) < time.Duration(r.cfg.CapacityLivenessSeconds*float64(time.Second)) {
-		return
-	}
-	r.capMu.Lock()
-	r.capWarned = true
-	r.capMu.Unlock()
-	r.metrics.SetCapacityMissing(true)
-	fmt.Printf("group-scheduler: CAPACITY MISSING — num_gpu_blocks still unknown %.0fs after the decode endpoint was observed (%d endpoint(s) polled): serving FCFS pass-through (A5). Check that the endpoint metrics carry cache block size/num blocks (--refresh-metrics-interval), and that the EPP was rolled AFTER decode readiness.\n",
-		now.Sub(seen).Seconds(), len(eps))
 }
 
 // Pick is the dispatch decision (§5). The waiting set is the queue-head
@@ -565,7 +671,8 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 		r.fcfsOnce.Do(func() {
 			fmt.Println("group-scheduler: num_gpu_blocks not yet measured; serving FCFS until the endpoint metrics arrive")
 		})
-		r.metrics.ObserveFCFS()
+		_, label := r.sched.FCFSServed()
+		r.metrics.ObserveFCFS(label)
 		if i := FCFSPick(heads); i >= 0 {
 			return queues[i], nil
 		}
@@ -587,9 +694,11 @@ func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.Inferen
 	// capacity first (belt-and-braces, third acquisition path): it must not
 	// depend on the request being trackable — anonymous traffic used to
 	// return before ever teaching the budget.
+	engine := ""
 	if endpoint := pickedEndpoint(schedulingResult); endpoint != nil {
 		r.rememberEndpoint(endpoint)
-		if err := r.learnCapacity(endpoint.GetMetrics(), "pre-request"); err != nil {
+		engine = endpointKey(endpoint)
+		if err := r.learnCapacity(engine, endpoint.GetMetrics(), "pre-request"); err != nil {
 			return err // the loud mismatch failure
 		}
 	}
@@ -617,7 +726,10 @@ func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.Inferen
 	}
 	request.PutAttribute(requestKeysKey, keys)
 	size := int64(request.RequestSizeBytes)
-	r.sched.Dispatched(id, request.RequestID, keys, size, time.Now())
+	// The engine here is AUTHORITATIVE (the pendingEngine idiom): Pick
+	// charged the seat to the member's homed engine, and the framework's
+	// actual choice moves that charge if it disagrees.
+	r.sched.DispatchedOn(id, request.RequestID, engine, keys, size, time.Now())
 	return nil
 }
 
@@ -640,7 +752,7 @@ func (r *GroupScheduler) blockKeysFor(request *fwksched.InferenceRequest) []Hash
 // ResponseBody: the first chunk is prefill complete (the cold-entry
 // release, B3); EndOfStream is the finalizer for every termination
 // cause (in-flight decrement always; the payback ledger natural-only).
-func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.InferenceRequest, response *fwkrc.Response, _ *fwkdl.EndpointMetadata) {
+func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.InferenceRequest, response *fwkrc.Response, target *fwkdl.EndpointMetadata) {
 	if request == nil || response == nil {
 		return
 	}
@@ -658,7 +770,14 @@ func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.Infer
 	if response.Usage.PromptTokenDetails != nil {
 		usage.Cached = response.Usage.PromptTokenDetails.CachedTokens
 	}
-	r.sched.Settle(id, request.RequestID, usage, response.TerminationCause == fwkrc.TerminationCauseNatural, time.Now())
+	// The settle's engine comes from the response's own endpoint metadata
+	// (F6: Settle without an endpoint silently folds B's keys into A's
+	// record). An empty metadata id keeps the binding.
+	engine := ""
+	if target != nil && target.ID.String() != "" {
+		engine = target.ID.String()
+	}
+	r.sched.SettleOn(id, request.RequestID, engine, usage, response.TerminationCause == fwkrc.TerminationCauseNatural, time.Now())
 }
 
 // DumpState reports the group snapshot (§13).

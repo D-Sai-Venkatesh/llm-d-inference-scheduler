@@ -265,3 +265,68 @@ func TestPluginPooledEndpointsAlarm(t *testing.T) {
 	require.EqualValues(t, 0, promtestutil.ToFloat64(gs2.metrics.pooledEndpoints))
 	require.Len(t, gs2.sched.EngineGroupIDs(), 2)
 }
+
+// TestMetricsLabelContract is audit item 2: the multi-pod instrumentation must
+// add series WITHOUT perturbing the label sets of the series the banked analyses
+// already read. Contract:
+//
+//   - every per-engine series carries exactly one label, "engine";
+//   - in the pooled (engineGroups=single) mode its value is "single", never empty,
+//     so `sum(llm_d_epp_group_seats)` is the same number a pre-multi-pod scrape
+//     carried;
+//   - llm_d_epp_group_pooled_endpoints carries NO labels (it is a property of the
+//     process, not of an engine), so it cannot collide with, or relabel, anything;
+//   - the per-engine values SUM to the whole-policy value (the reducer's oldest
+//     invariant).
+func TestMetricsLabelContract(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	p, err := Factory("gs", mpDecoder(t, `{}`), nil) // engineGroups defaults to single
+	require.NoError(t, err)
+	gs := p.(*GroupScheduler)
+	require.NoError(t, gs.metrics.register(reg))
+	a := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{ID: types.NamespacedName{Name: "engine-a"}},
+		&fwkdl.Metrics{CacheBlockSize: 64, CacheNumBlocks: 1000})
+	require.NoError(t, gs.Extract(t.Context(), fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: a}))
+	now := time.Now()
+	if _, i := gs.sched.PickFromHeadsEngine([]Head{{Member: "m1", ReqID: "r1", Arrival: now, SizeBytes: bytesFor(10)}}, now); i < 0 {
+		t.Fatal("m1 must seat")
+	}
+	gs.metrics.Refresh()
+
+	fams, err := reg.Gather()
+	require.NoError(t, err)
+	labelsOf := func(name string) map[string]string {
+		for _, f := range fams {
+			if f.GetName() != name {
+				continue
+			}
+			require.Len(t, f.GetMetric(), 1, "%s must have exactly one series here", name)
+			out := map[string]string{}
+			for _, l := range f.GetMetric()[0].GetLabel() {
+				out[l.GetName()] = l.GetValue()
+			}
+			return out
+		}
+		t.Fatalf("series %s not found", name)
+		return nil
+	}
+
+	perEngine := map[string]string{"engine": "single"}
+	for _, name := range []string{"llm_d_epp_group_seats", "llm_d_epp_group_members",
+		"llm_d_epp_group_sessions", "llm_d_epp_group_bound_members",
+		"llm_d_epp_group_cold_inflight_tokens", "llm_d_epp_group_unique_blocks",
+		"llm_d_epp_group_ne_blocks", "llm_d_epp_group_budget_blocks",
+		"llm_d_epp_group_num_gpu_blocks", "llm_d_epp_group_waiters"} {
+		require.Equal(t, perEngine, labelsOf(name),
+			"%s: pooled mode must label the single group \"single\" (an empty value would make a banked sum look different)", name)
+	}
+	// the process-level series has NO labels at all
+	require.Empty(t, labelsOf("llm_d_epp_group_pooled_endpoints"),
+		"pooled_endpoints is a property of the process; a label here would collide with the per-engine contract")
+	// and the value is the pool size (1 endpoint discovered, single mode)
+	require.EqualValues(t, 1, promtestutil.ToFloat64(gs.metrics.pooledEndpoints))
+	// the per-engine value equals the whole-policy value in pooled mode
+	snap := gs.sched.SnapshotLite()
+	require.EqualValues(t, snap.Seats, promtestutil.ToFloat64(gs.metrics.seats.WithLabelValues("single")))
+	require.Equal(t, 950, snap.BudgetBlocks)
+}

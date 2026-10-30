@@ -330,3 +330,39 @@ func TestMetricsLabelContract(t *testing.T) {
 	require.EqualValues(t, snap.Seats, promtestutil.ToFloat64(gs.metrics.seats.WithLabelValues("single")))
 	require.Equal(t, 950, snap.BudgetBlocks)
 }
+
+// TestPerEngineCounterSeriesExistBeforeTraffic is the live lesson of 2026-10-30
+// 18:23Z: a *CounterVec has NO series until its first observation, so the first
+// live multi-pod stack scraped WITHOUT llm_d_epp_group_dispatches_total and the
+// deploy pre-flight (rightly) refused it. Refresh must pre-instantiate the
+// per-engine counters at zero, for every engine, before any dispatch.
+func TestPerEngineCounterSeriesExistBeforeTraffic(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	p, err := Factory("gs", mpDecoder(t, `{"engineGroups":"per-engine"}`), nil)
+	require.NoError(t, err)
+	gs := p.(*GroupScheduler)
+	require.NoError(t, gs.metrics.register(reg))
+	for _, name := range []string{"engine-a", "engine-b"} {
+		ep := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{ID: types.NamespacedName{Name: name}},
+			&fwkdl.Metrics{CacheBlockSize: 64, CacheNumBlocks: 1000})
+		require.NoError(t, gs.Extract(t.Context(), fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: ep}))
+	}
+	gs.metrics.Refresh() // zero dispatches so far
+
+	fams, err := reg.Gather()
+	require.NoError(t, err)
+	want := map[string]int{}
+	for _, f := range fams {
+		switch f.GetName() {
+		case "llm_d_epp_group_dispatches_total", "llm_d_epp_group_fcfs_dispatches_total":
+			want[f.GetName()] = len(f.GetMetric())
+		case "llm_d_epp_group_exits_total":
+			want[f.GetName()] = len(f.GetMetric())
+		}
+	}
+	require.Equal(t, 2, want["llm_d_epp_group_dispatches_total"],
+		"both engines must expose dispatches_total=0 BEFORE any traffic (a missing series fails the pre-flight)")
+	require.Equal(t, 2, want["llm_d_epp_group_fcfs_dispatches_total"])
+	require.GreaterOrEqual(t, want["llm_d_epp_group_exits_total"], 2,
+		"exit counters must exist per engine at zero, not only after a member exits")
+}

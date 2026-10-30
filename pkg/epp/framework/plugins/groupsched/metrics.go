@@ -171,6 +171,12 @@ func (g *groupMetrics) Refresh() {
 		return
 	}
 	snap := g.sched.SnapshotLite()
+	// PRE-INSTANTIATE the per-engine COUNTER series for every known engine.
+	// A *CounterVec has no series until its first observation, so before any
+	// dispatch a scrape would carry no llm_d_epp_group_dispatches_total at all —
+	// and the deploy pre-flight (which requires that series, because the analysis
+	// reads it) failed on exactly that at 2026-10-30 18:23Z on the first live
+	// multi-pod stack. A ZERO is a fact; an absent series is a question.
 	seen := make(map[string]struct{}, len(snap.Engines))
 	for label, es := range snap.Engines {
 		seen[label] = struct{}{}
@@ -185,6 +191,16 @@ func (g *groupMetrics) Refresh() {
 		g.budgetBlocks.WithLabelValues(label).Set(float64(es.BudgetBlocks))
 		g.capacity.WithLabelValues(label).Set(float64(es.NumBlocks))
 		g.waiters.WithLabelValues(label).Set(float64(es.Waiters))
+		g.served.WithLabelValues(label).Add(0)
+		g.homings.WithLabelValues(label).Add(0)
+		if fcfsCounter != nil {
+			fcfsCounter.WithLabelValues(label).Add(0)
+		}
+		for _, reason := range []string{"paid", "idle", "nmax", "exiting", "engine-idle",
+			"quantum-complete", "ttl", "exiting-drain", "budget-idle", "budget-noqueue",
+			"budget-exiting", "engine-gone"} {
+			g.exits.WithLabelValues(label, reason).Add(0)
+		}
 	}
 	// an engine that disappeared must not keep its last gauge value
 	for label := range g.known {

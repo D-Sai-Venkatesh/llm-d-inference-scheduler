@@ -132,7 +132,7 @@ func TestAnonymousPassThrough(t *testing.T) {
 	s := newSched(t)
 	now := time.Now()
 	// a member mid-cap... simplest: only an anonymous head exists
-	anon := Head{Session: "", ReqID: "anon-1", Arrival: now.Add(-time.Second), SizeBytes: 1000}
+	anon := Head{Member: "", ReqID: "anon-1", Arrival: now.Add(-time.Second), SizeBytes: 1000}
 	if i := s.PickFromHeads([]Head{anon}, now); i != 0 {
 		t.Fatalf("an anonymous head must be served when no member head is dispatchable, got %d", i)
 	}
@@ -142,7 +142,7 @@ func TestAnonymousPassThrough(t *testing.T) {
 	}
 	// a member's head outranks it
 	s.PickFromHeads([]Head{head("m", 100*time.Millisecond, bytesFor(10))}, now) // seats m; its head dispatches
-	anonLater := Head{Session: "", ReqID: "anon-2", Arrival: now, SizeBytes: 1000}
+	anonLater := Head{Member: "", ReqID: "anon-2", Arrival: now, SizeBytes: 1000}
 	member := head("m", 100*time.Millisecond, bytesFor(10))
 	if i := s.PickFromHeads([]Head{anonLater, member}, now); i != 1 {
 		t.Fatalf("the member's head must outrank the anonymous one: got %d", i)
@@ -177,7 +177,7 @@ func TestHoldTheLine(t *testing.T) {
 		t.Fatalf("hold the line: only member heads (m1/m2) may dispatch, got head %d", i)
 	}
 	if i >= 0 { // the served member head is dispatched and settled (production shape)
-		id := h[i].Session
+		id := h[i].Member
 		dispatch(t, s, id, keys(400, 1), bytesFor(400))
 		settle(s, id, 400, 400)
 	}
@@ -189,7 +189,7 @@ func TestHoldTheLine(t *testing.T) {
 			t.Fatal("hold the line violated: small jumped the blocked big head")
 		}
 		if j >= 0 {
-			id := h[j].Session
+			id := h[j].Member
 			dispatch(t, s, id, keys(400, 1), bytesFor(400))
 			settle(s, id, 400, 400)
 		}
@@ -273,7 +273,7 @@ func TestNoStarvation(t *testing.T) {
 			if i < 0 {
 				break
 			}
-			id := hs[i].Session
+			id := hs[i].Member
 			if id != "" && s.Seated(id) {
 				dispatch(t, s, id, keys(300, Hash(uint64(id[len(id)-1]))), bytesFor(300))
 				settle(s, id, 300, 300)

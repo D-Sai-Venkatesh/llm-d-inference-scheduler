@@ -153,6 +153,14 @@ func runGoldenScenario(t *testing.T) string {
 	return runGoldenScenarioEnd(t, 2600)
 }
 
+// runGoldenScenarioCfg is the PARAMETRIZED driver used by the WAVE-1
+// session-ordering equality test: cfg is the scheduler config and sessions
+// maps a scripted chain's id to its SESSION attribute (nil = every head
+// carries none, i.e. session := member — base mode).
+func runGoldenScenarioCfg(t *testing.T, simEnd int, cfg Config, sessions func(id string) string) string {
+	return runGoldenScenarioFull(t, simEnd, cfg, sessions)
+}
+
 // runGoldenScenarioEnd drives the scenario truncated at simEnd (the
 // legacy-c57e92ed comparison uses 489 — the pre-C4 code stalls on this
 // scenario shortly after ~500, AND at t=490 the always-on C8 fix
@@ -162,7 +170,12 @@ func runGoldenScenario(t *testing.T) string {
 // hidden; S1).
 func runGoldenScenarioEnd(t *testing.T, simEnd int) string {
 	t.Helper()
-	s, err := NewScheduler(defaultConfig())
+	return runGoldenScenarioFull(t, simEnd, defaultConfig(), nil)
+}
+
+func runGoldenScenarioFull(t *testing.T, simEnd int, cfg Config, sessions func(id string) string) string {
+	t.Helper()
+	s, err := NewScheduler(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,8 +228,13 @@ func runGoldenScenarioEnd(t *testing.T, simEnd int) string {
 		for _, g := range ss {
 			if g.nextTurn <= sim {
 				// the head is queued since nextTurn
+				sess := ""
+				if sessions != nil {
+					sess = sessions(g.id)
+				}
 				hs = append(hs, Head{
-					Session:   g.id,
+					Member:    g.id,
+					Session:   sess,
 					ReqID:     fmt.Sprintf("%s-r%02d", g.id, reqSeq[g.id]+1),
 					Arrival:   goldenT0.Add(time.Duration(g.nextTurn) * time.Second),
 					SizeBytes: int64(len(g.chain)+g.turnBlocks()) * 4 * 64,
@@ -270,7 +288,7 @@ func runGoldenScenarioEnd(t *testing.T, simEnd int) string {
 				break
 			}
 			h := hs[i]
-			g := byID(h.Session)
+			g := byID(h.Member)
 			reqID := nextReqID(g.id)
 			// the dispatched request's context = chain + this turn's growth
 			g.turn++

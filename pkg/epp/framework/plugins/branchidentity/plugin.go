@@ -157,11 +157,40 @@ type Parameters struct {
 	// read-only: it is gated on LogRequests and touches neither the identity nor
 	// any decision (`TestLogHeadersKeepResolveOutcomeIdentical` pins that).
 	LogHeaders bool `json:"logHeaders,omitempty"`
+	// LogHeaderNames extends the logHeaders whitelist with further client headers
+	// to copy onto the same line (e.g. a harness's own thread/turn markers). It is
+	// APPENDED to the built-in list, gated on LogRequests AND LogHeaders, and is a
+	// pure observer: no header here is ever read by the identity, the scope or any
+	// matching decision (the whitelist is consulted only by loggedHeaders).
+	LogHeaderNames []string `json:"logHeaderNames,omitempty"`
 }
 
-// loggedHeaderNames is the logHeaders whitelist: the client's correlation id (the
-// thread ground truth a harness reports in its records) and its request id.
+// loggedHeaderNames is the built-in logHeaders whitelist: the client's correlation
+// id (the thread ground truth a harness reports in its records) and its request id.
 var loggedHeaderNames = []string{"x-correlation-id", "x-request-id"}
+
+// loggedHeaderList is the effective whitelist: the built-in pair plus any
+// configured extras, lowercased and de-duplicated (the handler stores header
+// keys lowercased; the scan below stays case-insensitive anyway).
+func loggedHeaderList(extra []string) []string {
+	out := append([]string(nil), loggedHeaderNames...)
+	seen := make(map[string]struct{}, len(out)+len(extra))
+	for _, n := range out {
+		seen[n] = struct{}{}
+	}
+	for _, n := range extra {
+		n = strings.ToLower(strings.TrimSpace(n))
+		if n == "" {
+			continue
+		}
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	return out
+}
 
 // maxLoggedHeaderLen truncates a copied header value so one malformed client
 // cannot blow up a log line.
@@ -218,14 +247,15 @@ type Plugin struct {
 	idx     *branchIndex
 	metrics *branchMetrics
 
-	markerTTL   time.Duration
-	sweep       time.Duration
-	forkOnBusy  bool
-	sticky      bool
-	retry       bool
-	logRequests bool
-	logHeaders  bool
-	sessions    []string
+	markerTTL      time.Duration
+	sweep          time.Duration
+	forkOnBusy     bool
+	sticky         bool
+	retry          bool
+	logRequests    bool
+	logHeaders     bool
+	logHeadersList []string
+	sessions       []string
 	// now is the clock seam: the replay validation (stage 0c) drives recorded
 	// arrival/dispatch/settle times through the real hooks, so every time
 	// observation the table makes must come from here rather than time.Now.
@@ -251,16 +281,17 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	}
 
 	p := &Plugin{
-		typedName:   fwkplugin.TypedName{Type: PluginType, Name: name},
-		markerTTL:   time.Duration(params.MarkerTTLSeconds * float64(time.Second)),
-		sweep:       time.Duration(params.SweepSeconds * float64(time.Second)),
-		forkOnBusy:  params.ForkOnBusy == nil || *params.ForkOnBusy,
-		sticky:      params.StickyBusyGuard == nil || *params.StickyBusyGuard,
-		retry:       params.RetryRule == nil || *params.RetryRule,
-		logRequests: params.LogRequests,
-		logHeaders:  params.LogRequests && params.LogHeaders,
-		sessions:    sessionHeaders(params.SessionHeaders),
-		now:         time.Now,
+		typedName:      fwkplugin.TypedName{Type: PluginType, Name: name},
+		markerTTL:      time.Duration(params.MarkerTTLSeconds * float64(time.Second)),
+		sweep:          time.Duration(params.SweepSeconds * float64(time.Second)),
+		forkOnBusy:     params.ForkOnBusy == nil || *params.ForkOnBusy,
+		sticky:         params.StickyBusyGuard == nil || *params.StickyBusyGuard,
+		retry:          params.RetryRule == nil || *params.RetryRule,
+		logRequests:    params.LogRequests,
+		logHeaders:     params.LogRequests && params.LogHeaders,
+		logHeadersList: loggedHeaderList(params.LogHeaderNames),
+		sessions:       sessionHeaders(params.SessionHeaders),
+		now:            time.Now,
 	}
 	p.idx = newBranchIndex(params.BlockSizeTokens, params.Salt, p.markerTTL, params.MaxBranches)
 	p.metrics = newBranchMetrics()
@@ -395,8 +426,8 @@ func (p *Plugin) loggedHeaders(request *fwksched.InferenceRequest) map[string]st
 	if !p.logHeaders || request == nil || len(request.Headers) == 0 {
 		return nil
 	}
-	out := make(map[string]string, len(loggedHeaderNames))
-	for _, name := range loggedHeaderNames {
+	out := make(map[string]string, len(p.logHeadersList))
+	for _, name := range p.logHeadersList {
 		v := request.Headers[name]
 		if v == "" {
 			for k, cand := range request.Headers {

@@ -69,7 +69,7 @@ func TestQuantumEligibilityAfterBusyPeriods(t *testing.T) {
 	turn(t, s, "a", keys(10, 1), now, true)
 	turn(t, s, "a", keys(10, 1), now.Add(10*time.Second), true)
 	s.mu.Lock()
-	m := s.members["a"]
+	m := s.eng().members["a"]
 	if m.busyPeriods != 2 {
 		t.Fatalf("busyPeriods = %d, want 2", m.busyPeriods)
 	}
@@ -106,7 +106,7 @@ func TestQuantumInfiniteNeverComplete(t *testing.T) {
 		turn(t, s, "a", keys(10, 1), now.Add(time.Duration(i)*10*time.Second), true)
 	}
 	s.mu.Lock()
-	m := s.members["a"]
+	m := s.eng().members["a"]
 	// 5s after the last settle: mid-quantum AND not silent — must stay seated
 	if reason, ok := s.eligibleLocked(m, now.Add(65*time.Second)); ok {
 		t.Fatalf("Q=∞ member became eligible: reason=%s", reason)
@@ -129,8 +129,8 @@ func TestQuantumBudgetLadderDoneBeforeMidQuantum(t *testing.T) {
 	turn(t, s, "mid", keys(10, 2), now, true)
 	// force budget pressure: both idle, "mid" has a waiting head
 	s.mu.Lock()
-	s.members["mid"].waitingSince = now.Add(-time.Second)
-	reason, victim := s.budgetVictimLocked(now.Add(2 * time.Second))
+	s.eng().members["mid"].waitingSince = now.Add(-time.Second)
+	reason, victim := s.budgetVictimLocked(s.eng(), now.Add(2 * time.Second))
 	s.mu.Unlock()
 	if victim == nil {
 		t.Fatal("no budget victim under pressure")
@@ -153,15 +153,15 @@ func TestSpecVictimOrderPrefersNoQueuedTurnOldestCompletion(t *testing.T) {
 		turn(t, s, id, keys(10, Hash(id[0])), now, true)
 	}
 	s.mu.Lock()
-	f := s.members["fresh"]
+	f := s.eng().members["fresh"]
 	f.earned = 1 << 30 // paid
 	f.waitingSince = now
 	f.lastCompletion = now.Add(-2 * time.Second)
-	st := s.members["stale"]
+	st := s.eng().members["stale"]
 	st.earned = 1 << 30
 	st.waitingSince = time.Time{}
 	st.lastCompletion = now.Add(-100 * time.Second)
-	_, victim := s.rotationVictimLocked(now.Add(time.Second))
+	_, victim := s.rotationVictimLocked(s.eng(), now.Add(time.Second))
 	s.mu.Unlock()
 	if victim == nil || victim.id != "stale" {
 		t.Fatalf("spec victim = %v, want stale (no queued turn, oldest completion)", victim)
@@ -179,14 +179,14 @@ func TestValveOffAllowsConcurrentColdEntries(t *testing.T) {
 	// "a" seats with a big cold charge in flight
 	s.PickFromHeads([]Head{{Member: "a", ReqID: "r-a", Arrival: now, SizeBytes: bytesFor(90)}}, now)
 	s.mu.Lock()
-	cold := s.coldInFlight
+	cold := s.eng().coldInFlight
 	s.mu.Unlock()
 	if cold == 0 {
 		t.Fatal("no cold charge taken")
 	}
 	// valve ON would block; valve OFF must allow the second cold entry
 	s.mu.Lock()
-	ok := s.coldAllows(&waiter{id: "b", coldTokens: 90 * 64})
+	ok := s.coldAllows(s.eng(), &waiter{id: "b", coldTokens: 90 * 64})
 	s.mu.Unlock()
 	if !ok {
 		t.Fatal("valve off still staggered a cold entry")
@@ -234,13 +234,13 @@ func TestDerivedWindowChainsReplaceAndExpire(t *testing.T) {
 	// the main chain dispatches AGAIN (later than the leaf)
 	turn(t, s, "root", c2, now.Add(25*time.Second), true)
 	s.mu.Lock()
-	sb := s.index.TrackLocked("root", 0)
+	sb := s.eng().index.TrackLocked("root", 0)
 	if len(sb.chains) != 2 {
 		t.Fatalf("chains = %d, want 2 (extended main + divergent leaf)", len(sb.chains))
 	}
 	// expiry: the leaf chain (last dispatch +5s) is idle past S; the
 	// main chain (last dispatch +25s) stays
-	s.index.ExpireChainsLocked(20*time.Second, now.Add(30*time.Second))
+	s.eng().index.ExpireChainsLocked(20*time.Second, now.Add(30*time.Second))
 	if len(sb.chains) != 1 {
 		t.Fatalf("chains after expiry = %d, want 1", len(sb.chains))
 	}
@@ -259,15 +259,15 @@ func TestC3ProvisionalInflightReaped(t *testing.T) {
 	turn(t, s, "a", keys(10, 1), now, true)
 	s.PickFromHeads([]Head{{Member: "a", ReqID: "ghost", Arrival: now, SizeBytes: bytesFor(10)}}, now.Add(time.Second))
 	s.mu.Lock()
-	if s.members["a"].inflight != 1 {
-		t.Fatalf("inflight = %d, want 1 (the ghost)", s.members["a"].inflight)
+	if s.eng().members["a"].inflight != 1 {
+		t.Fatalf("inflight = %d, want 1 (the ghost)", s.eng().members["a"].inflight)
 	}
 	s.mu.Unlock()
 	// 32s after the Pick (30s limit) the provisional id is reaped
 	s.mu.Lock()
 	s.reapInflightLocked(now.Add(32 * time.Second))
-	if s.members["a"].inflight != 0 {
-		t.Fatalf("ghost not reaped: inflight = %d", s.members["a"].inflight)
+	if s.eng().members["a"].inflight != 0 {
+		t.Fatalf("ghost not reaped: inflight = %d", s.eng().members["a"].inflight)
 	}
 	s.mu.Unlock()
 }
@@ -277,11 +277,11 @@ func TestC3LeakedColdChargeVanishesOnDerive(t *testing.T) {
 	s.mu.Lock()
 	// a leaked aggregate (as if an update path missed): derive must
 	// recompute from member records and clear it
-	s.coldInFlight = 999999
-	s.pendingTotal = 999999
+	s.eng().coldInFlight = 999999
+	s.eng().pendingTotal = 999999
 	s.deriveLocked()
-	if s.coldInFlight != 0 || s.pendingTotal != 0 {
-		t.Fatalf("derive did not clear leaked aggregates: cold=%d pending=%d", s.coldInFlight, s.pendingTotal)
+	if s.eng().coldInFlight != 0 || s.eng().pendingTotal != 0 {
+		t.Fatalf("derive did not clear leaked aggregates: cold=%d pending=%d", s.eng().coldInFlight, s.eng().pendingTotal)
 	}
 	s.mu.Unlock()
 }
@@ -293,9 +293,9 @@ func TestC8WaitingMemberNotIdleEvictedWithoutPicks(t *testing.T) {
 	// "a" has a queued head but NO Picks arrive (gate closure): its
 	// lastActivity goes stale while waitingSince stays set
 	s.mu.Lock()
-	s.members["a"].waitingSince = now
-	s.members["a"].lastActivity = now.Add(-60 * time.Second) // stale beyond S
-	reason, ok := s.eligibleLocked(s.members["a"], now)
+	s.eng().members["a"].waitingSince = now
+	s.eng().members["a"].lastActivity = now.Add(-60 * time.Second) // stale beyond S
+	reason, ok := s.eligibleLocked(s.eng().members["a"], now)
 	s.mu.Unlock()
 	if ok {
 		t.Fatalf("waiting member idle-eligible (reason=%s) — C8 regression: gate closure manufactures idle exits", reason)
@@ -314,9 +314,9 @@ func TestSeatExitEventsRecorded(t *testing.T) {
 	}
 	// force an exit (ttl) and check the EXIT event
 	s.mu.Lock()
-	m := s.members["a"]
+	m := s.eng().members["a"]
 	m.lastActivity = now.Add(-100 * time.Second)
-	s.exitLocked(m, "ttl", now.Add(-time.Second))
+	s.exitLocked(s.eng(), m, "ttl", now.Add(-time.Second))
 	s.mu.Unlock()
 	evs = s.Events()
 	last := evs[len(evs)-1]
@@ -396,7 +396,7 @@ func TestWhistleReplayNoFreeze(t *testing.T) {
 	big := Head{Member: "big", ReqID: "r-big", Arrival: now.Add(time.Second), SizeBytes: bytesFor(100)}
 	// before the reap bound: the dead charges hold the valve
 	s.mu.Lock()
-	coldBefore := s.coldInFlight
+	coldBefore := s.eng().coldInFlight
 	s.mu.Unlock()
 	if coldBefore == 0 {
 		t.Fatal("expected cold charges in flight")
@@ -409,7 +409,7 @@ func TestWhistleReplayNoFreeze(t *testing.T) {
 	later := now.Add(61 * time.Second)
 	s.Tick(later)
 	s.mu.Lock()
-	coldAfter := s.coldInFlight
+	coldAfter := s.eng().coldInFlight
 	frozen := coldAfter > 0
 	s.mu.Unlock()
 	if frozen {
@@ -438,8 +438,8 @@ func TestR1EmptyReqIDRoundTripEndsAtZero(t *testing.T) {
 	}
 	s.Dispatched("a", "", keys(10, 1), bytesFor(10), now)
 	s.mu.Lock()
-	n := len(s.members["a"].inflightIDs)
-	inflight := s.members["a"].inflight
+	n := len(s.eng().members["a"].inflightIDs)
+	inflight := s.eng().members["a"].inflight
 	emptyCount := s.counters.emptyReqIDs
 	s.mu.Unlock()
 	if n != 1 || inflight != 1 {
@@ -451,8 +451,8 @@ func TestR1EmptyReqIDRoundTripEndsAtZero(t *testing.T) {
 	s.Chunk("a")
 	s.Settle("a", "", struct{ Prompt, Cached int }{10, 8}, true, now.Add(time.Second))
 	s.mu.Lock()
-	n = len(s.members["a"].inflightIDs)
-	inflight = s.members["a"].inflight
+	n = len(s.eng().members["a"].inflightIDs)
+	inflight = s.eng().members["a"].inflight
 	s.mu.Unlock()
 	if n != 0 || inflight != 0 {
 		t.Fatalf("after settle: records=%d inflight=%d, want 0/0 — the round trip must fully drain", n, inflight)
@@ -473,7 +473,7 @@ func TestR2UnknownSettleRemovesNothing(t *testing.T) {
 	// oldest-fallback would delete a different live request's record)
 	s.Settle("a", "never-existed", struct{ Prompt, Cached int }{}, false, now.Add(time.Second))
 	s.mu.Lock()
-	n := len(s.members["a"].inflightIDs)
+	n := len(s.eng().members["a"].inflightIDs)
 	stray := s.counters.straySettles
 	s.mu.Unlock()
 	if n != 1 {
@@ -484,7 +484,7 @@ func TestR2UnknownSettleRemovesNothing(t *testing.T) {
 	}
 	// and the member is NOT evictable as idle while the real record lives
 	s.mu.Lock()
-	_, eligible := s.eligibleLocked(s.members["a"], now.Add(2*time.Second))
+	_, eligible := s.eligibleLocked(s.eng().members["a"], now.Add(2*time.Second))
 	s.mu.Unlock()
 	if eligible {
 		t.Fatal("member with a live in-flight record became rotation-eligible")
@@ -521,7 +521,7 @@ func TestR4CacheMatchesUncachedUnderRandomOps(t *testing.T) {
 			s.Tick(now.Add(time.Duration(op) * time.Second))
 		case 5:
 			s.mu.Lock()
-			s.index.ExpireChainsLocked(20*time.Second, now.Add(time.Duration(op)*time.Second))
+			s.eng().index.ExpireChainsLocked(20*time.Second, now.Add(time.Duration(op)*time.Second))
 			s.mu.Unlock()
 		}
 		now = now.Add(time.Duration(rng.Intn(3)) * time.Second)
@@ -531,12 +531,12 @@ func TestR4CacheMatchesUncachedUnderRandomOps(t *testing.T) {
 		s.mu.Lock()
 		for _, probe := range ids {
 			size := bytesFor(30 + rng.Intn(50))
-			cached := s.estimateCostCachedLocked(probe, size)
+			cached := s.estimateCostCachedLocked(s.eng(), probe, size)
 			// force a cold recompute by bypassing the cache
-			v := s.estVersion
-			s.estVersion = 0 // invalidates; recompute path
-			fresh := s.estimateCostCachedLocked(probe, size)
-			s.estVersion = v
+			v := s.eng().estVersion
+			s.eng().estVersion = 0 // invalidates; recompute path
+			fresh := s.estimateCostCachedLocked(s.eng(), probe, size)
+			s.eng().estVersion = v
 			if cached != fresh {
 				t.Fatalf("op %d: cached estimate %d != fresh %d for %s", op, cached, fresh, probe)
 			}
@@ -579,7 +579,7 @@ func TestSizeAwareGateFirstFitNotHeadOfLine(t *testing.T) {
 	}
 	// and the skipped head is counted
 	s.mu.Lock()
-	skipped := s.counters.gateSkipped
+	skipped := s.eng().counters.gateSkipped
 	s.mu.Unlock()
 	if skipped == 0 {
 		t.Fatal("the gate must count skipped heads (the freeze diagnostic)")

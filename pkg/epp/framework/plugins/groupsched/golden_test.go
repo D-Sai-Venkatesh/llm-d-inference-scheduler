@@ -125,10 +125,7 @@ func (g *goldenTrace) line(format string, args ...any) {
 // observeState appends the seated set ONLY when it changes (keeps the
 // golden small without losing decisions).
 func (g *goldenTrace) observeState(s *Scheduler) {
-	cur := map[string]bool{}
-	for id := range s.members {
-		cur[id] = true
-	}
+	cur := s.seatedIDs()
 	if len(cur) != len(g.seats) {
 		goto diff
 	}
@@ -179,7 +176,11 @@ func runGoldenScenarioFull(t *testing.T, simEnd int, cfg Config, sessions func(i
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetNumBlocks(64, 1000); err != nil { // budget 950
+	// The scenario names its ONE engine: in engineGroups=single the key
+	// collapses to the pooled group (the golden was generated that way), and
+	// in engineGroups=per-engine it is a real discovered engine — which is
+	// what makes TestPerEngineGoldenEquality a genuine unit-equivalence gate.
+	if err := s.SetNumBlocksFor("engine-a", 64, 1000); err != nil { // budget 950
 		t.Fatal(err)
 	}
 	tr := &goldenTrace{seats: map[string]bool{}}
@@ -187,10 +188,14 @@ func runGoldenScenarioFull(t *testing.T, simEnd int, cfg Config, sessions func(i
 	// exit/entry observation: hook order relative to the op is part of
 	// the trace (the hooks fire inside the op).
 	var exitLog, entryLog []string
-	s.onExit = func(reason string, resTurns int) {
+	// The hooks carry the ENGINE label in multi-engine mode; the trace text
+	// is unchanged, so a per-engine replay of this scenario compares against
+	// the same golden file line for line (PREREG-multipod-offload directive
+	// 1: the unit-equivalence gate).
+	s.onExit = func(_ string, reason string, resTurns int) {
 		exitLog = append(exitLog, fmt.Sprintf("EXIT reason=%s turns=%d", reason, resTurns))
 	}
-	s.onEntry = func(wait float64) {
+	s.onEntry = func(_ string, wait float64) {
 		entryLog = append(entryLog, fmt.Sprintf("SEAT wait=%.3f", wait))
 	}
 

@@ -235,7 +235,7 @@ func TestColdCapReleasedAtChunkNotDecodeEnd(t *testing.T) {
 	// decode is still running (no settle); the FIRST CHUNK releases the cap
 	s.Chunk("a")
 	s.mu.Lock()
-	cold := s.coldInFlight
+	cold := s.eng().coldInFlight
 	s.mu.Unlock()
 	if cold != 0 {
 		t.Fatalf("cold cap must be released at the first chunk, still %d", cold)
@@ -247,7 +247,7 @@ func TestColdCapReleasedAtChunkNotDecodeEnd(t *testing.T) {
 	// non-natural termination releases as well (settle without Chunk)
 	s.Settle("b", "", struct{ Prompt, Cached int }{}, false, now)
 	s.mu.Lock()
-	cold = s.coldInFlight
+	cold = s.eng().coldInFlight
 	s.mu.Unlock()
 	if cold != 0 {
 		t.Fatalf("non-natural termination must release the charge, still %d", cold)
@@ -270,7 +270,7 @@ func TestEveryTurnCountsTowardNMax(t *testing.T) {
 	}
 	// resTurns = 8 = n_max: eligible even though earned == 0
 	s.mu.Lock()
-	m := s.members["a"]
+	m := s.eng().members["a"]
 	eligible := m != nil && m.resTurns >= s.cfg.nMax()
 	s.mu.Unlock()
 	if !eligible {

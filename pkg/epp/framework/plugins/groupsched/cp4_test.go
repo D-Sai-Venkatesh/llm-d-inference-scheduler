@@ -84,7 +84,7 @@ func TestWaiterKeepsHistoryPastTTL(t *testing.T) {
 	}
 	// the history survives (the cost estimate stays small, not full-size)
 	s.mu.Lock()
-	est := s.estimateCostLocked("re", bytesFor(100))
+	est := s.estimateCostLocked(s.eng(), "re", bytesFor(100))
 	_, everSeated := s.everSeated["re"]
 	s.mu.Unlock()
 	if est > 100 {
@@ -110,7 +110,7 @@ func TestWarmEntryPaysBack(t *testing.T) {
 		settle(s, "w", 100, 100) // earned += 100 each
 	}
 	s.mu.Lock()
-	m := s.members["w"]
+	m := s.eng().members["w"]
 	earned, cost, recorded := m.earned, m.entryCost, m.entryRecorded
 	s.mu.Unlock()
 	if !recorded || cost != 0 {

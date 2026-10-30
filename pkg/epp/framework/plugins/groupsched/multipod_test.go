@@ -944,3 +944,98 @@ func runSimpleSeats(t *testing.T, s *Scheduler, n int) {
 		heads = append(heads[:i], heads[i+1:]...)
 	}
 }
+
+// TestBindingOutlivesRecordGC is the live lesson of 2026-10-30 19:00Z: on the
+// first pinned multi-pod stack, 11 % of dispatches in steady state still landed
+// off-binding — because the member RECORD's 30 s TTL forgot a silent member and
+// took its HOMING with it, so every return re-homed by least backlog while the
+// placement filter (3600 s) still pinned the old engine. The binding has its own
+// clock (bindingTtlSeconds, default max(20 x ttlSeconds, 3600)) and a silent
+// return must land on the SAME engine.
+func TestBindingOutlivesRecordGC(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.EngineGroups = "per-engine"
+	cfg.TTLSeconds = 30
+	s, err := NewScheduler(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireBindTTL(t, s, cfg)
+	// engine-b is deliberately EMPTIER than engine-a: least-backlog homing would
+	// send a returning member to b, so this test can only pass if the binding is
+	// honoured.
+	if err := s.SetNumBlocksFor("engine-a", 64, 100000); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNumBlocksFor("engine-b", 64, 100000); err != nil {
+		t.Fatal(err)
+	}
+	now := goldenT0
+	s.mu.Lock()
+	s.bindings["m1"] = "engine-a" // an existing homing
+	s.bindingSeen["m1"] = now
+	s.mu.Unlock()
+	if _, i := s.PickFromHeadsEngine([]Head{{Member: "m1", ReqID: "m1-r1", Arrival: now, SizeBytes: bytesFor(4)}}, now); i < 0 {
+		t.Fatal("m1 must seat")
+	}
+	if got := s.bindingOf("m1"); got != "engine-a" {
+		t.Fatalf("binding = %q, want engine-a", got)
+	}
+	// let the RECORD go: no activity for longer than TTLSeconds
+	later := now.Add(time.Duration(cfg.TTLSeconds+5) * time.Second)
+	s.Tick(later)
+	// the record may be gone; the HOMING must not be
+	if got := s.bindingOf("m1"); got != "engine-a" {
+		t.Fatalf("the homing was forgotten with the record (%q): a silent return would re-home off the placement pin", got)
+	}
+	// the return lands on the SAME engine even though engine-b is emptier
+	if engine, i := s.PickFromHeadsEngine([]Head{{Member: "m1", ReqID: "m1-r2", Arrival: later, SizeBytes: bytesFor(4)}}, later); i < 0 || engine != "engine-a" {
+		t.Fatalf("return placed on %q (i=%d), want engine-a (the homing)", engine, i)
+	}
+}
+
+// TestBindingReleasedOnItsOwnClock is the other half: the homing is NOT immortal.
+// After bindingTtlSeconds of silence it is released (the silent-member defrag —
+// nothing warm is left to lose), and that clock is checked on the GC pass alone so
+// a still-registered waiter cannot mask the policy.
+func TestBindingReleasedOnItsOwnClock(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.EngineGroups = "per-engine"
+	s, err := NewScheduler(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireBindTTL(t, s, cfg)
+	now := goldenT0
+	s.mu.Lock()
+	s.bindings["m1"] = "engine-a"
+	s.bindingSeen["m1"] = now
+	s.mu.Unlock()
+
+	// the record clock alone must not touch it
+	s.mu.Lock()
+	s.gcSilentRecordsLocked(now.Add(time.Duration(s.cfg.TTLSeconds+5) * time.Second))
+	s.mu.Unlock()
+	if got := s.bindingOf("m1"); got != "engine-a" {
+		t.Fatalf("binding = %q at record-TTL age, want it kept (the clocks are separate)", got)
+	}
+	// the binding clock releases it
+	s.mu.Lock()
+	s.gcSilentRecordsLocked(now.Add(time.Duration(s.cfg.BindingTTLSeconds+1) * time.Second))
+	s.mu.Unlock()
+	if got := s.bindingOf("m1"); got != "" {
+		t.Fatalf("binding = %q past bindingTtlSeconds, want it released for re-homing", got)
+	}
+	if s.SnapshotLite().Rehomes < 1 {
+		t.Fatal("a released binding must be counted in rehomes_total (the defrag is auditable)")
+	}
+}
+
+// requireBindTTL asserts the effective binding TTL is the long one, not the
+// record TTL (the two clocks must not be the same).
+func requireBindTTL(t *testing.T, s *Scheduler, cfg Config) {
+	t.Helper()
+	if cfg := s.cfg; cfg.BindingTTLSeconds < 3600 {
+		t.Fatalf("effective bindingTtlSeconds = %v, want >= 3600 (>= the placement filter's pin)", cfg.BindingTTLSeconds)
+	}
+}

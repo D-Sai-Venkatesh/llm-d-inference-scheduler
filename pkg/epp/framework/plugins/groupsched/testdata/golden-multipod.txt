@@ -2675,6 +2675,6 @@ t=600 PICK engine=engine-a m14 req=m14-r38 blocks=749
 t=600 STATE engine-a=7
 t=600 PICK -1
 SNAPSHOT served=791 violations=4 rebinds=1 enginesGone=1
-ENGINE engine-a seats=7 waiters=12 sessions=7 ne=917 budget=950 num=1000 bound=20 served=478 homings=19 forced=0
+ENGINE engine-a seats=7 waiters=12 sessions=7 ne=917 budget=950 num=1000 bound=20 served=478 homings=20 forced=0
 ENGINE-EXITS engine-a budget-idle=9
 ENGINE-EXITS engine-a paid=61

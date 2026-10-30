@@ -14,4 +14,4 @@
 #                       teardown and re-homing (TestMultiPodGolden)
 31051d4ddc7b3ac22d248e1e50ac435c17e27d953c5d6ffef8abfa8b50addcf1  golden.txt
 5671d20c6052cd26147fe96f974cd65ad18935baf680c5c55c42a44ee77324f3  golden-legacy.txt
-111db7841881426de37a187ae4edbb37aa27ce496a8457625c46295bf2c00d73  golden-multipod.txt
+c0c0319ee48e6bd86fb5ca3b314093aeb5bacc1aefe951aec5ba9f576a77a2d8  golden-multipod.txt

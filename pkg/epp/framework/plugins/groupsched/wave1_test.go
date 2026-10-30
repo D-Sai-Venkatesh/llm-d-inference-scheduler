@@ -731,6 +731,7 @@ func TestConsumesDeclaresNoBranchKeys(t *testing.T) {
 	require.True(t, ok, "the agent-identity key stays declared (its producer is layer -1, harmless)")
 }
 
+
 // epState is the per-endpoint capacity-acquisition record for ep (the
 // per-endpoint replacement for the old single firstSeen/capWarned/capFrom
 // fields).

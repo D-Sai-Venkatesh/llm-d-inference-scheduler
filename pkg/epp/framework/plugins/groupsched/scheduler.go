@@ -93,7 +93,10 @@ type Config struct {
 	// value here; nothing else in the config moves). Validated by buildModules. ----
 	//
 	//	Sizing       "index"            footprint from the engine's own BlockIndex
-	//	EntryOrder   "newcomer-first"   newcomers, then oldest, then id
+	//	EntryOrder   "newcomer-first"   newcomers, then oldest, then id |
+	//	             "hrrn-bounded"     bounded HRRN: wait ÷ min(cold tokens, the median
+	//	                                waiter's cold tokens), newcomers as the outer
+	//	                                class, then the ratio, then oldest, then id
 	//	EngineChoice "most-free-budget" most free budget where the head fits, tie → id
 	//	Rotation     "quantum"          fixed Q busy periods (plus S of silence)
 	//	Victim       "valve"            f0p's memory-pressure order

@@ -29,7 +29,8 @@ package groupsched
 //	            the engine's own BlockIndex (dedup + cold-token estimate), and the
 //	            engine's seat budget from its measured KV capacity.
 //	QUEUE       EntryOrder: which waiter is the head. Default newcomer-first, then
-//	            oldest arrival, then id.
+//	            oldest arrival, then id. Alternative: bounded HRRN (equal slowdown,
+//	            denominator capped at the median waiter size).
 //	PLACEMENT   EngineChooser: which engine takes the head. Default the most free
 //	            budget among the engines where it fits, tie → lowest engine id.
 //	TENURE      RotationPolicy: when a resident may be released. Default the fixed
@@ -47,7 +48,10 @@ package groupsched
 // as arguments (a small context struct with the READ-ONLY callbacks they need), and
 // they return decisions, never state. The scheduler owns all state.
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
 // ---- TENURE ------------------------------------------------------------------
 
@@ -232,10 +236,26 @@ func (BudgetValve) Victim(members []*member, ctx PressureCtx) (string, *member) 
 
 // ---- QUEUE -------------------------------------------------------------------
 
+// EntryCtx is what an entry order may consult about ONE decision pass. It is an
+// argument and not hidden state on purpose: the module sees only the facts the
+// scheduler hands it (never *Scheduler, never time.Now), so a replay is reproducible
+// and a policy cannot quietly read a clock its inputs never carried.
+type EntryCtx struct {
+	// Now is the decision pass's clock (never time.Now — a golden replay must be
+	// reproducible). "How long this head has waited" is derived from it and the
+	// waiter's own oldest arrival, never stored.
+	Now time.Time
+}
+
 // EntryOrder answers "which waiter is the head?" over the ONE shared queue.
+//
+// The comparison MUST be a TOTAL order ending in the member id. That is not a style
+// preference: the archive build compared unset timestamps in map-iteration order and
+// produced three different traces in four replays of the same scenario.
 type EntryOrder interface {
 	Name() string
-	Head(waiters map[string]*waiter) *waiter
+	// Head returns the head of the waiter set, or nil when nothing is waiting.
+	Head(waiters map[string]*waiter, ctx EntryCtx) *waiter
 }
 
 // NewcomerFirst is the default: newcomers before returning members, then the oldest
@@ -244,7 +264,7 @@ type NewcomerFirst struct{}
 
 func (NewcomerFirst) Name() string { return "newcomer-first" }
 
-func (NewcomerFirst) Head(waiters map[string]*waiter) *waiter {
+func (NewcomerFirst) Head(waiters map[string]*waiter, _ EntryCtx) *waiter {
 	var head *waiter
 	for _, w := range waiters {
 		if head == nil || newcomerLess(w, head) {
@@ -254,7 +274,7 @@ func (NewcomerFirst) Head(waiters map[string]*waiter) *waiter {
 	return head
 }
 
-// newcomerLess is the entry order's total comparison (lower wins).
+// newcomerLess is the default entry order's total comparison (lower wins).
 func newcomerLess(a, b *waiter) bool {
 	if a.newcomer != b.newcomer {
 		return a.newcomer // newcomers first
@@ -263,6 +283,124 @@ func newcomerLess(a, b *waiter) bool {
 		return a.since.Before(b.since) // oldest first
 	}
 	return a.id < b.id
+}
+
+// HrrnBounded is F5′: BOUNDED HRRN — the equal-slowdown criterion with the
+// denominator capped at the median waiter size. It is the archive's
+// `entryOrder: "hrrn-bounded"` (dsai/groupsched-tier-aware @ dd5350b5) moved here as ONE
+// EntryOrder implementation.
+//
+// THE RULE. Every waiter's priority is
+//
+//	wait ÷ s_eff,   s_eff = min(this waiter's cold tokens, the LOWER-median cold
+//	                       tokens of the waiters in THIS decision pass)
+//
+// and the highest-priority waiter is the head. "Cold tokens" is the admission cost the
+// sizing module already computed for the head (one unit everywhere, R1), so the rule
+// adds no estimate, no rate, no cache read and no clock of its own.
+//
+// WHY THE CAP (the measured defect of plain HRRN, B1b 2026-11-01). Uncapped, the
+// denominator is the waiter's OWN size, so a 200K-token entry ages ~67x slower than a 3K
+// one: its takeover bound is (a small waiter's ratio) × cold_big — starvation-free in
+// theory, ~an hour in practice (max entry wait 3,601 s, 20 stalled sessions). Capped at
+// the median, the bound becomes (that ratio) × median ≈ ten minutes, derived from the
+// queue rather than fitted.
+//
+// THREE PROPERTIES THE CAP BUYS, all from the LOWER median (index (n-1)/2):
+//
+//   - waiters BELOW the median keep their own size, so small-first ordering inside the
+//     small class is exactly uncapped HRRN's (the cap can only bind at or above it);
+//   - waiters AT or ABOVE it age at the same rate, so they are served oldest-first
+//     among themselves instead of in a size-ordered starvation;
+//   - the bound is the POPULATION's own size: a queue of big entries raises the median
+//     and they all age slowly together; a queue of small ones serves them at the small
+//     class's rate. Nothing here is a tuning constant.
+//
+// THE TOTAL ORDER. The newcomer CLASS is the outer key, exactly as in the archive's
+// entryKey (its isNew is compared before the response ratio), then the priority
+// DESCENDING, then the older arrival, then the id. So this is not "newcomer-first plus a
+// ratio": the class is the archive's outermost partition, and INSIDE a class the ratio
+// replaces age ordering entirely.
+type HrrnBounded struct {
+	// BlockSize is the engine's KV block size in tokens: the unit that floors a
+	// waiter's size (and therefore any age rate) at ONE BLOCK, so a fully warm head
+	// contributes the smallest possible size instead of collapsing the median to zero
+	// and silently restoring the unbounded rule. A wiring fact (Config, once).
+	BlockSize int
+}
+
+func (HrrnBounded) Name() string { return "hrrn-bounded" }
+
+func (h HrrnBounded) Head(waiters map[string]*waiter, ctx EntryCtx) *waiter {
+	// ONE bound per CALL, over the CURRENT waiter set — the same pool this loop orders.
+	// Computed here and never stored: a cached median would be a fact about an older
+	// queue. (The admission loop calls this once per head it hands out, so a pass that
+	// seats several heads recomputes the bound as its queue shrinks — which is the
+	// archive's accounting, and the equivalence golden depends on it.)
+	bound := lowerMedianColdTokens(waiters, h.BlockSize)
+	var head *waiter
+	var headPriority float64
+	for _, w := range waiters {
+		p := h.priority(w, bound, ctx.Now)
+		if head == nil || hrrnLess(w, p, head, headPriority) {
+			head, headPriority = w, p
+		}
+	}
+	return head
+}
+
+// priority is wait ÷ s_eff for ONE waiter under one pass's bound: the waiter's own cold
+// tokens, capped at the bound, floored at one block.
+func (h HrrnBounded) priority(w *waiter, bound int64, now time.Time) float64 {
+	den := w.coldTokens
+	if den <= 0 {
+		den = int64(h.BlockSize) // a fully warm head: the smallest possible size
+	}
+	if bound > 0 && bound < den {
+		den = bound // the cap binds only AT or ABOVE the median (see lowerMedianColdTokens)
+	}
+	wait := now.Sub(w.since).Seconds()
+	if wait < 0 {
+		wait = 0 // a head whose arrival is in the pass's future waits zero
+	}
+	return wait / float64(den)
+}
+
+// hrrnLess is bounded HRRN's total comparison (lower wins): the newcomer class, then the
+// higher response ratio, then the older arrival, then the id.
+func hrrnLess(a *waiter, aPriority float64, b *waiter, bPriority float64) bool {
+	if a.newcomer != b.newcomer {
+		return a.newcomer // the newcomer class is the OUTER key (the archive's isNew)
+	}
+	if aPriority != bPriority {
+		return aPriority > bPriority // higher response ratio first
+	}
+	if !a.since.Equal(b.since) {
+		return a.since.Before(b.since) // tie → the older arrival
+	}
+	return a.id < b.id // tie → the id (a TOTAL order)
+}
+
+// lowerMedianColdTokens is the LOWER median of the waiter set's cold-token sizes, each
+// floored at one block exactly as priority floors its denominator. The LOWER median is
+// deliberate: for n waiters it is sizes[(n-1)/2], so every size strictly below it is
+// below it in the sorted list too, and min(cold, median) can only bind at or above the
+// median — which is what leaves the small class's ordering untouched. 0 when nothing is
+// waiting (0 means "no cap": a lone waiter is its own median).
+func lowerMedianColdTokens(waiters map[string]*waiter, blockSize int) int64 {
+	if len(waiters) == 0 {
+		return 0
+	}
+	sizes := make([]int64, 0, len(waiters))
+	for _, w := range waiters {
+		n := w.coldTokens
+		if n <= 0 {
+			n = int64(blockSize)
+		}
+		sizes = append(sizes, n)
+	}
+	sort.Slice(sizes, func(i, j int) bool { return sizes[i] < sizes[j] })
+	return sizes[(len(sizes)-1)/2]
 }
 
 // ---- PLACEMENT ---------------------------------------------------------------
@@ -501,8 +639,10 @@ func buildModules(cfg Config) (modules, error) {
 	switch cfg.EntryOrder {
 	case "", "newcomer-first":
 		m.entry = NewcomerFirst{}
+	case "hrrn-bounded":
+		m.entry = HrrnBounded{BlockSize: cfg.BlockSizeTokens}
 	default:
-		return m, errValue("entryOrder", cfg.EntryOrder, "newcomer-first")
+		return m, errValue("entryOrder", cfg.EntryOrder, "newcomer-first|hrrn-bounded")
 	}
 	switch cfg.EngineChoice {
 	case "", "most-free-budget":

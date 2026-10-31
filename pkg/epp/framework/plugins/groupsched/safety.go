@@ -61,6 +61,29 @@ import (
 	"time"
 )
 
+// staleMultiple is how many framework refresh intervals a live sample may be behind
+// before it counts as stale (the detector fails OPEN on stale — see plugin.Saturation).
+// It is a WIRING FACT (the poll cadence), not a policy constant.
+const staleMultiple = 3
+
+// engineSample is one engine's LIVE metric reading plus the safety verdict it
+// produced. The plugin's Saturation call (the framework hands it the live datastore
+// endpoints) publishes a map of these copy-on-write; the ticker pushes them into the
+// scheduler for the per-engine holds and exports them as series. It is the ONLY
+// metrics view in the core — a remembered endpoint handle carries a construction-time
+// metrics CLONE (fwksched.NewEndpoint → metrics.Clone()), which freezes the moment
+// dispatches stop (the E-wave latch).
+type engineSample struct {
+	kv      float64
+	waiting int
+	blockSz int
+	numBlk  int
+	score   float64
+	fired   bool
+	stale   bool
+	at      time.Time
+}
+
 // engineLoad is ONE engine's pushed utilisation snapshot (the plugin's metrics
 // poll writes it; the policy never scrapes and never blocks).
 type engineLoad struct {

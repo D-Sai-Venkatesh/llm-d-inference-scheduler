@@ -769,10 +769,6 @@ func (r *Runner) registerInTreePlugins() {
 	// Beta
 	fwkplugin.Register(concurrency.ConcurrencyDetectorType, fwkplugin.StabilityBeta, concurrency.ConcurrencyDetectorFactory)
 	fwkplugin.Register(utilization.UtilizationDetectorType, fwkplugin.StabilityBeta, utilization.UtilizationDetectorFactory)
-	// the group scheduler's OWN memory-only detector (the core's detector slot: no
-	// queue term, threshold = the seat budget's own fraction, per engine, min for the
-	// pool, stale = open). FCFS arms keep the stock detector above.
-	fwkplugin.Register(groupsched.SafetyDetectorPluginType, fwkplugin.StabilityAlpha, groupsched.SafetyDetectorFactory)
 	fwkplugin.RegisterWithPluginDependencies(composite.MaxSaturationDetectorType, fwkplugin.StabilityBeta,
 		composite.MaxSaturationDetectorFactory, composite.MaxSaturationDetectorConfigParser)
 

@@ -33,9 +33,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
@@ -60,10 +62,24 @@ var (
 	_ fwkdl.Registrant            = &GroupScheduler{}
 	_ fwkdl.EndpointExtractor     = &GroupScheduler{}
 	_ fwkfc.FairnessPolicy        = &GroupScheduler{}
+	_ fwkfc.SaturationDetector    = &GroupScheduler{}
 	_ fwksched.Filter             = &GroupScheduler{}
 )
 
-// GroupScheduler is a single named instance shared by every hookup.
+// GroupScheduler is a single named instance shared by every hookup: the flow-control
+// FAIRNESS POLICY, the scheduling FILTER, and the SATURATION DETECTOR — one plugin,
+// one state, so the three answers cannot disagree.
+//
+//	policy    Pick: which queued request dispatches next (seated members only)
+//	filter    Filter: which engine may serve it (the member's seat)
+//	detector  Saturation: is the POOL saturated (the flow controller's dispatch gate)
+//
+// The detector answers from an ATOMIC snapshot and never takes the scheduler's mutex
+// (the flow controller polls it about once per millisecond). Its DEFAULT answer is
+// "not saturated": the SEAT BUDGET is the admission control, and this policy only ever
+// releases requests of members it has seated, so a pool-level gate has nothing left to
+// decide. The memory-only backstop (live datastore metrics, threshold = the budget
+// fraction, stale → open) is the alternative safety module and is OFF by default.
 type GroupScheduler struct {
 	typedName fwkplugin.TypedName
 	cfg       Config
@@ -92,17 +108,18 @@ type GroupScheduler struct {
 	capMu     sync.Mutex
 	endpoints map[string]*endpointState // endpoint id -> handle + acquisition state
 	hetero    map[string]struct{}       // engines already reported as capacity-heterogeneous
-	// liveSource is the ONLY sanctioned per-engine metrics view: the core's own
-	// detector plugin, which the framework hands the LIVE datastore endpoints on
-	// every Saturation call. A remembered endpoint handle carries a metrics CLONE
-	// taken at construction (fwksched.NewEndpoint → metrics.Clone()), so reading one
-	// freezes the gate's input whenever dispatches stop — the E-wave latch. nil when
-	// no group-safety-detector is configured, in which case nothing pushes load and
-	// the net stays open (the default module is a noop anyway).
-	liveSource func() map[string]engineSample
-
 	// ---- the placement pin (E4a, bindingMode=seat) ----
 	//
+	// detectorScore is the pool saturation last handed to the flow controller, as
+	// math.Float64bits (read at ~1 kHz by the detector, written once per Saturation).
+	detectorScore atomic.Uint64
+	// samples is the LIVE per-engine metric view, published copy-on-write by
+	// Saturation (which the framework hands the datastore endpoint objects) and read
+	// by the ticker. It is the only metrics path in the core: a remembered endpoint
+	// handle carries a construction-time CLONE (fwksched.NewEndpoint → metrics.Clone()),
+	// so a gate fed from one freezes the moment dispatches stop — the E-wave latch.
+	samples atomic.Pointer[map[string]engineSample]
+
 	// pins mirrors the scheduler's member→engine SEAT binding so the Filter can
 	// read it WITHOUT taking s.mu (see filter.go's lock discipline). The
 	// scheduler pushes every seat/unseat/rebind through onBind/onUnbind; nothing
@@ -196,20 +213,17 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 			engineLabel(engine), members)
 	}
 	if handle != nil {
-		// THE LIVE METRICS SOURCE: the core's own detector plugin reads the live
-		// datastore endpoints (the framework passes them to every Saturation call), so
-		// its samples are the only view whose input updates WITHOUT a dispatch.
-		for _, p := range handle.GetAllPlugins() {
-			if p == nil || p.TypedName().Type != SafetyDetectorPluginType {
-				continue
-			}
-			if det, ok := p.(*SafetyDetectorPlugin); ok {
-				r.liveSource = det.Samples
-				fmt.Printf("group-scheduler: safety input wired to the LIVE detector plugin %q (its samples come from the framework's live endpoint datastore, never from a remembered clone)\n", p.TypedName().Name)
-			}
-		}
-		if r.liveSource == nil {
-			fmt.Printf("group-scheduler: WARNING no '%s' in this config — the safety module receives NO live input (it stays open; the seat budget is the admission control) and per-engine capacity comes only from the endpoint-event metrics.\n", SafetyDetectorPluginType)
+		// THE DETECTOR-IDENTITY GATE. The loader FABRICATES the stock utilization
+		// detector when the config names none (loader/defaults.go ensureSaturationDetector),
+		// so a core arm can silently run the stock 0.80 kv / 5-waiting roofline gate
+		// instead of this plugin — the arm would then measure someone else's policy.
+		// Exactly one detector may exist, and on a core arm it must be THIS plugin
+		// (flowControl.saturationDetector.pluginRef: <this plugin's name>). Any other
+		// detector instance in the same config is announced as a conflict.
+		if others := r.otherDetectors(); len(others) > 0 {
+			fmt.Printf("group-scheduler: WARNING DETECTOR CONFLICT — %v is also configured as a saturation detector. Exactly one detector may answer the flow-control gate, and on a CORE arm it must be this plugin: set flowControl.saturationDetector.pluginRef to this plugin's name. If the stock detector is the one answering, this arm is running the 0.80 kv / 5-waiting roofline, not the core.\n", others)
+		} else {
+			fmt.Printf("group-scheduler: detector: THIS plugin answers the flow-control saturation gate (default answer: NOT saturated — the seat budget is the admission control; safety=%s).\n", r.cfg.Safety)
 		}
 		if reg := handle.Metrics(); reg != nil {
 			if err := r.metrics.register(reg); err != nil {
@@ -249,7 +263,7 @@ func (r *GroupScheduler) runTicker(ctx context.Context) {
 			r.pollCapacity(now)
 			r.pushEngineLoad(now)
 			r.sched.Tick(now)
-			r.metrics.Refresh()
+			r.metrics.Refresh(r.detectorScore.Load())
 		}
 	}
 }
@@ -332,6 +346,25 @@ func readID(request *fwksched.InferenceRequest, key fwkplugin.DataKey) string {
 	}
 	id, _ := fwksched.ReadRequestAttribute[string](request, key)
 	return id
+}
+
+// otherDetectors lists the OTHER plugins in this config that implement the
+// framework's SaturationDetector (the detector-identity gate's input).
+func (r *GroupScheduler) otherDetectors() []string {
+	if r.handle == nil {
+		return nil
+	}
+	var out []string
+	for _, p := range r.handle.GetAllPlugins() {
+		if p == nil || p.TypedName().Type == PluginType {
+			continue
+		}
+		if _, ok := p.(fwkfc.SaturationDetector); ok {
+			out = append(out, p.TypedName().String())
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // memberOf resolves the request's MEMBER id and the source that produced it:
@@ -589,26 +622,39 @@ func endpointKey(ep metricsSource) string {
 // A vanished endpoint's snapshot is cleared, because a stale verdict on an engine the
 // EPP no longer sees would keep it idle forever.
 func (r *GroupScheduler) pushEngineLoad(now time.Time) {
-	if r.liveSource == nil {
-		return
+	samples := r.liveSamples()
+	if samples == nil {
+		return // nothing published yet (no Saturation call has run)
 	}
-	samples := r.liveSource()
+	if r.metrics != nil {
+		for engine, sm := range samples {
+			if sm.stale {
+				r.metrics.ObserveStaleSample(engine)
+			}
+		}
+	}
+	withLoad := r.sched.mod.safety.Name() != "none"
 	seen := make(map[string]struct{}, len(samples))
 	for engine, sm := range samples {
 		seen[engine] = struct{}{}
-		// the sample carries the time the detector READ the datastore, so a frozen
-		// upstream is visible as staleness instead of being papered over with `now`
-		r.sched.SetEngineLoad(engine, sm.kv, sm.waiting, now)
+		// CAPACITY always rides the live path: the event-time copy may carry an empty
+		// geometry forever (the capacity race), and the live value is the same metric.
 		if sm.blockSz > 0 && sm.numBlk > 0 && !r.sched.HasCapacityFor(engine) {
-			// the live path also closes the capacity race: the event-time clone may
-			// carry an empty geometry forever
 			if err := r.learnCapacity(engine, &fwkdl.Metrics{CacheBlockSize: sm.blockSz,
 				CacheNumBlocks: sm.numBlk}, "live-detector"); err != nil {
 				fmt.Printf("group-scheduler: CAPACITY REJECTED from the live detector engine=%s: %v\n", r.sched.GroupLabel(engine), err)
 			}
 		}
+		if withLoad {
+			// the sample's OWN timestamp, never `now`: if the upstream froze, the age is
+			// visible instead of being papered over by the ticker's clock (the latch).
+			r.sched.SetEngineLoad(engine, sm.kv, sm.waiting, sm.at)
+		}
 	}
-	r.sched.ForgetEngineLoadsExcept(seen)
+	if withLoad {
+		r.sched.ForgetEngineLoadsExcept(seen)
+	}
+	_ = now
 }
 
 // pollCapacity is the STARTUP LIVENESS check (WAVE-1 item 1): once a decode endpoint
@@ -657,9 +703,100 @@ func (r *GroupScheduler) pollCapacity(now time.Time) {
 		}
 		r.capMu.Unlock()
 		r.metrics.SetCapacityMissing(r.sched.GroupLabel(t.key), true)
-		fmt.Printf("group-scheduler: CAPACITY MISSING engine=%s — its num_gpu_blocks is still unknown %.0fs after the endpoint was observed (%d endpoint(s) tracked): that engine seats nothing while the policy looks healthy, and any dispatch it takes is FCFS pass-through (A5). Check that the endpoint metrics carry cache block size/num blocks (--refresh-metrics-interval) and that a '%s' is configured (the live metrics path).\n",
-			engineLabel(t.key), now.Sub(t.firstSeen).Seconds(), len(targets), SafetyDetectorPluginType)
+		fmt.Printf("group-scheduler: CAPACITY MISSING engine=%s — its num_gpu_blocks is still unknown %.0fs after the endpoint was observed (%d endpoint(s) tracked): that engine seats nothing while the policy looks healthy, and any dispatch it takes is FCFS pass-through (A5). Check that the endpoint metrics carry cache block size/num blocks (--refresh-metrics-interval) and that the flow controller names this plugin as its saturationDetector (the live metrics path).\n",
+			engineLabel(t.key), now.Sub(t.firstSeen).Seconds(), len(targets))
 	}
+}
+
+// Saturation answers the flow controller's pool gate. HOT PATH (≈1 kHz): it must never
+// take the scheduler's mutex, so the default answer is a single atomic load.
+//
+//	safety = "none" (default)            → 0.0, always: seats are the admission control
+//	safety = "budget-fraction"           → MIN over engines of kv / groupBudgetFraction
+//	                                       (1.0 = at the budget fraction), computed from
+//	                                       the LIVE candidates the framework passes in;
+//	                                       an engine whose metrics are missing or older
+//	                                       than staleMultiple refresh intervals is
+//	                                       EXCLUDED (stale → open).
+//
+// The per-engine samples are published for the ticker (which pushes them into the
+// scheduler for the per-engine holds and exports them as series), so a metric that
+// changes with NO dispatch is still seen — the latch class has a regression test.
+func (r *GroupScheduler) Saturation(_ context.Context, candidates []fwkdl.Endpoint) float64 {
+	if r.sched.mod.safety.Name() == "none" {
+		r.detectorScore.Store(math.Float64bits(0))
+		if len(candidates) > 0 {
+			r.publishSamples(r.readSamples(candidates, time.Now()))
+		}
+		return 0
+	}
+	now := time.Now()
+	samples := r.readSamples(candidates, now)
+	pool := -1.0
+	for _, s := range samples {
+		if s.stale {
+			continue
+		}
+		score := r.sched.mod.safety.Score(s.kv, true)
+		if pool < 0 || score < pool {
+			pool = score
+		}
+	}
+	if pool < 0 {
+		pool = 0 // no usable engine: OPEN (the budget is the primary control)
+	}
+	r.detectorScore.Store(math.Float64bits(pool))
+	r.publishSamples(samples)
+	return pool
+}
+
+// readSamples reads the live endpoint metrics into an immutable per-engine map.
+func (r *GroupScheduler) readSamples(candidates []fwkdl.Endpoint, now time.Time) map[string]engineSample {
+	out := make(map[string]engineSample, len(candidates))
+	for _, e := range candidates {
+		if e == nil {
+			continue
+		}
+		engine := endpointKey(e)
+		s := engineSample{at: now, stale: true}
+		if m := e.GetMetrics(); m != nil {
+			s.kv = m.KVCacheUsagePercent
+			s.waiting = m.WaitingQueueSize
+			s.blockSz = m.CacheBlockSize
+			s.numBlk = m.CacheNumBlocks
+			s.stale = now.Sub(m.UpdateTime) > r.staleAfter()
+		}
+		s.fired = !s.stale && r.sched.mod.safety.Fired(s.kv, true)
+		s.score = 0
+		if !s.stale {
+			s.score = r.sched.mod.safety.Score(s.kv, true)
+		}
+		out[engine] = s
+	}
+	return out
+}
+
+func (r *GroupScheduler) publishSamples(m map[string]engineSample) { r.samples.Store(&m) }
+
+// liveSamples is the published snapshot (nil-safe).
+func (r *GroupScheduler) liveSamples() map[string]engineSample {
+	if p := r.samples.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// staleAfter is the freshness bound for the LIVE input: a few framework refresh
+// intervals. It is a wiring fact (the poll cadence), not a policy constant.
+func (r *GroupScheduler) staleAfter() time.Duration {
+	base := time.Duration(0)
+	if r.handle != nil {
+		base = r.handle.RefreshMetricsInterval()
+	}
+	if base <= 0 {
+		base = 50 * time.Millisecond
+	}
+	return staleMultiple * base
 }
 
 // Pick is the dispatch decision (§5). The waiting set is the queue-head

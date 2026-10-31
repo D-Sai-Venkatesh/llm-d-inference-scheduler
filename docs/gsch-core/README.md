@@ -99,6 +99,9 @@ base block with the core's:
 # emitted key that Config does not have is a CrashLoop on every arm (the
 # residueRelease lesson). Build-side contract: TestConfigEmitterConformance.
 if [ "${CHAIN:-}" = "groupsched-core" ]; then
+  # CORE_ENTRY_ORDER is "newcomer-first" (default) or "hrrn-bounded" (F5', see §4d):
+  # ONE value, and buildModules fails closed on anything else (a typo must never
+  # silently measure the anchor twice).
   printf -v CORE_MODULE_BLOCK '    sizing: "%s"\n    entryOrder: "%s"\n    engineChoice: "%s"\n    rotation: "%s"\n    victim: "%s"\n    safety: "%s"' \
     "${CORE_SIZING:-index}" "${CORE_ENTRY_ORDER:-newcomer-first}" \
     "${CORE_ENGINE_CHOICE:-most-free-budget}" "${CORE_ROTATION:-quantum}" \
@@ -211,6 +214,25 @@ The flow controller polls the detector at ~1 kHz. Measured on this build:
 `BenchmarkSaturationMemoryOnly` = 43 ns/op, 0 B/op, 0 allocs/op (the score is
 recomputed at most once per refresh interval, otherwise read from an atomic). The wave's
 report carries the EPP arrival-path p99 against B2a f0p's.
+
+## 4d. The F5′ arm (bounded HRRN) — the ONE value that changes
+
+The queue module has a second implementation, selected by `CORE_ENTRY_ORDER=hrrn-bounded`
+(rendered as `entryOrder: "hrrn-bounded"` in `CORE_MODULE_BLOCK`; the emitter's block for
+that arm is the one in `config_conformance_test.go`). Nothing else in an arm moves: the
+F5′-vs-Q4 pair is the same build, the same parameters, one selector value apart.
+
+The rule is the archive's dd5350b5 F5′: priority = wait ÷ `min(this waiter's cold tokens,
+the LOWER-median cold tokens of the current waiters)`, every size floored at one block,
+the median computed once per decision pass from the scheduler's own waiter accounting. The
+newcomer class stays the outer key (the archive's `isNew`), so inside a class the ratio
+replaces age ordering — a big entry ages at the MEDIAN rate, which bounds its takeover
+wait at `ratio × median` instead of `ratio × its own size` (the B1b far tail: max entry
+wait 3,601 s, 20 stalled sessions).
+
+Evidence that the core's rule IS the archive's rule: `TestHrrnBoundedEqualsTheArchiveF5P`
+reproduces the archive build's F5′ trace byte for byte on the 2,600 s replay (6,089 lines,
+1,664 dispatches, no normalisation). Recipe: `docs/gsch-core/golden-f5p-recipe.md`.
 
 ## 5. The wave (for the record)
 

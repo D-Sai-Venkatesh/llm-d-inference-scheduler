@@ -358,6 +358,80 @@ Evidence that the core's rule IS the archive's rule: `TestHrrnBoundedEqualsTheAr
 reproduces the archive build's F5′ trace byte for byte on the 2,600 s replay (6,089 lines,
 1,664 dispatches, no normalisation). Recipe: `docs/gsch-core/golden-f5p-recipe.md`.
 
+## 4e. The offload solution — `entryOrder: "hrrn-tier"` + the TIER SHADOW (2026-11-02)
+
+The queue module's THIRD value, and the only one that reads anything to do with vLLM's CPU
+offload tier. The whole design is one page in
+`~/.sai-ka-knowledge-bank/explore/ring-window-v2/PREREG-multipod-offload.md`
+(§"THE OFFLOAD SOLUTION"); the reasoning is `tier-design-data/OFFLOAD-FIRST-PRINCIPLES.md`.
+Three default-OFF pieces, and the `entryOrder` selector is unchanged as a shape — a new
+value, not a new knob:
+
+| piece | what it is | where |
+|---|---|---|
+| 1. TIER SHADOW | per engine, an LRU of block keys mimicking vLLM's CPU tier: capacity `cpuTierBytes ÷ kvBlockBytes` blocks, touch to MRU on dispatch, insert on settle, evict the tail past capacity. Reads NO cache state — the same dictate-don't-observe discipline as the GPU residue model | `tiershadow.go` |
+| 2. `hrrn-tier` | F5′ EXACTLY (newcomer class outer, bounded HRRN inside, LOWER-median clamp, the total tie order) with ONE input changed: a waiter's cost `s` = tokens resident in NEITHER the engine's GPU index NOR its tier shadow | `modules.go` (`HrrnTier`, `priorityWith`, `lowerMedianTokens`) |
+| 3. SHADOW VALIDATION | per seated RETURN: the predicted resident fraction (taken at seat, before the seat is written into the index) vs the measured `cached/prompt` at the turn's settle, emitted as a `SHADOW-VALIDATION` event with the `fairness_id` and as `llm_d_epp_group_tier_shadow_pairs_total{engine,pred_bin,meas_bin}` (the 11×11 matrix an AUC is computed from) | `scheduler.go`, `metrics.go` |
+
+**Two config values, both DEPLOYMENT FACTS** (they describe the engine, like
+`groupBudgetFraction` describes HBM): `cpuTierBytes` (vLLM's `cpu_bytes_to_use`) and
+`kvBlockBytes` (one KV block's bytes on this model+TP). Capacity is the division; a
+bytes-per-block constant would have been a magic number, so both are given. `0/0` = no
+tier: the shadow is nil, nothing is modelled, and `hrrn-tier` **degenerates to F5′**
+(`TestHrrnTierNoTierEqualsF5P`: byte-identical to `testdata/golden-f5p-archive.txt`).
+
+**The tier adds no seats.** The tier-aware cost is a PRIORITY input only — the seat
+budget, the cold-entry valve and placement keep the GPU-only cost, because vLLM runs only
+from HBM and an admission discounted by a restorable block would overbook the engine the
+moment the restores land (`TestHrrnTierDoesNotDiscountTheSeatBudget`).
+
+**What the effect is, from the c128 order cut:** a returner with a live CPU copy has a
+DEADLINE — its restored share falls 90 % → 30 % → 14 % → 6.4 % across the <1, 1-3, 3-5,
+5-10 min bins, and the scheduler's own entry wait for a seat-loss return is 328-420 s, so
+the queue is what pushes returners over the cliff. Under `hrrn-tier` such a returner costs
+~its new turn's tokens and is seated inside the bin; a COLD returner keeps
+`min(full, median)` (F5′'s bound unchanged) and therefore ages, overtaking at the COST
+RATIO × the warm wait. Newcomers are untouched: the class key is still the outer
+partition. Frozen gates vs core-Q4 ON at c128: returns away 1-10 min restored share
++≥30 pts, matched-work output +5-12 %, newcomer TTFT p90 ≤1.2× anchor, max entry wait
+≤1.5× anchor, real starved = 0, **shadow AUC ≥ 0.8**.
+
+**Emitter patch — REQUIRED before any offload arm deploys** (the exp-ops tree was live
+when this landed, so it is handed over as text, exactly as §2 was):
+
+```diff
+--- a/templates/plugins-core.yaml.tmpl
++++ b/templates/plugins-core.yaml.tmpl
+@@
+     capacityLivenessSeconds: @@CAPACITY_LIVENESS_SECONDS@@
+     inflightReapSeconds: @@INFLIGHT_REAP_SECONDS@@
++    # the CPU offload tier's two deployment facts (0/0 = no tier). The tier SHADOW's
++    # capacity is cpuTierBytes / kvBlockBytes; they only order the queue, they never
++    # admit (see docs/gsch-core/README.md §4e).
++    cpuTierBytes: @@CPU_TIER_BYTES@@
++    kvBlockBytes: @@KV_BLOCK_BYTES@@
+ @@BLOCK:CORE_MODULE_BLOCK@@
+
+--- a/lib/common.sh
++++ b/lib/common.sh
+@@
+   CORE_QUANTUM="${CORE_QUANTUM:-4}"
+   CORE_DETECTOR="${CORE_DETECTOR:-group}"
++  # The CPU tier the DECODE is configured with is the same fact the scheduler must model:
++  # default it from the offload deployment so the two can never disagree.
++  CPU_TIER_BYTES="${CPU_TIER_BYTES:-${DECODE_TIER_BYTES:-0}}"
++  KV_BLOCK_BYTES="${KV_BLOCK_BYTES:-0}"
++  export CPU_TIER_BYTES KV_BLOCK_BYTES
+   export CORE_QUANTUM CORE_DETECTOR
+```
+
+Arms (this directory): `core-q4-offload.env` (default queue, offload ON — the accounting
+fix's live confirmation AND the offload anchor) · `core-f5p-q4-offload.env` (tier-blind
+comparator; its settings diff to the arm below is the ONE line
+`CORE_ENTRY_ORDER=hrrn-bounded`) · `core-hrrn-tier-q4.env` (the arm). Each keeps
+`OFFLOAD=0` cells on the same digest for the OFF/ON pair; `EPP_IMAGE_*` stays a
+PLACEHOLDER until the reviewer has read the diff and a digest is built.
+
 ## 5. The wave (for the record)
 
 `2 pods × {FCFS, core-Q4, core-Q8} × {c64, c128, c32}`, 45 min each, batched

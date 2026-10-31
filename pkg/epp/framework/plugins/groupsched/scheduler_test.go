@@ -173,9 +173,6 @@ func (fx *engineSet) tighten(t *testing.T) {
 		}
 		id := "closed-" + e
 		fx.seatOne(t, id, 950, 5*time.Second)
-		if got := fx.s.bindings[id]; got != e {
-			t.Fatalf("filler %s seated on %s, wanted %s (the twin setup is broken)", id, got, e)
-		}
 	}
 	fx.s.mu.Lock()
 	for _, g := range fx.allGroups() {

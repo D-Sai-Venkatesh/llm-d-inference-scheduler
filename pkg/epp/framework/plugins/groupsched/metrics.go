@@ -18,6 +18,7 @@ package groupsched
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -68,6 +69,12 @@ type groupMetrics struct {
 	engineKV           *prometheus.GaugeVec
 	engineWaiting      *prometheus.GaugeVec
 
+	// poolScore is the pool saturation the plugin last handed the flow controller as
+	// the framework's detector (0 = not saturated, the default answer).
+	poolScore prometheus.Gauge
+	// staleFired counts per-engine samples the detector had to EXCLUDE because the
+	// metrics had not been refreshed (stale → open).
+	staleSamples *prometheus.CounterVec
 	// capacityHeterogeneous is 1 when a measured num_gpu_blocks deviates >1% from
 	// the first engine's: a heterogeneous pool must never silently inherit another
 	// engine's budget.
@@ -144,6 +151,10 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "the engine's scraped kv_cache_usage (the safety net's input)"}, engineLabels)
 	g.engineWaiting = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "engine_waiting_queue",
 		Help: "the engine's scraped vLLM waiting queue depth (REPORTING only: not part of the net)"}, engineLabels)
+	g.poolScore = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "detector_pool_score",
+		Help: "the pool saturation this plugin handed the flow controller as the saturation detector (0 = not saturated)"})
+	g.staleSamples = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "detector_stale_samples_total",
+		Help: "per-engine samples the detector excluded because the metrics were not refreshed"}, engineLabels)
 	g.capacityHeterogeneous = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "capacity_heterogeneous",
 		Help: "1 when an engine's num_gpu_blocks deviates >1% from the first measured engine"})
 	g.filterDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "filter_decisions_total",
@@ -161,7 +172,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.waiters, g.coldInFlight, g.capacity, g.waitersShared, g.exits, g.residency, g.entryWait,
 		g.reentryWait, g.refillShare, g.served, g.fcfs, g.capacityMissing, g.capacityLearned,
 		g.safetyFired, g.safetyFires, g.safetyFiredSeconds, g.safetySkips, g.engineKV, g.engineWaiting,
-		g.capacityHeterogeneous, g.filterDecisions, g.affinityViolations, g.rebinds, g.engineGone,
+		g.poolScore, g.staleSamples, g.capacityHeterogeneous, g.filterDecisions, g.affinityViolations, g.rebinds, g.engineGone,
 		g.valveBlockedEvictions} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second
@@ -180,7 +191,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 // Refresh pushes a scheduler snapshot into the gauges (the ticker calls it every
 // second; the counters and histograms are observed at their events by the
 // scheduler).
-func (g *groupMetrics) Refresh() {
+func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 	if g == nil || g.seats == nil {
 		return
 	}
@@ -239,6 +250,7 @@ func (g *groupMetrics) Refresh() {
 		}
 	}
 	g.waitersShared.Set(float64(snap.WaitersShared))
+	g.poolScore.Set(math.Float64frombits(poolScoreBits))
 	g.refillShare.Set(snap.RefillShare)
 	if len(snap.HeterogeneousEngines) > 0 {
 		g.capacityHeterogeneous.Set(1)
@@ -341,6 +353,14 @@ func (g *groupMetrics) SetCapacityMissing(engine string, missing bool) {
 		v = 1
 	}
 	g.capacityMissing.WithLabelValues(engine).Set(v)
+}
+
+// ObserveStaleSample books an engine sample the detector had to exclude.
+func (g *groupMetrics) ObserveStaleSample(engine string) {
+	if g == nil || g.staleSamples == nil {
+		return
+	}
+	g.staleSamples.WithLabelValues(engineLabel(engine)).Inc()
 }
 
 // ObserveFCFS records a pre-capacity FCFS dispatch (label "nocapacity": B2 — a

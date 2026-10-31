@@ -217,9 +217,11 @@ func (s *Scheduler) hasRotationVictimLocked(g *engineGroup, now time.Time) bool 
 	return v != nil
 }
 
-// entryHeadLocked is D1: the QUEUE module picks the head of the ONE shared queue.
-func (s *Scheduler) entryHeadLocked() *waiter {
-	return s.mod.entry.Head(s.waiters)
+// entryHeadLocked is D1: the QUEUE module picks the head of the ONE shared queue. The
+// module gets the pass's clock and nothing else — never the scheduler — and it answers
+// for the waiter set it was handed.
+func (s *Scheduler) entryHeadLocked(now time.Time) *waiter {
+	return s.mod.entry.Head(s.waiters, EntryCtx{Now: now})
 }
 
 // rotateLocked is the admission loop: hand the shared queue's head to an engine
@@ -236,7 +238,7 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 		budget += len(g.members)
 	}
 	for ; budget > 0; budget-- {
-		head := s.entryHeadLocked()
+		head := s.entryHeadLocked(now)
 		if head == nil {
 			return
 		}

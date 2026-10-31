@@ -172,6 +172,20 @@ replay, against `golden-f0p-total.txt` (the archive with only tie-break #0):
   is the stagger's waiting cost, and it must never be accompanied by budget exits it
   caused.
 * run-level safety: preemptions ≤ the FCFS arm's (hard fail if above).
+* **TTL exits are reported PER ARM at c32 and c64** (`llm_d_epp_group_exits_total{reason="ttl"}`):
+  the silence TTL is inert at c128 (1-6 exits per arm) and the open question is whether
+  it matters at low load, where seats are not scarce and a member could sit idle longer.
+
+### Instrumentation rules (apply to the collector and the reducers, not the build)
+
+* Every safety/gate gauge emits a REAL 0/1 in every mode (a `none` arm exports
+  `safety_fired = 0` and `detector_pool_score = 0`; an absent series is a question, a
+  zero is a fact). Where a series cannot exist, the arm config carries an explicit
+  "instrumented" flag rather than relying on a missing value.
+* The 15 s poller writes BLANK or `-1` for an absent series — NEVER 0 (a 0 is a
+  measurement; a gap is not).
+* Reducers filter the shared otel stream BY POD (two arms run concurrently; the stream
+  is not per-arm).
 
 ## 4c. Hot path
 

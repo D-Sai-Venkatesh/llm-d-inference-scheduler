@@ -61,6 +61,7 @@ var (
 	_ fwkdl.Registrant            = &GroupScheduler{}
 	_ fwkdl.EndpointExtractor     = &GroupScheduler{}
 	_ fwkfc.FairnessPolicy        = &GroupScheduler{}
+	_ fwksched.Filter             = &GroupScheduler{}
 )
 
 // GroupScheduler is a single named instance shared by every hookup.
@@ -98,6 +99,14 @@ type GroupScheduler struct {
 	// exactly once without a lock-guarded comparison per request.
 	pooledCount atomic.Int64
 	pooledOnce  sync.Once
+
+	// ---- the placement pin (E4a, bindingMode=seat) ----
+	//
+	// pins mirrors the scheduler's member→engine SEAT binding so the Filter can
+	// read it WITHOUT taking s.mu (see filter.go's lock discipline). The
+	// scheduler pushes every seat/unseat/rebind through onBind/onUnbind; nothing
+	// here infers anything.
+	pins *pinTable
 }
 
 // endpointState is one discovered endpoint's capacity-acquisition state.
@@ -133,6 +142,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		sched:     sched,
 		endpoints: map[string]*endpointState{},
 		hetero:    map[string]struct{}{},
+		pins:      newPinTable(),
 		// the handle is held for the RegisterDependencies-time gate: plugin
 		// construction order is NOT the config order (the runner may build
 		// the fairness policy first), so the token-producer check cannot
@@ -161,6 +171,13 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	} else {
 		fmt.Printf("group-scheduler: engine groups: SINGLE — one group sums every endpoint into one pool (correct only for one engine; the multi-pod arms set engineGroups=per-engine)\n")
 	}
+	// E4a: the binding model is the ONE variable between the E3 and E4a arms, so
+	// the run artifact must state it in words as well as in the config echo.
+	if cfg.seatPin() {
+		fmt.Printf("group-scheduler: binding mode: SEAT = PIN — the member→engine binding IS the current seat (created at seat, dropped at exit; no TTL, no pre-seat homing); waiters are ONE GLOBAL POOL and the seat engine is chosen by fit → least relative backlog per seat → cheapest-victim; placement is pinned by THIS plugin's scheduling Filter (no external session-affinity-filter).\n")
+	} else {
+		fmt.Printf("group-scheduler: binding mode: MEMBER-STABLE — the engine is chosen ONCE at first sight and kept (bindingTtlSeconds=%.0f); waiters are partitioned per engine; placement is pinned externally (session-affinity-filter) or not at all.\n", cfg.BindingTTLSeconds)
+	}
 	// The observation hooks are installed UNCONDITIONALLY: the metrics they
 	// feed are nil-safe, and a unit-mode run (no handle) must record the same
 	// accounting as a live one — the affinity-violation and engine-gone
@@ -173,6 +190,11 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		fmt.Printf("group-scheduler: AFFINITY VIOLATION member=%s charged=%s observed=%s — rebound (the observed endpoint wins)\n",
 			member, engineLabel(from), engineLabel(to))
 	}
+	// E4a: the pin table follows the SEATS. Installed in BOTH binding models —
+	// the Filter ignores it outside seat mode, and a table that is filled in
+	// member-stable mode costs one map write per seat.
+	r.sched.onBind = func(member, engine string) { r.pins.set(member, engine) }
+	r.sched.onUnbind = func(member string) { r.pins.del(member) }
 	r.sched.onEngineGone = func(engine string, members int) {
 		r.metrics.ObserveEngineGone()
 		fmt.Printf("group-scheduler: ENGINE GONE %s — exited %d member(s) and dropped the group; their homing is released for re-placement\n",

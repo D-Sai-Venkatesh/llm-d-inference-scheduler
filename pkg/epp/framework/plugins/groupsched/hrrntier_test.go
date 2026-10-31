@@ -273,7 +273,16 @@ func TestHrrnTierNoTierEqualsF5P(t *testing.T) {
 // DIFFERENT from F5′'s — a tier-aware module that produced F5′'s decisions would mean the
 // tier never reached the decision path.
 func TestHrrnTierConfiguredTraceIsPinned(t *testing.T) {
-	got := runGoldenScenarioCfg(t, 2600, tierConfig(2000))
+	// the replay on a scheduler we keep, so the arm's own state can be asserted after it:
+	// the trace says WHAT was decided, the snapshot says the tier pieces were actually live.
+	s, err := NewScheduler(tierConfig(2000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNumBlocksFor("engine-a", 64, 1000); err != nil {
+		t.Fatal(err)
+	}
+	got := runGoldenScenarioOn(t, s)
 	path := filepath.Join("testdata", "golden-hrrn-tier.txt")
 	if *updateGolden {
 		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
@@ -308,6 +317,20 @@ func TestHrrnTierConfiguredTraceIsPinned(t *testing.T) {
 	}
 	if got == string(f5p) {
 		t.Fatal("the tier-configured arm reproduced the F5′ trace exactly: the tier shadow is not on the decision path")
+	}
+	// COVERAGE, not a value: the arm must actually FILL its tier and actually produce
+	// validation pairs. A run whose shadow stays empty, or whose metric never fires, looks
+	// identical in the trace and would make the live AUC gate unanswerable.
+	snap := s.Snapshot()
+	es := snap.Engines["engine-a"]
+	if es.TierCapacityBlocks != 2000 {
+		t.Fatalf("tier capacity = %d blocks, want the configured 2000", es.TierCapacityBlocks)
+	}
+	if es.TierShadowBlocks != 2000 {
+		t.Fatalf("the tier shadow holds %d blocks, want it pinned at capacity 2000 (the replay stores far more than that)", es.TierShadowBlocks)
+	}
+	if snap.ShadowPairs < 50 {
+		t.Fatalf("the replay produced %d shadow-validation pairs, want the seated returns' worth (>= 50): the prediction/measurement pairing is not firing", snap.ShadowPairs)
 	}
 	// determinism: the whole replay, run again, is identical (no map order, no wall clock).
 	for i := 0; i < 2; i++ {
@@ -487,5 +510,62 @@ func TestShadowValidationMatrixIsScrapable(t *testing.T) {
 		if got := fracBin(f); got != want {
 			t.Errorf("fracBin(%v) = %q, want %q", f, got, want)
 		}
+	}
+}
+
+// TestTierConfiguredIsShadowNeutralForTheOtherArms pins the other half of the degeneracy:
+// a deployment that HAS a CPU tier, running a queue module that does not price with it,
+// makes exactly the same decisions as a deployment with no tier at all. That is what makes
+// the wave's OFF/ON pairs readable — core-q4 vs core-q4-offload differ in the DEPLOYMENT,
+// and any decision difference between them is the engine's behaviour, not a shadow that
+// leaked into the policy.
+//
+// It is asserted against the two existing goldens (the default arm's and the archive F5′'s),
+// so no new trace is introduced for a claim that is really "nothing changed".
+func TestTierConfiguredIsShadowNeutralForTheOtherArms(t *testing.T) {
+	tierFacts := func(entry string) Config {
+		c := defaultConfig()
+		c.EntryOrder = entry
+		c.KvBlockBytes = 4 * 64
+		c.CpuTierBytes = 2000 * c.KvBlockBytes
+		return c
+	}
+	cases := []struct {
+		name, entry, golden string
+	}{
+		{"newcomer-first (the anchor arms)", "newcomer-first", "golden-f0p-bugfixes.txt"},
+		{"hrrn-bounded (F5′, the tier-blind comparator)", "hrrn-bounded", "golden-f5p-archive.txt"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want, err := os.ReadFile(filepath.Join("testdata", tc.golden))
+			if err != nil {
+				t.Fatalf("golden missing: %v", err)
+			}
+			cfg := tierFacts(tc.entry)
+			if cfg.tierBlocks() == 0 {
+				t.Fatal("premise: the config must actually carry a tier")
+			}
+			got := runGoldenScenarioCfg(t, 2600, cfg)
+			if got == string(want) {
+				return
+			}
+			gotL := strings.Split(got, "\n")
+			wantL := strings.Split(string(want), "\n")
+			for i := 0; i < len(gotL) || i < len(wantL); i++ {
+				var a, b string
+				if i < len(gotL) {
+					a = gotL[i]
+				}
+				if i < len(wantL) {
+					b = wantL[i]
+				}
+				if a != b {
+					t.Fatalf("a configured CPU tier changed a decision at line %d under entryOrder=%s:\n  with tier: %s\n  golden:    %s\nThe tier must be invisible to every other module (it is a PRIORITY input for hrrn-tier only).",
+						i+1, tc.entry, a, b)
+				}
+			}
+			t.Fatalf("trace length differs under entryOrder=%s with a tier configured", tc.entry)
+		})
 	}
 }

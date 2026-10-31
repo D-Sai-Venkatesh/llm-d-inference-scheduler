@@ -71,10 +71,11 @@ func coldTokensForEngine(w *waiter, g *engineGroup, blockSize int) int64 {
 // and for the turnover numbers).
 //
 // It fills the TIER-AWARE twin at the same time (tierCostTokens), computed the same
-// way over a cost that also counts each engine's CPU-tier shadow as residence. With no
-// tier configured anywhere the twin is written EQUAL to coldTokens — not left zero —
-// because that equality is what makes `entryOrder: "hrrn-tier"` arithmetically F5′ on a
-// tier-less deployment (and what the F5′-equivalence golden pins).
+// way over a cost that also counts each engine's CPU-tier shadow as residence — but ONLY
+// for the queue module that prices with it (hrrn-tier). With no tier configured anywhere,
+// or with a module that does not read it, the twin is written EQUAL to coldTokens — not
+// left zero — because that equality is what makes `entryOrder: "hrrn-tier"` arithmetically
+// F5′ on a tier-less deployment (and what the F5′-equivalence golden pins).
 func (s *Scheduler) setWaiterCostsLocked(w *waiter) {
 	groups := s.activeGroupsLocked()
 	if len(groups) == 0 {
@@ -89,7 +90,7 @@ func (s *Scheduler) setWaiterCostsLocked(w *waiter) {
 		if best < 0 || e < best {
 			best = e
 		}
-		if g.tier.Enabled() {
+		if s.mod.entryPricesTier && g.tier.Enabled() {
 			t := s.estimateTierCostCachedLocked(g, w.id, w.sizeBytes)
 			if bestTier < 0 || t < bestTier {
 				bestTier = t

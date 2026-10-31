@@ -454,8 +454,8 @@ func lowerMedianTokens(waiters map[string]*waiter, blockSize int, cost func(*wai
 //
 // TIER OFF ⇒ F5′ EXACTLY. With no tier configured the scheduler writes the tier-aware
 // cost EQUAL to the cold cost for every waiter (setWaiterCostsLocked), so this module is
-// arithmetically the same function as HrrnBounded. TestHrrnTierWithNoTierEqualsTheF5P
-// Golden pins that on the full replay, byte for byte, against the archive's F5′ trace.
+// arithmetically the same function as HrrnBounded. TestHrrnTierNoTierEqualsF5P pins that on
+// the full replay, byte for byte, against the archive's F5′ trace.
 type HrrnTier struct {
 	// BlockSize is the engine's KV block size in tokens (see HrrnBounded.BlockSize).
 	BlockSize int
@@ -595,8 +595,9 @@ type FootprintSizer interface {
 	// TierCost is Cost with that engine's CPU-TIER SHADOW as a second residence
 	// oracle, split into the three numbers its two readers need:
 	//
-	//	cold     blocks resident in NEITHER the GPU index NOR the tier (the pieces
-	//	         an admission would have to PREFILL) — the tier-aware admission cost;
+	//	cold     blocks resident in NEITHER the GPU index NOR the tier — the tier-aware
+	//	         cold estimate that hrrn-tier's denominator uses. (It is a PRIORITY input:
+	//	         the seat budget and the cold valve keep cost()'s GPU-only number.)
 	//	resident blocks the index or the tier already holds (restorable ≈ free);
 	//	total    the head's whole estimated footprint (cold + resident).
 	//
@@ -741,6 +742,13 @@ type modules struct {
 	tenure   RotationPolicy
 	pressure VictimChooser
 	safety   SafetyDetector
+	// entryPricesTier reports that the wired QUEUE module prices waiters with the
+	// TIER-AWARE cost (hrrn-tier), so the scheduler should compute it. It is a fact about
+	// the module set, not a second knob: an arm that carries a CPU tier but queues with
+	// F5′/newcomer-first pays NOTHING for a number nothing reads — which matters, because
+	// the EPP's own CPU is a hidden TTFT variable and the comparator arms are exactly the
+	// ones that must not be perturbed by work their policy never uses.
+	entryPricesTier bool
 }
 
 // buildModules resolves one implementation per interface from the config's single
@@ -760,6 +768,7 @@ func buildModules(cfg Config) (modules, error) {
 		m.entry = HrrnBounded{BlockSize: cfg.BlockSizeTokens}
 	case "hrrn-tier":
 		m.entry = HrrnTier{BlockSize: cfg.BlockSizeTokens}
+		m.entryPricesTier = true
 	default:
 		return m, errValue("entryOrder", cfg.EntryOrder, "newcomer-first|hrrn-bounded|hrrn-tier")
 	}

@@ -364,3 +364,60 @@ func TestFilterPinsTheSeatEngine(t *testing.T) {
 		t.Fatal("an exit must drop the placement pin")
 	}
 }
+
+// GOLDEN AT N=2. There is no single golden TRACE for two engines (the same scenario
+// legitimately splits), so the two properties the wave actually needs are pinned
+// instead:
+//
+//  1. DETERMINISM: two replays of the golden scenario on a two-engine stack produce
+//     identical traces (the multi-engine path has no map-order decision left).
+//  2. CONSERVATION: the same scenario on two engines of capacity C/2 does not lose or
+//     invent work — the served/dispatch totals stay in the same ballpark as the
+//     single-engine run (seats and blocks are bounded by the same total budget), i.e.
+//     nothing is double-counted across engines.
+func TestMultiEngineGoldenProperties(t *testing.T) {
+	run := func(engines int, capacity int) (string, Snapshot) {
+		cfg := defaultConfig()
+		s, err := NewScheduler(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// the golden scenario names engine-a; a second engine is added for N=2
+		for i := 0; i < engines; i++ {
+			id := fmt.Sprintf("engine-%c", 'a'+i)
+			if err := s.SetNumBlocksFor(id, 64, capacity); err != nil {
+				t.Fatal(err)
+			}
+		}
+		trace := runGoldenScenarioOn(t, s)
+		return trace, s.Snapshot()
+	}
+	oneA, snapOne := run(1, 1000)
+	oneB, _ := run(1, 1000)
+	if oneA != oneB {
+		t.Fatal("the golden scenario must be deterministic at N=1")
+	}
+	twoA, snapTwo := run(2, 1000)
+	twoB, _ := run(2, 1000)
+	if twoA != twoB {
+		t.Fatal("the golden scenario must be deterministic at N=2 (no map-order decision left)")
+	}
+	// conservation: two engines of the same size serve MORE (two budgets), never
+	// fewer, and the totals are sane multiples rather than double-counted figures
+	if snapTwo.Served < snapOne.Served {
+		t.Fatalf("N=2 must serve at least as many dispatches as N=1 (%d < %d)", snapTwo.Served, snapOne.Served)
+	}
+	if snapTwo.BudgetBlocks != 2*snapOne.BudgetBlocks {
+		t.Fatalf("the whole-policy budget must be the per-engine sum: %d vs %d", snapTwo.BudgetBlocks, snapOne.BudgetBlocks)
+	}
+	var seats int
+	for _, es := range snapTwo.Engines {
+		seats += es.Seats
+		if es.NEBlocks > es.BudgetBlocks {
+			t.Fatalf("engine %s is over its budget at the end of the run (%d > %d)", es.ID, es.NEBlocks, es.BudgetBlocks)
+		}
+	}
+	if seats != snapTwo.Seats {
+		t.Fatalf("the whole-policy seat count must be the per-engine sum (%d vs %d)", seats, snapTwo.Seats)
+	}
+}

@@ -177,13 +177,22 @@ func runGoldenScenarioFull(t *testing.T, simEnd int, cfg Config) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The scenario names its ONE engine: in engineGroups=single the key
-	// collapses to the pooled group (the golden was generated that way), and
-	// in engineGroups=per-engine it is a real discovered engine — which is
-	// what makes TestPerEngineGoldenEquality a genuine unit-equivalence gate.
-	if err := s.SetNumBlocksFor("engine-a", 64, 1000); err != nil { // budget 950
+	// The scenario names its ONE engine: a real discovered engine whose budget is
+	// 950 of 1000 blocks.
+	if err := s.SetNumBlocksFor("engine-a", 64, 1000); err != nil {
 		t.Fatal(err)
 	}
+	return runGoldenScenarioOnSched(t, simEnd, s)
+}
+
+// runGoldenScenarioOn replays the golden scenario on an ALREADY-BUILT scheduler (the
+// multi-engine properties are asserted this way).
+func runGoldenScenarioOn(t *testing.T, s *Scheduler) string {
+	t.Helper()
+	return runGoldenScenarioOnSched(t, 2600, s)
+}
+
+func runGoldenScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 	tr := &goldenTrace{seats: map[string]bool{}}
 
 	// exit/entry observation: hook order relative to the op is part of

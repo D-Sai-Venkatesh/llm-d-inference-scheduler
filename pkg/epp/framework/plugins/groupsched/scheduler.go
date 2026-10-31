@@ -1589,9 +1589,6 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 		if victim.inflight > 0 {
 			g.index.MarkExitingLocked(victim.id)
 			s.countExitLocked(g, "exiting")
-			if debugVictim != nil {
-				debugVictim(s, now, g, "MARK-EXITING:"+reason, victim)
-			}
 			continue
 		}
 		s.exitLocked(g, victim, reason, now)

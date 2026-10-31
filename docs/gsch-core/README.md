@@ -153,6 +153,23 @@ replay, against `golden-f0p-total.txt` (the archive with only tie-break #0):
 | 3 | a stale queue view never justifies an eviction (the C8 race) + Tick re-syncs from the last head snapshot | **14 lines**, +9 class-3 exits, served unchanged (1,231). |
 | 4 | mid-flight exits reach the exit hook; dead rotation in-flight branch deleted | **62 extra `EXIT reason=exiting` lines**, 0 decisions changed (accounting only). |
 
+## 4a0. THE DIGEST (what the wave runs)
+
+    EPP_IMAGE_TAG=groupsched-88e74f85
+    EPP_IMAGE_DIGEST=sha256:16b02e17ed3e2d9022e9a37f94245e3783b538a776223855ba4b4b9287f20925   (OCI index, keeps the attestation)
+    EPP_IMAGE_DIGEST_AMD64=sha256:2f62059465efc17efe546890a3ed5576c75e523a33bc7c85858bf85496d88de2
+
+Built from dsai/gsch-core HEAD `88e74f85fb49b9f1a0e23af2d3e6970cdd2c0668` with a clean
+tree, `docker buildx --platform linux/amd64` and the Makefile's arg set (TARGETOS,
+TARGETARCH, COMMIT_SHA, BUILD_REF), pushed directly so the index carries the build
+attestation. Pull-back verification: the linux/amd64 manifest unpacks to an x86-64
+statically-linked `/app/epp` whose strings carry
+`version.CommitSHA=88e74f85fb49b9f1a0e23af2d3e6970cdd2c0668` and
+`version.BuildRef=dsai/gsch-core`, plus the core's own markers
+(`CORE policy`, `detector_pool_score`, `cold_valve_held_total`, `waiters_shared`,
+`most-free-budget`) and NONE of the removed series
+(`pat_eligible_*`, `residue_predicted_ratio`, `engine_gate_closed`, `pooled_endpoints`).
+
 ## 4b. Pre-flight gates (every core arm, before its window counts)
 
 * `llm_d_epp_group_detector_pool_score == 0` for the WHOLE window (the pool gate never

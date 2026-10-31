@@ -201,17 +201,26 @@ valve-held attribution, the C8 gauge/counter). An intermediate image of the modu
 alone (`groupsched-197c658e`) was built and is SUPERSEDED: no arm used it, and it lacks the
 observability pair the B5/B6 pre-flight reads.
 
+**WHICH BUILD EACH ARM RUNS** (ruled 2026-11-01 — one wave, one digest):
+
+| arms | build |
+|---|---|
+| the MP wave (`core-q4.env`, `core-q8.env`, `core-q4-anchor-n1.env`) | **§4a0** `groupsched-88e74f85` — that is where the wave is defined and where B1 ran. Do NOT re-pin these files (§4a1 exists for a different pair). |
+| B5/B6 (`core-q4-8397e9aa.env` ‖ `core-f5p-q4.env`) | **this digest** `groupsched-8397e9aa`, both arms, same hour — the pair carries its own same-digest Q4 anchor, so the entry order is the only difference between them. |
+
+The new build is decision-identical at `entryOrder: "newcomer-first"` (golden byte-identical
+at both commits), so nothing about the comparison depends on which build an arm runs; the
+split is about PROVENANCE — a mid-wave switch would blur what the wave measured even when
+the decisions are provably the same.
+
 **The two builds are decision-identical for every arm that does not select F5′.**
 `88e74f85 → 8397e9aa` changes one production file's behaviour (`modules.go`: the new
 `HrrnBounded` + the `EntryCtx` argument); everything else added is inert at
 `entryOrder: "newcomer-first"` — a label fix and two new series. Evidence:
 `testdata/golden-f0p-bugfixes.txt` is reproduced byte for byte at BOTH commits
 (`TestCoreEqualsF0P` was run at each), and the F5′ equivalence golden
-(`TestHrrnBoundedEqualsTheArchiveF5P`) is byte-identical too. So re-pinning a core arm from
-§4a0 to this digest does not move its decisions; the wave's already-run arms keep their
-recorded `groupsched-88e74f85` provenance, and the shipped configs (`core-q4.env`,
-`core-q8.env`, `core-q4-anchor-n1.env`, `core-f5p-q4.env`) now pin this digest, with the
-history stated inline in each file.
+(`TestHrrnBoundedEqualsTheArchiveF5P`) is byte-identical too. The wave's configs therefore
+STAY on §4a0 and the B5/B6 pair carries this digest on both of its arms.
 
 ## 4b. Pre-flight gates (every core arm, before its window counts)
 
@@ -269,8 +278,9 @@ The queue module has a second implementation, selected by `CORE_ENTRY_ORDER=hrrn
 (rendered as `entryOrder: "hrrn-bounded"` in `CORE_MODULE_BLOCK`; the emitter's block for
 that arm is the one in `config_conformance_test.go`). Nothing else in an arm moves: the
 F5′-vs-Q4 pair is the same build, the same parameters, one selector value apart —
-`core-f5p-q4.env` is `core-q4.env` with that one line changed, and B5/B6 run
-`{core-q4, core-f5p-q4} × {c64, c128}` on the §4a1 digest, each pair same-hour.
+`core-f5p-q4.env` is `core-q4-8397e9aa.env` (the B5/B6 same-digest Q4 anchor) with
+that one line changed, and B5/B6 run `{core-q4-8397e9aa, core-f5p-q4} × {c64, c128}`
+same-hour on the §4a1 digest.
 
 The rule is the archive's dd5350b5 F5′: priority = wait ÷ `min(this waiter's cold tokens,
 the LOWER-median cold tokens of the current waiters)`, every size floored at one block,
@@ -299,8 +309,9 @@ c64 → c128 → c32, plus **core-Q4 at N=1, c128, 45 min** as the matched ancho
 B2a f0p's first 45 minutes. Configs: `core-q4.env`, `core-q8.env`,
 `core-q4-anchor-n1.env` (this directory).
 
-Then **B5/B6**: `{core-q4, core-f5p-q4} × {c64, c128}` on the §4a1 digest, each pair
-same-hour — the entry-order question, one selector apart. Scored against the amended
+Then **B5/B6**: `{core-q4-8397e9aa, core-f5p-q4} × {c64, c128}` on the §4a1 digest, each
+pair same-hour — the entry-order question, one selector apart, on a digest of its own (the
+wave above keeps §4a0). Scored against the amended
 matched-work predictions (matched tokens +2-6 %, entry wait −10-15 %, newcomer p90 ≤
 anchor/3, per-thread goodput p10 +25-40 % at c128, starved = 0, max EW ≤ 1.5×), with
 tok/s and records reported but labelled "includes mix", and the path-flip and

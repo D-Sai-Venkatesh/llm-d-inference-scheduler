@@ -278,6 +278,41 @@ the decisions are provably the same.
 (`TestHrrnBoundedEqualsTheArchiveF5P`) is byte-identical too. The wave's configs therefore
 STAY on §4a0 and the B5/B6 pair carries this digest on both of its arms.
 
+## 4a3. THE FOURTH DIGEST — the OFFLOAD SOLUTION build (2026-11-02)
+
+    EPP_IMAGE_TAG=groupsched-99a47617
+    EPP_IMAGE_DIGEST=sha256:1163763c0afbe97e116bbe29d71a830105c4c73c16f7811304920d769aac3c4b   (OCI index, keeps the attestation)
+    EPP_IMAGE_DIGEST_AMD64=sha256:6207d362256d1708cc7f97673fb81d1c83f0449dea4023d3508eac62844522ca
+    attestation manifest  sha256:d3e59a6d3785e897015e8ae8d9b416fc001c42213ee136168c1d17cf9b98ffbe (unknown/unknown,
+                          vnd.docker.reference.digest = the amd64 manifest)
+
+Built from dsai/gsch-core HEAD `99a4761746e73f21fc3c89f45a9ffbc7fae761b1` with a clean tree,
+by the same recipe as §4a0/§4a1/§4a2 (`docker buildx build --platform linux/amd64`,
+`--build-arg TARGETOS=linux TARGETARCH=amd64 COMMIT_SHA=<head> BUILD_REF=dsai/gsch-core
+LDFLAGS="-s -w"`, `--push`). Pull-back verification: the linux/amd64 manifest unpacks to a
+75,612,322-byte x86-64 statically-linked stripped `/app/epp` (go1.26.8) whose build settings
+carry `CommitSHA=99a4761746e73f21fc3c89f45a9ffbc7fae761b1`, `BuildRef=dsai/gsch-core`,
+`CGO_ENABLED=0`, `GOARCH=amd64`; strings carry everything §4a2 carries (`CORE policy`,
+`detector_pool_score`, `cold_valve_held_total`, `waiters_shared`, `most-free-budget`,
+`newcomer-first`, `hrrn-bounded`, `queue_view_age_seconds`,
+`queue_view_untrusted_passes_total`, `cold_cap_tokens`, `event_ring_dropped_total`) PLUS the
+four things this build adds: `hrrn-tier`, `cpuTierBytes`, `kvBlockBytes`,
+`tier_shadow_blocks`, `tier_shadow_capacity_blocks`, `tier_shadow_pairs_total` and
+`SHADOW-VALIDATION`; and NONE of the removed series (`pat_eligible_*`,
+`residue_predicted_ratio`, `engine_gate_closed`, `pooled_endpoints`, `mlfq2`,
+`rotateWhenFree`), no `coldEntryCapTokens`, no `residueRelease`.
+
+What it contains on top of §4a2 (four commits): the TIER SHADOW, `entryOrder: "hrrn-tier"`
+and the SHADOW-VALIDATION metric (`1f6a0ac5`), the three offload arm configs + this
+document's §4e + the loader gate (`cd600a66`), the gating of the tier-aware cost to the
+module that reads it + the shadow-neutrality pin (`251cdc40`), and pairing COLD returns
+(`99a47617`). DECISION EQUIVALENCE with §4a2 is a test, not a claim: with `cpuTierBytes: 0`
+the new value reproduces `testdata/golden-f5p-archive.txt` byte for byte, and with a tier
+CONFIGURED the default and F5′ arms reproduce their own goldens byte for byte
+(`TestTierConfiguredIsShadowNeutralForTheOtherArms`) — so an OFF/ON pair on this digest
+differs by the DEPLOYMENT, not by the shadow. The arm's own trace is
+`testdata/golden-hrrn-tier.txt` (4,774 lines, 1,020 dispatches).
+
 ## 4b. Pre-flight gates (every core arm, before its window counts)
 
 * `llm_d_epp_group_detector_pool_score == 0` for the WHOLE window (the pool gate never

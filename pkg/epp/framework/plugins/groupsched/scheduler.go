@@ -1390,6 +1390,8 @@ func (s *Scheduler) pressureCtxLocked(g *engineGroup, now time.Time) PressureCtx
 		RotationVictim: func() (string, *member) { return s.rotationVictimLocked(g, now) },
 		Silent:         tctx.Silent,
 		Headless:       tctx.Headless,
+		QueueViewTrusted: !tctx.QueueView.IsZero() &&
+			now.Sub(tctx.QueueView) <= time.Duration(s.cfg.IdleSeconds*float64(time.Second)),
 	}
 }
 

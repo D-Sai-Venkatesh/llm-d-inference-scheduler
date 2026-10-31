@@ -193,12 +193,6 @@ type Config struct {
 	//	                   prefill rate). Small-first without starving big jobs: wait
 	//	                   grows without bound, so every head eventually wins.
 	EntryOrder string `json:"entryOrder"`
-	// ResidueRelease (F6′): "off" (default) | "on". When ON and waiters exist, a
-	// seated IDLE member whose predicted surviving fraction is below the warm/cold
-	// cut loses its seat — the seat protects nothing, so releasing it costs no
-	// cache. Requires the residue model (it is the same shadow, read for "are this
-	// member's blocks still there").
-	ResidueRelease string `json:"residueRelease"`
 	// RotateWhenFree (F7): when true, a rotation-based eviction is allowed only
 	// while the engine's PREFILL BACKLOG (dispatched, no first token yet, in
 	// TOKENS) is under MaxNumBatchedTokens. When prefill is saturated the slices
@@ -324,7 +318,6 @@ func defaultConfig() Config {
 		ResidueReconcile:        "off",
 		QuantumMode:             "fixed",
 		EntryOrder:              "newcomer-first",
-		ResidueRelease:          "off",
 		MaxNumBatchedTokens:     8192,
 		EngineGate:              "off",
 		SatKvThreshold:          0.80,
@@ -393,9 +386,6 @@ func (c Config) effective() Config {
 	if c.EntryOrder == "" {
 		c.EntryOrder = def.EntryOrder
 	}
-	if c.ResidueRelease == "" {
-		c.ResidueRelease = def.ResidueRelease
-	}
 	if c.MaxNumBatchedTokens == 0 {
 		c.MaxNumBatchedTokens = def.MaxNumBatchedTokens
 	}
@@ -462,19 +452,14 @@ func (c Config) validate() error {
 	default:
 		return fmt.Errorf("entryOrder: invalid value %q (newcomer-first|hrrn)", c.EntryOrder)
 	}
-	switch c.ResidueRelease {
-	case "", "off", "on":
-	default:
-		return fmt.Errorf("residueRelease: invalid value %q (off|on)", c.ResidueRelease)
-	}
 	if c.QuantumCeiling < 0 {
 		return fmt.Errorf("quantumCeiling must be >= 0 (0 = off), got %d", c.QuantumCeiling)
 	}
 	if c.MaxNumBatchedTokens < 0 {
 		return fmt.Errorf("maxNumBatchedTokens must be >= 0, got %d", c.MaxNumBatchedTokens)
 	}
-	if c.ResidueRelease == "on" && !c.residueOn() {
-		return fmt.Errorf("residueRelease=\"on\" requires residue=\"tiebreak\" (F6' reads the same per-engine shadow)")
+	if c.VictimOrder == "residue" && !c.residueOn() {
+		return fmt.Errorf("victimOrder=\"residue\" requires residue=\"tiebreak\" (F6\" reads the same per-engine shadow)")
 	}
 	if c.ValveMode == "" {
 		c.ValveMode = "on"
@@ -488,9 +473,9 @@ func (c Config) validate() error {
 		c.VictimOrder = "legacy"
 	}
 	switch c.VictimOrder {
-	case "legacy", "spec":
+	case "legacy", "spec", "residue":
 	default:
-		return fmt.Errorf("victimOrder: invalid value %q (legacy|spec)", c.VictimOrder)
+		return fmt.Errorf("victimOrder: invalid value %q (legacy|spec|residue)", c.VictimOrder)
 	}
 	if c.WindowMode == "" {
 		c.WindowMode = "last4"
@@ -618,6 +603,26 @@ func (s *Scheduler) SetEngineLoad(engine string, kv float64, waiting int, at tim
 		return
 	}
 	s.load[engine] = engineLoad{kv: kv, waiting: waiting, at: at}
+}
+
+// EngineLoadStat is one engine's pushed saturation snapshot, exported for the
+// metrics layer (the gate's inputs must be visible in the run artifacts or "the gate
+// was closed X% of the time" is unfalsifiable — the banked arms left only a final
+// snapshot behind).
+type EngineLoadStat struct {
+	KV      float64
+	Waiting int
+}
+
+// EngineLoads snapshots the per-engine gate inputs.
+func (s *Scheduler) EngineLoads() map[string]EngineLoadStat {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]EngineLoadStat, len(s.load))
+	for k, v := range s.load {
+		out[k] = EngineLoadStat{KV: v.kv, Waiting: v.waiting}
+	}
+	return out
 }
 
 // ForgetEngineLoadsExcept drops load snapshots for engines the EPP no longer sees.
@@ -2599,14 +2604,6 @@ func (s *Scheduler) coldAllows(g *engineGroup, w *waiter) bool {
 // borrow another engine's idleness to justify an eviction, and an idle
 // engine must not spend a decision on waiters bound elsewhere.
 func (s *Scheduler) rotationVictimLocked(g *engineGroup, now time.Time) (string, *member) {
-	// F6′: a seat whose blocks are already gone protects nothing — release it first,
-	// because it costs no cache to take. (Needs the residue model: it reads the same
-	// shadow as E4b.)
-	if s.cfg.ResidueRelease == "on" {
-		if reason, m := s.residueReleaseVictimLocked(g, now); m != nil {
-			return reason, m
-		}
-	}
 	// F7: when the engine's PREFILL is already the bottleneck, a rotation's cold
 	// re-prefill costs the whole pool — so hold, unless this member has hit the
 	// tenure ceiling (the guarantee that stops holding from becoming starvation).
@@ -2627,7 +2624,14 @@ func (s *Scheduler) rotationVictimLocked(g *engineGroup, now time.Time) (string,
 		}
 		hasWaiting := !m.waitingSince.IsZero()
 		var better bool
-		if s.cfg.VictimOrder == "spec" {
+		if s.cfg.VictimOrder == "residue" {
+			// F6″: the SAME eligible set (eligibility is untouched — nobody loses a
+			// seat early), ordered by what the eviction COSTS: the coldest member
+			// first. Class before raw ratio, so two cold members tie on class and the
+			// spec tie-break (oldest last completion) decides instead of a noisy
+			// 0.001-vs-0.002 comparison.
+			better = best == nil || colderVictim(g, m, best)
+		} else if s.cfg.VictimOrder == "spec" {
 			// spec: prefer NO queued turn, then oldest last completion
 			better = best == nil ||
 				(!hasWaiting && bestHasWaiting) ||
@@ -2670,6 +2674,28 @@ func (s *Scheduler) rotationVictimLocked(g *engineGroup, now time.Time) (string,
 		}
 	}
 	return bestReason, best
+}
+
+// colderVictim is F6″'s order: cold (predicted surviving fraction below the warm/cold
+// cut) before warm; then the RAW ratio, lower first; then oldest last completion; then
+// id. A member whose engine has no usable model is treated as WARM (its cache is not
+// known to be gone, so it is not the cheaper victim).
+func colderVictim(g *engineGroup, a, b *member) bool {
+	if g == nil || g.residue == nil {
+		return olderCompletion(a, b)
+	}
+	ra, rb := g.residue.ratio(a.id), g.residue.ratio(b.id)
+	ca, cb := ra < residueWarmFraction, rb < residueWarmFraction
+	if g.residue.disabled {
+		ca, cb = false, false // no verdict: fall through to the spec order
+	}
+	if ca != cb {
+		return ca // cold goes first
+	}
+	if ca && cb && ra != rb {
+		return ra < rb
+	}
+	return olderCompletion(a, b)
 }
 
 // olderCompletion is the spec order's tie-break: oldest last

@@ -195,43 +195,59 @@ func TestHRRNCannotStarvate(t *testing.T) {
 
 // ---- F6′ residue-driven release ----
 
-// TestResidueReleaseFreesAColdSeat: a seated idle member whose blocks the model says
-// are gone loses its seat when a waiter needs it; a WARM member does not.
-func TestResidueReleaseFreesAColdSeat(t *testing.T) {
+// TestResidueVictimOrderIsFairAndColdFirst is F6″:
+//
+//  1. a COLD member that has NOT completed its quantum is NEVER evicted for being
+//     cold (eligibility is the fair-share definition and F6″ does not touch it);
+//  2. among two ELIGIBLE members, the colder one goes;
+//  3. ties on class fall through to the spec order (oldest last completion).
+func TestResidueVictimOrderIsFairAndColdFirst(t *testing.T) {
 	s := fArmScheduler(t, func(c *Config) {
 		c.Residue = "tiebreak"
-		c.ResidueRelease = "on"
+		c.VictimOrder = "residue"
 	})
 	now := goldenT0
-	seatWithBlocks(t, s, "warm", 60, now)
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	g := s.eng()
-	// the model is made to say "warm" for warm and "cold" for a second member
 	g.residue.setCapacity(1000)
-	h := g.residue.dispatch("warm", 60)
-	g.residue.settle(false, "warm", h, 0, 0)
+	// warm-el Is genuinely warm: dispatched and settled, so its prefix reads resident.
+	// Every OTHER member has no chain entries at all, i.e. the model calls it COLD.
+	warmHeld := g.residue.dispatch("warm-el", 100)
+	g.residue.settle(false, "warm-el", warmHeld, 100, 0)
 	g.residue.samples = 0
-	cold := &member{id: "cold", engine: "engine-a", seatTime: now, lastActivity: now}
-	g.members["cold"] = cold
-	if g.residue.ratio("warm") < residueWarmFraction {
-		s.mu.Unlock()
-		t.Fatal("test premise: warm must be warm")
+
+	mk := func(id string, busy int, lastDone time.Time) *member {
+		return &member{id: id, engine: "engine-a", seatTime: now, lastActivity: now,
+			busyPeriods: busy, resTurns: busy, lastCompletion: lastDone}
 	}
-	// a waiter exists (the release only fires when somebody wants the seat)
-	g.waiters["needy"] = &waiter{id: "needy", since: now}
-	reason, victim := s.residueReleaseVictimLocked(g, now)
-	s.mu.Unlock()
-	if victim == nil || victim.id != "cold" || reason != "residue-cold" {
-		t.Fatalf("release victim = %+v (%q), want the cold member", victim, reason)
+	// NOT eligible: 0 busy periods (fair share not served) — cold must not change that
+	g.members["fresh-cold"] = mk("fresh-cold", 0, time.Time{})
+	// a member in flight keeps the ENGINE-IDLE liveness rule out of the way (that rule
+	// fires when nothing is in flight and nothing is dispatchable — it is a stall
+	// guard, not a victim policy, and it is not what this test is about)
+	g.members["busy"] = &member{id: "busy", engine: "engine-a", seatTime: now, lastActivity: now,
+		inflight: 1, busyPeriods: 0}
+	g.waiters["w"] = &waiter{id: "w", since: now}
+	if reason, v := s.rotationVictimLocked(g, now); v != nil && v.id == "fresh-cold" {
+		t.Fatalf("a cold member with 0 busy periods was evicted (%q): F6\" must not create evictions", reason)
 	}
-	// with NO waiter nothing is released (a release would only lose cache)
-	s.mu.Lock()
-	delete(g.waiters, "needy")
-	if _, v := s.residueReleaseVictimLocked(g, now); v != nil {
-		s.mu.Unlock()
-		t.Fatalf("released %q with no waiter waiting", v.id)
+	// two ELIGIBLE members: cold first
+	g.members["cold-el"] = mk("cold-el", 4, now.Add(-100*time.Second))
+	g.members["warm-el"] = mk("warm-el", 4, now.Add(-200*time.Second))
+	reason, v := s.rotationVictimLocked(g, now)
+	if v == nil {
+		t.Fatal("no victim among the eligible members")
 	}
-	s.mu.Unlock()
+	if v.id != "cold-el" {
+		t.Fatalf("victim = %q (%q), want cold-el — the colder ELIGIBLE member is the cheaper eviction even though warm-el finished earlier", v.id, reason)
+	}
+	// with BOTH cold the class ties and the spec order (oldest completion) decides
+	delete(g.residue.chains, "warm-el")
+	g.members["warm-el"].lastCompletion = now.Add(-500 * time.Second)
+	if reason, v := s.rotationVictimLocked(g, now); v == nil || v.id != "warm-el" {
+		t.Fatalf("class tie must fall through to oldest-last-completion (warm-el), got %v (%q)", v, reason)
+	}
 }
 
 // ---- F7 rotate-when-free ----
@@ -409,9 +425,9 @@ func TestMLFQ2ArbitrationServesBothPools(t *testing.T) {
 func TestFArmKnobsOffKeepTheGolden(t *testing.T) {
 	c := defaultConfig()
 	if c.QuantumMode != "fixed" || c.EntryOrder != "newcomer-first" ||
-		c.ResidueRelease != "off" || c.RotateWhenFree || c.QuantumCeiling != 0 {
-		t.Fatalf("an F-knob default is not off: quantumMode=%q entryOrder=%q residueRelease=%q rotateWhenFree=%v ceiling=%d",
-			c.QuantumMode, c.EntryOrder, c.ResidueRelease, c.RotateWhenFree, c.QuantumCeiling)
+		c.VictimOrder != "legacy" || c.RotateWhenFree || c.QuantumCeiling != 0 {
+		t.Fatalf("an F-knob default is not off: quantumMode=%q entryOrder=%q victimOrder=%q rotateWhenFree=%v ceiling=%d",
+			c.QuantumMode, c.EntryOrder, c.VictimOrder, c.RotateWhenFree, c.QuantumCeiling)
 	}
 	// and the F0 base (the q4 anchor) is expressed purely in config
 	f0 := defaultConfig()
@@ -419,11 +435,11 @@ func TestFArmKnobsOffKeepTheGolden(t *testing.T) {
 	f0.QuantumBusyPeriods = 4
 	f0.GateMode = "size-aware"
 	for _, arm := range []func(*Config){
-		func(c *Config) { c.QuantumMode = "dyn-size" },                      // F3
-		func(c *Config) { c.EntryOrder = "hrrn" },                           // F5
-		func(c *Config) { c.Residue = "tiebreak"; c.ResidueRelease = "on" }, // F6'
-		func(c *Config) { c.RotateWhenFree = true; c.QuantumCeiling = 16 },  // F7
-		func(c *Config) { c.RotationMode = "mlfq2" },                        // F9
+		func(c *Config) { c.QuantumMode = "dyn-size" },                        // F3
+		func(c *Config) { c.EntryOrder = "hrrn" },                             // F5
+		func(c *Config) { c.Residue = "tiebreak"; c.VictimOrder = "residue" }, // F6"
+		func(c *Config) { c.RotateWhenFree = true; c.QuantumCeiling = 16 },    // F7
+		func(c *Config) { c.RotationMode = "mlfq2" },                          // F9
 	} {
 		cfg := f0
 		arm(&cfg)
@@ -431,11 +447,11 @@ func TestFArmKnobsOffKeepTheGolden(t *testing.T) {
 			t.Fatalf("arm config rejected: %v", err)
 		}
 	}
-	// F6' without the residue model is a startup failure, not a silent no-op.
+	// F6" without the residue model is a startup failure, not a silent no-op.
 	bad := f0
-	bad.ResidueRelease = "on"
+	bad.VictimOrder = "residue"
 	if err := bad.effective().validate(); err == nil {
-		t.Fatal("residueRelease=on without residue=tiebreak must fail validation")
+		t.Fatal("victimOrder=residue without residue=tiebreak must fail validation")
 	}
 }
 

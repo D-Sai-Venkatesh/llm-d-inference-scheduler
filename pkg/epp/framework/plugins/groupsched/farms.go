@@ -21,7 +21,7 @@ package groupsched
 //
 //	F3  quantumMode: fixed|dyn-size      per-member quantum scaled by footprint
 //	F5  entryOrder:  newcomer-first|hrrn  HRRN over the entry head (D1)
-//	F6′ residueRelease: off|on            release a seat whose blocks are gone
+//	F6″ victimOrder:    residue             evict the COLDEST eligible member first
 //	F7  rotateWhenFree                    rotate only while prefill is not saturated
 //	F9  rotationMode: mlfq2 (+longQuantum) two pools, HRRN arbitration
 //
@@ -210,44 +210,6 @@ func entryPriority(waitSeconds float64, coldTokens int64, blockSize int) float64
 // nowLocked is the current decision pass's clock (never time.Now — a golden replay
 // must be reproducible).
 func (s *Scheduler) nowLocked() time.Time { return s.now }
-
-// ---- F6′: residue-driven seat release ----
-
-// residueReleaseVictimLocked is F6′: when waiters exist, a SEATED IDLE member whose
-// predicted surviving fraction is below the warm/cold cut holds a seat that is
-// protecting nothing — releasing it costs no cache and gives the seat-time to a
-// waiter. Among the candidates the longest-idle goes first.
-//
-// This is the residue model's SINGLE-ENGINE use: the same shadow, read for "are
-// this member's blocks still there" instead of "which engine has them".
-func (s *Scheduler) residueReleaseVictimLocked(g *engineGroup, now time.Time) (string, *member) {
-	if g == nil || !g.residue.usable() {
-		return "", nil
-	}
-	if len(s.waitersLocked(g)) == 0 && len(s.gWaiters) == 0 {
-		return "", nil // nobody wants the seat: a release would only lose the cache
-	}
-	var best *member
-	for _, m := range g.members {
-		if g.index.ExitingLocked(m.id) || m.inflight > 0 {
-			continue
-		}
-		if !m.waitingSince.IsZero() {
-			continue // it has a turn queued: it is about to run, not idle
-		}
-		if g.residue.ratio(m.id) >= residueWarmFraction {
-			continue // warm: the seat is protecting a real prefix
-		}
-		if best == nil || m.lastActivity.Before(best.lastActivity) ||
-			(m.lastActivity.Equal(best.lastActivity) && m.id < best.id) {
-			best = m
-		}
-	}
-	if best == nil {
-		return "", nil
-	}
-	return "residue-cold", best
-}
 
 // ---- F7: rotate only while prefill has room ----
 

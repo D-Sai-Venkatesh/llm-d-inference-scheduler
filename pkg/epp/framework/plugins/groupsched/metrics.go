@@ -110,6 +110,11 @@ type groupMetrics struct {
 	// engineGateClosed it is the "the gate is per-engine now" evidence in the run.
 	engineGateSkips  *prometheus.CounterVec
 	engineGateClosed *prometheus.GaugeVec
+	// engineKV / engineWaiting export the gate's OWN inputs per engine (the pushed
+	// scraped values the gate reads), so a run's gate behaviour is auditable from
+	// the series alone.
+	engineKV      *prometheus.GaugeVec
+	engineWaiting *prometheus.GaugeVec
 	// affinityViolations counts requests that landed off their member's
 	// engine (from = the engine the member was charged to, to = the engine
 	// the framework actually picked). CORRECTNESS, not instrumentation.
@@ -206,6 +211,10 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "dispatches (and seats) the per-engine saturation gate held back, by engine"}, engineLabels)
 	g.engineGateClosed = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "engine_gate_closed",
 		Help: "1 when THIS engine's own saturation_e >= 1 (the per-engine gate is closed for it)"}, engineLabels)
+	g.engineKV = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "engine_kv_usage",
+		Help: "the SCRAPED per-engine kv_cache_usage this policy's per-engine gate reads (not the pool average)"}, engineLabels)
+	g.engineWaiting = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "engine_waiting_queue",
+		Help: "the SCRAPED per-engine waiting queue depth this policy's per-engine gate reads"}, engineLabels)
 	fcfsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: "llm_d_epp_group", Name: "fcfs_dispatches_total",
 		Help: "pre-capacity FCFS pass-through dispatches, per engine"}, engineLabels)
 	for _, c := range []prometheus.Collector{g.seats, g.members, g.sessions, g.boundMembers,
@@ -214,7 +223,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.capacityMissing, g.capacityLearned, g.pooledEndpoints, g.capacityHeterogeneous,
 		g.affinityViolations, g.rebinds, g.homings, g.rehomes, g.engineGone, g.filterDecisions,
 		g.residuePredicted, g.residueActual, g.residueDecided, g.residueResets, g.residueOff,
-		g.valveBlockedEvictions, g.engineGateSkips, g.engineGateClosed} {
+		g.valveBlockedEvictions, g.engineGateSkips, g.engineGateClosed, g.engineKV, g.engineWaiting} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second
 			// plugin config in the same test binary) must not fail startup: the
@@ -240,6 +249,17 @@ func (g *groupMetrics) Refresh() {
 		return
 	}
 	snap := g.sched.SnapshotLite()
+	if g.engineKV != nil {
+		for engine, st := range g.sched.EngineLoads() {
+			g.engineKV.WithLabelValues(engineLabel(engine)).Set(st.KV)
+			g.engineWaiting.WithLabelValues(engineLabel(engine)).Set(float64(st.Waiting))
+			closed := 0.0
+			if st.KV >= 0.80 || st.Waiting >= 5 {
+				closed = 1
+			}
+			g.engineGateClosed.WithLabelValues(engineLabel(engine)).Set(closed)
+		}
+	}
 	// PRE-INSTANTIATE the per-engine COUNTER series for every known engine.
 	// A *CounterVec has no series until its first observation, so before any
 	// dispatch a scrape would carry no llm_d_epp_group_dispatches_total at all —

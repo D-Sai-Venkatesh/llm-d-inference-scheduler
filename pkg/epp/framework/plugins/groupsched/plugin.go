@@ -173,9 +173,9 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	}
 	// F-arms: echo each knob in words when it is NOT at its default, so a run's
 	// artifacts state which rotation policy actually ran.
-	fmt.Printf("group-scheduler: rotation policy: mode=%s quantum=%d quantumMode=%s ceiling=%d entryOrder=%s residueRelease=%s rotateWhenFree=%v maxNumBatchedTokens=%d longQuantum=%d\n",
+	fmt.Printf("group-scheduler: rotation policy: mode=%s quantum=%d quantumMode=%s ceiling=%d entryOrder=%s victimOrder=%s rotateWhenFree=%v maxNumBatchedTokens=%d longQuantum=%d\n",
 		cfg.RotationMode, cfg.quantum(), cfg.QuantumMode, cfg.QuantumCeiling, cfg.EntryOrder,
-		cfg.ResidueRelease, cfg.RotateWhenFree, cfg.MaxNumBatchedTokens, cfg.LongQuantum)
+		cfg.VictimOrder, cfg.RotateWhenFree, cfg.MaxNumBatchedTokens, cfg.LongQuantum)
 	if cfg.residueOn() {
 		fmt.Printf("group-scheduler: residue model: TIEBREAK — a per-engine shadow of vLLM's free-block queue (allocate from the head, free tail-block-first to the tail, live blocks never evictable) predicts the surviving PREFIX of a returning member's chain and breaks ties among FIT-PASSING engines only (never a ranker of two cold engines). Reconciled at settle against usage.cached_tokens; parameter-free (no clock, no threshold, no cache read).\n")
 	} else {

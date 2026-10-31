@@ -150,10 +150,14 @@ The gate line to read on a `none` arm: `detector_pool_score == 0` for the whole 
    never the valve, so the loop evicted every eligible member and left the seats
    cold-empty. Measured on the replay (`coldEntryCapTokens` = 640, one engine):
    **3,220 valve-blocked passes, 20 evictions taken for nothing** → 0 with the fix;
-   served 1,201 → 1,253; 4,432 of 5,034 trace lines differ. On the shipped config
-   (cap 131,072 tokens) the valve does not bind and the trace is byte-identical.
-   f0p's own live artifact agrees on the magnitude: `final-epp.prom` shows
-   `rotation_evictions_valve_blocked_total = 913,162` passes.
+   served 1,201 → 1,253; 4,432 of 5,034 trace lines differ.
+   **REPLAY: 0 divergences at the shipped cap (131,072 tokens — the valve does not
+   bind there), 20 pointless evictions at a tiny cap. LIVE: measured by the anchor** —
+   f0p's live artifact shows `rotation_evictions_valve_blocked_total = 913,162`
+   passes, and every one that found an eligible victim evicted for nothing; those
+   evictions are indistinguishable from ordinary quantum-complete/idle exits in the
+   banked artifacts, so the live effect is UNKNOWN (bounded by the rotation exits,
+   ~40-45 % of exits). The single-pod core anchor arm measures it.
 
 ## 4b. Pre-flight gates (every core arm, before its window counts)
 

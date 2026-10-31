@@ -76,8 +76,15 @@ measured effect.
 cold-valve fix (`TestCoreEqualsF0PWithTheValveFix`) — on a replay where the valve
 BINDS (`coldEntryCapTokens` = 640 tokens): f0p took **20 evictions for nothing** on
 this scenario, the core takes 0, and the run serves 1,201 → 1,253 dispatches (+4.3 %).
-On the SHIPPED config the valve does not bind and the trace is byte-identical to f0p,
-so no banked number moves.
+
+**Replay: 0 at the shipped cap, 20 at a tiny cap. Live: measured by the anchor.**
+On the shipped config the valve does not bind in the synthetic trace and the replay is
+byte-identical — but that says nothing about a live workload: live f0p logged
+913,162 valve-blocked passes and the old code evicted on every one that found an
+eligible victim, and those evictions are indistinguishable from ordinary
+quantum-complete/idle exits in the banked artifacts. The live effect is UNKNOWN
+(bounded by the rotation exits, ~40-45 % of exits) and the single-pod core anchor arm
+(core-Q4, N=1, c128, 45 min vs B2a f0p's first 45 min) is what measures it.
 
 ## 3. Constants
 
@@ -91,7 +98,7 @@ tagged for removal.
 | `quantum` (Q) | 4 | config | the tenure bound in completed busy periods. ONE value; Q8 is the same code with 8. Also a policy constant (the campaign's measured knee at Q8, Q4 as the safe default). |
 | `idleSeconds` (S) | 20 | config | **inherited from f0p**, kept ONLY for golden equality. A time constant (the human's no-magic-time-constants rule): flagged for removal — the replacement candidate is "the member's own think-gap history", which was measured (F4) and then retired with the F-arms. |
 | `ttlSeconds` | 30 | config | **inherited from f0p** (the silence GC for headless records). Same flag as S: a time constant, kept for golden equality. |
-| `coldEntryCapTokens` | 131072 | config | the per-engine cold-ENTRY stagger cap (one cold entry always allowed). Inherited from the campaign; it bounds concurrent cold prefills per engine, which is a memory-safety bound rather than a tuned knob. |
+| **`coldEntryCapTokens`** | **131072** | config | **THE BINDING ADMISSION CONSTRAINT — read this row first.** The per-engine cold-ENTRY stagger cap (one cold entry always allowed). Measured on f0p: **99.7-99.8 % of budget-feasible admission attempts were refused by this valve**, and a cold charge is outstanding ~100 % of the window — so the RE-SEAT RATE, and therefore the entry/re-entry waits, are set by this constant together with the engine's prefill speed, not by Q. It is < 1/2 of the cold cap's worth of tokens per seat on the campaign stacks, which is why the valve binds. It stays for this wave (golden equality) and is FLAGGED for a constant-free replacement (the candidate: derive the cap from the engine's measured prefill service rate × S), which needs the human's sign-off. |
 | `inFlightCap` | 64 | config | per-member concurrent requests (the pre-existing liveness bound; it is a request-count safety valve, not a policy variable). |
 | `blockSizeTokens` | 64 | config | **a wiring fact, not a knob**: it must equal the engine's `--block-size`. A measured mismatch fails loudly per engine. |
 | `capacityLivenessSeconds` | 120 | config | how long an endpoint may go without a measured capacity before the loud `capacity_missing` alarm. An alarm deadline, not a decision input. |

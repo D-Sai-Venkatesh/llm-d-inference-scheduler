@@ -59,11 +59,34 @@ type TenureCtx struct {
 	// IdleSeconds is S, the silence bound: a member silent that long (and with no
 	// queued head — the C8 fix) is not going to use its seat.
 	IdleSeconds float64
+	// QueueView is when the queue-head snapshot behind this decision pass was taken,
+	// and QueueViewKnown whether there is one at all. A member's "has a queued head"
+	// lives in `waitingSince`, which only a PASS OVER THE QUEUE can maintain
+	// (syncWaitersLocked). When the flow controller's gate is closed no Pick runs, so
+	// that flag goes STALE — and an eviction rule that trusted a stale "no head" took
+	// seats away from members whose head was queued the whole time (the C8 race: heads
+	// arriving just before a Tick, victims' heads then waiting 4.7-25 min, cold).
+	QueueView    time.Time
+	QueueViewSet bool
 }
 
-// Silent reports the idle test for a member: no queued head and no activity for S.
-func (c TenureCtx) Silent(m *member) bool {
+// Headless reports "this member has no queued head" as EVIDENCE rather than as a
+// guess: it is true only when the queue view is recent enough for the absence to mean
+// something (a view older than S cannot tell a busy member from an idle one).
+func (c TenureCtx) Headless(m *member) bool {
 	if !m.waitingSince.IsZero() {
+		return false
+	}
+	if !c.QueueViewSet || c.Now.Sub(c.QueueView) > time.Duration(c.IdleSeconds*float64(time.Second)) {
+		return false // no trustworthy view: silence is NOT evidence
+	}
+	return true
+}
+
+// Silent reports the idle test for a member: headless (see Headless) and no activity
+// for S.
+func (c TenureCtx) Silent(m *member) bool {
+	if !c.Headless(m) {
 		return false
 	}
 	return c.Now.Sub(m.lastActivity) > time.Duration(c.IdleSeconds*float64(time.Second))
@@ -111,6 +134,9 @@ type PressureCtx struct {
 	RotationVictim func() (string, *member)
 	// Silent is the same idle test the tenure policy uses.
 	Silent func(m *member) bool
+	// Headless reports whether the member has no queued head, as EVIDENCE (false when
+	// the queue view is stale — see TenureCtx.Headless).
+	Headless func(m *member) bool
 }
 
 // VictimChooser answers "who leaves when the engine is over its budget?".
@@ -141,7 +167,7 @@ func (BudgetValve) Victim(members []*member, ctx PressureCtx) (string, *member) 
 		if ctx.Exiting(m.id) || m.inflight > 0 {
 			continue
 		}
-		if m.waitingSince.IsZero() || ctx.Silent(m) {
+		if ctx.Headless(m) || ctx.Silent(m) {
 			if best == nil || olderCompletion(m, best) {
 				best = m
 			}
@@ -150,11 +176,16 @@ func (BudgetValve) Victim(members []*member, ctx PressureCtx) (string, *member) 
 	if best != nil {
 		return "budget-noqueue", best
 	}
+	// class (3): mid-quantum. THE ORDER MATTERS: a member that has not served a turn
+	// in this residency, or that has a queued head right now, is the LAST choice —
+	// taking its seat back before its first turn makes it wait another admission cycle
+	// (measured on f0p's class-3 victims: 100 % had a queued head and 53/54 had served
+	// ZERO turns in the residency). Only then "oldest last completion", then id.
 	for _, m := range members {
 		if ctx.Exiting(m.id) || m.inflight > 0 {
 			continue
 		}
-		if best == nil || olderCompletion(m, best) {
+		if best == nil || class3Less(m, best) {
 			best = m
 		}
 	}
@@ -373,6 +404,18 @@ type SafetyDetector interface {
 	// Score is the utilisation the framework's Saturation signal uses: kv /
 	// Threshold, so 1.0 means exactly "firing".
 	Score(kv float64, have bool) float64
+}
+
+// class3Less is the mid-quantum (class 3) victim order: UNSTARTED or WANTING members
+// sort last (they have not had the seat long enough for it to be worth reclaiming),
+// then the oldest last completion, then the id.
+func class3Less(a, b *member) bool {
+	aRaw := a.resTurns == 0 || !a.waitingSince.IsZero()
+	bRaw := b.resTurns == 0 || !b.waitingSince.IsZero()
+	if aRaw != bRaw {
+		return !aRaw // a member that has used its seat goes first
+	}
+	return olderCompletion(a, b)
 }
 
 // NoopSafety never fires: dispatch and admission are governed by the seat budget

@@ -194,20 +194,32 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatChoice {
 		fits: cands[idx].Fits}
 }
 
-// coldValveHolds reports whether the ONLY thing keeping this head out is the
-// cold-entry valve: some engine has the budget for it and the valve refuses.
-func (s *Scheduler) coldValveHolds(head *waiter, now time.Time) bool {
+// coldValveHeldOn reports WHICH engine's cold-entry valve is the only thing keeping
+// this head out — the engine whose BUDGET would take it while the valve refuses it — and
+// whether any engine is in that state at all. The engine id is the attribution: the
+// series said `engine="single"` on a two-engine stack until this returned a name
+// (2026-11-01). When several engines hold the head the answer is the one the placement
+// module would have chosen, most free budget first then engine id, so the metric names
+// the engine the head is actually waiting for instead of the first one in a loop.
+func (s *Scheduler) coldValveHeldOn(head *waiter) (string, bool) {
+	best := EngineCandidate{Engine: ""}
 	for _, g := range s.activeGroupsLocked() {
 		if g.numBlocks <= 0 || s.safetyFiredLocked(g) {
-			continue
+			continue // no measured capacity, or the engine is not taking seats at all
 		}
 		tokens := coldTokensForEngine(head, g, s.blockSize)
-		if tokens/int64(s.blockSize) <= s.freeBudgetLocked(g) && !s.coldAllowsTokens(g, tokens) {
-			return true
+		if tokens/int64(s.blockSize) > s.freeBudgetLocked(g) {
+			continue // the BUDGET is the blocker on this engine: the valve is not the reason
+		}
+		if s.coldAllowsTokens(g, tokens) {
+			continue // the valve allows it: whatever held the head, it was not this
+		}
+		c := EngineCandidate{Engine: g.id, FreeBudget: s.freeBudgetLocked(g)}
+		if best.Engine == "" || betterEngine(c, best) {
+			best = c
 		}
 	}
-	_ = now
-	return false
+	return best.Engine, best.Engine != ""
 }
 
 // hasRotationVictimLocked reports whether an engine can evict somebody right now
@@ -245,11 +257,15 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 		cand := s.seatEngineLocked(head, now)
 		if cand == nil || cand.g == nil {
 			// nothing to do this pass. If the reason is the cold-entry valve holding a
-			// head that WOULD fit the budget, book it: the head waits for the prefill
-			// slot, and that is a measurable cost of the stagger (never a reason to
-			// evict — see EngineCandidate.Fits).
-			if s.onColdValveHeld != nil && s.coldValveHolds(head, now) {
-				s.onColdValveHeld("")
+			// head that WOULD fit the budget, book it AGAINST THAT ENGINE: the head waits
+			// for the prefill slot, and that is a measurable cost of the stagger (never a
+			// reason to evict — see EngineCandidate.Fits). The attribution is the engine
+			// id, not "": cold_valve_held_total read `engine="single"` on a two-engine
+			// stack while this passed the empty id (2026-11-01).
+			if s.onColdValveHeld != nil {
+				if engine, held := s.coldValveHeldOn(head); held {
+					s.onColdValveHeld(engine)
+				}
 			}
 			return
 		}

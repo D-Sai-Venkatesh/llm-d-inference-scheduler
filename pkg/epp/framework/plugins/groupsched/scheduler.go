@@ -505,6 +505,11 @@ type Scheduler struct {
 	// (syncWaitersLocked) — the evidence clock behind "this member has no queued
 	// head". A stale view must never justify an eviction (the C8 race).
 	queueViewAt time.Time
+	// headsObservedAt is when the head list was last OBSERVED — a Pick, which carries a
+	// candidate set. A Tick RE-APPLIES the last observation (so the waiting flags stay
+	// honest) and must NOT refresh this clock: this is the age of the EVIDENCE itself,
+	// i.e. the size of the window in which a head can be queued with nobody looking.
+	headsObservedAt time.Time
 	// now is the virtual clock of the CURRENT decision pass (set at the top of
 	// every public decision entry point). Nothing here calls time.Now: a golden
 	// replay has to be reproducible.
@@ -540,6 +545,9 @@ type Scheduler struct {
 		totalTok           int64
 		served             int64
 		fcfsServed         int64
+		// queueViewUntrusted counts budget-enforcement passes that ran with an
+		// untrusted queue view (the C8 guard skipped the head-presence classes).
+		queueViewUntrusted int64
 		// memberSources counts dispatches by the attribute the member id came from
 		// (the run's effective-member-source echo).
 		memberSources map[string]int64
@@ -818,7 +826,7 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.now = now
-	s.deriveLocked() // derive-don't-accumulate: recomputed, never trusted across paths
+	s.headsObservedAt = now // a Pick is the only FRESH observation of the queue
 	s.reapInflightLocked(now)
 	s.syncWaitersLocked(heads, now)
 	groups := s.activeGroupsLocked()
@@ -1597,6 +1605,31 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 	return true
 }
 
+// queueViewTrustedLocked reports whether the queue-head snapshot behind this decision
+// pass is recent enough that "this member has no queued head" means anything at all.
+func (s *Scheduler) queueViewTrustedLocked(now time.Time) bool {
+	return !s.queueViewAt.IsZero() &&
+		now.Sub(s.queueViewAt) <= time.Duration(s.cfg.IdleSeconds*float64(time.Second))
+}
+
+// queueEvidenceAgeSecondsLocked is how old the head list the queue view was built from
+// is, on the DECISION clock (-1 when no head list has been observed yet — the
+// absent-signal convention: a 0 would read as "fresh"). It grows whenever Picks stop
+// (a closed pool gate is the normal cause), which is exactly the window in which a head
+// can be queued while `waitingSince` says otherwise (the C8 race).
+func (s *Scheduler) queueEvidenceAgeSecondsLocked() float64 {
+	if s.headsObservedAt.IsZero() {
+		return -1
+	}
+	return s.now.Sub(s.headsObservedAt).Seconds()
+}
+
+// noteQueueViewUntrustedLocked books one enforcement pass that ran without trustworthy
+// head evidence. The value is CUMULATIVE and exported from the snapshot (one source of
+// truth: the metrics layer converts it to a Prometheus counter by delta, so a hook
+// nobody wired cannot leave the series at zero).
+func (s *Scheduler) noteQueueViewUntrustedLocked() { s.counters.queueViewUntrusted++ }
+
 // enforceBudgetLocked is MEMORY PRESSURE on the growth path: while the engine's
 // accounted footprint (NE + pending estimates) is over its budget, take victims in
 // the valve's order until it fits or nothing is evictable.
@@ -1604,7 +1637,17 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 	if g.budgetBlocks <= 0 {
 		return // no measured capacity yet for THIS engine: nothing to enforce
 	}
+	countedStale := false
 	for int64(g.index.UniqueBlocksNELocked())+g.pendingTotal > int64(g.budgetBlocks) {
+		if !countedStale && !s.queueViewTrustedLocked(now) {
+			// ONE per engine-pass: this pass will choose victims with a queue view too old
+			// to tell a busy member from an idle one, so the C8 guard drops the
+			// head-presence classes. The gauge beside this counter is the clock itself;
+			// both are the evidence that the guard is doing something (or that the
+			// decision clock has run away from the queue syncs).
+			s.noteQueueViewUntrustedLocked()
+			countedStale = true
+		}
 		reason, victim := s.budgetVictimLocked(g, now)
 		if victim == nil {
 			return
@@ -1866,6 +1909,15 @@ type Snapshot struct {
 	// HeterogeneousEngines lists engines whose num_gpu_blocks deviates >1% from the
 	// first measured engine (the wiring alarm).
 	HeterogeneousEngines []string `json:"heterogeneousEngines,omitempty"`
+	// QueueViewAgeSeconds is how old the head EVIDENCE behind the queue view was on the
+	// DECISION clock (a Tick re-applies the last observation, so this keeps measuring the
+	// observation's age), and QueueViewUntrusted the number of budget-enforcement passes
+	// that ran with the guard's own view too old to trust (−1 = no head list observed
+	// yet). Together they are the C8 guard's state: a growing age is the window in which
+	// a head can be queued unseen, and an untrusted-pass count means the enforcement
+	// passes are re-syncing less often than S.
+	QueueViewAgeSeconds float64 `json:"queueViewAgeSeconds"`
+	QueueViewUntrusted  int64   `json:"queueViewUntrustedPasses"`
 }
 
 // EngineSnapshot is ONE engine's group state: seats, waiters (accounted), the
@@ -1921,8 +1973,10 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 	snap := Snapshot{Exits: map[string]int64{},
 		Served: s.counters.served, FCFSServed: s.counters.fcfsServed,
 		AffinityViolations: s.counters.affinityViolations, Rebinds: s.counters.rebinds,
-		EngineGone: s.counters.engineGone,
-		Engines:    map[string]EngineSnapshot{}, Bindings: map[string]int{}}
+		EngineGone:          s.counters.engineGone,
+		QueueViewAgeSeconds: s.queueEvidenceAgeSecondsLocked(),
+		QueueViewUntrusted:  s.counters.queueViewUntrusted,
+		Engines:             map[string]EngineSnapshot{}, Bindings: map[string]int{}}
 	if full {
 		snap.Config = s.cfg
 		snap.RecentEvents = append([]Event(nil), s.events...)

@@ -50,13 +50,25 @@ type groupMetrics struct {
 	// waitersShared is the SHARED waiter queue's size (one number, no engine label,
 	// because a waiter belongs to no engine until one seats it).
 	waitersShared prometheus.Gauge
-	exits         *prometheus.CounterVec
-	residency     *prometheus.HistogramVec
-	entryWait     *prometheus.HistogramVec
-	reentryWait   *prometheus.HistogramVec
-	refillShare   prometheus.Gauge
-	served        *prometheus.CounterVec
-	fcfs          *prometheus.CounterVec
+	// queueViewAge is how old the queue-head snapshot behind "has a queued head" was on
+	// the decision clock, and queueViewUntrusted counts the budget-enforcement passes
+	// that ran with it too old to trust. The C8 guard SKIPS the head-presence classes in
+	// exactly those passes, so without these two the guard's own clock is invisible — a
+	// stack whose queue view is never refreshed and one that is always fresh look
+	// identical in every other series.
+	queueViewAge       prometheus.Gauge
+	queueViewUntrusted prometheus.Counter
+	// queueViewUntrustedLast is the scheduler's cumulative counter as last exported:
+	// Refresh adds the DELTA, so the series has exactly one source of truth (the
+	// scheduler's own count) and nothing can be double-booked or forgotten.
+	queueViewUntrustedLast int64
+	exits                  *prometheus.CounterVec
+	residency              *prometheus.HistogramVec
+	entryWait              *prometheus.HistogramVec
+	reentryWait            *prometheus.HistogramVec
+	refillShare            prometheus.Gauge
+	served                 *prometheus.CounterVec
+	fcfs                   *prometheus.CounterVec
 
 	capacityMissing *prometheus.GaugeVec
 	capacityLearned *prometheus.CounterVec
@@ -122,6 +134,10 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "measured KV capacity in blocks for this engine"}, engineLabels)
 	g.waitersShared = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "waiters_shared",
 		Help: "heads waiting in the ONE shared admission queue"})
+	g.queueViewAge = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "queue_view_age_seconds",
+		Help: "age of the queue-head snapshot the 'has a queued head' evidence comes from, on the decision clock (-1 = no snapshot yet, always > idleSeconds = the evidence is untrustworthy)"})
+	g.queueViewUntrusted = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "queue_view_untrusted_passes_total",
+		Help: "budget-enforcement passes whose victim choice ran with a queue view older than idleSeconds (the C8 guard skipped the head-presence classes)"})
 	g.exits = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "exits_total",
 		Help: "member exits by reason"}, []string{"engine", "reason"})
 	g.residency = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "residency_turns",
@@ -174,7 +190,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.reentryWait, g.refillShare, g.served, g.fcfs, g.capacityMissing, g.capacityLearned,
 		g.safetyFired, g.safetyFires, g.safetyFiredSeconds, g.safetySkips, g.engineKV, g.engineWaiting,
 		g.poolScore, g.staleSamples, g.capacityHeterogeneous, g.filterDecisions, g.affinityViolations, g.rebinds, g.engineGone,
-		g.coldValveHeld} {
+		g.coldValveHeld, g.queueViewAge, g.queueViewUntrusted} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second
 			// plugin config in the same test binary) must not fail startup: the series
@@ -251,6 +267,11 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 		}
 	}
 	g.waitersShared.Set(float64(snap.WaitersShared))
+	g.queueViewAge.Set(snap.QueueViewAgeSeconds)
+	if d := snap.QueueViewUntrusted - g.queueViewUntrustedLast; d > 0 {
+		g.queueViewUntrusted.Add(float64(d))
+		g.queueViewUntrustedLast = snap.QueueViewUntrusted
+	}
 	g.poolScore.Set(math.Float64frombits(poolScoreBits))
 	g.refillShare.Set(snap.RefillShare)
 	if len(snap.HeterogeneousEngines) > 0 {

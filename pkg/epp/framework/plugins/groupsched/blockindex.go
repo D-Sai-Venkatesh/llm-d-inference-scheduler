@@ -107,8 +107,6 @@ type BlockIndex struct {
 	salt            Hash
 	blockSizeTokens int
 	chunkBytes      int
-	// useChains selects the derived dispatch window (SetWindowMode).
-	useChains bool
 	// version bumps on EVERY mutation (the scheduler's estimate cache
 	// key — M2: Picks run at ~1kHz; unchanged state must not recompute).
 	version uint64
@@ -120,16 +118,10 @@ type BlockIndex struct {
 	seated   map[string]struct{}
 }
 
-// sessionBlocks is one session's rolling block set: the union of its
-// waiting requests and its last-window dispatched requests, plus the
-// seating state.
-//
-// The dispatch window has two modes (BUILD-PLAN §1, windowMode):
-//   - last4 (legacy): the fixed N-request window (dispHist/dispSet).
-//   - derived: one entry per LIVE prefix-chain (chains) — the last
-//     request of each chain, expiring after S of no dispatch on that
-//     chain. MANDATORY under root-session identity, where fan-out
-//     within one id is real and a fixed window undercounts.
+// sessionBlocks is one member's rolling block set: the union of its waiting
+// requests and its last-window dispatched requests (the fixed 4-request window:
+// one entry per live prefix chain, expiring after S, was tried and retired), plus
+// the seating state.
 type sessionBlocks struct {
 	id            string
 	window        int
@@ -140,23 +132,7 @@ type sessionBlocks struct {
 	dispSet       map[Hash]struct{}
 	waitSet       map[Hash]struct{}
 	exiting       bool
-	// chains is the derived-window state (useChains selects the mode).
-	useChains bool
-	chains    []chainEntry
 }
-
-// chainEntry is the derived window's unit: the latest request of one
-// prefix-chain (a chain = a sequence of requests where each extends the
-// previous one's hash prefix — conversation growth; a divergent or
-// shorter request starts a new chain, e.g. a sub-agent leaf sharing
-// only the preamble).
-type chainEntry struct {
-	hashes []Hash
-	last   time.Time // last dispatch on this chain (the expiry input)
-}
-
-// maxChains bounds the derived window per session (fan-out safety).
-const maxChains = 64
 
 // NewBlockIndex returns an index for an engine whose KV blocks hold
 // blockSizeTokens tokens (from cache_config_info / the endpoint metrics).
@@ -194,44 +170,6 @@ func (b *BlockIndex) ChunkBytes() int { return b.chunkBytes }
 
 // BlockSizeTokens is the measured engine block size in tokens.
 func (b *BlockIndex) BlockSizeTokens() int { return b.blockSizeTokens }
-
-// SetWindowMode selects the dispatch window mode BEFORE any tracking:
-// "last4" (legacy fixed window) or "derived" (per-live-chain). Must be
-// called at construction (the scheduler does), not mid-flight.
-func (b *BlockIndex) SetWindowMode(mode string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.useChains = mode == "derived"
-}
-
-// ExpireChainsLocked expires the derived window's idle chains (window
-// mode "derived"; the scheduler's Tick calls it with S). Under the
-// scheduler's lock.
-func (b *BlockIndex) ExpireChainsLocked(maxAge time.Duration, now time.Time) {
-	if !b.useChains {
-		return
-	}
-	// R5: bump only on an actual change — a per-Tick bump would flush
-	// the estimate cache every second.
-	changed := false
-	for id, s := range b.sessions {
-		if _, isSeated := b.seated[id]; !isSeated {
-			// unseated records still feed waiter estimates (SetBlocks)
-			if s.expireChains(maxAge, now) {
-				changed = true
-			}
-			continue
-		}
-		old := s.set()
-		if s.expireChains(maxAge, now) {
-			changed = true
-			b.applyDeltaLocked(s, old)
-		}
-	}
-	if changed {
-		b.version++
-	}
-}
 
 // HashBody chunks a serialized request body and returns the CHAINED hash
 // of each chunk: h_i = H(salt ‖ h_{i−1} ‖ chunk_i). Position-sensitive:
@@ -286,7 +224,7 @@ func (b *BlockIndex) Track(id string, window int) *sessionBlocks {
 	if window <= 0 {
 		window = DefaultDispatchWindow
 	}
-	s := &sessionBlocks{id: id, window: window, useChains: b.useChains,
+	s := &sessionBlocks{id: id, window: window,
 		waiting: make(map[string][]Hash), waitSince: make(map[string]time.Time),
 		dispSet: make(map[Hash]struct{}), waitSet: make(map[Hash]struct{})}
 	b.sessions[id] = s
@@ -375,7 +313,7 @@ func (b *BlockIndex) TrackLocked(id string, window int) *sessionBlocks {
 	if window <= 0 {
 		window = DefaultDispatchWindow
 	}
-	s := &sessionBlocks{id: id, window: window, useChains: b.useChains,
+	s := &sessionBlocks{id: id, window: window,
 		waiting: make(map[string][]Hash), waitSince: make(map[string]time.Time),
 		dispSet: make(map[Hash]struct{}), waitSet: make(map[Hash]struct{})}
 	b.sessions[id] = s
@@ -549,10 +487,6 @@ func (b *BlockIndex) applyDeltaLocked(s *sessionBlocks, old map[Hash]struct{}) {
 }
 
 func (s *sessionBlocks) pushDispatched(hashes []Hash) {
-	if s.useChains {
-		s.pushChain(hashes, time.Now())
-		return
-	}
 	s.dispHist = append(s.dispHist, hashes)
 	if len(s.dispHist) > s.window {
 		s.dispHist = s.dispHist[len(s.dispHist)-s.window:]
@@ -560,112 +494,8 @@ func (s *sessionBlocks) pushDispatched(hashes []Hash) {
 	s.rebuildDispSet()
 }
 
-// pushChain records a dispatch on the derived window: if the request
-// extends an existing chain's prefix (chain growth, or an identical
-// retry), the entry is replaced; otherwise it starts a new chain.
-// Returns whether the touched chain is the session's MAIN (largest)
-// chain. When the cap is hit the SMALLEST chain is dropped (V2: never
-// the main chain — its blocks are the ones the next turn needs).
-func (s *sessionBlocks) pushChain(hashes []Hash, now time.Time) bool {
-	touched := -1
-	for i := range s.chains {
-		if isPrefix(s.chains[i].hashes, hashes) {
-			s.chains[i] = chainEntry{hashes: hashes, last: now}
-			touched = i
-			break
-		}
-	}
-	if touched < 0 {
-		s.chains = append(s.chains, chainEntry{hashes: hashes, last: now})
-		touched = len(s.chains) - 1
-	}
-	if len(s.chains) > maxChains {
-		victim := -1
-		main := s.mainChainLocked()
-		for i := range s.chains {
-			if i == main {
-				continue
-			}
-			if victim < 0 || len(s.chains[i].hashes) < len(s.chains[victim].hashes) ||
-				(len(s.chains[i].hashes) == len(s.chains[victim].hashes) && s.chains[i].last.Before(s.chains[victim].last)) {
-				victim = i
-			}
-		}
-		if victim >= 0 {
-			s.chains = append(s.chains[:victim], s.chains[victim+1:]...)
-			if victim < touched {
-				touched--
-			}
-		}
-	}
-	s.rebuildDispSet()
-	// the dispatch is MAIN iff it landed on the (now-)largest chain; the
-	// touched entry's `last` is `now`, so it wins recency ties
-	return touched == s.mainChainLocked()
-}
-
-// mainChainLocked is the index of the largest chain (ties: latest last).
-func (s *sessionBlocks) mainChainLocked() int {
-	best := 0
-	for i := range s.chains {
-		if len(s.chains[i].hashes) > len(s.chains[best].hashes) ||
-			(len(s.chains[i].hashes) == len(s.chains[best].hashes) && s.chains[i].last.After(s.chains[best].last)) {
-			best = i
-		}
-	}
-	return best
-}
-
-// isPrefix reports whether a is a hash-prefix of b (chained hashes:
-// extension of the same conversation prefix).
-func isPrefix(a, b []Hash) bool {
-	if len(a) == 0 || len(a) > len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// expireChains drops chains with no dispatch for longer than maxAge and
-// rebuilds the set — EXCEPT the main (largest) chain, which is never
-// expired (V2: the main thread may wait on its sub-agents for minutes;
-// dropping its chain would unreserve the very blocks its next turn
-// needs). Returns true if anything changed.
-func (s *sessionBlocks) expireChains(maxAge time.Duration, now time.Time) bool {
-	if !s.useChains || len(s.chains) == 0 {
-		return false
-	}
-	main := s.mainChainLocked()
-	kept := s.chains[:0]
-	changed := false
-	for i, c := range s.chains {
-		if i != main && now.Sub(c.last) > maxAge {
-			changed = true
-			continue
-		}
-		kept = append(kept, c)
-	}
-	if changed {
-		s.chains = kept
-		s.rebuildDispSet()
-	}
-	return changed
-}
-
 func (s *sessionBlocks) rebuildDispSet() {
 	s.dispSet = make(map[Hash]struct{})
-	if s.useChains {
-		for _, c := range s.chains {
-			for _, h := range c.hashes {
-				s.dispSet[h] = struct{}{}
-			}
-		}
-		return
-	}
 	for _, w := range s.dispHist {
 		for _, h := range w {
 			s.dispSet[h] = struct{}{}
@@ -821,11 +651,7 @@ func (b *BlockIndex) SettleDispatchedAtLocked(id, reqID string, hashes []Hash, n
 	}
 	main := true
 	if hashes != nil {
-		if s.useChains {
-			main = s.pushChain(hashes, now)
-		} else {
-			s.pushDispatched(hashes)
-		}
+		s.pushDispatched(hashes)
 	}
 	b.applyDeltaLocked(s, old)
 	return main

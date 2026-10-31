@@ -36,7 +36,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
@@ -93,12 +92,14 @@ type GroupScheduler struct {
 	capMu     sync.Mutex
 	endpoints map[string]*endpointState // endpoint id -> handle + acquisition state
 	hetero    map[string]struct{}       // engines already reported as capacity-heterogeneous
-	// pooledCount is the number of endpoints the pooled (engineGroups=single)
-	// group is summing, kept as an ATOMIC so the hot path costs one load and a
-	// no-change swap; pooledOnce LATCHES the AUDIT-N1 warning so it is emitted
-	// exactly once without a lock-guarded comparison per request.
-	pooledCount atomic.Int64
-	pooledOnce  sync.Once
+	// liveSource is the ONLY sanctioned per-engine metrics view: the core's own
+	// detector plugin, which the framework hands the LIVE datastore endpoints on
+	// every Saturation call. A remembered endpoint handle carries a metrics CLONE
+	// taken at construction (fwksched.NewEndpoint → metrics.Clone()), so reading one
+	// freezes the gate's input whenever dispatches stop — the E-wave latch. nil when
+	// no group-safety-detector is configured, in which case nothing pushes load and
+	// the net stays open (the default module is a noop anyway).
+	liveSource func() map[string]engineSample
 
 	// ---- the placement pin (E4a, bindingMode=seat) ----
 	//
@@ -111,7 +112,10 @@ type GroupScheduler struct {
 
 // endpointState is one discovered endpoint's capacity-acquisition state.
 type endpointState struct {
-	ep metricsSource
+	// NOTE: no metrics handle is stored. A remembered handle's metrics are a
+	// construction-time CLONE (fwksched.NewEndpoint → metrics.Clone()), so every read
+	// of one is a frozen input; the live view is the detector plugin's sample set
+	// (liveSource).
 	// firstSeen is this endpoint's first observation (its OWN liveness
 	// deadline starts here, not the process's).
 	firstSeen time.Time
@@ -157,49 +161,16 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	if echo, err := json.Marshal(cfg); err == nil {
 		fmt.Printf("group-scheduler: effective config %s\n", echo)
 	}
-	// WAVE-1 item 2: the member-key mode is the one knob whose EFFECT is
-	// invisible in the config text ("auto" resolves per request), so state
-	// the resolution rule in words at startup and log the first resolution
-	// at runtime.
-	fmt.Printf("group-scheduler: member key source: %s (%s); session ordering: %s\n",
-		cfg.MemberKey, memberKeyRule(cfg.MemberKey), cfg.SessionOrder)
-	// The engine scope is the one knob whose EFFECT is a discovered set, so
-	// state it in words: a run whose config says per-engine but whose EPP
-	// sees one endpoint is numerically a single-engine run.
-	if cfg.perEngine() {
-		fmt.Printf("group-scheduler: engine groups: PER-ENGINE — one fairness group per DISCOVERED endpoint (own index, own 95%% budget, own cold-entry cap, own rotation loop); identity stays global; members are homed at first seat and never migrate while active. Groups are created on endpoint add and torn down on endpoint delete.\n")
+	// The policy has no MODES left, so the echo states the six things it does in
+	// words — a run's artifacts then say what ran without decoding knob names.
+	fmt.Printf("group-scheduler: CORE policy — identity: derived branch (member = queue key; nothing is written into the session slot)\n")
+	fmt.Printf("group-scheduler: CORE policy — sizing: per-engine seat budget = %v x that engine's measured num_gpu_blocks; footprint from the engine's own block index (dedup + cold-token estimate)\n", cfg.GroupBudgetFraction)
+	fmt.Printf("group-scheduler: CORE policy — admission: ONE shared waiter queue, newcomer-first then oldest; the head goes to the engine with the MOST FREE BUDGET where it fits (tie -> lowest engine id); the binding lasts only while seated\n")
+	fmt.Printf("group-scheduler: CORE policy — rotation: fixed quantum Q=%d completed busy periods (plus silence > %vs); memory pressure: the budget valve\n", cfg.quantum(), cfg.IdleSeconds)
+	if cfg.Safety == "none" {
+		fmt.Printf("group-scheduler: CORE policy — safety: NONE (the seat budget IS the admission control; run-level safety is preemptions <= the FCFS arm's)\n")
 	} else {
-		fmt.Printf("group-scheduler: engine groups: SINGLE — one group sums every endpoint into one pool (correct only for one engine; the multi-pod arms set engineGroups=per-engine)\n")
-	}
-	// F-arms: echo each knob in words when it is NOT at its default, so a run's
-	// artifacts state which rotation policy actually ran.
-	fmt.Printf("group-scheduler: rotation policy: mode=%s quantum=%d quantumMode=%s ceiling=%d entryOrder=%s victimOrder=%s rotateWhenFree=%v maxNumBatchedTokens=%d longQuantum=%d eligibilityMode=%s\n",
-		cfg.RotationMode, cfg.quantum(), cfg.QuantumMode, cfg.QuantumCeiling, cfg.EntryOrder,
-		cfg.VictimOrder, cfg.RotateWhenFree, cfg.MaxNumBatchedTokens, cfg.LongQuantum, cfg.EligibilityMode)
-	if cfg.patOn() {
-		// PAT is an adaptive rule whose output (which member, which reason) is invisible
-		// in the config text, so state it in words: the two eligibility rules, the three
-		// inputs they read and the one constant that is NOT a policy knob (the ceiling is
-		// the measured Q8 knee).
-		q, bounded := sched.patFairShare()
-		fair := "unbounded (quantumBusyPeriods=-1: only the ceiling can fire)"
-		if bounded {
-			fair = fmt.Sprintf("%d busy periods (the quantum)", q)
-		}
-		fmt.Printf("group-scheduler: eligibility model: PAT — PAUSE-ALIGNED TENURE. Eligible iff (a) FAIR SHARE served (%s) AND idle (no queued turn, nothing in flight) AND residue class COLD (the parameter-free model predicts under half the chain resident: the pause OUTLIVED THE CACHE, derived from block ALLOCATIONS — no clock, no threshold, no cache read), or (b) the safety CEILING (%d busy periods, the measured-safe knee) is reached. Nothing is released before fair share; the victim order among the eligible is F6″'s (coldest class, then raw ratio, then oldest last completion, then id). Counters: llm_d_epp_group_pat_eligible_fair_share_cold_total / _pat_eligible_ceiling_total.\n",
-			fair, sched.patCeiling())
-	}
-	if cfg.residueOn() {
-		fmt.Printf("group-scheduler: residue model: TIEBREAK — a per-engine shadow of vLLM's free-block queue (allocate from the head, free tail-block-first to the tail, live blocks never evictable) predicts the surviving PREFIX of a returning member's chain and breaks ties among FIT-PASSING engines only (never a ranker of two cold engines). Reconciled at settle against usage.cached_tokens; parameter-free (no clock, no threshold, no cache read).\n")
-	} else {
-		fmt.Printf("group-scheduler: residue model: OFF — the seat-time engine choice is fit → least relative backlog per seat → cheapest-victim engine.\n")
-	}
-	// E4a: the binding model is the ONE variable between the E3 and E4a arms, so
-	// the run artifact must state it in words as well as in the config echo.
-	if cfg.seatPin() {
-		fmt.Printf("group-scheduler: binding mode: SEAT = PIN — the member→engine binding IS the current seat (created at seat, dropped at exit; no TTL, no pre-seat homing); waiters are ONE GLOBAL POOL and the seat engine is chosen by fit → least relative backlog per seat → cheapest-victim; placement is pinned by THIS plugin's scheduling Filter (no external session-affinity-filter).\n")
-	} else {
-		fmt.Printf("group-scheduler: binding mode: MEMBER-STABLE — the engine is chosen ONCE at first sight and kept (bindingTtlSeconds=%.0f); waiters are partitioned per engine; placement is pinned externally (session-affinity-filter) or not at all.\n", cfg.BindingTTLSeconds)
+		fmt.Printf("group-scheduler: CORE policy — safety: MEMORY-ONLY net per engine, fires at measured kv >= %v (the budget's own fraction; no queue term), holds that engine's own dispatches and new seats, never influences placement\n", cfg.GroupBudgetFraction)
 	}
 	// The observation hooks are installed UNCONDITIONALLY: the metrics they
 	// feed are nil-safe, and a unit-mode run (no handle) must record the same
@@ -213,36 +184,11 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		fmt.Printf("group-scheduler: AFFINITY VIOLATION member=%s charged=%s observed=%s — rebound (the observed endpoint wins)\n",
 			member, engineLabel(from), engineLabel(to))
 	}
-	// E4a: the pin table follows the SEATS. Installed in BOTH binding models —
-	// the Filter ignores it outside seat mode, and a table that is filled in
-	// member-stable mode costs one map write per seat.
+	// The pin table follows the SEATS: one map write per seat, one delete per exit.
 	r.sched.onBind = func(member, engine string) { r.pins.set(member, engine) }
 	r.sched.onUnbind = func(member string) { r.pins.del(member) }
-	// E4b: the counterfactual export. Every seat-time engine choice reports the
-	// predicted surviving fraction and whether the MODEL decided it; every settle
-	// reports (predicted, actual) so the arm can score its own argmax post-hoc
-	// against usage.cached_tokens. An engine that drops to fit-only says so once.
-	r.sched.onResiduePick = func(engine string, predicted float64, decided bool) {
-		r.metrics.ObserveResiduePredicted(engineLabel(engine), predicted, decided)
-	}
-	r.sched.onResidueSettle = func(engine string, predicted, actual float64) {
-		r.metrics.ObserveResidueSettled(engineLabel(engine), predicted, actual)
-	}
-	r.sched.onEngineGateSkip = func(engine string) {
-		r.metrics.ObserveEngineGateSkip(engineLabel(engine))
-	}
 	r.sched.onValveBlockedEviction = func(engine string) {
 		r.metrics.ObserveValveBlockedEviction(engineLabel(engine))
-	}
-	// PAT: one increment per member that BECOMES eligible, on the counter of the rule
-	// that made it eligible — the mechanism's visibility in the run's artifacts.
-	r.sched.onPatEligible = func(engine, reason string) {
-		r.metrics.ObservePatEligible(engineLabel(engine), reason)
-	}
-	r.sched.onResidueDisabled = func(engine string) {
-		r.metrics.SetResidueDisabled(engineLabel(engine))
-		fmt.Printf("group-scheduler: RESIDUE MODEL DISABLED on engine=%s — sustained prediction error above %.2f over >=%d reconciled requests. That engine is now ranked by fit → backlog only (never by residue). Cause is almost always a state the model cannot see: an engine restart, a second EPP replica, or traffic outside this EPP.\n",
-			engineLabel(engine), residueErrLimit, residueMinCalibration)
 	}
 	r.sched.onEngineGone = func(engine string, members int) {
 		r.metrics.ObserveEngineGone()
@@ -250,6 +196,21 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 			engineLabel(engine), members)
 	}
 	if handle != nil {
+		// THE LIVE METRICS SOURCE: the core's own detector plugin reads the live
+		// datastore endpoints (the framework passes them to every Saturation call), so
+		// its samples are the only view whose input updates WITHOUT a dispatch.
+		for _, p := range handle.GetAllPlugins() {
+			if p == nil || p.TypedName().Type != SafetyDetectorPluginType {
+				continue
+			}
+			if det, ok := p.(*SafetyDetectorPlugin); ok {
+				r.liveSource = det.Samples
+				fmt.Printf("group-scheduler: safety input wired to the LIVE detector plugin %q (its samples come from the framework's live endpoint datastore, never from a remembered clone)\n", p.TypedName().Name)
+			}
+		}
+		if r.liveSource == nil {
+			fmt.Printf("group-scheduler: WARNING no '%s' in this config — the safety module receives NO live input (it stays open; the seat budget is the admission control) and per-engine capacity comes only from the endpoint-event metrics.\n", SafetyDetectorPluginType)
+		}
 		if reg := handle.Metrics(); reg != nil {
 			if err := r.metrics.register(reg); err != nil {
 				return nil, fmt.Errorf("failed to register metrics of the '%s' plugin: %w", PluginType, err)
@@ -373,47 +334,29 @@ func readID(request *fwksched.InferenceRequest, key fwkplugin.DataKey) string {
 	return id
 }
 
-// memberOf resolves the request's MEMBER id, its SESSION attribute, and which
-// source produced the member (Config.MemberKey):
+// memberOf resolves the request's MEMBER id and the source that produced it:
 //
-//	branch  -> the derived branch id (branch-identity)
-//	session -> the agent-identity session attribute (pre-WAVE-1 behaviour)
+//	branch  -> the derived branch id (branch-identity; the BASE mode)
+//	session -> the agent-identity session attribute, when the branch plugin is not
+//	           in the config (the queue key is then the session, as it always was)
 //	(none)  -> nothing resolvable: anonymous traffic, R9 FCFS pass-through
 //
-// It is a PURE READ. The branch id is never written into the agent-identity
-// slot (in session mode that slot must hold the real session), and the session
-// attribute is never derived from the branch here — the session layer applies
-// its own "session := member when absent" rule, in ONE place, in the
-// scheduler.
-func (r *GroupScheduler) memberOf(request *fwksched.InferenceRequest) (member, session, source string) {
+// It is a PURE READ: the branch id is never written into the agent-identity slot
+// (that slot keeps meaning "the client's session" for the rest of the stack).
+func (r *GroupScheduler) memberOf(request *fwksched.InferenceRequest) (member, source string) {
 	if request == nil {
-		return "", "", ""
+		return "", ""
 	}
 	// reads are lazy: the hot Pick path pays at most two attribute loads (the
-	// branch, and the session only when it is the member source). At most two
-	// per head is the ceiling — attribute loads are a sync.Map read.
-	branch := readID(request, branchidentity.BranchIdentityKey)
-	session = r.sessionAttr(request)
-	switch r.cfg.MemberKey {
-	case "branch":
-		if branch != "" {
-			return branch, session, "branch"
-		}
-		return "", session, ""
-	case "session":
-		if session != "" {
-			return session, session, "session"
-		}
-		return "", session, ""
-	default: // "auto": branch when present, else the session, else R9
-		if branch != "" {
-			return branch, session, "branch"
-		}
-		if session != "" {
-			return session, session, "session"
-		}
-		return "", "", ""
+	// branch, and the session only when the branch is absent). Attribute loads are a
+	// sync.Map read.
+	if branch := readID(request, branchidentity.BranchIdentityKey); branch != "" {
+		return branch, "branch"
 	}
+	if session := r.sessionAttr(request); session != "" {
+		return session, "session"
+	}
+	return "", ""
 }
 
 // sessionAttr is the request's SESSION attribute: the system's agent-identity
@@ -462,23 +405,12 @@ func (r *GroupScheduler) validateMemberProducer() error {
 			s = true
 		}
 	}
-	switch r.cfg.MemberKey {
-	case "branch":
-		if !b {
-			return fmt.Errorf("memberKey=\"branch\" requires the '%s' plugin in the same config (the member id comes from its derived branch)", branchidentity.PluginType)
-		}
-	case "session":
-		if !s {
-			return fmt.Errorf("memberKey=\"session\" requires the '%s' plugin in the same config (the member id comes from the session attribute)", agentidentity.PluginType)
-		}
-	default:
-		if !b && !s {
-			return fmt.Errorf("memberKey=%q needs at least one identity plugin ('%s' or '%s'); with neither, every request is anonymous and the group policy degrades to R9 FCFS",
-				"auto", branchidentity.PluginType, agentidentity.PluginType)
-		}
+	if !b && !s {
+		return fmt.Errorf("the identity source needs at least one identity plugin ('%s' or '%s'); with neither, every request is anonymous and the group policy degrades to R9 FCFS",
+			branchidentity.PluginType, agentidentity.PluginType)
 	}
 	if b && !s {
-		fmt.Printf("group-scheduler: no '%s' plugin in the config — the SESSION attribute is absent, so the session layer runs with session := member (base mode)\n", agentidentity.PluginType)
+		fmt.Printf("group-scheduler: no '%s' plugin in the config — the SESSION attribute is absent, so the derived branch is the member key on every request (base mode)\n", agentidentity.PluginType)
 	}
 	return nil
 }
@@ -620,26 +552,7 @@ func (r *GroupScheduler) rememberEndpoint(ep metricsSource) {
 		st = &endpointState{firstSeen: time.Now()}
 		r.endpoints[key] = st
 	}
-	st.ep = ep // the handle is refreshed: the datalayer swaps metrics in place
-	n := int64(len(r.endpoints))
-	pooled := !r.cfg.perEngine()
-	want := int64(0)
-	if pooled {
-		want = n
-	}
-	// One atomic swap: the gauge is touched only when the pool size CHANGES, so
-	// rememberEndpoint (called on every PreRequest) costs a load + a swap.
-	if r.pooledCount.Swap(want) != want {
-		r.metrics.SetPooledEndpoints(int(want))
-	}
-	if pooled && n > 1 {
-		// AUDIT N1: the knob's default fails OPEN, so a multi-endpoint pool is
-		// announced ONCE (sync.Once — latched, never re-tested per request) and
-		// reported forever as llm_d_epp_group_pooled_endpoints.
-		r.pooledOnce.Do(func() {
-			fmt.Printf("group-scheduler: WARNING engineGroups=single with %d discovered endpoints — the policy is POOLING independent engines into ONE group: one BlockIndex (a block on A counted as if B held it), one budget, one seat set, and the capacity comes from whichever engine reported first. That is correct only for a single-engine stack: set engineGroups=per-engine for a multi-engine stack. llm_d_epp_group_pooled_endpoints reports the pool size.\n", n)
-		})
-	}
+	_ = ep // the handle is NOT stored: see endpointState's note (live read only)
 }
 
 func (r *GroupScheduler) forgetEndpoint(ep metricsSource) {
@@ -668,81 +581,66 @@ func endpointKey(ep metricsSource) string {
 	return fmt.Sprint(ep)
 }
 
-// pushEngineLoad feeds the PER-ENGINE saturation gate (engineGate=per-engine) from
-// the endpoint metrics the plugin already polls. The policy never scrapes and never
-// blocks; it receives one snapshot per engine per tick and applies the DETECTOR'S
-// OWN FORMULA per engine (max(waiting/queueThreshold, kv/kvThreshold) >= 1).
+// pushEngineLoad feeds the safety module and the capacity path from the LIVE
+// per-engine sample set — never from a remembered endpoint (see liveSource: a
+// remembered handle's metrics are a construction-time CLONE, which is how the E-wave's
+// gate latched closed; nothing in this core reads one).
 //
-// A vanished endpoint's snapshot is cleared, because a stale "saturated" flag on an
-// engine the EPP no longer sees would keep a live sibling's gate closed forever.
+// A vanished endpoint's snapshot is cleared, because a stale verdict on an engine the
+// EPP no longer sees would keep it idle forever.
 func (r *GroupScheduler) pushEngineLoad(now time.Time) {
-	if !r.cfg.engineGating() {
+	if r.liveSource == nil {
 		return
 	}
-	r.capMu.Lock()
-	type target struct {
-		key string
-		ep  metricsSource
-	}
-	targets := make([]target, 0, len(r.endpoints))
-	for key, st := range r.endpoints {
-		if st == nil || st.ep == nil {
-			continue
+	samples := r.liveSource()
+	seen := make(map[string]struct{}, len(samples))
+	for engine, sm := range samples {
+		seen[engine] = struct{}{}
+		// the sample carries the time the detector READ the datastore, so a frozen
+		// upstream is visible as staleness instead of being papered over with `now`
+		r.sched.SetEngineLoad(engine, sm.kv, sm.waiting, now)
+		if sm.blockSz > 0 && sm.numBlk > 0 && !r.sched.HasCapacityFor(engine) {
+			// the live path also closes the capacity race: the event-time clone may
+			// carry an empty geometry forever
+			if err := r.learnCapacity(engine, &fwkdl.Metrics{CacheBlockSize: sm.blockSz,
+				CacheNumBlocks: sm.numBlk}, "live-detector"); err != nil {
+				fmt.Printf("group-scheduler: CAPACITY REJECTED from the live detector engine=%s: %v\n", r.sched.GroupLabel(engine), err)
+			}
 		}
-		targets = append(targets, target{key: key, ep: st.ep})
-	}
-	r.capMu.Unlock()
-	sort.Slice(targets, func(i, j int) bool { return targets[i].key < targets[j].key })
-	seen := make(map[string]struct{}, len(targets))
-	for _, t := range targets {
-		m := t.ep.GetMetrics()
-		if m == nil {
-			continue
-		}
-		seen[t.key] = struct{}{}
-		r.sched.SetEngineLoad(t.key, m.KVCacheUsagePercent, m.WaitingQueueSize, now)
 	}
 	r.sched.ForgetEngineLoadsExcept(seen)
 }
 
-// pollCapacity is the METRICS-POLL FALLBACK (WAVE-1 item 1), run on the
-// ticker while the capacity is unknown: re-read every remembered endpoint's
-// metrics (the datalayer refreshes them in place on the same object) and take
-// the first one that carries the cache geometry. It also carries the STARTUP
-// LIVENESS check: once a decode endpoint has been observed, the capacity must
-// arrive within capacityLivenessSeconds, else the FCFS pass-through (A5) is
-// being served silently — log loudly and raise the missing gauge.
+// pollCapacity is the STARTUP LIVENESS check (WAVE-1 item 1): once a decode endpoint
+// has been observed, its capacity must arrive within capacityLivenessSeconds, else
+// the FCFS pass-through (A5) is being served silently — log loudly and raise the
+// missing gauge.
+//
+// It reads NO metrics: the capacity RETRY rides the live detector samples
+// (pushEngineLoad, same tick). A remembered endpoint handle carries a
+// construction-time metrics CLONE, so a poll over clones could never see the geometry
+// arrive late — the read that used to live here was itself the capacity-race bug's
+// shape (and, for the gate, the E-wave latch).
 func (r *GroupScheduler) pollCapacity(now time.Time) {
 	r.capMu.Lock()
 	type pollTarget struct {
 		key       string
-		ep        metricsSource
 		firstSeen time.Time
 		warned    bool
 	}
 	targets := make([]pollTarget, 0, len(r.endpoints))
 	for key, st := range r.endpoints {
-		if st == nil || st.ep == nil {
+		if st == nil {
 			continue
 		}
-		targets = append(targets, pollTarget{key: key, ep: st.ep, firstSeen: st.firstSeen, warned: st.warned})
+		targets = append(targets, pollTarget{key: key, firstSeen: st.firstSeen, warned: st.warned})
 	}
 	r.capMu.Unlock()
 
-	// sort for a deterministic log/poll order (the map is not)
+	// sort for a deterministic log order (the map is not)
 	sort.Slice(targets, func(i, j int) bool { return targets[i].key < targets[j].key })
 
 	for _, t := range targets {
-		if r.sched.HasCapacityFor(t.key) {
-			continue
-		}
-		if err := r.learnCapacity(t.key, t.ep.GetMetrics(), "metrics-poll"); err != nil {
-			// a block-size mismatch is loud and permanent: keep it in the
-			// log, don't spin the ticker on it
-			if !t.warned {
-				fmt.Printf("group-scheduler: CAPACITY REJECTED from metrics-poll engine=%s: %v\n", r.sched.GroupLabel(t.key), err)
-			}
-		}
 		if r.sched.HasCapacityFor(t.key) {
 			continue
 		}
@@ -759,8 +657,8 @@ func (r *GroupScheduler) pollCapacity(now time.Time) {
 		}
 		r.capMu.Unlock()
 		r.metrics.SetCapacityMissing(r.sched.GroupLabel(t.key), true)
-		fmt.Printf("group-scheduler: CAPACITY MISSING engine=%s — its num_gpu_blocks is still unknown %.0fs after the endpoint was observed (%d endpoint(s) polled): that engine seats nothing while the policy looks healthy, and any dispatch it takes is FCFS pass-through (A5). Check that the endpoint metrics carry cache block size/num blocks (--refresh-metrics-interval), and that the EPP was rolled AFTER decode readiness.\n",
-			engineLabel(t.key), now.Sub(t.firstSeen).Seconds(), len(targets))
+		fmt.Printf("group-scheduler: CAPACITY MISSING engine=%s — its num_gpu_blocks is still unknown %.0fs after the endpoint was observed (%d endpoint(s) tracked): that engine seats nothing while the policy looks healthy, and any dispatch it takes is FCFS pass-through (A5). Check that the endpoint metrics carry cache block size/num blocks (--refresh-metrics-interval) and that a '%s' is configured (the live metrics path).\n",
+			engineLabel(t.key), now.Sub(t.firstSeen).Seconds(), len(targets), SafetyDetectorPluginType)
 	}
 }
 
@@ -781,11 +679,11 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 		if h == nil {
 			return true
 		}
-		member, scope, source := "", "", ""
+		member, source := "", ""
 		reqID, size, fid := "", int64(0), ""
 		if req := h.OriginalRequest(); req != nil {
 			if ir := req.InferenceRequest(); ir != nil {
-				member, scope, source = r.memberOf(ir)
+				member, source = r.memberOf(ir)
 				reqID = ir.RequestID
 				fid = ir.FairnessID // the wire-level identity (the queue key)
 				size = int64(ir.RequestSizeBytes)
@@ -795,7 +693,7 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 			}
 		}
 		queues = append(queues, q)
-		heads = append(heads, Head{Member: member, Session: scope, Source: source,
+		heads = append(heads, Head{Member: member, Source: source,
 			FairnessID: fid, ReqID: reqID, Arrival: h.EnqueueTime(), SizeBytes: size})
 		return true
 	})
@@ -839,23 +737,9 @@ func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.Inferen
 			return err // the loud mismatch failure
 		}
 	}
-	id, _, _ := r.memberOf(request)
+	id, _ := r.memberOf(request)
 	if id == "" {
 		return nil
-	}
-	// V3/R6: the engine-side stagger — RESIDENT turns get priority over
-	// cold ENTRY prefills in vLLM's waiting loop (Phase-2 deployments
-	// with --scheduling-policy priority; lower value = higher
-	// priority). The split is entry-vs-resident, not seated-vs-not:
-	// seating happens in Pick BEFORE PreRequest, so a seated test would
-	// mark every tracked request high. EntryTurn marks this residency's
-	// first dispatch (the entry) low; every later turn is high.
-	if r.cfg.PriorityHeader == "engine" && request.Headers != nil {
-		if r.sched.EntryTurn(id) {
-			request.Headers["X-Vllm-Priority"] = "10"
-		} else {
-			request.Headers["X-Vllm-Priority"] = "0"
-		}
 	}
 	keys := r.blockKeysFor(request)
 	if keys == nil {
@@ -893,7 +777,7 @@ func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.Infer
 	if request == nil || response == nil {
 		return
 	}
-	id, _, _ := r.memberOf(request)
+	id, _ := r.memberOf(request)
 	if id == "" {
 		return
 	}

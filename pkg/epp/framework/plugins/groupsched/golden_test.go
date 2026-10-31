@@ -155,8 +155,8 @@ func runGoldenScenario(t *testing.T) string {
 // session-ordering equality test: cfg is the scheduler config and sessions
 // maps a scripted chain's id to its SESSION attribute (nil = every head
 // carries none, i.e. session := member — base mode).
-func runGoldenScenarioCfg(t *testing.T, simEnd int, cfg Config, sessions func(id string) string) string {
-	return runGoldenScenarioFull(t, simEnd, cfg, sessions)
+func runGoldenScenarioCfg(t *testing.T, simEnd int, cfg Config) string {
+	return runGoldenScenarioFull(t, simEnd, cfg)
 }
 
 // runGoldenScenarioEnd drives the scenario truncated at simEnd (the
@@ -168,10 +168,10 @@ func runGoldenScenarioCfg(t *testing.T, simEnd int, cfg Config, sessions func(id
 // hidden; S1).
 func runGoldenScenarioEnd(t *testing.T, simEnd int) string {
 	t.Helper()
-	return runGoldenScenarioFull(t, simEnd, defaultConfig(), nil)
+	return runGoldenScenarioFull(t, simEnd, defaultConfig())
 }
 
-func runGoldenScenarioFull(t *testing.T, simEnd int, cfg Config, sessions func(id string) string) string {
+func runGoldenScenarioFull(t *testing.T, simEnd int, cfg Config) string {
 	t.Helper()
 	s, err := NewScheduler(cfg)
 	if err != nil {
@@ -234,13 +234,8 @@ func runGoldenScenarioFull(t *testing.T, simEnd int, cfg Config, sessions func(i
 		for _, g := range ss {
 			if g.nextTurn <= sim {
 				// the head is queued since nextTurn
-				sess := ""
-				if sessions != nil {
-					sess = sessions(g.id)
-				}
 				hs = append(hs, Head{
 					Member:    g.id,
-					Session:   sess,
 					ReqID:     fmt.Sprintf("%s-r%02d", g.id, reqSeq[g.id]+1),
 					Arrival:   goldenT0.Add(time.Duration(g.nextTurn) * time.Second),
 					SizeBytes: int64(len(g.chain)+g.turnBlocks()) * 4 * 64,
@@ -466,5 +461,51 @@ func TestGoldenHashesPinned(t *testing.T) {
 		if got != h {
 			t.Fatalf("%s: sha256 %s != pinned %s — if the change is intended, update both the trace and testdata/SHA256SUMS (and say why in the commit)", name, got, h)
 		}
+	}
+}
+
+// ---- GSCH-CORE: the f0p golden equality ----
+//
+// The core's baseline is f0p — the single-pod anchor every banked number is stated
+// against. testdata/golden-f0p-core.txt was produced by the ARCHIVE build
+// (dsai/groupsched-tier-aware @ dd5350b5) on THIS scenario with f0p's rendered
+// config: rotationMode=quantum Q4, valve on, victimOrder legacy, windowMode last4,
+// gateMode detector (no plugin-side dispatch gate), engineGroups=per-engine,
+// bindingMode=member-stable, every F/PAT/residue knob at its default-off value.
+//
+// The core must reproduce it BYTE FOR BYTE at N=1. The ONE declared behavioural
+// difference between the two builds is the safety module, and this comparison is
+// exact because of the module's DEFAULT: NoopSafety (the seat budget is the whole
+// admission control). f0p's plugin-side gate was OFF as well, so the two builds run
+// with the SAME gate state — open, always. (Run the core with safety=budget-fraction
+// and the trace MAY diverge wherever that net fires; that arm's divergence is the
+// measured effect of the net, not a golden violation, and the wave's matched anchor
+// arm measures it on the cluster.)
+//
+// What the trace proves: identical picks, identical seats, identical exits with
+// reasons, identical seated-set transitions, identical served/refill totals, over
+// 2,600 simulated seconds and 1,210 dispatches.
+func TestCoreEqualsF0P(t *testing.T) {
+	got := runGoldenScenario(t)
+	want, err := os.ReadFile(filepath.Join("testdata", "golden-f0p-core.txt"))
+	if err != nil {
+		t.Fatalf("f0p golden missing: %v", err)
+	}
+	if got != string(want) {
+		gotL := strings.Split(got, "\n")
+		wantL := strings.Split(string(want), "\n")
+		for i := 0; i < len(gotL) || i < len(wantL); i++ {
+			var a, b string
+			if i < len(gotL) {
+				a = gotL[i]
+			}
+			if i < len(wantL) {
+				b = wantL[i]
+			}
+			if a != b {
+				t.Fatalf("core/f0p divergence at line %d:\n  core: %s\n  f0p:  %s", i+1, a, b)
+			}
+		}
+		t.Fatal("core/f0p divergence (length)")
 	}
 }

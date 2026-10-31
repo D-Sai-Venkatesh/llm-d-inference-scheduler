@@ -219,12 +219,50 @@ valve-held attribution, the C8 gauge/counter). An intermediate image of the modu
 alone (`groupsched-197c658e`) was built and is SUPERSEDED: no arm used it, and it lacks the
 observability pair the B5/B6 pre-flight reads.
 
+## 4a2. THE THIRD DIGEST — the ACCOUNTING BUG-FIX build (2026-11-01)
+
+    EPP_IMAGE_TAG=groupsched-33e038da
+    EPP_IMAGE_DIGEST=sha256:cd73a1a41c3665dd01b06759838197a71418aca4508e08a486ccac367a6509fa   (OCI index, keeps the attestation)
+    EPP_IMAGE_DIGEST_AMD64=sha256:46483357da8dba17836a5ae66664db82e61ef22cc418d9e024fc40f24647c8e2
+    attestation manifest  sha256:b17d04a1853054583a9de649e8ad7bb4dbe56d24a8b34369f0dffa4cd0945010 (unknown/unknown,
+                          vnd.docker.reference.digest = the amd64 manifest)
+
+Built from dsai/gsch-core HEAD `33e038da3b016fb745e40824fbd4498b6e9eb9ee` with a clean tree,
+by the same recipe as §4a0/§4a1 (`docker buildx build --platform linux/amd64`, `--build-arg
+TARGETOS=linux TARGETARCH=amd64 COMMIT_SHA=<head> BUILD_REF=dsai/gsch-core LDFLAGS="-s -w"`,
+`--push`). Pull-back verification: the linux/amd64 manifest unpacks to a 75,587,746-byte
+x86-64 statically-linked stripped `/app/epp` whose build settings carry
+`CommitSHA=33e038da3b016fb745e40824fbd4498b6e9eb9ee` and `BuildRef=dsai/gsch-core`; strings
+carry `CORE policy`, `detector_pool_score`, `cold_valve_held_total`, `waiters_shared`,
+`most-free-budget`, `newcomer-first`, `hrrn-bounded`, `queue_view_age_seconds`,
+`queue_view_untrusted_passes_total` and the two series this build adds
+(`cold_cap_tokens`, `event_ring_dropped_total`); strings carry NONE of the removed
+series (`pat_eligible_*`, `residue_predicted_ratio`, `engine_gate_closed`,
+`pooled_endpoints`, `mlfq2`, `rotateWhenFree`) and no `coldEntryCapTokens` at all — the
+config key is gone, not merely defaulted.
+
+What it contains on top of §4a1 (one commit): the three accounting fixes and their
+goldens — (iii) an exiting member's blocks stay on the used side until it drains,
+(E) the cold-entry cap derived from the budget's headroom and enforced, (C) the
+trailing partial block counted. Both fix-bearing goldens were regenerated through the
+archive-patch recipe, so the new traces are archive-generated, not self-referential
+(package README §2/§2a, recipe §3). Divergence from the previous build is DECLARED:
+6,378 / 5,907 / 0 lines per fix alone on the 2,600 s replay, 989 dispatches vs 1,231.
+
+**First live use (ruled): same-digest ANCHORS for the offload solution — core-Q4 with
+offload OFF and ON at the load the reviewer picks.** The OFF anchor against
+`88e74f85`'s OFF cell quantifies the fixes' live effect (cross-digest, flagged as such):
+preemptions, throughput, and the pinned-set invariant (reconstructed pinned set <= pool at
+p90 per engine). Nothing launches on this digest before the reviewer has read
+OFFLOAD-SIMPLE c64.
+
 **WHICH BUILD EACH ARM RUNS** (ruled 2026-11-01 — one wave, one digest):
 
 | arms | build |
 |---|---|
 | the MP wave (`core-q4.env`, `core-q8.env`, `core-q4-anchor-n1.env`) | **§4a0** `groupsched-88e74f85` — that is where the wave is defined and where B1 ran. Do NOT re-pin these files (§4a1 exists for a different pair). |
-| B5/B6 (`core-q4-8397e9aa.env` ‖ `core-f5p-q4.env`) | **this digest** `groupsched-8397e9aa`, both arms, same hour — the pair carries its own same-digest Q4 anchor, so the entry order is the only difference between them. |
+| B5/B6 (`core-q4-8397e9aa.env` ‖ `core-f5p-q4.env`) | **§4a1** `groupsched-8397e9aa`, both arms, same hour — the pair carries its own same-digest Q4 anchor, so the entry order is the only difference between them. |
+| the offload anchors and every arm after the accounting build | **§4a2** `groupsched-33e038da` — the fixed core. One digest per wave still holds: the offload cells are its own same-digest OFF/ON pair. |
 
 The new build is decision-identical at `entryOrder: "newcomer-first"` (golden byte-identical
 at both commits), so nothing about the comparison depends on which build an arm runs; the

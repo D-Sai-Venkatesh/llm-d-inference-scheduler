@@ -152,67 +152,64 @@ func (s *Scheduler) mlffqLongLocked(m *member) bool {
 	return s.promoted[m.id] // survives rotation/exit: the class is a property of the member
 }
 
+// uncachedTokensLocked is the request's ESTIMATED UNCACHED prompt work against ONE
+// engine, in tokens: the tier-A keys this engine does not already hold, times the
+// block size. It is the policy's OWN accounting (dedup against the engine's index,
+// which is exactly what the NE-counter delta already computes) — no cache read.
+//
+// WHY NOT prompt tokens: prompt tokens make F7 degenerate. A warm seated turn is
+// 50-100k tokens at ~0.9 hit, so ONE such turn in prefill would exceed an 8,192-token
+// step budget 6-12x while its real prefill work is a few k — the gate would sit closed
+// almost permanently and F7 would be a fixed-Q arm (P∞ + ceiling) rather than a
+// load-adaptive one.
+func (s *Scheduler) uncachedTokensLocked(g *engineGroup, keys []Hash) int64 {
+	if g == nil || len(keys) == 0 {
+		return 0
+	}
+	var missing int64
+	for _, h := range keys {
+		if !g.index.HasNELocked(h) {
+			missing++
+		}
+	}
+	return missing * int64(s.blockSize)
+}
+
 // ---- F5 / F9: HRRN over the entry head ----
 
-// prefillRateLocked is the engine's MEASURED prefill rate in tokens/second, from
-// the running observations the scheduler already collects: each tracked request is
-// timed from its dispatch (PreRequest) to its FIRST TOKEN (ResponseBody's
-// StartOfStream), and paired at settle with that request's uncached prompt tokens.
-// EWMA (alpha 0.2) so a slow first observation does not pin the estimate.
+// entryPriorityLocked is F5's priority: the HRRN response ratio
 //
-// The confound is stated where it belongs: dispatch→first-token includes whatever
-// engine-side queueing the request suffered, so under load the estimate is a
-// conservative (lower) rate — which makes s LARGER for everybody, i.e. it changes
-// the SHAPE of the HRRN ratio less than it changes its scale.
-func (s *Scheduler) prefillRateLocked(g *engineGroup) (float64, bool) {
-	if g == nil || g.prefillSamples < prefillRateMinSamples || g.prefillRate <= 0 {
-		return 0, false
+//	(wait + s) / s
+//
+// with s the entry's estimated prefill SECONDS. The engine's measured prefill rate
+// is COMMON to every waiter at one decision instant, so it CANCELS out of the
+// ordering — (wait + cold/rate)/(cold/rate) is a monotone function of wait/cold — so
+// the key is computed directly as
+//
+//	wait / cold_tokens   (descending)
+//
+// which deletes the rate estimator, its EWMA constant, its warm-up period and its
+// fallback ordering: the rule is active from the first decision. This is the "equal
+// slowdown" criterion (waits proportional to entry size) — shortest-job-first that
+// cannot starve, because wait grows without bound while cold_tokens is fixed.
+//
+// The denominator is floored at one block so a zero-cold head is not a division by
+// zero; ties (wait 0, or equal ratios) fall through to the age/id tie-breaks of the
+// D1 key.
+func entryPriority(waitSeconds float64, coldTokens int64, blockSize int) float64 {
+	den := coldTokens
+	if den <= 0 {
+		den = int64(blockSize)
 	}
-	return g.prefillRate, true
-}
-
-// notePrefillLocked books one prefill observation: seconds from dispatch to first
-// token, and the uncached prompt tokens the engine actually had to prefill.
-func (s *Scheduler) notePrefillLocked(g *engineGroup, seconds float64, uncachedTokens int64) {
-	if g == nil || seconds <= 0 || uncachedTokens <= 0 {
-		return
+	if waitSeconds < 0 {
+		waitSeconds = 0
 	}
-	rate := float64(uncachedTokens) / seconds
-	g.prefillSamples++
-	if g.prefillSamples == 1 {
-		g.prefillRate = rate
-		return
-	}
-	g.prefillRate = 0.8*g.prefillRate + 0.2*rate
-}
-
-// estimatedPrefillSeconds is s in the HRRN ratio: the head's cold tokens over the
-// MEASURED rate. Returns (0,false) when no honest rate exists yet.
-func (s *Scheduler) estimatedPrefillSeconds(g *engineGroup, w *waiter) (float64, bool) {
-	rate, ok := s.prefillRateLocked(g)
-	if !ok {
-		return 0, false
-	}
-	if w.coldTokens <= 0 {
-		return 0, true // nothing to prefill: an infinite ratio, handled by the caller
-	}
-	return float64(w.coldTokens) / rate, true
+	return waitSeconds / float64(den)
 }
 
 // nowLocked is the current decision pass's clock (never time.Now — a golden replay
 // must be reproducible).
 func (s *Scheduler) nowLocked() time.Time { return s.now }
-
-// hrrn returns the response ratio (wait + s) / s: the LONGER a head waits, the
-// higher its priority, and the SMALLER its estimated service, the higher its
-// priority. That is shortest-job-first that cannot starve: wait grows without
-// bound, so every head eventually outranks every other.
-func hrrn(waitSeconds, serviceSeconds float64) float64 {
-	if serviceSeconds <= 0 {
-		return 1e18 // no prefill work: maximally attractive, still a finite ORDER
-	}
-	return (waitSeconds + serviceSeconds) / serviceSeconds
-}
 
 // ---- F6′: residue-driven seat release ----
 

@@ -119,79 +119,75 @@ func TestTenureCeilingBoundsDynamicQuantum(t *testing.T) {
 
 // ---- F5 HRRN ----
 
-// TestHRRNOrdersByTheRatio: the entry head is the highest (wait + s)/s, so a small
-// entry jumps an older large one only while its ratio is genuinely higher.
+// TestHRRNOrdersByTheRatio: the entry head is the highest wait/cold_tokens — the
+// HRRN ratio with the (common) prefill rate cancelled out — so a small entry jumps
+// an older large one only while its slowdown is genuinely higher.
 func TestHRRNOrdersByTheRatio(t *testing.T) {
 	s := fArmScheduler(t, func(c *Config) { c.EntryOrder = "hrrn" })
 	now := goldenT0
-	// seed a measured prefill rate: 6400 tokens in 1s = 6400 tok/s
-	s.mu.Lock()
-	s.eng().prefillSamples = prefillRateMinSamples
-	s.eng().prefillRate = 6400
-	s.mu.Unlock()
-
-	// waiter A: old (wait 100s), big (6400 cold tokens ⇒ s = 1s) → ratio 101
-	// waiter B: new (wait 1s), tiny (64 cold tokens ⇒ s = 0.01s) → ratio 101
-	// ⇒ nearly tied; then make B's wait 3s and its ratio wins outright.
 	mk := func(id string, since time.Time, cold int64) *waiter {
 		return &waiter{id: id, since: since, sizeBytes: bytesFor(int(cold / 64)), coldTokens: cold}
 	}
 	s.mu.Lock()
+	s.now = now
+	// A: waited 100s over 6400 cold tokens  → 0.0156 tokens-normalised
+	// B: waited 1s over 64 cold tokens      → 0.0156  (a near tie, B wins on age)
+	// C: waited 10s over 64 cold tokens     → 0.156   (the smallest job by far)
 	s.eng().waiters["A"] = mk("A", now.Add(-100*time.Second), 6400)
 	s.eng().waiters["B"] = mk("B", now.Add(-1*time.Second), 64)
-	s.eng().waiters["C"] = mk("C", now.Add(-1000*time.Second), 64) // huge wait, tiny job
+	s.eng().waiters["C"] = mk("C", now.Add(-10*time.Second), 64)
 	head := s.entryHeadLocked(s.eng(), nil)
 	s.mu.Unlock()
 	if head == nil || head.id != "C" {
-		t.Fatalf("HRRN head = %v, want C (wait 1000s over 0.01s service)", head)
+		t.Fatalf("HRRN head = %v, want C (10s / 64 tokens = the highest slowdown)", head)
 	}
-	// raise A's wait so its ratio overtakes C's
+	// a big head that has waited long enough takes over — the ratio is monotone in
+	// wait, which is the whole no-starvation argument. The takeover is NOT soon: the
+	// bound is the small job's ratio x the big job's cold tokens (~500,000s here),
+	// which is exactly why "wait/cold" is a starvation-free order rather than a
+	// small-first-forever one.
 	s.mu.Lock()
-	s.now = now.Add(10000 * time.Second)
+	// age ONLY the big head: its competitors' waits stay where they were (sustained
+	// arrivals keep producing FRESH small jobs, which is the regime that matters).
+	s.eng().waiters["A"].since = now.Add(-600000 * time.Second)
 	head = s.entryHeadLocked(s.eng(), nil)
+	kA := s.entryKeyLocked(s.eng().waiters["A"], nil)
+	kC := s.entryKeyLocked(s.eng().waiters["C"], nil)
 	s.mu.Unlock()
 	if head == nil {
 		t.Fatal("no head")
 	}
-	// C's ratio also grew (tiny service), so C still wins — the property is
-	// MONOTONICITY in wait, not a swap. Assert the ordering property instead:
-	s.mu.Lock()
-	kC := s.entryKeyLocked(s.eng().waiters["C"], nil)
-	kA := s.entryKeyLocked(s.eng().waiters["A"], nil)
-	s.mu.Unlock()
-	if !(kC.hrrn > kA.hrrn) {
-		t.Fatalf("small-job-first violated: C hrrn %.1f must exceed A hrrn %.1f", kC.hrrn, kA.hrrn)
+	if kA.hrrn <= kC.hrrn {
+		t.Fatalf("after 600000s the big head's slowdown (%.3f) must exceed the small one's (%.3f)", kA.hrrn, kC.hrrn)
+	}
+	if head.id != "A" {
+		t.Fatalf("head = %q, want A once its wait dominates", head.id)
 	}
 }
 
-// TestHRRNCannotStarvate is the property test the arm needs: under SUSTAINED
-// arrivals of small jobs, a big job's ratio eventually exceeds every small one's
-// (wait grows without bound, service is finite), so it is served.
+// TestHRRNCannotStarvate is the property the arm needs: under SUSTAINED arrivals of
+// small jobs, a big job's priority eventually exceeds every small one's.
 func TestHRRNCannotStarvate(t *testing.T) {
-	// The no-starvation property is arithmetic, and this is the whole proof:
-	// (wait + s)/s is strictly increasing in wait and strictly decreasing in s, so
-	// for ANY finite population of short jobs there is a FINITE wait beyond which
-	// the long job outranks every one of them.
-	const bigService = 8.0   // a big entry: 8s of prefill
-	const smallService = 0.1 // a small entry: 0.1s
-	const smallWait = 600.0  // the worst competitor: a small job already waiting 600s
-	smallRatio := hrrn(smallWait, smallService)
-	if !(smallRatio > hrrn(0, bigService)) {
+	// The property is arithmetic: wait/cold is strictly increasing in wait and
+	// strictly decreasing in cold, so for ANY finite competitor there is a FINITE
+	// wait beyond which the big job outranks it — bound = competitor_ratio * cold_big.
+	const bigCold = 6400  // a big entry: 100 blocks
+	const smallCold = 64  // a small entry: 1 block
+	const smallWait = 600 // the worst competitor: a small job already waiting 600s
+	smallRatio := entryPriority(smallWait, smallCold, 64)
+	if !(smallRatio > entryPriority(0, bigCold, 64)) {
 		t.Fatal("small-first violated: a waiting small job must outrank a fresh big one")
 	}
-	// the big job's wait that beats it solves (W + s)/s > smallRatio:  W > s·ratio − s
-	bound := bigService*smallRatio - bigService
+	bound := smallRatio * bigCold // the wait at which the big job's ratio reaches smallRatio
 	if bound < 0 || bound > 1e9 {
 		t.Fatalf("the starvation bound is not finite: %v", bound)
 	}
-	if !(hrrn(bound+1, bigService) > smallRatio) {
-		t.Fatalf("a big job waiting %.0fs (ratio %.2f) must beat the small job (ratio %.2f)",
-			bound+1, hrrn(bound+1, bigService), smallRatio)
+	if !(entryPriority(bound+1, bigCold, 64) > smallRatio) {
+		t.Fatalf("a big job waiting %.0fs (%.4f) must beat the small job (%.4f)",
+			bound+1, entryPriority(bound+1, bigCold, 64), smallRatio)
 	}
-	// and the bound stays finite for any realistic wait a small job can accumulate —
-	// which is what "sustained arrivals cannot starve a long job" reduces to.
 	for _, w := range []float64{1, 30, 600, 3600, 86400} {
-		if b := bigService*hrrn(w, smallService) - bigService; b < 0 || b > 1e9 {
+		if b := entryPriority(w, smallCold, 64) * bigCold; b < 0 || b > 1e9 {
 			t.Fatalf("starvation bound for a small job waiting %v s is %v", w, b)
 		}
 	}
@@ -382,8 +378,6 @@ func TestMLFQ2ArbitrationServesBothPools(t *testing.T) {
 	})
 	now := goldenT0
 	s.mu.Lock()
-	s.eng().prefillSamples = prefillRateMinSamples
-	s.eng().prefillRate = 6400
 	s.now = now
 	// one SHORT head that has waited 1s for a tiny job, one LONG head that has
 	// waited 100s for a bigger one
@@ -395,7 +389,7 @@ func TestMLFQ2ArbitrationServesBothPools(t *testing.T) {
 	if head == nil {
 		t.Fatal("no head")
 	}
-	// ratios: shorty (1+0.01)/0.01 = 101 ; longy (100+0.64)/0.64 = 157 → longy wins
+	// slowdowns: shorty 1s/64 = 0.0156 ; longy 100s/4096 = 0.0244 → longy wins
 	if head.id != "longy" {
 		t.Fatalf("head = %q, want longy (the higher response ratio)", head.id)
 	}
@@ -504,5 +498,36 @@ func TestFArmKnobSurfaceIsConfigOnly(t *testing.T) {
 	cfg.QuantumMode = "dyn-size"
 	if fmt.Sprintf("%+v", cfg) == base {
 		t.Fatal("knob assignment did not change the config")
+	}
+}
+
+// TestPrefillChargeIsUncachedNotPrompt is RF7: the F7 gate must see the request's
+// ESTIMATED UNCACHED work, not its prompt size. A warm seated turn (most of its
+// blocks already resident on this engine) charges a small fraction; a cold entry
+// charges all of it. With prompt tokens the gate would sit closed almost always
+// (one warm 50-100k-token turn beats an 8,192-token step budget on its own) and F7
+// would stop being load-adaptive.
+func TestPrefillChargeIsUncachedNotPrompt(t *testing.T) {
+	s := fArmScheduler(t, func(c *Config) { c.RotateWhenFree = true })
+	now := goldenT0
+	// a member with 100 blocks resident: dispatch them so the index holds them
+	seatWithBlocks(t, s, "warm", 100, now)
+	s.ChunkAt("warm", now.Add(500*time.Millisecond))
+	// its next turn re-sends the same 100 blocks plus nothing new: a full warm hit
+	warmKeys := append(keys(100, Hash(len("warm")*97+100)), Hash(999999))
+	s.mu.Lock()
+	g := s.eng()
+	cold := s.uncachedTokensLocked(g, warmKeys)
+	total := int64(len(warmKeys)) * int64(s.blockSize)
+	s.mu.Unlock()
+	if cold >= total/2 {
+		t.Fatalf("a warm turn charged %d of %d tokens: the charge must be the UNCACHED work, not the prompt", cold, total)
+	}
+	// a cold entry: every key is new, so it charges the whole prompt
+	s.mu.Lock()
+	coldEntry := s.uncachedTokensLocked(g, keys(50, Hash(424242)))
+	s.mu.Unlock()
+	if coldEntry != 50*int64(s.blockSize) {
+		t.Fatalf("a cold entry charged %d, want its full %d tokens", coldEntry, 50*int64(s.blockSize))
 	}
 }

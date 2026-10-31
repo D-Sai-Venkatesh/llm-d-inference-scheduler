@@ -1431,14 +1431,25 @@ func (s *Scheduler) rotationVictimLocked(g *engineGroup, now time.Time) (string,
 	return bestReason, best
 }
 
-// olderCompletion breaks a tie between two equally-costly victims: oldest last
-// completion first (a member that finished seconds ago is the LAST candidate).
+// olderCompletion breaks a tie between two equally-costly victims: a REAL last
+// completion beats "never completed", then oldest completion first, then the id.
+//
+// The last clause is a CORRECTNESS fix, not a taste: f0p's version returned false
+// for a member that had never completed a busy period, so among the (common) set of
+// members that have not completed one yet the "first one in map iteration order" won
+// — and Go randomises that. The archive build therefore produces DIFFERENT traces on
+// the same scenario and config (measured: 3 divergences in 4 replays of the 2,600 s
+// golden scenario with f0p's own config). Every victim rule below iterates a slice
+// built from the member map, so a total order is what makes a replay reproducible at
+// all; testdata/golden-f0p-total.txt is the archive build with EXACTLY this tie-break
+// added, and the core reproduces it byte for byte.
 func olderCompletion(a, b *member) bool {
-	if a.lastCompletion.IsZero() {
-		return false
+	az, bz := a.lastCompletion.IsZero(), b.lastCompletion.IsZero()
+	if az != bz {
+		return bz // a real completion is the cheaper victim
 	}
-	if b.lastCompletion.IsZero() {
-		return true
+	if az {
+		return a.id < b.id // TOTAL tie-break among members that never completed
 	}
 	return a.lastCompletion.Before(b.lastCompletion) ||
 		(a.lastCompletion.Equal(b.lastCompletion) && a.id < b.id)

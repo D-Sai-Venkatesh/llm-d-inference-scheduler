@@ -450,21 +450,19 @@ func TestAnonymousPassThrough(t *testing.T) {
 // Hold the line: a blocked head does not let a later, smaller head jump it.
 func TestHoldTheLine(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		// both residents must live on ONE engine, so the tests' own members are seated
+		// first (the first lands on e0 by the id tie) and THEN the other engines are
+		// closed off; a resident that still lands elsewhere makes the shape invalid
 		fx.seatOne(t, "m1", 450, 3*time.Second)
 		settle(fx.s, "m1", 450, 450)
-		fx.seatOne(t, "m2", 450, 2*time.Second)
-		// both residents have queued turns (so the engine-idle rule cannot fire), on
-		// ONE engine, and the queue head is a newcomer that does not fit there
 		fx.tighten(t)
-		fx.s.mu.Lock()
+		fx.seatOne(t, "m2", 450, 2*time.Second)
 		m1, g1 := fx.member(t, "m1")
 		m2, g2 := fx.member(t, "m2")
-		_ = g2
 		if g1 != g2 {
-			s2 := fx.s
-			s2.mu.Unlock()
-			t.Skipf("residents landed on different engines; the hold-the-line shape needs them together")
+			t.Skip("residents landed on different engines; the hold-the-line shape needs them together")
 		}
+		fx.s.mu.Lock()
 		m1.waitingSince = fx.clock.Add(-3 * time.Second)
 		m1.lastActivity = fx.clock
 		m2.waitingSince = fx.clock.Add(-2 * time.Second)
@@ -555,13 +553,13 @@ func TestTTLForgetsSilentRecordsKeepsWaiters(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "quiet", 100, time.Second)
 		settle(fx.s, "quiet", 100, 100)
-		// a second member seats, then its head blocks (the budget is filled by a big
-		// resident) so it stays a WAITER — its record must survive any TTL
+		// a second member seats, then leaves so it is a returning WAITER — its record
+		// must survive any TTL while it has a live head
 		fx.seatOne(t, "waiter", 100, time.Second)
 		settle(fx.s, "waiter", 100, 100)
+		m, g := fx.member(t, "waiter")
 		fx.s.mu.Lock()
-		m := fx.g().members["waiter"]
-		fx.s.exitLocked(fx.g(), m, "test", fx.clock)
+		fx.s.exitLocked(g, m, "test", fx.clock)
 		fx.s.mu.Unlock()
 		longAgo := fx.clock.Add(-time.Duration(10*defaultConfig().TTLSeconds) * time.Second)
 		fx.clock = longAgo
@@ -598,8 +596,11 @@ func TestWaitingMemberIsNotIdleEvicted(t *testing.T) {
 func TestProvisionalInflightReaped(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 100, time.Second)
-		// one more head, picked but never dispatched => provisional
-		fx.pick(head("m", time.Second, bytesFor(100)))
+		// one more head, picked but never dispatched => provisional (a NEW req id, or
+		// the record would simply overwrite the confirmed one)
+		h2 := head("m", time.Second, bytesFor(100))
+		h2.ReqID = "r-m-2"
+		fx.pick(h2)
 		fx.s.mu.Lock()
 		m := fx.g().members["m"]
 		before := m.inflight

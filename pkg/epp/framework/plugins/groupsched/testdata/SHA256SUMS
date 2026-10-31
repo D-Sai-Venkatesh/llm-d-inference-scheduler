@@ -9,6 +9,9 @@
 #   golden-f0p-core.txt      the archive with NO fix (one of its legal traces): the archive
 #                            cannot reproduce itself past line 2,167 (evidence of the
 #                            map-order victim tie-break).
+#   golden-hrrn-tier.txt     THE hrrn-tier ARM'S OWN TRACE: the same replay with a CPU tier
+#                            configured (2,000 blocks) and entryOrder: "hrrn-tier".
+#                            TestHrrnTierConfiguredTraceIsPinned.
 #   golden-f5p-archive.txt   THE F5' EQUIVALENCE GOLDEN: the SAME archive build (dd5350b5
 #                            + the seven declared fixes, verified by regenerating
 #                            golden-f0p-bugfixes.txt byte for byte) with ONE value changed,
@@ -21,3 +24,4 @@
 f3b667e87003a38e74026f0a6e3c6dc6809772c9dc3fda7c3fd0c121c347aa70  golden-f0p-core.txt
 643c75490f1fd34cd551be978e6b4fffbc735473a15e305b9d5431d5e17f3aa8  golden-f0p-total.txt
 93635406db669b3bfc1dce0a73df2a9827cb820f96e91e930cdf755d73615568  golden-f5p-archive.txt
+d79e0419b02e3e322550d949c376d9596cbc893fe412cc623a08ab0584b32efd  golden-hrrn-tier.txt

@@ -29,8 +29,10 @@ package groupsched
 //	            the engine's own BlockIndex (dedup + cold-token estimate), and the
 //	            engine's seat budget from its measured KV capacity.
 //	QUEUE       EntryOrder: which waiter is the head. Default newcomer-first, then
-//	            oldest arrival, then id. Alternative: bounded HRRN (equal slowdown,
-//	            denominator capped at the median waiter size).
+//	            oldest arrival, then id. Alternatives: bounded HRRN (equal slowdown,
+//	            denominator capped at the median waiter size) and bounded HRRN with
+//	            the CPU-tier shadow in the denominator (hrrn-tier: a returner whose
+//	            blocks are still in the engine's offload tier is CHEAP to re-seat).
 //	PLACEMENT   EngineChooser: which engine takes the head. Default the most free
 //	            budget among the engines where it fits, tie → lowest engine id.
 //	TENURE      RotationPolicy: when a resident may be released. Default the fixed
@@ -352,12 +354,21 @@ func (h HrrnBounded) Head(waiters map[string]*waiter, ctx EntryCtx) *waiter {
 // priority is wait ÷ s_eff for ONE waiter under one pass's bound: the waiter's own cold
 // tokens, capped at the bound, floored at one block.
 func (h HrrnBounded) priority(w *waiter, bound int64, now time.Time) float64 {
-	den := w.coldTokens
+	return priorityWith(w, w.coldTokens, bound, now, h.BlockSize)
+}
+
+// priorityWith is the ONE priority formula, over an explicit cost: wait ÷ s_eff, where
+// s_eff = min(cost, the pass's bound) floored at one block. Both F5′ and hrrn-tier are
+// this function; they differ only in WHAT they hand it as the cost (the cold tokens of
+// the GPU-estimate, or the tier-aware cold tokens), which is what keeps the two arms a
+// one-value comparison rather than two rules.
+func priorityWith(w *waiter, cost int64, bound int64, now time.Time, blockSize int) float64 {
+	den := cost
 	if den <= 0 {
-		den = int64(h.BlockSize) // a fully warm head: the smallest possible size
+		den = int64(blockSize) // a fully warm head: the smallest possible size
 	}
 	if bound > 0 && bound < den {
-		den = bound // the cap binds only AT or ABOVE the median (see lowerMedianColdTokens)
+		den = bound // the cap binds only AT or ABOVE the median (see lowerMedianTokens)
 	}
 	wait := now.Sub(w.since).Seconds()
 	if wait < 0 {
@@ -388,12 +399,19 @@ func hrrnLess(a *waiter, aPriority float64, b *waiter, bPriority float64) bool {
 // median — which is what leaves the small class's ordering untouched. 0 when nothing is
 // waiting (0 means "no cap": a lone waiter is its own median).
 func lowerMedianColdTokens(waiters map[string]*waiter, blockSize int) int64 {
+	return lowerMedianTokens(waiters, blockSize, func(w *waiter) int64 { return w.coldTokens })
+}
+
+// lowerMedianTokens is the same bound over a CHOSEN cost, so the two bounded-HRRN
+// implementations cannot drift apart in the part they share (the median, the floor, the
+// cap): F5′ passes the cold tokens, hrrn-tier passes the tier-aware ones.
+func lowerMedianTokens(waiters map[string]*waiter, blockSize int, cost func(*waiter) int64) int64 {
 	if len(waiters) == 0 {
 		return 0
 	}
 	sizes := make([]int64, 0, len(waiters))
 	for _, w := range waiters {
-		n := w.coldTokens
+		n := cost(w)
 		if n <= 0 {
 			n = int64(blockSize)
 		}
@@ -401,6 +419,78 @@ func lowerMedianColdTokens(waiters map[string]*waiter, blockSize int) int64 {
 	}
 	sort.Slice(sizes, func(i, j int) bool { return sizes[i] < sizes[j] })
 	return sizes[(len(sizes)-1)/2]
+}
+
+// HrrnTier is F5′ WITH THE CPU TIER IN THE DENOMINATOR (PREREG-multipod-offload,
+// "THE OFFLOAD SOLUTION" piece 2): byte-for-byte F5′'s rule — the newcomer class as the
+// OUTER key, bounded HRRN inside a class, the LOWER-median clamp, the same total tie
+// order — with ONE input changed:
+//
+//	s = tokens predicted resident in NEITHER the engine's GPU index NOR its CPU-tier
+//	    shadow     (restorable tokens count as CACHED)
+//
+// WHY. Measured on the c128 order cut: the share of a returning branch's prefix that
+// comes back from the CPU tier falls off a cliff between one and three minutes away
+// (90 % under 1 min, 30 % at 1-3 min, 14 % at 3-5 min, 6.4 % at 5-10 min), and the
+// scheduler's own entry wait for a seat-loss return is 328-420 s — i.e. the queue
+// itself is what pushes returners over that cliff. A returner with a live CPU copy has
+// a DEADLINE: seating it a minute later costs a full cold prefill, seating it now costs
+// a restore. Plain F5′ is FIFO-shaped among returners of equal size and therefore serves
+// the most-likely-cold first — the wrong way round.
+//
+// MECHANISM, and why it is not a new knob. A returner whose blocks are still in the
+// engine's tier costs ~its NEW TURN's tokens (its history is restorable), so its ratio
+// wait ÷ s is large almost immediately and it is seated before it falls off the cliff. A
+// returner whose copy is gone (a COLD return, s = min(full, median) — the F5′ bound
+// unchanged) keeps a small ratio and therefore AGES; when its wait does overtake, the
+// takeover bound is the COST RATIO times the warm waiter's wait, so the landscape is F5′'s
+// bounded HRRN with the warm class served first. Newcomers are untouched: the class key
+// is still the outer partition, so a returner — warm or cold — never jumps a newcomer.
+//
+// WHAT IT MAY NOT DO. The tier-aware cost is a PRIORITY input ONLY: the seat budget, the
+// cold-entry valve and placement keep the GPU-only cost (offload adds no SEATS — vLLM
+// runs only from HBM — so admitting against a tier-aware cost would overbook the engine
+// the moment the restores land).
+//
+// TIER OFF ⇒ F5′ EXACTLY. With no tier configured the scheduler writes the tier-aware
+// cost EQUAL to the cold cost for every waiter (setWaiterCostsLocked), so this module is
+// arithmetically the same function as HrrnBounded. TestHrrnTierWithNoTierEqualsTheF5P
+// Golden pins that on the full replay, byte for byte, against the archive's F5′ trace.
+type HrrnTier struct {
+	// BlockSize is the engine's KV block size in tokens (see HrrnBounded.BlockSize).
+	BlockSize int
+}
+
+func (HrrnTier) Name() string { return "hrrn-tier" }
+
+func (h HrrnTier) Head(waiters map[string]*waiter, ctx EntryCtx) *waiter {
+	bound := lowerMedianTokens(waiters, h.BlockSize, tierCostOf)
+	var head *waiter
+	var headPriority float64
+	for _, w := range waiters {
+		p := h.priority(w, bound, ctx.Now)
+		if head == nil || hrrnLess(w, p, head, headPriority) {
+			head, headPriority = w, p
+		}
+	}
+	return head
+}
+
+// priority is F5′'s priority over the TIER-AWARE cost.
+func (h HrrnTier) priority(w *waiter, bound int64, now time.Time) float64 {
+	return priorityWith(w, tierCostOf(w), bound, now, h.BlockSize)
+}
+
+// tierCostOf is the cost hrrn-tier prices a waiter with: the tier-aware cold tokens the
+// scheduler computed for this decision pass. A waiter whose tier cost was never computed
+// (no engine had a tier during its sync — the tier-off case, and the unit-test fixtures
+// that build a queue directly) falls back to its plain cold tokens, which is exactly
+// F5′'s denominator: the degenerate case is the DEFAULT, not a special path.
+func tierCostOf(w *waiter) int64 {
+	if w.tierCostSet {
+		return w.tierCostTokens
+	}
+	return w.coldTokens
 }
 
 // ---- PLACEMENT ---------------------------------------------------------------
@@ -502,6 +592,18 @@ type FootprintSizer interface {
 	// Cost is the conservative admission cost of a QUEUED request against one
 	// engine's index, in blocks.
 	Cost(idx *BlockIndex, member string, sizeBytes int64) int64
+	// TierCost is Cost with that engine's CPU-TIER SHADOW as a second residence
+	// oracle, split into the three numbers its two readers need:
+	//
+	//	cold     blocks resident in NEITHER the GPU index NOR the tier (the pieces
+	//	         an admission would have to PREFILL) — the tier-aware admission cost;
+	//	resident blocks the index or the tier already holds (restorable ≈ free);
+	//	total    the head's whole estimated footprint (cold + resident).
+	//
+	// A nil tier means "no offload tier configured" and reproduces Cost exactly
+	// (Cost is this function's cold term), so the tier-aware path and the default
+	// path can never disagree about the same engine state.
+	TierCost(idx *BlockIndex, tier *tierShadow, member string, sizeBytes int64) (cold, resident, total int64)
 	// Tokens converts a block count to tokens (R1: one unit everywhere).
 	Tokens(blocks int64) int64
 }
@@ -521,11 +623,19 @@ func (z IndexSizer) BudgetBlocks(numBlocks int) int {
 }
 
 func (z IndexSizer) Cost(idx *BlockIndex, member string, sizeBytes int64) int64 {
-	known := int64(0)
+	cold, _, _ := z.TierCost(idx, nil, member, sizeBytes)
+	return cold
+}
+
+func (z IndexSizer) TierCost(idx *BlockIndex, tier *tierShadow, member string, sizeBytes int64) (cold, resident, total int64) {
 	for _, h := range idx.SetBlocks(member) { // persisted across residencies (CP1)
-		if !idx.HasNELocked(h) {
-			known++
+		if idx.HasNELocked(h) || tier.Holds(h) {
+			// the engine can reach this block without recomputing it: in HBM now, or
+			// restorable from its CPU tier for ~1-4 % of a prefill.
+			resident++
+			continue
 		}
+		cold++
 	}
 	// the baseline is the member's last DISPATCHED body size (the index record,
 	// updated at PreRequest) — never the current head's size, or the second sight of
@@ -537,9 +647,11 @@ func (z IndexSizer) Cost(idx *BlockIndex, member string, sizeBytes int64) int64 
 	// ROUNDED UP: a partial block still occupies a block. Truncating the division
 	// understates every head whose growth is not a whole block, in the same
 	// direction as (and on top of) the byte-to-token conversion this estimate is
-	// stuck with.
+	// stuck with. The GROWTH is always cold: a block that never existed cannot be
+	// restorable, whatever the tier holds.
 	blockBytes := 4 * int64(z.BlockSize)
-	return known + (delta+blockBytes-1)/blockBytes
+	cold += (delta + blockBytes - 1) / blockBytes
+	return cold, resident, cold + resident
 }
 
 func (z IndexSizer) Tokens(blocks int64) int64 { return blocks * int64(z.BlockSize) }
@@ -646,8 +758,10 @@ func buildModules(cfg Config) (modules, error) {
 		m.entry = NewcomerFirst{}
 	case "hrrn-bounded":
 		m.entry = HrrnBounded{BlockSize: cfg.BlockSizeTokens}
+	case "hrrn-tier":
+		m.entry = HrrnTier{BlockSize: cfg.BlockSizeTokens}
 	default:
-		return m, errValue("entryOrder", cfg.EntryOrder, "newcomer-first|hrrn-bounded")
+		return m, errValue("entryOrder", cfg.EntryOrder, "newcomer-first|hrrn-bounded|hrrn-tier")
 	}
 	switch cfg.EngineChoice {
 	case "", "most-free-budget":

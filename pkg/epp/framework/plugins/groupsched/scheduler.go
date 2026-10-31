@@ -81,6 +81,24 @@ type Config struct {
 	// plugin logs loudly and raises llm_d_epp_group_capacity_missing: an engine
 	// without capacity seats nothing while every other series looks healthy.
 	CapacityLivenessSeconds float64 `json:"capacityLivenessSeconds"`
+
+	// ---- the CPU offload tier (PREREG-multipod-offload §"THE OFFLOAD SOLUTION") ----
+	//
+	// These two numbers are DEPLOYMENT FACTS about the engine, not tuning knobs: they
+	// describe the CPU tier the decode pods are running with, exactly as
+	// GroupBudgetFraction describes the HBM budget. Together they size the TIER SHADOW
+	// (tiershadow.go): capacityBlocks = CpuTierBytes ÷ KvBlockBytes.
+	//
+	// CpuTierBytes is vLLM's `cpu_bytes_to_use` (exp-ops: DECODE_TIER_BYTES, 512 GiB on
+	// the campaign stacks). 0 = this deployment has NO CPU tier: the shadow is absent,
+	// nothing is modelled, and `entryOrder: "hrrn-tier"` degenerates to F5′ exactly.
+	CpuTierBytes int64 `json:"cpuTierBytes"`
+	// KvBlockBytes is ONE KV block's size in bytes on this deployment
+	// (2 x layers x kv_heads x head_dim x dtype_bytes x blockSizeTokens — a model+TP
+	// fact). Required > 0 whenever CpuTierBytes > 0: bytes ÷ bytes is the only unit
+	// conversion in this file that has no measurement behind it, so it is given, never
+	// guessed.
+	KvBlockBytes int64 `json:"kvBlockBytes"`
 	// InflightReapSeconds bounds the age of a CONFIRMED in-flight request id
 	// before reconciliation drops it (requests whose termination is never
 	// observed — the harness request timeout is 3600 s, so 3700 reaps only true
@@ -95,7 +113,12 @@ type Config struct {
 	//	EntryOrder   "newcomer-first"   newcomers, then oldest, then id |
 	//	             "hrrn-bounded"     bounded HRRN: wait ÷ min(cold tokens, the median
 	//	                                waiter's cold tokens), newcomers as the outer
-	//	                                class, then the ratio, then oldest, then id
+	//	                                class, then the ratio, then oldest, then id |
+	//	             "hrrn-tier"        F5′ with the CPU-tier shadow in the denominator:
+	//	                                wait ÷ min(tier-aware cold tokens, the median of
+	//	                                them) — restorable tokens count as CACHED, so a
+	//	                                returner with a live CPU copy is re-seated before
+	//	                                it falls off the tier's cliff
 	//	EngineChoice "most-free-budget" most free budget where the head fits, tie → id
 	//	Rotation     "quantum"          fixed Q busy periods (plus S of silence)
 	//	Victim       "valve"            f0p's memory-pressure order
@@ -187,6 +210,13 @@ func (c Config) effective() Config {
 // quantum is the effective Q (one value, never unbounded).
 func (c Config) quantum() int { return c.Quantum }
 
+// tierBlocks is the TIER SHADOW's capacity in blocks: the configured CPU tier ÷ one
+// KV block. 0 means "no tier on this deployment" — the shadow is then absent and the
+// tier-aware cost is the GPU-only cost (hrrn-tier ≡ F5′).
+func (c Config) tierBlocks() int {
+	return tierBlocksFor(c.CpuTierBytes, c.KvBlockBytes)
+}
+
 func (c Config) validate() error {
 	if c.GroupBudgetFraction <= 0 || c.GroupBudgetFraction > 1 {
 		return fmt.Errorf("groupBudgetFraction must be in (0,1], got %v", c.GroupBudgetFraction)
@@ -208,6 +238,18 @@ func (c Config) validate() error {
 	}
 	if c.CapacityLivenessSeconds < 0 {
 		return fmt.Errorf("capacityLivenessSeconds must be >= 0 (0 = default; got %v)", c.CapacityLivenessSeconds)
+	}
+	if c.CpuTierBytes < 0 {
+		return fmt.Errorf("cpuTierBytes must be >= 0 (0 = no CPU tier; got %d)", c.CpuTierBytes)
+	}
+	if c.KvBlockBytes < 0 {
+		return fmt.Errorf("kvBlockBytes must be >= 0 (0 = no CPU tier; got %d)", c.KvBlockBytes)
+	}
+	if c.CpuTierBytes > 0 && c.KvBlockBytes <= 0 {
+		return fmt.Errorf("kvBlockBytes is required when cpuTierBytes > 0: the tier shadow's capacity is cpuTierBytes ÷ kvBlockBytes, and a bytes-per-block constant would be a magic number (got cpuTierBytes=%d, kvBlockBytes=%d)", c.CpuTierBytes, c.KvBlockBytes)
+	}
+	if c.CpuTierBytes > 0 && c.tierBlocks() == 0 {
+		return fmt.Errorf("cpuTierBytes (%d) is smaller than one KV block (%d bytes): a tier that can hold nothing predicts nothing", c.CpuTierBytes, c.KvBlockBytes)
 	}
 	return nil
 }
@@ -305,6 +347,14 @@ type member struct {
 	// fairnessID is the last fairness id (queue key) this member was seen with —
 	// the join key for its SEAT/EXIT events (see Head.FairnessID).
 	fairnessID string
+	// predResident / predSet carry the SHADOW-VALIDATION prediction (piece 3) from the
+	// moment this member was SEATED as a RETURN to the settlement of the turn that
+	// seat was taken for: the fraction of that turn's estimated footprint the engine's
+	// GPU index + its CPU-tier shadow said was already resident. It is paired there
+	// with the MEASURED cached/prompt the engine reports, then cleared — one
+	// prediction, one measurement.
+	predResident float64
+	predSet      bool
 }
 
 // inflightRec is one in-flight request's reconciliation record (C3).
@@ -312,6 +362,11 @@ type inflightRec struct {
 	since     time.Time // Pick time (provisional) / PreRequest time (confirmed)
 	confirmed bool
 	main      bool // landed on the member's main chain (V1)
+	// keys are the exact tier-A chain blocks recorded at PreRequest. They are kept
+	// because SETTLE is where a request's blocks enter the CPU tier (a model of vLLM
+	// storing them) and settle otherwise carries no hash list — re-deriving the set
+	// from the index at settle would insert blocks of turns that have NOT run yet.
+	keys []Hash
 }
 
 // estEntry is one cached admission estimate (M2): blocks for a given head size;
@@ -340,6 +395,17 @@ type waiter struct {
 	// index, so an engine that does not hold the member's blocks is costed as cold
 	// — which is the truth about that engine — instead of inheriting the best case.
 	coldTokensByEngine map[string]int64
+	// tierCostTokens is coldTokens' TIER-AWARE twin: the same best-case scalar with
+	// each engine's CPU-tier shadow counted as residence, so a block that is still
+	// restorable from some engine's tier is NOT part of it. It is the denominator
+	// `entryOrder: "hrrn-tier"` prices a waiter with, and it is deliberately a
+	// SEPARATE field: the admission cost above must stay GPU-only (offload adds no
+	// seats, so admitting against a tier-aware cost would overbook the engine).
+	// tierCostSet records that it was computed for this pass; when no engine has a
+	// tier the scheduler writes it EQUAL to coldTokens, which is what makes
+	// hrrn-tier degenerate to F5′ rather than to a special case.
+	tierCostTokens int64
+	tierCostSet    bool
 	// fairnessID rides with the head (see Head.FairnessID) so a SEAT event can name
 	// the wire-level identity even before the member has a record.
 	fairnessID string
@@ -389,6 +455,21 @@ type engineGroup struct {
 	estCache   map[string]estEntry
 	estVersion uint64
 
+	// tier is THIS engine's CPU offload tier, as a model (tiershadow.go): nil when the
+	// deployment configures no tier. It is a per-engine fact like the index — a block
+	// in engine A's CPU tier is worthless to B — and it is consulted ONLY by the two
+	// readers that need it: the tier-aware admission estimate (hrrn-tier's denominator)
+	// and the shadow-validation metric. Dispatch, the budget and the cold valve never
+	// see it: offload adds no seats.
+	tier *tierShadow
+	// estTierCache caches the TIER-AWARE estimate keyed on BOTH mutation versions —
+	// the index's (a block arriving or leaving the GPU set changes the answer) and the
+	// tier's (a store or an eviction does). One cache would let a tier mutation read a
+	// stale cost for the rest of the index's version epoch.
+	estTierCache    map[string]estEntry
+	estTierIndexVer uint64
+	estTierTierVer  uint64
+
 	counters struct {
 		served     int64 // dispatches served on this engine
 		fcfsServed int64 // pre-capacity FCFS dispatches counted here
@@ -426,13 +507,14 @@ func (g *engineGroup) coldCapTokens(fraction float64, blockSize int) int64 {
 	return headroomBlocks * int64(blockSize)
 }
 
-func newEngineGroup(id string, blockSizeTokens int) (*engineGroup, error) {
+func newEngineGroup(id string, blockSizeTokens, tierBlocks int) (*engineGroup, error) {
 	idx, err := NewBlockIndex(blockSizeTokens)
 	if err != nil {
 		return nil, err
 	}
 	g := &engineGroup{id: id, index: idx,
-		members: map[string]*member{}, estCache: map[string]estEntry{}}
+		members: map[string]*member{}, estCache: map[string]estEntry{},
+		tier: newTierShadow(tierBlocks)}
 	g.counters.exits = map[string]int64{}
 	return g, nil
 }
@@ -480,6 +562,10 @@ type Scheduler struct {
 	onColdValveHeld func(engine string)
 	// onSafetyFire fires when an engine's safety net OPENS (a fire event).
 	onSafetyFire func(engine string)
+	// onShadowValidation receives one (predicted resident fraction, measured
+	// cached/prompt) pair per seated return — the CPU-tier shadow's accuracy, exported
+	// for the analysis-time AUC. nil in tests.
+	onShadowValidation func(engine string, predicted, measured float64)
 
 	// groups holds one engineGroup per DISCOVERED engine, keyed by endpoint id.
 	groups map[string]*engineGroup
@@ -569,6 +655,11 @@ type Scheduler struct {
 		// memberSources counts dispatches by the attribute the member id came from
 		// (the run's effective-member-source echo).
 		memberSources map[string]int64
+		// shadowPairs counts the SHADOW-VALIDATION pairs collected (one per seated
+		// return whose first turn settled with a measured cache hit): the denominator
+		// of any AUC the analysis computes, reported so an arm with no pairs cannot be
+		// read as "the shadow was right".
+		shadowPairs int64
 	}
 }
 
@@ -601,7 +692,7 @@ func (s *Scheduler) groupForLocked(id string) (*engineGroup, error) {
 	if g, ok := s.groups[id]; ok {
 		return g, nil
 	}
-	g, err := newEngineGroup(id, s.blockSize)
+	g, err := newEngineGroup(id, s.blockSize, s.cfg.tierBlocks())
 	if err != nil {
 		return nil, err
 	}
@@ -1098,6 +1189,26 @@ func (s *Scheduler) estimateCostLocked(g *engineGroup, id string, sizeBytes int6
 	return s.mod.sizer.Cost(g.index, id, sizeBytes)
 }
 
+// estimateTierCostCachedLocked is estimateCostCachedLocked over the TIER-AWARE cost:
+// the head's blocks that are resident in NEITHER this engine's GPU index NOR its CPU
+// tier, in tokens. The cache is keyed on BOTH mutation versions (index and tier): a
+// store or an eviction changes the answer just as surely as a block arriving does, and
+// one version alone would let a tier change read stale for the rest of the epoch.
+func (s *Scheduler) estimateTierCostCachedLocked(g *engineGroup, id string, sizeBytes int64) int64 {
+	iv, tv := g.index.VersionLocked(), g.tier.Version()
+	if g.estTierCache == nil || g.estTierIndexVer != iv || g.estTierTierVer != tv {
+		g.estTierCache = map[string]estEntry{}
+		g.estTierIndexVer, g.estTierTierVer = iv, tv
+	}
+	if e, ok := g.estTierCache[id]; ok && e.sizeBytes == sizeBytes {
+		return e.blocks
+	}
+	cold, _, _ := s.mod.sizer.TierCost(g.index, g.tier, id, sizeBytes)
+	t := s.mod.sizer.Tokens(cold)
+	g.estTierCache[id] = estEntry{sizeBytes: sizeBytes, blocks: t}
+	return t
+}
+
 // ---- PreRequest (post-dispatch): the exact tier-A correction ----
 
 // Dispatched records a released request at PreRequest without an observed endpoint
@@ -1143,6 +1254,10 @@ func (s *Scheduler) DispatchedOn(id, reqID, engine string, keys []Hash, sizeByte
 	}
 	g.index.SetSizeLocked(id, sizeBytes) // the estimate baseline
 	onMain := g.index.SettleDispatchedAtLocked(id, reqID, keys, now)
+	// THE TIER SHADOW's DISPATCH HOOK: the request's chain blocks move to MRU in this
+	// engine's CPU-tier model. Touching only REFRESHES blocks the tier already holds —
+	// the new ones enter at settle (a block being prefilled is not stored yet).
+	g.tier.Touch(keys)
 	if m, ok := g.members[id]; ok {
 		m.lastActivity = now
 		m.lastSizeBytes = sizeBytes
@@ -1172,7 +1287,7 @@ func (s *Scheduler) DispatchedOn(id, reqID, engine string, keys []Hash, sizeByte
 		if m.inflightIDs == nil {
 			m.inflightIDs = map[string]inflightRec{}
 		}
-		m.inflightIDs[reqID] = inflightRec{since: now, confirmed: true, main: onMain}
+		m.inflightIDs[reqID] = inflightRec{since: now, confirmed: true, main: onMain, keys: keys}
 		m.inflight = len(m.inflightIDs)
 		m.mainInflight = 0
 		for _, rec := range m.inflightIDs {
@@ -1271,6 +1386,7 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 		// (defensive legacy path — never blind).
 		removed := false
 		removedMain := false
+		var settledKeys []Hash
 		if reqID != "" {
 			// R2: a known id removes itself; an UNKNOWN non-empty id removes NOTHING
 			// (the oldest-fallback would delete a different live request's record
@@ -1278,7 +1394,7 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 			// and evict mid-flight). Counted as a stray.
 			if rec, had := m.inflightIDs[reqID]; had {
 				delete(m.inflightIDs, reqID)
-				removed, removedMain = true, rec.main
+				removed, removedMain, settledKeys = true, rec.main, rec.keys
 			} else {
 				s.counters.straySettles++
 			}
@@ -1291,9 +1407,14 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 			}
 			if rec, had := m.inflightIDs[key]; had {
 				delete(m.inflightIDs, key)
-				removed, removedMain = true, rec.main
+				removed, removedMain, settledKeys = true, rec.main, rec.keys
 			}
 		}
+		// THE TIER SHADOW's SETTLE HOOK: a settled request's blocks are now STORED in
+		// this engine's CPU tier (vLLM keeps them; the LRU evicts past capacity). The
+		// request's OWN keys, not the member's whole set — a queued turn that has not
+		// run yet is not in the tier and inserting it would make the shadow lie warm.
+		g.tier.Insert(settledKeys)
 		if removed {
 			m.inflight = len(m.inflightIDs)
 			m.mainInflight = 0
@@ -1328,6 +1449,27 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 	}
 	if !natural {
 		return
+	}
+	// SHADOW VALIDATION (piece 3): pair the prediction taken when this member was
+	// SEATED as a return with the measured cache hit of the turn that seat was for.
+	// One prediction, one measurement, then cleared — a second settle cannot inherit
+	// the first prediction's claim. The engine's `prompt` and `cached` are the ground
+	// truth (cached = the prefix vLLM served from its GPU cache AND its CPU tier), so
+	// the pair is (predicted resident fraction, measured cached/prompt) with the
+	// fairness id that makes the record joinable to the wire-level request.
+	if m.predSet {
+		m.predSet = false
+		if promptTokens > 0 {
+			measured := float64(cachedTokens) / float64(promptTokens)
+			s.recordEventOn(Event{T: now, Kind: "SHADOW-VALIDATION", ID: id,
+				Engine: engineLabel(g.id), Member: id,
+				Detail: fmt.Sprintf("pred=%.4f measured=%.4f prompt=%d cached=%d fairness_id=%s",
+					m.predResident, measured, promptTokens, cachedTokens, fairnessOrNone(m.fairnessID))})
+			s.counters.shadowPairs++
+			if s.onShadowValidation != nil {
+				s.onShadowValidation(engineLabel(g.id), m.predResident, measured)
+			}
+		}
 	}
 	uncached := int64(promptTokens - cachedTokens)
 	if uncached < 0 {
@@ -1577,6 +1719,17 @@ func (s *Scheduler) countExitLocked(g *engineGroup, reason string) {
 // seatLocked seats one waiting head on the engine the admission pass chose. It is
 // the ONE place a binding is created: seat = pin, and the seat is the whole of it.
 func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
+	// THE SHADOW-VALIDATION PREDICTION, taken BEFORE the seat is written into the index:
+	// TrySeat puts the member's blocks in NE, after which every block of its own set
+	// would read as resident and the prediction would be a tautology (1.0 by
+	// construction). Only a RETURNING member gets one — a newcomer has no history to be
+	// resident, and the metric is defined over seated returns.
+	predResident, predOK := 0.0, false
+	if !w.newcomer && g.tier.Enabled() {
+		if _, resident, total := s.mod.sizer.TierCost(g.index, g.tier, w.id, w.sizeBytes); total > 0 && resident > 0 {
+			predResident, predOK = float64(resident)/float64(total), true
+		}
+	}
 	// seat in the index first (history-based cost; the estimate-based budget check
 	// already ran in the admission pass — D13 reconciles the difference). Returns
 	// false when TrySeat rejects (the caller must refresh and return — C4).
@@ -1603,6 +1756,8 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 		// a member that is about to dispatch (A1's livelock class).
 		waitingSince: w.since,
 		fairnessID:   w.fairnessID,
+		predResident: predResident,
+		predSet:      predOK,
 	}
 	// B6: ALL entries carry a cold charge (tokens, R1), CAPPED at the engine's own
 	// stagger cap — the valve's job is to serialise cold prefills inside the budget's
@@ -1968,6 +2123,10 @@ type Snapshot struct {
 	// the dump's RecentEvents covers the LAST eventRingSize events, and this says how
 	// much of the window lies before them.
 	EventRingDropped int64 `json:"eventRingDropped"`
+	// ShadowPairs counts the CPU-tier shadow's VALIDATION pairs (one per seated return
+	// whose turn settled with a measured cache hit). 0 on an arm without a configured
+	// tier — and on an arm WITH one it is the denominator of the shadow's AUC.
+	ShadowPairs int64 `json:"shadowPairs"`
 }
 
 // EngineSnapshot is ONE engine's group state: seats, waiters (accounted), the
@@ -2006,6 +2165,12 @@ type EngineSnapshot struct {
 	ReentryWaitP50 float64          `json:"reentryWaitP50"`
 	Exits          map[string]int64 `json:"exits,omitempty"`
 	BlockSizeErr   string           `json:"blockSizeMismatch,omitempty"`
+	// TierShadowBlocks / TierCapacityBlocks are the CPU-tier shadow's fill and its
+	// configured capacity, in blocks (both 0 when no tier is configured). A shadow
+	// pinned at capacity is the model's steady state; a shadow far below it means the
+	// store traffic the tier was sized for never arrived.
+	TierShadowBlocks   int `json:"tierShadowBlocks"`
+	TierCapacityBlocks int `json:"tierCapacityBlocks"`
 }
 
 // SnapshotLite is Snapshot without the event ring and config echo — the metrics
@@ -2031,6 +2196,7 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 		QueueViewAgeSeconds: s.queueEvidenceAgeSecondsLocked(),
 		QueueViewUntrusted:  s.counters.queueViewUntrusted,
 		EventRingDropped:    s.counters.eventsDropped,
+		ShadowPairs:         s.counters.shadowPairs,
 		Engines:             map[string]EngineSnapshot{}, Bindings: map[string]int{}}
 	if full {
 		snap.Config = s.cfg
@@ -2063,8 +2229,10 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 			SafetyFiring:  st.Fired, SafetyFires: st.Fires,
 			SafetyFiredSeconds: st.FiredSeconds, SafetySkips: g.counters.safetySkips,
 			SafetyKV: st.KV, SafetyWaitingQueue: st.Waiting,
-			EntryWaitP50:   p50(g.counters.entryWaits),
-			ReentryWaitP50: p50(g.counters.reentryWaits)}
+			EntryWaitP50:       p50(g.counters.entryWaits),
+			ReentryWaitP50:     p50(g.counters.reentryWaits),
+			TierShadowBlocks:   g.tier.Len(),
+			TierCapacityBlocks: g.tier.Capacity()}
 		if g.blockSizeMismatch != nil {
 			es.BlockSizeErr = g.blockSizeMismatch.Error()
 		}

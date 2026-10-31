@@ -69,6 +69,12 @@ func coldTokensForEngine(w *waiter, g *engineGroup, blockSize int) int64 {
 // vector (each engine's OWN index estimate, frozen for the decision pass — reviewer
 // R2) and the pool's best-case scalar (the minimum, used for the cold-entry charge
 // and for the turnover numbers).
+//
+// It fills the TIER-AWARE twin at the same time (tierCostTokens), computed the same
+// way over a cost that also counts each engine's CPU-tier shadow as residence. With no
+// tier configured anywhere the twin is written EQUAL to coldTokens — not left zero —
+// because that equality is what makes `entryOrder: "hrrn-tier"` arithmetically F5′ on a
+// tier-less deployment (and what the F5′-equivalence golden pins).
 func (s *Scheduler) setWaiterCostsLocked(w *waiter) {
 	groups := s.activeGroupsLocked()
 	if len(groups) == 0 {
@@ -76,18 +82,30 @@ func (s *Scheduler) setWaiterCostsLocked(w *waiter) {
 	}
 	vec := make(map[string]int64, len(groups))
 	best := int64(-1)
+	bestTier := int64(-1)
 	for _, g := range groups {
 		e := s.mod.sizer.Tokens(s.estimateCostCachedLocked(g, w.id, w.sizeBytes))
 		vec[g.id] = e
 		if best < 0 || e < best {
 			best = e
 		}
+		if g.tier.Enabled() {
+			t := s.estimateTierCostCachedLocked(g, w.id, w.sizeBytes)
+			if bestTier < 0 || t < bestTier {
+				bestTier = t
+			}
+		}
 	}
 	if best < 0 {
 		best = 0
 	}
+	if bestTier < 0 {
+		bestTier = best // NO engine has a tier: the tier-aware cost IS the cold cost
+	}
 	w.coldTokensByEngine = vec
 	w.coldTokens = best
+	w.tierCostTokens = bestTier
+	w.tierCostSet = true
 }
 
 // queuedPerSeatLocked is the engine's OWN queued demand per seat it holds: seated

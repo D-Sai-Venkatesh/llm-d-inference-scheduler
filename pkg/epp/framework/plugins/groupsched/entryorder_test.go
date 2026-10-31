@@ -30,6 +30,9 @@ package groupsched
 // under test. The class itself is pinned separately (TestHrrnBoundedKeepsTheArchiveClass).
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -354,4 +357,59 @@ func TestHrrnBoundedKeepsTheArchiveNewcomerClass(t *testing.T) {
 			t.Fatalf("head = %v, want a small-class newcomer: inside the class the response ratio beats the raw wait", h)
 		}
 	})
+}
+
+// ---- (6) EQUIVALENCE: the core's F5′ IS the archive's F5′ ----
+
+// TestHrrnBoundedEqualsTheArchiveF5P is the module's GOLDEN: on the same 2,600 s replay,
+// with ONE config value changed (entryOrder: newcomer-first -> hrrn-bounded) and NOTHING
+// else, the core must reproduce the ARCHIVE build's trace byte for byte.
+//
+// How testdata/golden-f5p-archive.txt was produced (and why it is not circular):
+//
+//  1. the archive tree at `dsai/groupsched-tier-aware` @ dd5350b5 — the commit that
+//     introduced F5′ there — in a scratch worktree;
+//  2. the four DECLARED FIXES of README §2 applied to it (total victim tie-break, the
+//     valve never evicts, class-3 unstarted/wanting last, the stale-view guard) — the
+//     patch is in docs/gsch-core/golden-f5p-recipe.md;
+//  3. VALIDATED before use: that patched archive regenerates testdata/
+//     golden-f0p-bugfixes.txt BYTE FOR BYTE (so the patch is the same recipe the other
+//     goldens came from, not a re-invention);
+//  4. the archive's own golden driver (this file's scenario, verbatim) at f0p's rendered
+//     config with entryOrder: "hrrn-bounded".
+//
+// The result: 6,089 trace lines, 1,664 dispatches, 2,600 simulated seconds, identical
+// picks, seats, exits-with-reasons, seated-set transitions and totals. There is no
+// normalisation of any kind — no divergence to document, which is also the evidence that
+// the module carries the archive's newcomer-class outer key (dropping it moves decisions
+// from the first minute).
+func TestHrrnBoundedEqualsTheArchiveF5P(t *testing.T) {
+	want, err := os.ReadFile(filepath.Join("testdata", "golden-f5p-archive.txt"))
+	if err != nil {
+		t.Fatalf("F5′ equivalence golden missing: %v", err)
+	}
+	got := runGoldenScenarioCfg(t, 2600, boundedConfig())
+	if got == string(want) {
+		return
+	}
+	gotL := strings.Split(got, "\n")
+	wantL := strings.Split(string(want), "\n")
+	diff := 0
+	for i := 0; i < len(gotL) || i < len(wantL); i++ {
+		var a, b string
+		if i < len(gotL) {
+			a = gotL[i]
+		}
+		if i < len(wantL) {
+			b = wantL[i]
+		}
+		if a == b {
+			continue
+		}
+		diff++
+		if diff <= 5 {
+			t.Errorf("divergence at line %d:\n  core:    %s\n  archive: %s", i+1, a, b)
+		}
+	}
+	t.Fatalf("the core's F5′ differs from the archive build's in %d lines: the module must be the archive's rule, not an approximation of it", diff)
 }

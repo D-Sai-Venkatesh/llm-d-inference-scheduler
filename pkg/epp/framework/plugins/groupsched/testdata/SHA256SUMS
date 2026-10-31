@@ -10,6 +10,11 @@
 #                            matches its first 2,167 lines and the archive cannot
 #                            reproduce itself past that point (evidence of the map-order
 #                            victim tie-break).
+#   golden-f5p-archive.txt   THE F5' EQUIVALENCE GOLDEN: the SAME archive build (dd5350b5
+#                            + the four declared fixes, verified by regenerating
+#                            golden-f0p-bugfixes.txt byte for byte) with ONE value changed,
+#                            entryOrder: "hrrn-bounded". TestHrrnBoundedEqualsTheArchiveF5P.
 cbfa11dee60fffcd802f7baa67eb03e9f69da53a9971fe6ac1cc35858b1aa582  golden-f0p-bugfixes.txt
 f3b667e87003a38e74026f0a6e3c6dc6809772c9dc3fda7c3fd0c121c347aa70  golden-f0p-core.txt
 643c75490f1fd34cd551be978e6b4fffbc735473a15e305b9d5431d5e17f3aa8  golden-f0p-total.txt
+0a1460b7590e31a4812a9120841cf553c184d04778a842fc11025c989716103b  golden-f5p-archive.txt

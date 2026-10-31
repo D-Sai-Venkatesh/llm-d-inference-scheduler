@@ -44,19 +44,19 @@ func TestResidueFreeQueueOrder(t *testing.T) {
 	if got := e.survivingPrefix("m1"); got != 4 {
 		t.Fatalf("live blocks must read as resident, got %d", got)
 	}
-	e.settle("m1", h, 0, 0) // completion: 4 blocks freed tail-first → prefix deepest
+	e.settle(true, "m1", h, 0, 0) // completion: 4 blocks freed tail-first → prefix deepest
 	if got := e.survivingPrefix("m1"); got != 4 {
 		t.Fatalf("after completion m1's prefix = %d, want 4 (nothing has been evicted yet)", got)
 	}
 	// m2 now consumes the remaining 4 anonymous slots and then starts evicting.
 	// The first identities to go are m1's TAIL blocks (they entered the queue last).
 	h2 := e.dispatch("m2", 4) // 4 anon slots, m1 untouched
-	e.settle("m2", h2, 0, 0)
+	e.settle(false, "m2", h2, 0, 0)
 	if got := e.survivingPrefix("m1"); got != 4 {
 		t.Fatalf("m1 prefix after m2 filled the pool = %d, want 4", got)
 	}
 	h3 := e.dispatch("m2", 8) // now the queue must recycle: m1's tail goes first
-	e.settle("m2", h3, 4, 0)
+	e.settle(false, "m2", h3, 4, 0)
 	if got := e.survivingPrefix("m1"); got != 0 {
 		t.Fatalf("m1 prefix after every slot was recycled = %d, want 0", got)
 	}
@@ -66,11 +66,11 @@ func TestResidueFreeQueueOrder(t *testing.T) {
 // departed chain first, which is what makes "prefix survives longest" observable.
 func TestResiduePrefixErodesFromTheTail(t *testing.T) {
 	e := newResidueEngine(10)
-	h := e.dispatch("m1", 6) // 6 live blocks
-	e.settle("m1", h, 0, 0)  // all 6 go to the queue tail, pos 0 deepest
+	h := e.dispatch("m1", 6)      // 6 live blocks
+	e.settle(true, "m1", h, 0, 0) // all 6 go to the queue tail, pos 0 deepest
 	// consume the 4 anonymous slots then 2 recycled identities (m1's pos 5, 4)
 	h2 := e.dispatch("m2", 6)
-	e.settle("m2", h2, 0, 0)
+	e.settle(false, "m2", h2, 0, 0)
 	if got := e.survivingPrefix("m1"); got != 4 {
 		t.Fatalf("m1 surviving prefix = %d, want 4 (positions 0..3 survive, 4..5 recycled)", got)
 	}
@@ -86,13 +86,13 @@ func TestResidueReconcileCountsBothErrorDirections(t *testing.T) {
 	// OVER-CREDIT: the model claims 4 cached blocks, the engine reports 0.
 	e := newResidueEngine(64)
 	h := e.dispatch("m1", 8)
-	e.settle("m1", h, 0, 0) // 8 resident
+	e.settle(true, "m1", h, 0, 0) // 8 resident
 	h2 := e.dispatch("m1", 8)
 	if h2.predHit != 8 {
 		t.Fatalf("predHit = %d, want 8", h2.predHit)
 	}
 	before := e.overCred
-	e.settle("m1", h2, 2, 0) // engine says only 2 hit → 6 blocks were re-allocated
+	e.settle(true, "m1", h2, 2, 0) // engine says only 2 hit → 6 blocks were re-allocated
 	if e.overCred <= before {
 		t.Fatalf("over-credit not counted (%d → %d)", before, e.overCred)
 	}
@@ -107,7 +107,7 @@ func TestResidueReconcileCountsBothErrorDirections(t *testing.T) {
 	}
 	// a PARTIAL resync (3 of 8): above the burst threshold a full reset voids the
 	// shadow instead, which TestResidueResetOnResyncBurst covers.
-	e2.settle("m2", residueHeld{predHit: 0, full: 8}, 3, 0)
+	e2.settle(true, "m2", residueHeld{predHit: 0, full: 8}, 3, 0)
 	if e2.resyncs == 0 {
 		t.Fatal("resync not counted: the engine reported hits on blocks the model had no identity for")
 	}
@@ -125,7 +125,7 @@ func TestResidueDisabledOnSustainedError(t *testing.T) {
 	for i := 0; i < residueMinCalibration+4; i++ {
 		// claim warm (8 blocks believed cached) and be wrong every time
 		h := residueHeld{predHit: 8, full: 8}
-		e.settle("m1", h, 0, 0)
+		e.settle(true, "m1", h, 0, 0)
 	}
 	if !e.disabled {
 		t.Fatalf("model not disabled after %d fully-wrong reconciliations (errEWMA=%.2f)", residueMinCalibration+4, e.errEWMA)
@@ -141,13 +141,17 @@ func TestResidueDisabledOnSustainedError(t *testing.T) {
 func TestResidueResetOnResyncBurst(t *testing.T) {
 	e := newResidueEngine(64)
 	gen := e.gen
-	h := residueHeld{predHit: 0, full: 10} // claims fully cold...
-	e.settle("m1", h, 10, 0)               // ...but the engine reports a full hit
-	if e.gen == gen {
-		t.Fatal("a full resync burst did not void the residue (gen unchanged)")
+	// Under open loop the model does NOT correct itself from the measured hit; the
+	// persistent mismatch shows up as calibration error and drops the engine to
+	// fit-only (the resync-burst reset was folded into that single verdict).
+	for i := 0; i < residueMinCalibration; i++ {
+		e.settle(false, "m1", residueHeld{predHit: 0, full: 10}, 10, 0)
 	}
-	if e.resets == 0 {
-		t.Fatal("reset not counted")
+	if e.gen != gen {
+		t.Fatal("open loop must not void the shadow on a resync burst (that would be a state correction)")
+	}
+	if !e.disabled {
+		t.Fatalf("a persistently mis-predicting engine must drop to fit-only (errEWMA=%.2f, samples=%d)", e.errEWMA, e.samples)
 	}
 }
 
@@ -171,7 +175,7 @@ func TestResidueTieBreakOnlyAmongFittingWarmEngines(t *testing.T) {
 	gb := s.groups["engine-b"]
 	gb.residue.setCapacity(4000)
 	h := gb.residue.dispatch("m1", 100)
-	gb.residue.settle("m1", h, 0, 0)
+	gb.residue.settle(true, "m1", h, 0, 0)
 	gb.residue.samples = 0 // keep it enabled/calibrated for this check
 	warm := gb.residue.ratio("m1")
 	coldA := s.groups["engine-a"].residue.ratio("m1")
@@ -285,5 +289,70 @@ func TestResidueSurvivesARunEndToEnd(t *testing.T) {
 	s.mu.Unlock()
 	if ratio < 0.9 {
 		t.Fatalf("after a full hit on a 20-block prompt the model should call m1 warm, ratio=%v", ratio)
+	}
+}
+
+// TestEngineGateSkipsSaturatedEngine is the per-engine gate: a saturated engine
+// takes no new seats (its own residents keep dispatching), so the queue goes to the
+// sibling that has room. The signal is the DETECTOR'S OWN FORMULA de-averaged:
+// max(waiting/5, kv/0.80) >= 1.
+func TestEngineGateSkipsSaturatedEngine(t *testing.T) {
+	cfg := e4aCfg()
+	cfg.EngineGate = "per-engine"
+	s, err := NewScheduler(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"engine-a", "engine-b"} {
+		if err := s.SetNumBlocksFor(id, 64, 4000); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := goldenT0
+	// engine-a is at kv 0.90 (> the 0.80 threshold) — saturated by its own kv
+	s.SetEngineLoad("engine-a", 0.90, 0, now)
+	s.SetEngineLoad("engine-b", 0.10, 0, now)
+	w := &waiter{id: "m1", since: now, sizeBytes: bytesFor(40),
+		coldTokensByEngine: map[string]int64{"engine-a": 40 * 64, "engine-b": 40 * 64}}
+	s.mu.Lock()
+	c := s.seatEngineLocked(w, now)
+	s.mu.Unlock()
+	if c == nil || c.g.id != "engine-b" {
+		t.Fatalf("a kv-saturated engine must be skipped, got %+v", c)
+	}
+	// and by its own waiting queue (>= 5)
+	s.SetEngineLoad("engine-a", 0.10, 6, now)
+	s.SetEngineLoad("engine-b", 0.10, 0, now)
+	s.mu.Lock()
+	c = s.seatEngineLocked(w, now)
+	s.mu.Unlock()
+	if c == nil || c.g.id != "engine-b" {
+		t.Fatalf("a queue-saturated engine must be skipped, got %+v", c)
+	}
+	// BOTH saturated ⇒ no candidate: admission waits rather than piling onto a
+	// saturated engine (the heads stay queued; nothing is lost).
+	s.SetEngineLoad("engine-b", 0.95, 0, now)
+	s.mu.Lock()
+	c = s.seatEngineLocked(w, now)
+	s.mu.Unlock()
+	if c != nil {
+		t.Fatalf("with every engine saturated the seat choice must return nothing, got %+v", c)
+	}
+	// and the gate is OFF by default: the same state admits normally.
+	off, err := NewScheduler(e4aCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"engine-a", "engine-b"} {
+		if err := off.SetNumBlocksFor(id, 64, 4000); err != nil {
+			t.Fatal(err)
+		}
+	}
+	off.SetEngineLoad("engine-a", 0.99, 99, now) // a no-op with the gate off
+	off.mu.Lock()
+	cOff := off.seatEngineLocked(w, now)
+	off.mu.Unlock()
+	if cOff == nil {
+		t.Fatal("with engineGate=off the seat choice must be unaffected by load")
 	}
 }

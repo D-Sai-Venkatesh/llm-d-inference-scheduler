@@ -37,13 +37,14 @@ package groupsched
 // per-block set.
 //
 // This mirrors the offline validation's residue-sim.py (the reference
-// implementation, r 0.88-0.92 against measured cached_tokens). One deliberate
-// difference: the simulator replays a finished run and knows each request's
-// measured cached_tokens AT dispatch, while an online scheduler only learns them
-// at Settle. So the model predicts at dispatch (what it believes is resident) and
-// RECONCILES at settle against usage.cached_tokens — the reference's
-// settle-corrected variant, one request later. The reconciliation is counted
-// (overCredit / resyncs) and drives the calibration gauge.
+// implementation, r 0.88-0.92 against measured cached_tokens). The shipped form is
+// the OPEN-LOOP variant: the model predicts at dispatch (consumes prompt −
+// PREDICTED cached) and its STATE is never corrected from usage.cached_tokens —
+// DICTATE, DON'T OBSERVE. The validation's ablation found open-loop identical to
+// settle-corrected (stage 1: 0.920/0.964 vs 0.919/0.964), so the measured hit is
+// used ONLY as a VALIDATION signal (residue_actual_ratio + the calibration EWMA
+// that drops an engine to fit-only), never to move state. Reconcile stays
+// available as a diagnostic knob (residueReconcile: settle) and is off by default.
 //
 // THE MODEL IS NOT A RANKER OF COLD ENGINES (§11 + the reviewer's ruling): it
 // only breaks ties among engines that already PASSED the fit gate, and only when
@@ -275,12 +276,30 @@ func (e *residueEngine) dispatch(member string, promptBlocks int) residueHeld {
 // (usage.prompt / usage.cached — the OUTCOME of our decisions, not a cache read),
 // models the decode allocations, and frees the request's blocks in REVERSE
 // position order.
-func (e *residueEngine) settle(member string, held residueHeld, hitBlocks, outBlocks int) (predicted, actual float64) {
+func (e *residueEngine) settle(reconcile bool, member string, held residueHeld, hitBlocks, outBlocks int) (predicted, actual float64) {
 	if hitBlocks < 0 {
 		hitBlocks = 0
 	}
 	if hitBlocks > held.full {
 		hitBlocks = held.full
+	}
+	if !reconcile {
+		// OPEN LOOP (the shipped form): the measured hit is a VALIDATION signal
+		// only. The state moves on the model's own prediction — that is what
+		// "dictate, don't observe" means — and the prediction/actual pair below is
+		// what the arm scores post-hoc.
+		for pos := held.full; pos < held.full+outBlocks; pos++ {
+			n := e.alloc(member, pos)
+			n.refs = 1
+			held.nodes = append(held.nodes, n)
+		}
+		if hi := held.full + outBlocks; hi > e.hi[member] {
+			e.hi[member] = hi
+		}
+		for i := len(held.nodes) - 1; i >= 0; i-- {
+			e.release(held.nodes[i])
+		}
+		return e.validate(member, held, hitBlocks)
 	}
 	// OVER-CREDIT: the model claimed [actHit, predHit) were cached; the engine
 	// allocated them. Give them identities so the queue stays honest.
@@ -305,13 +324,11 @@ func (e *residueEngine) settle(member string, held residueHeld, hitBlocks, outBl
 	}
 	// UNDER-CREDIT (resync): the engine reported a hit on blocks the model had
 	// evicted — it was wrong about the eviction order, so re-assign them.
-	resynced := 0
 	for pos := held.predHit; pos < hitBlocks; pos++ {
 		if e.chains[member] != nil && e.chains[member][pos] != nil {
 			continue
 		}
 		e.resyncs++
-		resynced++
 		n := e.alloc(member, pos)
 		n.refs = 1
 		held.nodes = append(held.nodes, n)
@@ -329,7 +346,13 @@ func (e *residueEngine) settle(member string, held residueHeld, hitBlocks, outBl
 	for i := len(held.nodes) - 1; i >= 0; i-- {
 		e.release(held.nodes[i])
 	}
-	// calibration: predicted vs measured surviving fraction of the PROMPT
+	return e.validate(member, held, hitBlocks)
+}
+
+// validate books the prediction/actual pair and the calibration verdict. It NEVER
+// changes the shadow: this is the arm scoring its own argmax, not the model
+// correcting itself.
+func (e *residueEngine) validate(member string, held residueHeld, hitBlocks int) (predicted, actual float64) {
 	predicted = 0.0
 	if held.full > 0 {
 		predicted = float64(held.predHit) / float64(held.full)
@@ -355,14 +378,9 @@ func (e *residueEngine) settle(member string, held residueHeld, hitBlocks, outBl
 	if !e.disabled && e.samples >= residueMinCalibration && e.errEWMA > residueErrLimit {
 		e.disabled = true
 	}
-	// SELF-MODEL RESET (1b): a RESYNC BURST — most of one request's claimed hits were
-	// blocks the model had already evicted — means the shadow lost the engine's
-	// state (a restart we did not observe, a second EPP, a pool re-creation). Voiding
-	// the residue is strictly better than carrying a model we know is wrong: the
-	// engine keeps serving, it just stops being ranked on residue until it rebuilds.
-	if held.full > 0 && resynced*2 >= held.full && !e.disabled {
-		e.reset("resync-burst")
-	}
+	// (The resync-burst detector is folded into this same verdict: a model that
+	// claims cached where the engine says cold shows up as calibration error, and the
+	// fit-only drop is the response. There is no second reset path to get wrong.)
 	return predicted, actual
 }
 

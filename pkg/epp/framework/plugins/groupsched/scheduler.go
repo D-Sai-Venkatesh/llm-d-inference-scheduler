@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -168,11 +169,46 @@ type Config struct {
 	// endpoints the EPP already sees and are torn down on EventDelete.
 	EngineGroups string `json:"engineGroups"`
 
+	// ---- per-engine gating (both arms: the multi-pod gate coupling fix) ----
+
+	// EngineGate applies the saturation gate PER ENGINE, at head selection:
+	//
+	//	"off"        — today's behaviour: the pool-level detector alone gates
+	//	               dispatch, and admission never looks at an individual
+	//	               engine's saturation. DEFAULT (golden-pinned).
+	//	"per-engine" — a head is admitted only to an engine that is NOT saturated
+	//	               (that engine's OWN kv < SatKvThreshold AND its waiting queue
+	//	               < SatQueueThreshold). A saturated engine takes no new seats;
+	//	               seats that free there still serve its own residents.
+	//
+	// WHY (measured): the pool detector aggregates over endpoints, so with one
+	// engine at 0.95 beside one at 0.50 the pool reads 0.725 and NOTHING is gated
+	// while an engine is saturated — and because the gate closes on the pool
+	// average while one engine is starved, the under-filled engine keeps getting
+	// FEWER seats (0.71:1): the gate never rebalances. Both arms of the E3′/E4
+	// contrast carry this fix so the comparison is gate-clean.
+	EngineGate string `json:"engineGate"`
+	// SatKvThreshold / SatQueueThreshold are the per-engine saturation limits used
+	// by EngineGate. They are the detector's own defaults (0.80 / 5), repeated
+	// here because the policy must gate on the SAME numbers the detector does —
+	// a different pair would make the two gates disagree.
+	SatKvThreshold    float64 `json:"satKvThreshold"`
+	SatQueueThreshold int     `json:"satQueueThreshold"`
+
 	// ---- E4b knob (the parameter-free residue model) ----
 
 	// Residue selects whether the seat-time engine choice uses the scheduler's own
 	// RESIDUE MODEL (residue.go) as a TIE-BREAK among engines that already pass the
 	// fit gate:
+	//
+	//	ResidueReconcile (json "residueReconcile", off|settle, default off) is the
+	//	diagnostic knob: with "settle" the shadow is corrected from the measured
+	//	cached_tokens at each settle (the reference's settle-corrected variant).
+	//	Default "off" = open loop, because the validation's ablation found the two
+	//	identical (0.920/0.964 vs 0.919/0.964) and open loop is the strict form of
+	//	dictate-don't-observe. The measured hit ALWAYS feeds the calibration verdict
+	//	and the actual-ratio series; it never moves state unless this knob says so.
+	ResidueReconcile string `json:"residueReconcile"`
 	//
 	//	"off"       — fit → least relative backlog per seat → cheapest-victim.
 	//	              DEFAULT, and what the E3 arm runs (the model is never built).
@@ -240,6 +276,10 @@ func defaultConfig() Config {
 		EngineGroups:            "single",
 		BindingMode:             "member-stable",
 		Residue:                 "off",
+		ResidueReconcile:        "off",
+		EngineGate:              "off",
+		SatKvThreshold:          0.80,
+		SatQueueThreshold:       5,
 	}
 }
 
@@ -294,6 +334,18 @@ func (c Config) effective() Config {
 	}
 	if c.Residue == "" {
 		c.Residue = def.Residue
+	}
+	if c.ResidueReconcile == "" {
+		c.ResidueReconcile = def.ResidueReconcile
+	}
+	if c.EngineGate == "" {
+		c.EngineGate = def.EngineGate
+	}
+	if c.SatKvThreshold == 0 {
+		c.SatKvThreshold = def.SatKvThreshold
+	}
+	if c.SatQueueThreshold == 0 {
+		c.SatQueueThreshold = def.SatQueueThreshold
 	}
 	if c.BindingTTLSeconds == 0 {
 		c.BindingTTLSeconds = 20 * c.TTLSeconds
@@ -405,6 +457,22 @@ func (c Config) validate() error {
 	default:
 		return fmt.Errorf("bindingMode: invalid value %q (member-stable|seat)", c.BindingMode)
 	}
+	switch c.ResidueReconcile {
+	case "", "off", "settle":
+	default:
+		return fmt.Errorf("residueReconcile: invalid value %q (off|settle)", c.ResidueReconcile)
+	}
+	switch c.EngineGate {
+	case "", "off", "per-engine":
+	default:
+		return fmt.Errorf("engineGate: invalid value %q (off|per-engine)", c.EngineGate)
+	}
+	if c.SatKvThreshold < 0 || c.SatKvThreshold > 1 {
+		return fmt.Errorf("satKvThreshold must be in (0,1], got %v", c.SatKvThreshold)
+	}
+	if c.SatQueueThreshold < 0 {
+		return fmt.Errorf("satQueueThreshold must be >= 0, got %d", c.SatQueueThreshold)
+	}
 	switch c.Residue {
 	case "", "off", "tiebreak":
 	default:
@@ -426,12 +494,84 @@ func (c Config) seatPin() bool { return c.BindingMode == "seat" }
 // residueOn reports whether the residue model ranks the fitting engines (E4b).
 func (c Config) residueOn() bool { return c.Residue == "tiebreak" }
 
+// residueReconcile reports whether the residue shadow is corrected from the
+// measured cached_tokens at settle. OFF by default: the shipped model is OPEN LOOP
+// (dictate, don't observe) and the measured hit is a validation signal only.
+func (c Config) residueReconcile() bool { return c.ResidueReconcile == "settle" }
+
+// engineGating reports whether admission is gated per engine.
+func (c Config) engineGating() bool { return c.EngineGate == "per-engine" }
+
 // reapSeconds is the effective confirmed-id reap bound (0 → default).
 func (c Config) reapSeconds() float64 {
 	if c.InflightReapSeconds > 0 {
 		return c.InflightReapSeconds
 	}
 	return 3700
+}
+
+// engineLoad is ONE engine's pushed saturation snapshot.
+type engineLoad struct {
+	kv      float64
+	waiting int
+	at      time.Time
+}
+
+// SetEngineLoad records one engine's saturation snapshot (called by the plugin from
+// its metrics poll). A zero `at` clears the entry.
+func (s *Scheduler) SetEngineLoad(engine string, kv float64, waiting int, at time.Time) {
+	if !s.cfg.engineGating() {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.load == nil {
+		s.load = map[string]engineLoad{}
+	}
+	if at.IsZero() {
+		delete(s.load, engine)
+		return
+	}
+	s.load[engine] = engineLoad{kv: kv, waiting: waiting, at: at}
+}
+
+// ForgetEngineLoadsExcept drops load snapshots for engines the EPP no longer sees.
+func (s *Scheduler) ForgetEngineLoadsExcept(keep map[string]struct{}) {
+	if !s.cfg.engineGating() {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k := range s.load {
+		if _, ok := keep[k]; !ok {
+			delete(s.load, k)
+		}
+	}
+}
+
+// saturatingLocked reports whether an engine is SATURATED by its own numbers: kv
+// utilisation at or above the detector's threshold, or a waiting queue at or above
+// its queue threshold. An engine with no snapshot is NOT saturated: absence of
+// evidence must not silently stop admission on a healthy engine (the pool detector
+// is the fail-closed layer, and capacity_missing already alarms on unknown engines).
+func (s *Scheduler) saturatingLocked(g *engineGroup) bool {
+	if g == nil || !s.cfg.engineGating() {
+		return false
+	}
+	l, ok := s.load[g.id]
+	if !ok || l.at.IsZero() {
+		return false
+	}
+	// THE DETECTOR'S OWN FORMULA, de-averaged: the per-endpoint score is
+	//
+	//	saturation_e = max(waiting_e / queueThreshold, kv_e / kvThreshold)
+	//
+	// (utilization.Detector.Saturation's roofline, for ONE endpoint) and the engine
+	// is saturated at >= 1. This is deliberately the SCRAPED kv, not the policy's
+	// own NE/budget: they measure different things (kv_cache_usage is the blocks
+	// held by RUNNING requests; NE is the seated set the budget tracks), and the
+	// gate's job is to leave preemption headroom for running work.
+	return math.Max(float64(l.waiting)/float64(s.cfg.SatQueueThreshold), l.kv/s.cfg.SatKvThreshold) >= 1
 }
 
 // ---- the queue-head snapshot (S0-1: waiting state comes from the
@@ -457,6 +597,12 @@ type Head struct {
 	// "session" | ""). Counted per dispatch (the run is auditable from the
 	// artifacts without re-deriving it from the config).
 	Source string
+	// FairnessID is the request's flow-control identity — the id the GATEWAY and
+	// the harness record on the wire (x_correlation_id / the client's thread id).
+	// The member id is a DERIVED branch id and joins to nothing in the request
+	// records (measured 0/768 matches), so every SEAT/EXIT event must carry this
+	// too or a run's seat membership cannot be joined to its own requests.
+	FairnessID string
 }
 
 // ---- per-session scheduling state (§3) ----
@@ -530,6 +676,9 @@ type member struct {
 	awaitingEngine bool
 	// waitingSince is the member's oldest queued head (B5: kept oldest).
 	waitingSince time.Time
+	// fairnessID is the last fairness id (queue key) this member was seen with —
+	// the join key for its SEAT/EXIT events (see Head.FairnessID).
+	fairnessID string
 }
 
 // inflightRec is one in-flight request's reconciliation record (C3).
@@ -567,6 +716,9 @@ type waiter struct {
 	// — which is the truth about that engine — instead of inheriting the pool's
 	// best case.
 	coldTokensByEngine map[string]int64
+	// fairnessID rides with the head (see Head.FairnessID) so a SEAT event can name
+	// the wire-level identity even before the member has a record.
+	fairnessID string
 }
 
 // ---- the per-engine group (PREREG-multipod-offload task 1) ----
@@ -746,6 +898,12 @@ type Scheduler struct {
 	// stray read is a nil-map read, never a silent cross-model mix).
 	gWaiters map[string]*waiter
 
+	// load is the PER-ENGINE saturation view the plugin pushes up from the endpoint
+	// metrics it already polls (kv utilisation and waiting queue depth). A pushed
+	// snapshot, never a schedule: the policy never scrapes and never blocks. Keyed
+	// by endpoint id and only allocated when the per-engine gate is on.
+	load map[string]engineLoad
+
 	// pickSeq synthesizes request ids for heads that lack one (M1).
 	pickSeq int64
 	// turnSeen / gapHistory are the per-member INTER-TURN GAP history (F4's
@@ -813,6 +971,9 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 	}
 	s.counters.exits = map[string]int64{}
 	s.counters.memberSources = map[string]int64{}
+	if cfg.engineGating() {
+		s.load = map[string]engineLoad{}
+	}
 	if _, err := s.groupForLocked(""); err != nil {
 		return nil, err
 	}
@@ -1357,6 +1518,13 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 			continue
 		}
 		present[h.Member] = h.Arrival
+		if h.FairnessID != "" {
+			if g := s.groupOfLocked(h.Member); g != nil {
+				if m, seated := g.members[h.Member]; seated && m.fairnessID != h.FairnessID {
+					m.fairnessID = h.FairnessID
+				}
+			}
+		}
 		// the F4 pause rule's input: the gap between successive TURNS of this
 		// member, measured on the head's own enqueue time (the truthful
 		// inter-arrival). It is a fact about the MEMBER, so it is recorded
@@ -1402,6 +1570,7 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 		// the ordering layer's unit follows the head (session attribute,
 		// else the member key — base mode)
 		w.session = sessionUnitOf(h.Session, h.Member)
+		w.fairnessID = h.FairnessID
 		// B5: keep the OLDEST arrival across fan-out re-arrivals
 		if w.since.IsZero() || h.Arrival.Before(w.since) {
 			w.since = h.Arrival
@@ -1852,7 +2021,7 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 			held = residueHeld{predHit: hit, full: pblk}
 		}
 		delete(g.resFlights, reqID)
-		pred, act := g.residue.settle(id, held, hit, oblk)
+		pred, act := g.residue.settle(s.cfg.residueReconcile(), id, held, hit, oblk)
 		if s.onResidueSettle != nil {
 			s.onResidueSettle(g.id, pred, act)
 		}
@@ -2023,6 +2192,13 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 }
 
 func (s *Scheduler) rotateEngineLocked(g *engineGroup, seatsP *map[string]int, now time.Time) {
+	if s.saturatingLocked(g) {
+		// PER-ENGINE GATE: a saturated engine takes no new seats. Its own residents
+		// keep dispatching (they are already admitted); only ADMISSION stops, which
+		// is exactly what lets the sibling engine serve the queue instead.
+		g.counters.gateSkipped++
+		return
+	}
 	seats := *seatsP
 	for {
 		head := s.entryHeadLocked(g, seats)
@@ -2372,7 +2548,7 @@ func (s *Scheduler) exitLocked(g *engineGroup, m *member, reason string, now tim
 	g.index.UnseatLocked(m.id)
 	delete(g.members, m.id)
 	s.countExitLocked(g, reason)
-	s.recordEvent("EXIT", m.id, fmt.Sprintf("reason=%s turns=%d", reason, m.resTurns), now)
+	s.recordEvent("EXIT", m.id, fmt.Sprintf("reason=%s turns=%d fairness_id=%s", reason, m.resTurns, fairnessOrNone(m.fairnessID)), now)
 	if s.onExit != nil {
 		s.onExit(engineLabel(g.id), reason, m.resTurns)
 	}
@@ -2405,6 +2581,15 @@ func (s *Scheduler) exitLocked(g *engineGroup, m *member, reason string, now tim
 			pool[m.id] = w
 		}
 	}
+}
+
+// fairnessOrNone renders an absent fairness id as "-" so a parser never sees an
+// empty field.
+func fairnessOrNone(id string) string {
+	if id == "" {
+		return "-"
+	}
+	return id
 }
 
 // countExitLocked books an exit (or an exiting-mark) on the engine AND in
@@ -2496,7 +2681,7 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 	} else {
 		s.counters.reentryWaits = append(s.counters.reentryWaits, now.Sub(w.since).Seconds())
 	}
-	s.recordEvent("SEAT", w.id, fmt.Sprintf("kind=%s wait=%.3f", kind, now.Sub(w.since).Seconds()), now)
+	s.recordEvent("SEAT", w.id, fmt.Sprintf("kind=%s wait=%.3f fairness_id=%s", kind, now.Sub(w.since).Seconds(), fairnessOrNone(w.fairnessID)), now)
 	g.members[w.id] = m
 	return true
 }

@@ -1,91 +1,91 @@
-EVENT kind=SEAT engine=engine-a id=m00 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-a id=m00 kind=newcomer wait=0.000 fairness_id=-
 t=10 PICK engine=engine-a m00 req=m00-r01 blocks=18
 t=10 STATE engine-a=1 engine-b=0
-EVENT kind=SEAT engine=engine-b id=m01 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-b id=m01 kind=newcomer wait=0.000 fairness_id=-
 t=11 PICK engine=engine-b m01 req=m01-r01 blocks=18
 t=11 STATE engine-a=1 engine-b=1
-EVENT kind=SEAT engine=engine-b id=m02 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-b id=m02 kind=newcomer wait=0.000 fairness_id=-
 t=12 PICK engine=engine-b m02 req=m02-r01 blocks=18
 t=12 STATE engine-a=1 engine-b=2
-EVENT kind=SEAT engine=engine-a id=m03 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-a id=m03 kind=newcomer wait=0.000 fairness_id=-
 t=13 PICK engine=engine-a m03 req=m03-r01 blocks=18
 t=13 STATE engine-a=2 engine-b=2
-EVENT kind=SEAT engine=engine-b id=m04 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-b id=m04 kind=newcomer wait=0.000 fairness_id=-
 t=14 PICK engine=engine-b m04 req=m04-r01 blocks=18
 t=14 STATE engine-a=2 engine-b=3
-EVENT kind=SEAT engine=engine-b id=m05 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-b id=m05 kind=newcomer wait=0.000 fairness_id=-
 t=15 PICK engine=engine-b m05 req=m05-r01 blocks=18
 t=15 STATE engine-a=2 engine-b=4
-EVENT kind=SEAT engine=engine-a id=m06 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-a id=m06 kind=newcomer wait=0.000 fairness_id=-
 t=16 PICK engine=engine-a m06 req=m06-r01 blocks=18
 t=16 STATE engine-a=3 engine-b=4
-EVENT kind=SEAT engine=engine-b id=m07 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-b id=m07 kind=newcomer wait=0.000 fairness_id=-
 t=17 PICK engine=engine-b m07 req=m07-r01 blocks=18
 t=17 STATE engine-a=3 engine-b=5
 t=18 SETTLE m00 req=m00-r01 engine=engine-a
-EVENT kind=SEAT engine=engine-b id=m08 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-b id=m08 kind=newcomer wait=0.000 fairness_id=-
 t=18 PICK engine=engine-b m08 req=m08-r01 blocks=18
 t=18 STATE engine-a=3 engine-b=6
 t=19 SETTLE m01 req=m01-r01 engine=engine-b
-EVENT kind=SEAT engine=engine-a id=m09 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-a id=m09 kind=newcomer wait=0.000 fairness_id=-
 t=19 PICK engine=engine-a m09 req=m09-r01 blocks=18
 t=19 STATE engine-a=4 engine-b=6
 t=20 SETTLE m02 req=m02-r01 engine=engine-b
-EVENT kind=SEAT engine=engine-b id=m10 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-b id=m10 kind=newcomer wait=0.000 fairness_id=-
 t=20 PICK engine=engine-a m00 req=m00-r02 blocks=29
 t=20 STATE engine-a=4 engine-b=7
 t=20 PICK engine=engine-b m10 req=m10-r01 blocks=18
 t=20 STATE engine-a=4 engine-b=7
 t=21 SETTLE m03 req=m03-r01 engine=engine-a
-EVENT kind=SEAT engine=engine-b id=m11 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-b id=m11 kind=newcomer wait=0.000 fairness_id=-
 t=21 PICK engine=engine-b m01 req=m01-r02 blocks=29
 t=21 STATE engine-a=4 engine-b=8
 t=21 PICK engine=engine-b m11 req=m11-r01 blocks=18
 t=21 STATE engine-a=4 engine-b=8
 t=22 SETTLE m04 req=m04-r01 engine=engine-b
-EVENT kind=SEAT engine=engine-a id=m12 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-a id=m12 kind=newcomer wait=0.000 fairness_id=-
 t=22 PICK engine=engine-a m12 req=m12-r01 blocks=18
 t=22 STATE engine-a=5 engine-b=8
 t=22 PICK engine=engine-b m02 req=m02-r02 blocks=29
 t=22 STATE engine-a=5 engine-b=8
 t=23 SETTLE m05 req=m05-r01 engine=engine-b
-EVENT kind=SEAT engine=engine-b id=m13 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-b id=m13 kind=newcomer wait=0.000 fairness_id=-
 t=23 PICK engine=engine-a m03 req=m03-r02 blocks=29
 t=23 STATE engine-a=5 engine-b=9
 t=23 PICK engine=engine-b m13 req=m13-r01 blocks=18
 t=23 STATE engine-a=5 engine-b=9
 t=24 SETTLE m06 req=m06-r01 engine=engine-a
-EVENT kind=SEAT engine=engine-b id=m14 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-b id=m14 kind=newcomer wait=0.000 fairness_id=-
 t=24 PICK engine=engine-b m04 req=m04-r02 blocks=29
 t=24 STATE engine-a=5 engine-b=10
 t=24 PICK engine=engine-b m14 req=m14-r01 blocks=18
 t=24 STATE engine-a=5 engine-b=10
 t=25 SETTLE m07 req=m07-r01 engine=engine-b
-EVENT kind=SEAT engine=engine-a id=m15 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-a id=m15 kind=newcomer wait=0.000 fairness_id=-
 t=25 PICK engine=engine-a m15 req=m15-r01 blocks=18
 t=25 STATE engine-a=6 engine-b=10
 t=25 PICK engine=engine-b m05 req=m05-r02 blocks=29
 t=25 STATE engine-a=6 engine-b=10
 t=26 SETTLE m08 req=m08-r01 engine=engine-b
-EVENT kind=SEAT engine=engine-b id=m16 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-b id=m16 kind=newcomer wait=0.000 fairness_id=-
 t=26 PICK engine=engine-a m06 req=m06-r02 blocks=29
 t=26 STATE engine-a=6 engine-b=11
 t=26 PICK engine=engine-b m16 req=m16-r01 blocks=18
 t=26 STATE engine-a=6 engine-b=11
 t=27 SETTLE m09 req=m09-r01 engine=engine-a
-EVENT kind=SEAT engine=engine-b id=m17 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-b id=m17 kind=newcomer wait=0.000 fairness_id=-
 t=27 PICK engine=engine-b m07 req=m07-r02 blocks=29
 t=27 STATE engine-a=6 engine-b=12
 t=27 PICK engine=engine-b m17 req=m17-r01 blocks=18
 t=27 STATE engine-a=6 engine-b=12
 t=28 SETTLE m10 req=m10-r01 engine=engine-b
-EVENT kind=SEAT engine=engine-a id=m18 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-a id=m18 kind=newcomer wait=0.000 fairness_id=-
 t=28 PICK engine=engine-a m18 req=m18-r01 blocks=18
 t=28 STATE engine-a=7 engine-b=12
 t=28 PICK engine=engine-b m08 req=m08-r02 blocks=29
 t=28 STATE engine-a=7 engine-b=12
 t=29 SETTLE m11 req=m11-r01 engine=engine-b
-EVENT kind=SEAT engine=engine-b id=m19 kind=newcomer wait=0.000
+EVENT kind=SEAT engine=engine-b id=m19 kind=newcomer wait=0.000 fairness_id=-
 t=29 PICK engine=engine-a m09 req=m09-r02 blocks=29
 t=29 STATE engine-a=7 engine-b=13
 t=29 PICK engine=engine-b m19 req=m19-r01 blocks=18
@@ -1501,18 +1501,18 @@ t=319 STATE engine-a=8 engine-b=12
 t=319 PICK engine=engine-a m06 req=m06-r26 blocks=437
 t=319 STATE engine-a=8 engine-b=12
 t=320 SETTLE m03 req=m03-r25 engine=engine-a
-EVENT kind=EXIT engine=engine-b id=m01 reason=engine-gone turns=26
-EVENT kind=EXIT engine=engine-b id=m02 reason=engine-gone turns=26
-EVENT kind=EXIT engine=engine-b id=m04 reason=engine-gone turns=24
-EVENT kind=EXIT engine=engine-b id=m07 reason=engine-gone turns=24
-EVENT kind=EXIT engine=engine-b id=m08 reason=engine-gone turns=24
-EVENT kind=EXIT engine=engine-b id=m10 reason=engine-gone turns=24
-EVENT kind=EXIT engine=engine-b id=m11 reason=engine-gone turns=24
-EVENT kind=EXIT engine=engine-b id=m13 reason=engine-gone turns=24
-EVENT kind=EXIT engine=engine-b id=m14 reason=engine-gone turns=24
-EVENT kind=EXIT engine=engine-b id=m16 reason=engine-gone turns=23
-EVENT kind=EXIT engine=engine-b id=m17 reason=engine-gone turns=23
-EVENT kind=EXIT engine=engine-b id=m19 reason=engine-gone turns=23
+EVENT kind=EXIT engine=engine-b id=m01 reason=engine-gone turns=26 fairness_id=-
+EVENT kind=EXIT engine=engine-b id=m02 reason=engine-gone turns=26 fairness_id=-
+EVENT kind=EXIT engine=engine-b id=m04 reason=engine-gone turns=24 fairness_id=-
+EVENT kind=EXIT engine=engine-b id=m07 reason=engine-gone turns=24 fairness_id=-
+EVENT kind=EXIT engine=engine-b id=m08 reason=engine-gone turns=24 fairness_id=-
+EVENT kind=EXIT engine=engine-b id=m10 reason=engine-gone turns=24 fairness_id=-
+EVENT kind=EXIT engine=engine-b id=m11 reason=engine-gone turns=24 fairness_id=-
+EVENT kind=EXIT engine=engine-b id=m13 reason=engine-gone turns=24 fairness_id=-
+EVENT kind=EXIT engine=engine-b id=m14 reason=engine-gone turns=24 fairness_id=-
+EVENT kind=EXIT engine=engine-b id=m16 reason=engine-gone turns=23 fairness_id=-
+EVENT kind=EXIT engine=engine-b id=m17 reason=engine-gone turns=23 fairness_id=-
+EVENT kind=EXIT engine=engine-b id=m19 reason=engine-gone turns=23 fairness_id=-
 t=320 ENGINE-GONE engine-b exited=12
 t=320 STATE engine-a=8
 t=320 PICK engine=engine-a m12 req=m12-r25 blocks=414
@@ -1520,40 +1520,40 @@ t=320 STATE engine-a=8
 t=321 PICK engine=engine-a m09 req=m09-r26 blocks=437
 t=321 STATE engine-a=8
 t=323 SETTLE m04 req=m04-r26 engine=engine-b
-EVENT kind=SEAT engine=engine-a id=m07 kind=re-entry wait=0.000
+EVENT kind=SEAT engine=engine-a id=m07 kind=re-entry wait=0.000 fairness_id=-
 t=323 PICK engine=engine-a m00 req=m00-r27 blocks=460
 t=323 STATE engine-a=9
-EVENT kind=EXIT engine=engine-a id=m03 reason=paid turns=26
+EVENT kind=EXIT engine=engine-a id=m03 reason=paid turns=26 fairness_id=-
 t=323 PICK engine=engine-a m07 req=m07-r26 blocks=437
 t=323 STATE engine-a=8
 t=324 SETTLE m04 req=m04-r25 engine=engine-b
 t=324 SETTLE m16 req=m16-r24 engine=engine-b
-EVENT kind=EXIT engine=engine-a id=m15 reason=paid turns=24
-EVENT kind=SEAT engine=engine-a id=m08 kind=re-entry wait=0.000
-EVENT kind=EXIT engine=engine-a id=m18 reason=paid turns=24
+EVENT kind=EXIT engine=engine-a id=m15 reason=paid turns=24 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m08 kind=re-entry wait=0.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m18 reason=paid turns=24 fairness_id=-
 t=324 PICK engine=engine-a m08 req=m08-r26 blocks=437
 t=324 STATE engine-a=7
-EVENT kind=SEAT engine=engine-a id=m11 kind=re-entry wait=0.000
+EVENT kind=SEAT engine=engine-a id=m11 kind=re-entry wait=0.000 fairness_id=-
 t=324 PICK engine=engine-a m11 req=m11-r25 blocks=414
 t=324 STATE engine-a=8
 t=325 SETTLE m17 req=m17-r24 engine=engine-b
 t=325 SETTLE m05 req=m05-r26 engine=engine-a
 t=325 SETTLE m06 req=m06-r26 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m15 kind=re-entry wait=1.000
+EVENT kind=SEAT engine=engine-a id=m15 kind=re-entry wait=1.000 fairness_id=-
 t=325 PICK engine=engine-a m15 req=m15-r25 blocks=414
 t=325 STATE engine-a=9
 t=325 PICK -1
 t=326 SETTLE m05 req=m05-r25 engine=engine-a
 t=326 SETTLE m06 req=m06-r25 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m05 reason=paid turns=26
-EVENT kind=EXIT engine=engine-a id=m06 reason=paid turns=26
+EVENT kind=EXIT engine=engine-a id=m05 reason=paid turns=26 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m06 reason=paid turns=26 fairness_id=-
 t=326 PICK -1
 t=327 SETTLE m09 req=m09-r26 engine=engine-a
 t=327 PICK engine=engine-a m12 req=m12-r26 blocks=437
 t=327 STATE engine-a=7
 t=327 PICK -1
 t=328 SETTLE m09 req=m09-r25 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m09 reason=paid turns=26
+EVENT kind=EXIT engine=engine-a id=m09 reason=paid turns=26 fairness_id=-
 t=328 PICK -1
 t=329 SETTLE m19 req=m19-r24 engine=engine-b
 t=329 SETTLE m07 req=m07-r26 engine=engine-a
@@ -1561,12 +1561,12 @@ t=329 PICK -1
 EVENT kind=AFFINITY-VIOLATION engine=engine-a id=m07 bound=engine-a settled_on=engine-b
 t=330 SETTLE m07 req=m07-r25 engine=engine-b
 t=330 SETTLE m08 req=m08-r26 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m07 reason=paid turns=2
+EVENT kind=EXIT engine=engine-a id=m07 reason=paid turns=2 fairness_id=-
 t=330 PICK -1
 EVENT kind=AFFINITY-VIOLATION engine=engine-a id=m08 bound=engine-a settled_on=engine-b
 t=331 SETTLE m08 req=m08-r25 engine=engine-b
-EVENT kind=EXIT engine=engine-a id=m08 reason=paid turns=2
-EVENT kind=SEAT engine=engine-a id=m01 kind=re-entry wait=6.000
+EVENT kind=EXIT engine=engine-a id=m08 reason=paid turns=2 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m01 kind=re-entry wait=6.000 fairness_id=-
 t=331 PICK engine=engine-a m01 req=m01-r27 blocks=460
 t=331 STATE engine-a=5
 t=331 PICK engine=engine-a m11 req=m11-r26 blocks=437
@@ -1574,8 +1574,8 @@ t=331 STATE engine-a=5
 EVENT kind=AFFINITY-VIOLATION engine=engine-a id=m10 bound=engine-a settled_on=engine-b
 t=332 SETTLE m10 req=m10-r25 engine=engine-b
 t=332 SETTLE m00 req=m00-r27 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m00 reason=paid turns=27
-EVENT kind=SEAT engine=engine-a id=m02 kind=re-entry wait=7.000
+EVENT kind=EXIT engine=engine-a id=m00 reason=paid turns=27 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m02 kind=re-entry wait=7.000 fairness_id=-
 t=332 PICK engine=engine-a m02 req=m02-r27 blocks=460
 t=332 STATE engine-a=5
 t=332 PICK engine=engine-a m15 req=m15-r26 blocks=437
@@ -1583,31 +1583,31 @@ t=332 STATE engine-a=5
 t=333 SETTLE m12 req=m12-r26 engine=engine-a
 t=333 PICK -1
 t=334 SETTLE m12 req=m12-r25 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m12 reason=paid turns=26
+EVENT kind=EXIT engine=engine-a id=m12 reason=paid turns=26 fairness_id=-
 t=334 PICK -1
 t=335 PICK -1
 t=336 PICK -1
 t=337 SETTLE m11 req=m11-r26 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m10 kind=re-entry wait=12.000
+EVENT kind=SEAT engine=engine-a id=m10 kind=re-entry wait=12.000 fairness_id=-
 t=337 PICK engine=engine-a m10 req=m10-r26 blocks=437
 t=337 STATE engine-a=5
 t=337 PICK -1
 t=338 SETTLE m11 req=m11-r25 engine=engine-a
 t=338 SETTLE m15 req=m15-r26 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m13 kind=re-entry wait=12.000
-EVENT kind=EXIT engine=engine-a id=m11 reason=paid turns=2
+EVENT kind=SEAT engine=engine-a id=m13 kind=re-entry wait=12.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m11 reason=paid turns=2 fairness_id=-
 t=338 PICK engine=engine-a m13 req=m13-r25 blocks=414
 t=338 STATE engine-a=5
 t=338 PICK -1
 t=339 SETTLE m15 req=m15-r25 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m15 reason=paid turns=2
+EVENT kind=EXIT engine=engine-a id=m15 reason=paid turns=2 fairness_id=-
 t=339 PICK -1
 t=340 SETTLE m01 req=m01-r27 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m14 kind=re-entry wait=14.000
-EVENT kind=SEAT engine=engine-a id=m03 kind=re-entry wait=13.000
+EVENT kind=SEAT engine=engine-a id=m14 kind=re-entry wait=14.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m03 kind=re-entry wait=13.000 fairness_id=-
 t=340 PICK engine=engine-a m14 req=m14-r25 blocks=414
 t=340 STATE engine-a=6
-EVENT kind=SEAT engine=engine-a id=m18 kind=re-entry wait=13.000
+EVENT kind=SEAT engine=engine-a id=m18 kind=re-entry wait=13.000 fairness_id=-
 t=340 PICK engine=engine-a m03 req=m03-r27 blocks=460
 t=340 STATE engine-a=7
 t=341 SETTLE m02 req=m02-r27 engine=engine-a
@@ -1636,7 +1636,7 @@ t=351 PICK engine=engine-a m10 req=m10-r27 blocks=460
 t=351 STATE engine-a=7
 t=351 PICK -1
 t=352 SETTLE m13 req=m13-r25 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m13 reason=paid turns=2
+EVENT kind=EXIT engine=engine-a id=m13 reason=paid turns=2 fairness_id=-
 t=352 PICK engine=engine-a m01 req=m01-r28 blocks=484
 t=352 STATE engine-a=6
 t=352 PICK -1
@@ -1646,17 +1646,17 @@ t=353 STATE engine-a=6
 t=353 PICK -1
 t=354 SETTLE m14 req=m14-r25 engine=engine-a
 t=354 SETTLE m18 req=m18-r26 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m14 reason=paid turns=2
+EVENT kind=EXIT engine=engine-a id=m14 reason=paid turns=2 fairness_id=-
 t=354 PICK -1
 t=355 SETTLE m18 req=m18-r25 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m18 reason=paid turns=2
+EVENT kind=EXIT engine=engine-a id=m18 reason=paid turns=2 fairness_id=-
 t=355 PICK -1
 t=356 PICK -1
 t=357 PICK -1
 t=358 PICK -1
 t=359 PICK -1
 t=360 SETTLE m10 req=m10-r27 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m10 reason=paid turns=2
+EVENT kind=EXIT engine=engine-a id=m10 reason=paid turns=2 fairness_id=-
 t=360 PICK -1
 t=361 PICK engine=engine-a m01 req=m01-r29 blocks=508
 t=361 STATE engine-a=3
@@ -1684,10 +1684,10 @@ t=373 PICK -1
 t=374 PICK -1
 t=375 PICK -1
 t=376 SETTLE m01 req=m01-r29 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m01 reason=paid turns=3
+EVENT kind=EXIT engine=engine-a id=m01 reason=paid turns=3 fairness_id=-
 t=376 PICK -1
 t=377 SETTLE m02 req=m02-r29 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m02 reason=paid turns=3
+EVENT kind=EXIT engine=engine-a id=m02 reason=paid turns=3 fairness_id=-
 t=377 PICK -1
 t=378 PICK -1
 t=379 PICK -1
@@ -1697,28 +1697,28 @@ t=382 PICK -1
 t=383 PICK -1
 t=384 PICK -1
 t=385 SETTLE m03 req=m03-r29 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m03 reason=paid turns=3
-EVENT kind=SEAT engine=engine-a id=m04 kind=re-entry wait=54.000
-EVENT kind=SEAT engine=engine-a id=m16 kind=re-entry wait=53.000
-EVENT kind=SEAT engine=engine-a id=m05 kind=re-entry wait=52.000
-EVENT kind=EXIT engine=engine-a id=m04 reason=budget-idle turns=0
-EVENT kind=SEAT engine=engine-a id=m04 kind=re-entry wait=54.000
-EVENT kind=SEAT engine=engine-a id=m06 kind=re-entry wait=52.000
+EVENT kind=EXIT engine=engine-a id=m03 reason=paid turns=3 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m04 kind=re-entry wait=54.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m16 kind=re-entry wait=53.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m05 kind=re-entry wait=52.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m04 reason=budget-idle turns=0 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m04 kind=re-entry wait=54.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m06 kind=re-entry wait=52.000 fairness_id=-
 t=385 PICK engine=engine-a m04 req=m04-r27 blocks=460
 t=385 STATE engine-a=4
-EVENT kind=EXIT engine=engine-a id=m05 reason=budget-idle turns=0
-EVENT kind=SEAT engine=engine-a id=m05 kind=re-entry wait=52.000
+EVENT kind=EXIT engine=engine-a id=m05 reason=budget-idle turns=0 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m05 kind=re-entry wait=52.000 fairness_id=-
 t=385 PICK engine=engine-a m16 req=m16-r25 blocks=414
 t=385 STATE engine-a=4
-EVENT kind=SEAT engine=engine-a id=m17 kind=re-entry wait=53.000
+EVENT kind=SEAT engine=engine-a id=m17 kind=re-entry wait=53.000 fairness_id=-
 t=386 PICK engine=engine-a m05 req=m05-r27 blocks=460
 t=386 STATE engine-a=5
 t=386 PICK engine=engine-a m06 req=m06-r27 blocks=460
 t=386 STATE engine-a=5
-EVENT kind=SEAT engine=engine-a id=m09 kind=re-entry wait=52.000
+EVENT kind=SEAT engine=engine-a id=m09 kind=re-entry wait=52.000 fairness_id=-
 t=387 PICK engine=engine-a m17 req=m17-r25 blocks=414
 t=387 STATE engine-a=6
-EVENT kind=SEAT engine=engine-a id=m07 kind=re-entry wait=50.000
+EVENT kind=SEAT engine=engine-a id=m07 kind=re-entry wait=50.000 fairness_id=-
 t=387 PICK engine=engine-a m09 req=m09-r27 blocks=460
 t=387 STATE engine-a=7
 t=388 PICK engine=engine-a m07 req=m07-r27 blocks=460
@@ -1739,18 +1739,18 @@ t=395 SETTLE m05 req=m05-r27 engine=engine-a
 t=395 SETTLE m06 req=m06-r27 engine=engine-a
 t=395 PICK -1
 t=396 SETTLE m09 req=m09-r27 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m19 kind=re-entry wait=59.000
+EVENT kind=SEAT engine=engine-a id=m19 kind=re-entry wait=59.000 fairness_id=-
 t=396 PICK engine=engine-a m19 req=m19-r25 blocks=414
 t=396 STATE engine-a=8
-EVENT kind=SEAT engine=engine-a id=m08 kind=re-entry wait=58.000
-EVENT kind=SEAT engine=engine-a id=m12 kind=re-entry wait=55.000
-EVENT kind=SEAT engine=engine-a id=m00 kind=re-entry wait=52.000
-EVENT kind=SEAT engine=engine-a id=m11 kind=re-entry wait=51.000
-EVENT kind=SEAT engine=engine-a id=m15 kind=re-entry wait=50.000
-EVENT kind=SEAT engine=engine-a id=m13 kind=re-entry wait=37.000
-EVENT kind=SEAT engine=engine-a id=m14 kind=re-entry wait=35.000
-EVENT kind=SEAT engine=engine-a id=m18 kind=re-entry wait=34.000
-EVENT kind=SEAT engine=engine-a id=m10 kind=re-entry wait=24.000
+EVENT kind=SEAT engine=engine-a id=m08 kind=re-entry wait=58.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m12 kind=re-entry wait=55.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m00 kind=re-entry wait=52.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m11 kind=re-entry wait=51.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m15 kind=re-entry wait=50.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m13 kind=re-entry wait=37.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m14 kind=re-entry wait=35.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m18 kind=re-entry wait=34.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m10 kind=re-entry wait=24.000 fairness_id=-
 t=396 PICK engine=engine-a m08 req=m08-r27 blocks=460
 t=396 STATE engine-a=17
 t=397 SETTLE m07 req=m07-r27 engine=engine-a
@@ -1764,7 +1764,7 @@ t=398 STATE engine-a=17
 t=398 PICK engine=engine-a m15 req=m15-r27 blocks=460
 t=398 STATE engine-a=17
 t=399 SETTLE m16 req=m16-r25 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m16 reason=paid turns=2
+EVENT kind=EXIT engine=engine-a id=m16 reason=paid turns=2 fairness_id=-
 t=399 PICK engine=engine-a m13 req=m13-r27 blocks=460
 t=399 STATE engine-a=16
 t=399 PICK engine=engine-a m14 req=m14-r27 blocks=460
@@ -1775,7 +1775,7 @@ t=400 STATE engine-a=16
 t=400 PICK engine=engine-a m10 req=m10-r28 blocks=484
 t=400 STATE engine-a=16
 t=401 SETTLE m17 req=m17-r25 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m17 reason=paid turns=2
+EVENT kind=EXIT engine=engine-a id=m17 reason=paid turns=2 fairness_id=-
 t=401 PICK -1
 t=402 PICK -1
 t=403 PICK engine=engine-a m19 req=m19-r26 blocks=437
@@ -1797,10 +1797,10 @@ t=407 PICK engine=engine-a m06 req=m06-r28 blocks=484
 t=407 STATE engine-a=15
 t=408 SETTLE m13 req=m13-r27 engine=engine-a
 t=408 SETTLE m14 req=m14-r27 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m01 kind=re-entry wait=31.000
-EVENT kind=SEAT engine=engine-a id=m02 kind=re-entry wait=30.000
-EVENT kind=SEAT engine=engine-a id=m03 kind=re-entry wait=22.000
-EVENT kind=SEAT engine=engine-a id=m16 kind=re-entry wait=2.000
+EVENT kind=SEAT engine=engine-a id=m01 kind=re-entry wait=31.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m02 kind=re-entry wait=30.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m03 kind=re-entry wait=22.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m16 kind=re-entry wait=2.000 fairness_id=-
 t=408 PICK engine=engine-a m01 req=m01-r30 blocks=533
 t=408 STATE engine-a=19
 t=408 PICK engine=engine-a m02 req=m02-r30 blocks=533
@@ -1808,7 +1808,7 @@ t=408 STATE engine-a=19
 t=409 SETTLE m00 req=m00-r28 engine=engine-a
 t=409 SETTLE m18 req=m18-r27 engine=engine-a
 t=409 SETTLE m19 req=m19-r26 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m17 kind=re-entry wait=1.000
+EVENT kind=SEAT engine=engine-a id=m17 kind=re-entry wait=1.000 fairness_id=-
 t=409 PICK engine=engine-a m03 req=m03-r30 blocks=533
 t=409 STATE engine-a=20
 t=409 PICK engine=engine-a m16 req=m16-r27 blocks=460
@@ -2317,19 +2317,19 @@ t=516 PICK engine=engine-a m01 req=m01-r40 blocks=808
 t=516 STATE engine-a=20
 t=517 SETTLE m14 req=m14-r35 engine=engine-a
 t=517 SETTLE m03 req=m03-r38 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m00 reason=paid turns=10
-EVENT kind=EXIT engine=engine-a id=m08 reason=paid turns=9
-EVENT kind=EXIT engine=engine-a id=m10 reason=paid turns=10
-EVENT kind=EXIT engine=engine-a id=m11 reason=paid turns=9
-EVENT kind=EXIT engine=engine-a id=m12 reason=paid turns=9
-EVENT kind=EXIT engine=engine-a id=m13 reason=paid turns=9
-EVENT kind=SEAT engine=engine-a id=m00 kind=re-entry wait=0.000
-EVENT kind=EXIT engine=engine-a id=m14 reason=paid turns=9
-EVENT kind=EXIT engine=engine-a id=m15 reason=paid turns=9
-EVENT kind=EXIT engine=engine-a id=m19 reason=paid turns=10
+EVENT kind=EXIT engine=engine-a id=m00 reason=paid turns=10 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m08 reason=paid turns=9 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m10 reason=paid turns=10 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m11 reason=paid turns=9 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m12 reason=paid turns=9 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m13 reason=paid turns=9 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m00 kind=re-entry wait=0.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m14 reason=paid turns=9 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m15 reason=paid turns=9 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m19 reason=paid turns=10 fairness_id=-
 t=517 PICK engine=engine-a m00 req=m00-r38 blocks=749
 t=517 STATE engine-a=12
-EVENT kind=SEAT engine=engine-a id=m08 kind=re-entry wait=0.000
+EVENT kind=SEAT engine=engine-a id=m08 kind=re-entry wait=0.000 fairness_id=-
 t=517 PICK engine=engine-a m05 req=m05-r37 blocks=720
 t=517 STATE engine-a=13
 t=518 SETTLE m01 req=m01-r39 engine=engine-a
@@ -2340,14 +2340,14 @@ t=518 PICK engine=engine-a m08 req=m08-r36 blocks=692
 t=518 STATE engine-a=13
 t=519 SETTLE m04 req=m04-r36 engine=engine-a
 t=519 SETTLE m04 req=m04-r37 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m11 kind=re-entry wait=0.000
+EVENT kind=SEAT engine=engine-a id=m11 kind=re-entry wait=0.000 fairness_id=-
 t=519 PICK engine=engine-a m02 req=m02-r40 blocks=808
 t=519 STATE engine-a=14
 t=519 PICK engine=engine-a m09 req=m09-r37 blocks=720
 t=519 STATE engine-a=14
 t=520 SETTLE m02 req=m02-r39 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m04 reason=paid turns=11
-EVENT kind=EXIT engine=engine-a id=m18 reason=paid turns=9
+EVENT kind=EXIT engine=engine-a id=m04 reason=paid turns=11 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m18 reason=paid turns=9 fairness_id=-
 t=520 PICK engine=engine-a m11 req=m11-r36 blocks=692
 t=520 STATE engine-a=12
 t=520 PICK engine=engine-a m00 req=m00-r39 blocks=778
@@ -2357,33 +2357,33 @@ t=521 STATE engine-a=12
 t=521 PICK engine=engine-a m03 req=m03-r40 blocks=808
 t=521 STATE engine-a=12
 t=522 SETTLE m16 req=m16-r35 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m16 reason=paid turns=9
+EVENT kind=EXIT engine=engine-a id=m16 reason=paid turns=9 fairness_id=-
 t=522 PICK -1
 t=523 SETTLE m05 req=m05-r36 engine=engine-a
 t=523 SETTLE m06 req=m06-r36 engine=engine-a
 t=523 SETTLE m03 req=m03-r39 engine=engine-a
 t=523 SETTLE m05 req=m05-r37 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m05 reason=paid turns=11
+EVENT kind=EXIT engine=engine-a id=m05 reason=paid turns=11 fairness_id=-
 t=523 PICK -1
 t=524 SETTLE m09 req=m09-r36 engine=engine-a
 t=524 SETTLE m17 req=m17-r35 engine=engine-a
 t=524 SETTLE m06 req=m06-r37 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m06 reason=paid turns=11
-EVENT kind=EXIT engine=engine-a id=m17 reason=paid turns=9
+EVENT kind=EXIT engine=engine-a id=m06 reason=paid turns=11 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m17 reason=paid turns=9 fairness_id=-
 t=524 PICK -1
 t=525 SETTLE m09 req=m09-r37 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m09 reason=paid turns=11
+EVENT kind=EXIT engine=engine-a id=m09 reason=paid turns=11 fairness_id=-
 t=525 PICK -1
 t=526 SETTLE m07 req=m07-r36 engine=engine-a
 t=526 SETTLE m00 req=m00-r38 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m19 kind=re-entry wait=6.000
-EVENT kind=SEAT engine=engine-a id=m12 kind=re-entry wait=4.000
+EVENT kind=SEAT engine=engine-a id=m19 kind=re-entry wait=6.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m12 kind=re-entry wait=4.000 fairness_id=-
 t=526 PICK engine=engine-a m19 req=m19-r35 blocks=664
 t=526 STATE engine-a=9
 t=526 PICK engine=engine-a m12 req=m12-r36 blocks=692
 t=526 STATE engine-a=9
 t=527 SETTLE m07 req=m07-r37 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m07 reason=paid turns=11
+EVENT kind=EXIT engine=engine-a id=m07 reason=paid turns=11 fairness_id=-
 t=527 PICK engine=engine-a m08 req=m08-r37 blocks=720
 t=527 STATE engine-a=8
 t=527 PICK -1
@@ -2395,21 +2395,21 @@ t=530 PICK engine=engine-a m00 req=m00-r40 blocks=808
 t=530 STATE engine-a=8
 t=530 PICK -1
 t=531 SETTLE m01 req=m01-r40 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m01 reason=paid turns=11
+EVENT kind=EXIT engine=engine-a id=m01 reason=paid turns=11 fairness_id=-
 t=531 PICK -1
 t=532 SETTLE m08 req=m08-r36 engine=engine-a
 t=532 SETTLE m00 req=m00-r39 engine=engine-a
 t=532 PICK -1
 t=533 SETTLE m08 req=m08-r37 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m08 reason=paid turns=2
+EVENT kind=EXIT engine=engine-a id=m08 reason=paid turns=2 fairness_id=-
 t=533 PICK -1
 t=534 SETTLE m02 req=m02-r40 engine=engine-a
 t=534 SETTLE m11 req=m11-r36 engine=engine-a
 t=534 SETTLE m11 req=m11-r37 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m15 kind=re-entry wait=11.000
-EVENT kind=SEAT engine=engine-a id=m13 kind=re-entry wait=10.000
-EVENT kind=EXIT engine=engine-a id=m02 reason=paid turns=11
-EVENT kind=EXIT engine=engine-a id=m11 reason=paid turns=2
+EVENT kind=SEAT engine=engine-a id=m15 kind=re-entry wait=11.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m13 kind=re-entry wait=10.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m02 reason=paid turns=11 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m11 reason=paid turns=2 fairness_id=-
 t=534 PICK engine=engine-a m15 req=m15-r36 blocks=692
 t=534 STATE engine-a=6
 t=534 PICK engine=engine-a m13 req=m13-r36 blocks=692
@@ -2418,21 +2418,21 @@ t=535 PICK engine=engine-a m12 req=m12-r37 blocks=720
 t=535 STATE engine-a=6
 t=535 PICK -1
 t=536 SETTLE m03 req=m03-r40 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m03 reason=paid turns=11
+EVENT kind=EXIT engine=engine-a id=m03 reason=paid turns=11 fairness_id=-
 t=536 PICK -1
 t=537 SETTLE m19 req=m19-r35 engine=engine-a
 t=537 PICK -1
 t=538 PICK -1
 t=539 PICK -1
 t=540 SETTLE m12 req=m12-r36 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m10 kind=re-entry wait=15.000
-EVENT kind=SEAT engine=engine-a id=m14 kind=re-entry wait=14.000
+EVENT kind=SEAT engine=engine-a id=m10 kind=re-entry wait=15.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m14 kind=re-entry wait=14.000 fairness_id=-
 t=540 PICK engine=engine-a m10 req=m10-r38 blocks=749
 t=540 STATE engine-a=7
 t=540 PICK engine=engine-a m14 req=m14-r36 blocks=692
 t=540 STATE engine-a=7
 t=541 SETTLE m12 req=m12-r37 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m12 reason=paid turns=2
+EVENT kind=EXIT engine=engine-a id=m12 reason=paid turns=2 fairness_id=-
 t=541 PICK -1
 t=542 PICK engine=engine-a m13 req=m13-r37 blocks=720
 t=542 STATE engine-a=6
@@ -2443,7 +2443,7 @@ t=543 STATE engine-a=6
 t=543 PICK -1
 t=544 PICK -1
 t=545 SETTLE m00 req=m00-r40 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m00 reason=paid turns=3
+EVENT kind=EXIT engine=engine-a id=m00 reason=paid turns=3 fairness_id=-
 t=545 PICK -1
 t=546 PICK engine=engine-a m19 req=m19-r36 blocks=692
 t=546 STATE engine-a=5
@@ -2453,11 +2453,11 @@ t=548 SETTLE m15 req=m15-r36 engine=engine-a
 t=548 SETTLE m13 req=m13-r36 engine=engine-a
 t=548 SETTLE m13 req=m13-r37 engine=engine-a
 t=548 SETTLE m15 req=m15-r37 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m18 kind=re-entry wait=21.000
-EVENT kind=SEAT engine=engine-a id=m04 kind=re-entry wait=20.000
-EVENT kind=SEAT engine=engine-a id=m16 kind=re-entry wait=17.000
-EVENT kind=EXIT engine=engine-a id=m13 reason=paid turns=2
-EVENT kind=EXIT engine=engine-a id=m15 reason=paid turns=2
+EVENT kind=SEAT engine=engine-a id=m18 kind=re-entry wait=21.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m04 kind=re-entry wait=20.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m16 kind=re-entry wait=17.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m13 reason=paid turns=2 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m15 reason=paid turns=2 fairness_id=-
 t=548 PICK engine=engine-a m18 req=m18-r36 blocks=692
 t=548 STATE engine-a=6
 t=548 PICK engine=engine-a m04 req=m04-r38 blocks=749
@@ -2481,14 +2481,14 @@ t=554 STATE engine-a=6
 t=554 PICK -1
 t=555 SETTLE m10 req=m10-r39 engine=engine-a
 t=555 SETTLE m14 req=m14-r37 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m14 reason=paid turns=2
+EVENT kind=EXIT engine=engine-a id=m14 reason=paid turns=2 fairness_id=-
 t=555 PICK -1
 t=556 PICK engine=engine-a m18 req=m18-r37 blocks=720
 t=556 STATE engine-a=5
 t=556 PICK -1
 t=557 SETTLE m04 req=m04-r38 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m05 kind=re-entry wait=25.000
-EVENT kind=SEAT engine=engine-a id=m01 kind=re-entry wait=24.000
+EVENT kind=SEAT engine=engine-a id=m05 kind=re-entry wait=25.000 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m01 kind=re-entry wait=24.000 fairness_id=-
 t=557 PICK engine=engine-a m05 req=m05-r38 blocks=749
 t=557 STATE engine-a=7
 t=557 PICK engine=engine-a m01 req=m01-r41 blocks=838
@@ -2499,7 +2499,7 @@ t=558 PICK -1
 t=559 PICK -1
 t=560 SETTLE m19 req=m19-r36 engine=engine-a
 t=560 SETTLE m19 req=m19-r37 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m19 reason=paid turns=3
+EVENT kind=EXIT engine=engine-a id=m19 reason=paid turns=3 fairness_id=-
 t=560 PICK engine=engine-a m05 req=m05-r39 blocks=778
 t=560 STATE engine-a=6
 t=560 PICK -1
@@ -2508,35 +2508,35 @@ t=561 STATE engine-a=6
 t=561 PICK -1
 t=562 SETTLE m18 req=m18-r36 engine=engine-a
 t=562 SETTLE m18 req=m18-r37 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m18 reason=paid turns=2
+EVENT kind=EXIT engine=engine-a id=m18 reason=paid turns=2 fairness_id=-
 t=562 PICK engine=engine-a m01 req=m01-r42 blocks=869
 t=562 STATE engine-a=5
 t=562 PICK -1
 t=563 SETTLE m16 req=m16-r36 engine=engine-a
 t=563 SETTLE m04 req=m04-r39 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m06 kind=re-entry wait=30.000
+EVENT kind=SEAT engine=engine-a id=m06 kind=re-entry wait=30.000 fairness_id=-
 t=563 PICK engine=engine-a m06 req=m06-r38 blocks=749
 t=563 STATE engine-a=6
 t=563 PICK -1
 t=564 SETTLE m01 req=m01-r41 engine=engine-a
 t=564 SETTLE m16 req=m16-r37 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m17 kind=re-entry wait=31.000
-EVENT kind=EXIT engine=engine-a id=m16 reason=paid turns=2
+EVENT kind=SEAT engine=engine-a id=m17 kind=re-entry wait=31.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m16 reason=paid turns=2 fairness_id=-
 t=564 PICK engine=engine-a m17 req=m17-r36 blocks=692
 t=564 STATE engine-a=6
 t=564 PICK -1
 t=565 PICK -1
 t=566 SETTLE m05 req=m05-r38 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m09 kind=re-entry wait=32.000
-EVENT kind=EXIT engine=engine-a id=m09 reason=budget-idle turns=0
-EVENT kind=SEAT engine=engine-a id=m09 kind=re-entry wait=32.000
+EVENT kind=SEAT engine=engine-a id=m09 kind=re-entry wait=32.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m09 reason=budget-idle turns=0 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m09 kind=re-entry wait=32.000 fairness_id=-
 t=566 PICK engine=engine-a m09 req=m09-r38 blocks=749
 t=566 STATE engine-a=7
 t=566 PICK engine=engine-a m06 req=m06-r39 blocks=778
 t=566 STATE engine-a=7
 t=567 PICK -1
 t=568 SETTLE m10 req=m10-r40 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m10 reason=paid turns=3
+EVENT kind=EXIT engine=engine-a id=m10 reason=paid turns=3 fairness_id=-
 t=568 PICK -1
 t=569 PICK engine=engine-a m09 req=m09-r39 blocks=778
 t=569 STATE engine-a=6
@@ -2548,9 +2548,9 @@ t=571 PICK -1
 t=572 SETTLE m05 req=m05-r39 engine=engine-a
 t=572 SETTLE m01 req=m01-r42 engine=engine-a
 t=572 SETTLE m06 req=m06-r38 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m02 kind=re-entry wait=36.000
-EVENT kind=EXIT engine=engine-a id=m01 reason=paid turns=2
-EVENT kind=SEAT engine=engine-a id=m07 kind=re-entry wait=36.000
+EVENT kind=SEAT engine=engine-a id=m02 kind=re-entry wait=36.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m01 reason=paid turns=2 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m07 kind=re-entry wait=36.000 fairness_id=-
 t=572 PICK engine=engine-a m02 req=m02-r41 blocks=838
 t=572 STATE engine-a=7
 t=572 PICK engine=engine-a m07 req=m07-r38 blocks=749
@@ -2564,7 +2564,7 @@ t=575 PICK engine=engine-a m07 req=m07-r39 blocks=778
 t=575 STATE engine-a=7
 t=575 PICK -1
 t=576 SETTLE m04 req=m04-r40 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m04 reason=paid turns=3
+EVENT kind=EXIT engine=engine-a id=m04 reason=paid turns=3 fairness_id=-
 t=576 PICK engine=engine-a m06 req=m06-r40 blocks=808
 t=576 STATE engine-a=6
 t=576 PICK -1
@@ -2573,18 +2573,18 @@ t=577 STATE engine-a=6
 t=577 PICK -1
 t=578 SETTLE m17 req=m17-r36 engine=engine-a
 t=578 SETTLE m06 req=m06-r39 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m03 kind=re-entry wait=40.000
-EVENT kind=EXIT engine=engine-a id=m03 reason=budget-idle turns=0
-EVENT kind=SEAT engine=engine-a id=m03 kind=re-entry wait=40.000
+EVENT kind=SEAT engine=engine-a id=m03 kind=re-entry wait=40.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m03 reason=budget-idle turns=0 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m03 kind=re-entry wait=40.000 fairness_id=-
 t=578 PICK engine=engine-a m03 req=m03-r41 blocks=838
 t=578 STATE engine-a=7
 t=578 PICK -1
 t=579 SETTLE m02 req=m02-r41 engine=engine-a
 t=579 SETTLE m17 req=m17-r37 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m17 reason=paid turns=2
-EVENT kind=SEAT engine=engine-a id=m08 kind=re-entry wait=37.000
-EVENT kind=EXIT engine=engine-a id=m08 reason=budget-idle turns=0
-EVENT kind=SEAT engine=engine-a id=m08 kind=re-entry wait=37.000
+EVENT kind=EXIT engine=engine-a id=m17 reason=paid turns=2 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m08 kind=re-entry wait=37.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m08 reason=budget-idle turns=0 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m08 kind=re-entry wait=37.000 fairness_id=-
 t=579 PICK engine=engine-a m08 req=m08-r38 blocks=749
 t=579 STATE engine-a=7
 t=579 PICK engine=engine-a m09 req=m09-r40 blocks=808
@@ -2602,10 +2602,10 @@ t=583 PICK -1
 t=584 PICK -1
 t=585 SETTLE m05 req=m05-r40 engine=engine-a
 t=585 SETTLE m03 req=m03-r41 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m05 reason=paid turns=3
-EVENT kind=SEAT engine=engine-a id=m11 kind=re-entry wait=42.000
-EVENT kind=EXIT engine=engine-a id=m11 reason=budget-idle turns=0
-EVENT kind=SEAT engine=engine-a id=m11 kind=re-entry wait=42.000
+EVENT kind=EXIT engine=engine-a id=m05 reason=paid turns=3 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m11 kind=re-entry wait=42.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m11 reason=budget-idle turns=0 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m11 kind=re-entry wait=42.000 fairness_id=-
 t=585 PICK engine=engine-a m11 req=m11-r38 blocks=749
 t=585 STATE engine-a=7
 t=585 PICK engine=engine-a m07 req=m07-r40 blocks=808
@@ -2613,10 +2613,10 @@ t=585 STATE engine-a=7
 t=586 PICK -1
 t=587 SETTLE m07 req=m07-r39 engine=engine-a
 t=587 SETTLE m02 req=m02-r42 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m02 reason=paid turns=2
-EVENT kind=SEAT engine=engine-a id=m00 kind=re-entry wait=40.000
-EVENT kind=EXIT engine=engine-a id=m00 reason=budget-idle turns=0
-EVENT kind=SEAT engine=engine-a id=m00 kind=re-entry wait=40.000
+EVENT kind=EXIT engine=engine-a id=m02 reason=paid turns=2 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m00 kind=re-entry wait=40.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m00 reason=budget-idle turns=0 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m00 kind=re-entry wait=40.000 fairness_id=-
 t=587 PICK engine=engine-a m00 req=m00-r41 blocks=838
 t=587 STATE engine-a=7
 t=587 PICK -1
@@ -2627,10 +2627,10 @@ t=588 PICK -1
 t=589 PICK -1
 t=590 PICK -1
 t=591 SETTLE m06 req=m06-r40 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m06 reason=paid turns=3
-EVENT kind=SEAT engine=engine-a id=m12 kind=re-entry wait=41.000
-EVENT kind=EXIT engine=engine-a id=m12 reason=budget-idle turns=0
-EVENT kind=SEAT engine=engine-a id=m12 kind=re-entry wait=41.000
+EVENT kind=EXIT engine=engine-a id=m06 reason=paid turns=3 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m12 kind=re-entry wait=41.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m12 reason=budget-idle turns=0 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m12 kind=re-entry wait=41.000 fairness_id=-
 t=591 PICK engine=engine-a m12 req=m12-r38 blocks=749
 t=591 STATE engine-a=7
 t=591 PICK -1
@@ -2639,17 +2639,17 @@ t=592 STATE engine-a=7
 t=592 PICK engine=engine-a m08 req=m08-r40 blocks=808
 t=592 STATE engine-a=7
 t=593 SETTLE m03 req=m03-r42 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m03 reason=paid turns=2
+EVENT kind=EXIT engine=engine-a id=m03 reason=paid turns=2 fairness_id=-
 t=593 PICK -1
 t=594 SETTLE m09 req=m09-r40 engine=engine-a
 t=594 SETTLE m08 req=m08-r39 engine=engine-a
 t=594 SETTLE m11 req=m11-r38 engine=engine-a
 t=594 SETTLE m00 req=m00-r41 engine=engine-a
-EVENT kind=SEAT engine=engine-a id=m13 kind=re-entry wait=37.000
-EVENT kind=EXIT engine=engine-a id=m09 reason=paid turns=3
+EVENT kind=SEAT engine=engine-a id=m13 kind=re-entry wait=37.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m09 reason=paid turns=3 fairness_id=-
 t=594 PICK engine=engine-a m13 req=m13-r38 blocks=749
 t=594 STATE engine-a=6
-EVENT kind=SEAT engine=engine-a id=m15 kind=re-entry wait=37.000
+EVENT kind=SEAT engine=engine-a id=m15 kind=re-entry wait=37.000 fairness_id=-
 t=594 PICK engine=engine-a m15 req=m15-r38 blocks=749
 t=594 STATE engine-a=7
 t=595 PICK engine=engine-a m12 req=m12-r39 blocks=778
@@ -2667,10 +2667,10 @@ t=599 PICK -1
 t=600 SETTLE m07 req=m07-r40 engine=engine-a
 t=600 SETTLE m11 req=m11-r39 engine=engine-a
 t=600 SETTLE m12 req=m12-r38 engine=engine-a
-EVENT kind=EXIT engine=engine-a id=m07 reason=paid turns=3
-EVENT kind=SEAT engine=engine-a id=m14 kind=re-entry wait=36.000
-EVENT kind=EXIT engine=engine-a id=m14 reason=budget-idle turns=0
-EVENT kind=SEAT engine=engine-a id=m14 kind=re-entry wait=36.000
+EVENT kind=EXIT engine=engine-a id=m07 reason=paid turns=3 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m14 kind=re-entry wait=36.000 fairness_id=-
+EVENT kind=EXIT engine=engine-a id=m14 reason=budget-idle turns=0 fairness_id=-
+EVENT kind=SEAT engine=engine-a id=m14 kind=re-entry wait=36.000 fairness_id=-
 t=600 PICK engine=engine-a m14 req=m14-r38 blocks=749
 t=600 STATE engine-a=7
 t=600 PICK -1

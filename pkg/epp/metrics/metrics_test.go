@@ -132,7 +132,7 @@ func TestRecordRequestCounterandSizes(t *testing.T) {
 	for _, scenario := range scenarios {
 		t.Run(scenario.name, func(t *testing.T) {
 			for _, req := range scenario.reqs {
-				RecordRequestCounter(req.modelName, req.targetModelName, reqcommon.APISurfaceUnknown, req.fairnessID, 0)
+				RecordRequestCounter(req.modelName, req.targetModelName, reqcommon.APISurfaceUnknown, req.fairnessID, 0, "")
 				RecordRequestSizes(req.modelName, req.targetModelName, reqcommon.APISurfaceUnknown, req.fairnessID, "0", req.reqSize)
 			}
 

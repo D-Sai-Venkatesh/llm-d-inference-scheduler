@@ -124,10 +124,45 @@ type apiConfig struct {
 	// When no such producer is configured the compensation is skipped and the
 	// detector relies solely on the scraped WaitingQueueSize.
 	InFlightLoadProducerName string `json:"inFlightLoadProducerName,omitempty"`
+
+	// Aggregation selects how the per-endpoint saturation scores are combined into
+	// the POOL score the flow-control gate uses:
+	//
+	//	"mean" — the arithmetic mean over the candidate endpoints. DEFAULT, and the
+	//	         behaviour every banked run was produced with.
+	//	"min"  — the MINIMUM over the endpoints, i.e. the pool is gated only when
+	//	         EVERY engine is saturated.
+	//
+	// The mean is what couples the gate to pool-level load in a multi-engine stack:
+	// one engine at 0.95 beside one at 0.50 reads 0.725, so NOTHING is gated while
+	// an engine is saturated (PREREG-multipod-offload audit N2). It also never
+	// rebalances: the gate closes on the pool average while one engine is starved,
+	// so the under-filled engine keeps getting fewer seats. "min" decouples them at
+	// the cost of gating later.
+	//
+	// Staleness interacts with the aggregation by design: an endpoint whose metrics
+	// are stale/absent is EXCLUDED from the min (it can neither open nor close the
+	// gate) and its 1.0 keeps counting in the mean; if no endpoint has fresh metrics
+	// the pool scores 1.0 either way (fail-closed preserved).
+	//
+	// Single-engine stacks are byte-identical under both values.
+	Aggregation *string `json:"aggregation,omitempty"`
 }
+
+// Aggregation selects how per-endpoint saturation scores become the pool score.
+type Aggregation string
+
+const (
+	// AggregationMean averages the per-endpoint scores (the legacy behaviour).
+	AggregationMean Aggregation = "mean"
+	// AggregationMin takes the minimum, so the pool gates only when every endpoint
+	// is saturated.
+	AggregationMin Aggregation = "min"
+)
 
 // Config is the internal, fully-validated configuration used by the detector.
 type Config struct {
+	Aggregation               Aggregation
 	QueueDepthThreshold       int
 	KVCacheUtilThreshold      float64
 	MetricsStalenessThreshold time.Duration
@@ -151,7 +186,12 @@ func buildConfig(apiCfg *apiConfig) (*Config, error) {
 		return nil, fmt.Errorf("invalid utilization detector configuration: %w", err)
 	}
 
+	aggregation := AggregationMean
+	if safeCfg.Aggregation != nil {
+		aggregation = Aggregation(*safeCfg.Aggregation)
+	}
 	return &Config{
+		Aggregation:               aggregation,
 		QueueDepthThreshold:       *safeCfg.QueueDepthThreshold,
 		KVCacheUtilThreshold:      *safeCfg.KVCacheUtilThreshold,
 		MetricsStalenessThreshold: safeCfg.MetricsStalenessThreshold.Duration,
@@ -197,6 +237,10 @@ func validateConfig(cfg *apiConfig) error {
 	}
 	if cfg.Headroom != nil && *cfg.Headroom < 0.0 {
 		errs = append(errs, fmt.Errorf("headroom must be a non-negative value, got %f", *cfg.Headroom))
+	}
+	if cfg.Aggregation != nil && *cfg.Aggregation != string(AggregationMean) && *cfg.Aggregation != string(AggregationMin) {
+		errs = append(errs, fmt.Errorf("aggregation must be %q or %q, got %q",
+			AggregationMean, AggregationMin, *cfg.Aggregation))
 	}
 	if cfg.StalenessPolicy != nil && *cfg.StalenessPolicy != StalenessSaturated &&
 		*cfg.StalenessPolicy != StalenessIgnore {

@@ -218,6 +218,14 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatCandidate
 	}
 	cands := make([]seatCandidate, 0, len(ready))
 	for _, g := range ready {
+		if s.saturatingLocked(g) {
+			// PER-ENGINE GATE: excluded from the candidate list entirely, so a
+			// saturated engine takes no new seat and the head goes to a sibling that
+			// has room (or waits). First-fit over the FIT candidates, as the
+			// size-aware dispatch gate does.
+			g.counters.gateSkipped++
+			continue
+		}
 		// THE FIT TEST USES A PER-ENGINE ESTIMATE, FROZEN AT SYNC TIME for this pass
 		// (head.coldTokensByEngine[g]). Two properties this buys:
 		//

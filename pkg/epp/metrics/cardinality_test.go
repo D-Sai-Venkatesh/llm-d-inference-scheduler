@@ -27,6 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	metricsutil "github.com/llm-d/llm-d-router/pkg/common/observability/metrics"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 )
 
@@ -35,7 +36,7 @@ func TestRequestMetricsBoundAPISurface(t *testing.T) {
 	t.Cleanup(Reset)
 	received := time.Now()
 	record := func(surface reqcommon.APISurface) {
-		RecordRequestCounter("model", "target", surface, "", 0)
+		RecordRequestCounter("model", "target", surface, "", 0, "")
 		RecordRequestErrCounter(context.Background(), "model", "target", surface, "", "0", "502")
 		require.True(t, RecordRequestLatencies(context.Background(), "model", "target", surface, "", "0", received, received.Add(time.Second)))
 		RecordRequestSizes("model", "target", surface, "", "0", 100)
@@ -72,7 +73,7 @@ func TestRequestMetricsBoundAPISurface(t *testing.T) {
 		require.Equal(t, 7, promtestutil.CollectAndCount(collector), "six supported surfaces plus unknown must bound the series count")
 	}
 	require.Equal(t, float64(2000), promtestutil.ToFloat64(llmdRequestCounter.WithLabelValues(
-		boundModel("model"), boundModel("target"), "", "0", reqcommon.APISurfaceUnknown.String(),
+		boundModel("model"), boundModel("target"), "", "0", reqcommon.APISurfaceUnknown.String(), "",
 	)))
 	for _, surface := range []string{reqcommon.APITypeMessages.String(), reqcommon.APISurfaceUnknown.String()} {
 		require.Zero(t, promtestutil.ToFloat64(llmdRunningRequests.WithLabelValues(
@@ -101,9 +102,9 @@ func TestPreAdmitModelLabelsSurvivesFlood(t *testing.T) {
 
 	PreAdmitModelLabels("llama-70b", "llama-70b-canary")
 	for i := 0; i < 1000; i++ {
-		RecordRequestCounter(fmt.Sprintf("junk-%d", i), "target", reqcommon.APISurfaceUnknown, "fairness", 0)
+		RecordRequestCounter(fmt.Sprintf("junk-%d", i), "target", reqcommon.APISurfaceUnknown, "fairness", 0, "")
 	}
-	RecordRequestCounter("llama-70b", "llama-70b-canary", reqcommon.APISurfaceUnknown, "fairness", 0)
+	RecordRequestCounter("llama-70b", "llama-70b-canary", reqcommon.APISurfaceUnknown, "fairness", 0, "")
 
 	series := promtestutil.CollectAndCount(llmdRequestCounter)
 	require.LessOrEqualf(t, series, testCap+2, "cardinality must stay bounded, got %d series", series)
@@ -126,7 +127,7 @@ func TestRecordRequestCounterBoundsModelCardinality(t *testing.T) {
 	})
 
 	for i := 0; i < 1000; i++ {
-		RecordRequestCounter(fmt.Sprintf("model-%d", i), "target", reqcommon.APISurfaceUnknown, "fairness", 0)
+		RecordRequestCounter(fmt.Sprintf("model-%d", i), "target", reqcommon.APISurfaceUnknown, "fairness", 0, "")
 	}
 
 	count := promtestutil.CollectAndCount(llmdRequestCounter)
@@ -193,7 +194,7 @@ func TestFairnessLabelBoundOnRequestMetrics(t *testing.T) {
 	})
 
 	for i := 0; i < 100; i++ {
-		RecordRequestCounter("model-a", "model-a", reqcommon.APISurfaceUnknown, fmt.Sprintf("tenant-%d", i), 0)
+		RecordRequestCounter("model-a", "model-a", reqcommon.APISurfaceUnknown, fmt.Sprintf("tenant-%d", i), 0, "")
 	}
 
 	require.Equal(t, testCap+1, promtestutil.CollectAndCount(llmdRequestCounter),
@@ -317,6 +318,8 @@ func TestInitFairnessIDResolutionMetricsCreatesOverflowSeries(t *testing.T) {
 
 	InitFairnessIDResolutionMetrics("pool-a")
 
-	require.Equal(t, 3, promtestutil.CollectAndCount(llmdFairnessIDOverflowCounter))
+	// four sources: header, agent_identity, branch_identity, default.
+	require.Equal(t, 4, promtestutil.CollectAndCount(llmdFairnessIDOverflowCounter))
 	require.Equal(t, 0.0, promtestutil.ToFloat64(llmdFairnessIDOverflowCounter.WithLabelValues("header", "pool-a")))
+	require.Equal(t, 0.0, promtestutil.ToFloat64(llmdFairnessIDOverflowCounter.WithLabelValues(tracing.AttributionSourceBranchIdentity, "pool-a")))
 }

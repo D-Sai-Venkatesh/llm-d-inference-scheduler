@@ -347,13 +347,15 @@ type member struct {
 	// fairnessID is the last fairness id (queue key) this member was seen with —
 	// the join key for its SEAT/EXIT events (see Head.FairnessID).
 	fairnessID string
-	// predResident / predSet carry the SHADOW-VALIDATION prediction (piece 3) from the
-	// moment this member was SEATED as a RETURN to the settlement of the turn that
-	// seat was taken for: the fraction of that turn's estimated footprint the engine's
-	// GPU index + its CPU-tier shadow said was already resident. It is paired there
-	// with the MEASURED cached/prompt the engine reports, then cleared — one
-	// prediction, one measurement.
+	// predResident / predBlocks / predSet carry the SHADOW-VALIDATION prediction
+	// (piece 3) from the moment this member was SEATED as a RETURN to the settlement of
+	// the turn that seat was taken for: the fraction of that turn's estimated footprint
+	// the engine's GPU index + its CPU-tier shadow said was already resident, and the
+	// footprint it was a fraction OF (an analysis can then weight or exclude a
+	// prediction made over a single new block). It is paired there with the MEASURED
+	// cached/prompt the engine reports, then cleared — one prediction, one measurement.
 	predResident float64
+	predBlocks   int64
 	predSet      bool
 }
 
@@ -1462,8 +1464,8 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 			measured := float64(cachedTokens) / float64(promptTokens)
 			s.recordEventOn(Event{T: now, Kind: "SHADOW-VALIDATION", ID: id,
 				Engine: engineLabel(g.id), Member: id,
-				Detail: fmt.Sprintf("pred=%.4f measured=%.4f prompt=%d cached=%d fairness_id=%s",
-					m.predResident, measured, promptTokens, cachedTokens, fairnessOrNone(m.fairnessID))})
+				Detail: fmt.Sprintf("pred=%.4f measured=%.4f pred_blocks=%d prompt=%d cached=%d fairness_id=%s",
+					m.predResident, measured, m.predBlocks, promptTokens, cachedTokens, fairnessOrNone(m.fairnessID))})
 			s.counters.shadowPairs++
 			if s.onShadowValidation != nil {
 				s.onShadowValidation(engineLabel(g.id), m.predResident, measured)
@@ -1723,10 +1725,14 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 	// would read as resident and the prediction would be a tautology (1.0 by
 	// construction). Only a RETURNING member gets one — a newcomer has no history to be
 	// resident, and the metric is defined over seated returns.
-	predResident, predOK := 0.0, false
+	predResident, predBlocks, predOK := 0.0, int64(0), false
 	if !w.newcomer && g.tier.Enabled() {
-		if _, resident, total := s.mod.sizer.TierCost(g.index, g.tier, w.id, w.sizeBytes); total > 0 && resident > 0 {
-			predResident, predOK = float64(resident)/float64(total), true
+		// A COLD return is predicted as 0.0 on purpose: it is the class the AUC needs to
+		// separate from the warm one, and dropping it (keeping only resident > 0) would
+		// bias the pair population toward warm returns and flatter the model. Only "no
+		// estimate at all" (an empty footprint) produces no pair.
+		if _, resident, total := s.mod.sizer.TierCost(g.index, g.tier, w.id, w.sizeBytes); total > 0 {
+			predResident, predBlocks, predOK = float64(resident)/float64(total), total, true
 		}
 	}
 	// seat in the index first (history-based cost; the estimate-based budget check
@@ -1756,6 +1762,7 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 		waitingSince: w.since,
 		fairnessID:   w.fairnessID,
 		predResident: predResident,
+		predBlocks:   predBlocks,
 		predSet:      predOK,
 	}
 	// B6: ALL entries carry a cold charge (tokens, R1), CAPPED at the engine's own

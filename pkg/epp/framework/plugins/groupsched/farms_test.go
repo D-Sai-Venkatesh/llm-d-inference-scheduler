@@ -238,6 +238,312 @@ func TestHRRNCannotStarvate(t *testing.T) {
 	}
 }
 
+// ---- F5′ bounded HRRN ----
+
+// hrrnSpec is one waiter of a scenario: how long it has waited and how many cold
+// tokens it will have to prefill.
+type hrrnSpec struct {
+	id   string
+	wait time.Duration
+	cold int64
+}
+
+// hrrnWaiterSet installs a waiter set on a scheduler built with the given entry order
+// and returns the scheduler, so one scenario can be read through both rules.
+func hrrnWaiterSet(t *testing.T, order string, now time.Time, specs ...hrrnSpec) *Scheduler {
+	t.Helper()
+	s := fArmScheduler(t, func(c *Config) { c.EntryOrder = order })
+	s.mu.Lock()
+	s.now = now
+	s.eng().waiters = map[string]*waiter{}
+	for _, spec := range specs {
+		s.eng().waiters[spec.id] = &waiter{id: spec.id, since: now.Add(-spec.wait),
+			sizeBytes: bytesFor(int(spec.cold / 64)), coldTokens: spec.cold}
+	}
+	s.mu.Unlock()
+	return s
+}
+
+// headOf is the D1 head of the scheduler's single engine.
+func headOf(s *Scheduler) *waiter {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.entryHeadLocked(s.eng(), nil)
+}
+
+// TestHRRNBoundedPriorityAgesAtTheMedianRate is F5′'s intent test (the reviewer's):
+// a 200K-token waiter must catch a fresh/normal-sized one within ~median-size x ratio,
+// NOT within ~an hour.
+//
+// The scenario is B1b's tail in miniature — one big entry beside a queue of 3K ones
+// that have each been waiting ten minutes (the regime that produced the measured
+// 3,601 s max entry wait). With the median = 3,000 tokens:
+//
+//	plain HRRN   bound = (600/3,000) x 200,000 = 40,000 s   <- the measured defect
+//	bounded      bound = (600/3,000) x   3,000 =    600 s   <- the fix, parameter-free
+//
+// and the bounded priority grows at exactly the MEDIAN rate (2w doubles it), which is
+// the property the prediction rests on.
+func TestHRRNBoundedPriorityAgesAtTheMedianRate(t *testing.T) {
+	const (
+		bigCold   int64 = 200_000 // the huge entry that stalled ~an hour
+		smallCold int64 = 3_000   // the small class; it IS the median here
+		smallWait       = 600 * time.Second
+	)
+	now := goldenT0
+	specs := []hrrnSpec{
+		{"s1", smallWait, smallCold},
+		{"s2", smallWait, smallCold},
+		{"s3", smallWait, smallCold},
+		{"s4", smallWait, smallCold},
+	}
+	withBig := func(wait time.Duration) []hrrnSpec {
+		return append([]hrrnSpec{{"big", wait, bigCold}}, specs...)
+	}
+
+	// the bound a pass actually uses is the live median of the waiter set
+	plain := hrrnWaiterSet(t, "hrrn", now, withBig(0)...)
+	bounded := hrrnWaiterSet(t, "hrrn-bounded", now, withBig(0)...)
+	plain.mu.Lock()
+	if got := plain.entryColdBoundLocked(plain.waitersLocked(plain.eng())); got != 0 {
+		t.Fatalf("plain hrrn must carry no bound, got %d", got)
+	}
+	plain.mu.Unlock()
+	bounded.mu.Lock()
+	if got := bounded.entryColdBoundLocked(bounded.waitersLocked(bounded.eng())); got != smallCold {
+		t.Fatalf("bound = %d, want the live median %d (one 200K entry among four 3K ones)", got, smallCold)
+	}
+	bounded.mu.Unlock()
+
+	// (1) SMALL-FIRST IS PRESERVED: while the big entry is young it is not the head
+	// under either rule — the 3K entries, all older, go first.
+	for _, s := range []*Scheduler{plain, bounded} {
+		s.mu.Lock()
+		s.eng().waiters["big"].since = now.Add(-60 * time.Second)
+		s.mu.Unlock()
+		if h := headOf(s); h == nil || h.coldTokens == bigCold {
+			t.Fatalf("head = %v at a 60 s big-entry wait, want a 3K entry (small-first)", h)
+		}
+	}
+
+	// (2) THE BOUNDED OVERTOKE: one small-wait's worth of extra aging is enough — the
+	// bounded priority grows at the median rate, so 601 s beats the 600 s small class.
+	bounded.mu.Lock()
+	bounded.eng().waiters["big"].since = now.Add(-601 * time.Second)
+	bounded.mu.Unlock()
+	if h := headOf(bounded); h == nil || h.id != "big" {
+		t.Fatalf("bounded head = %v at a 601 s big-entry wait, want big (bound = ratio x median = 600 s)", h)
+	}
+
+	// (3) ... and PLAIN HRRN is nowhere near it at that wait: the 67x size gap is the
+	// whole defect. Its bound is ratio x cold_big = 40,000 s, and it is still not the
+	// head at 39,000 s.
+	plain.mu.Lock()
+	plain.eng().waiters["big"].since = now.Add(-39_000 * time.Second)
+	plain.mu.Unlock()
+	if h := headOf(plain); h == nil || h.id == "big" {
+		t.Fatalf("plain hrrn head = %v at a 39,000 s big-entry wait, want a 3K entry (its bound is 40,000 s)", h)
+	}
+	plain.mu.Lock()
+	plain.eng().waiters["big"].since = now.Add(-40_001 * time.Second)
+	plain.mu.Unlock()
+	if h := headOf(plain); h == nil || h.id != "big" {
+		t.Fatalf("plain hrrn head = %v at a 40,001 s big-entry wait, want big (ratio x cold_big)", h)
+	}
+
+	// (4) THE RATE ITSELF: the bounded priority is entryPriority over the MEDIAN
+	// denominator, so it is linear in the wait and identical to plain HRRN's value for
+	// a median-sized entry.
+	for _, w := range []float64{0, 30, 600, 3601} {
+		got := boundedEntryPriority(w, bigCold, smallCold, 64)
+		want := entryPriority(w, smallCold, 64)
+		if got != want {
+			t.Fatalf("bounded priority at %vs = %v, want the median-rate value %v", w, got, want)
+		}
+		if d := boundedEntryPriority(2*w, bigCold, smallCold, 64); d != 2*got {
+			t.Fatalf("bounded priority is not linear in the wait: p(%v)=%v, p(%v)=%v", w, got, 2*w, d)
+		}
+	}
+	if boundedEntryPriority(601, bigCold, 0, 64) != entryPriority(601, bigCold, 64) {
+		t.Fatal("coldBound 0 must be EXACTLY entryPriority (the unbounded path)")
+	}
+}
+
+// TestHRRNBoundedKeepsSmallFirstInsideTheSmallClass: the bound only ever binds AT or
+// ABOVE the median (the even-set median is the LOWER one), so an entry below the median
+// keeps its own size and the small class's small-first ordering is F5's exactly.
+func TestHRRNBoundedKeepsSmallFirstInsideTheSmallClass(t *testing.T) {
+	now := goldenT0
+	s := hrrnWaiterSet(t, "hrrn-bounded", now,
+		hrrnSpec{"tiny", 600 * time.Second, 1_000},
+		hrrnSpec{"small", 600 * time.Second, 2_000},
+		hrrnSpec{"big", 0 * time.Second, 200_000},
+	)
+	s.mu.Lock()
+	bound := s.entryColdBoundLocked(s.waitersLocked(s.eng()))
+	if bound != 2_000 {
+		t.Fatalf("bound = %d, want 2000 (the lower median of {1000,2000,200000})", bound)
+	}
+	// below the median: the entry keeps its OWN size, i.e. the key is plain HRRN's
+	kTiny := s.entryKeyBoundLocked(s.eng().waiters["tiny"], nil, bound)
+	kSmall := s.entryKeyBoundLocked(s.eng().waiters["small"], nil, bound)
+	kBig := s.entryKeyBoundLocked(s.eng().waiters["big"], nil, bound)
+	s.mu.Unlock()
+	if kTiny.hrrn != entryPriority(600, 1_000, 64) {
+		t.Fatalf("the 1K entry's priority = %v, want its own size (%v)", kTiny.hrrn, entryPriority(600, 1_000, 64))
+	}
+	// same wait, smaller size -> higher priority: small-first inside the small class
+	if !(kTiny.hrrn > kSmall.hrrn) {
+		t.Fatalf("the 1K entry (%v) must outrank the 2K one (%v) at equal wait", kTiny.hrrn, kSmall.hrrn)
+	}
+	// a FRESH big entry is behind both: the small class is served first
+	if !(kTiny.hrrn > kBig.hrrn && kSmall.hrrn > kBig.hrrn) {
+		t.Fatalf("a fresh big entry (%v) must be behind both small ones (%v, %v)", kBig.hrrn, kTiny.hrrn, kSmall.hrrn)
+	}
+	if h := headOf(s); h == nil || h.id != "tiny" {
+		t.Fatalf("head = %v, want tiny (smallest of the small class)", h)
+	}
+}
+
+// TestHRRNBoundedReproducesTheB1bTailAsBounded replays the measured B1b shape: twenty
+// waiters, nineteen small ones already waiting up to an hour, one 200K-token entry that
+// was still queued at the 3,601 s mark. Under plain HRRN that entry is NOT the head (its
+// ratio is ~67x too small); under F5′ it is, because it ages at the small class's rate.
+func TestHRRNBoundedReproducesTheB1bTailAsBounded(t *testing.T) {
+	now := goldenT0
+	const bigCold, smallCold int64 = 200_000, 3_000
+	var specs []hrrnSpec
+	for i := 0; i < 19; i++ {
+		// staggered like a saturated queue: 3,600 s down to ~0, one per ~190 s
+		specs = append(specs, hrrnSpec{fmt.Sprintf("s%02d", i), time.Duration(3600-i*190) * time.Second, smallCold})
+	}
+	specs = append(specs, hrrnSpec{"big", 3610 * time.Second, bigCold})
+
+	bounded := hrrnWaiterSet(t, "hrrn-bounded", now, specs...)
+	if h := headOf(bounded); h == nil || h.id != "big" {
+		t.Fatalf("bounded head = %v at the B1b tail, want big (the median rate gives it a bounded wait)", h)
+	}
+	plain := hrrnWaiterSet(t, "hrrn", now, specs...)
+	h := headOf(plain)
+	if h == nil || h.id == "big" {
+		t.Fatalf("plain hrrn head = %v, want a small entry — the measured 3,601 s stall", h)
+	}
+	// the arithmetic of the defect, stated as a number: the big entry's ratio is the
+	// small class's divided by the size gap.
+	plain.mu.Lock()
+	bigP := plain.entryKeyLocked(plain.eng().waiters["big"], nil).hrrn
+	plain.mu.Unlock()
+	bounded.mu.Lock()
+	bigB := bounded.entryKeyBoundLocked(bounded.eng().waiters["big"], nil, smallCold).hrrn
+	bounded.mu.Unlock()
+	if !(bigB > bigP*50) {
+		t.Fatalf("bounded big priority (%v) must exceed the plain one (%v) by ~the 67x size gap", bigB, bigP)
+	}
+}
+
+// TestHRRNBoundedEqualsPlainWhenTheBoundCannotBind is the no-op guarantee: when every
+// waiter is the same size the median IS that size, so min(cold, median) = cold and the
+// bounded order is bit-for-bit plain HRRN's. A single waiter is the same case.
+func TestHRRNBoundedEqualsPlainWhenTheBoundCannotBind(t *testing.T) {
+	now := goldenT0
+	uniform := func(wait time.Duration) []hrrnSpec {
+		var out []hrrnSpec
+		for i, w := range []time.Duration{wait, wait / 2, wait / 3, 0} {
+			out = append(out, hrrnSpec{fmt.Sprintf("u%d", i), w, 3_000})
+		}
+		return out
+	}
+	for _, wait := range []time.Duration{0, 10 * time.Second, 600 * time.Second, 3600 * time.Second} {
+		plain := hrrnWaiterSet(t, "hrrn", now, uniform(wait)...)
+		bounded := hrrnWaiterSet(t, "hrrn-bounded", now, uniform(wait)...)
+		if hb, hp := headOf(bounded), headOf(plain); hb == nil || hp == nil || hb.id != hp.id {
+			t.Fatalf("wait %v: heads differ (%v vs %v) with a uniform-size set", wait, hb, hp)
+		}
+		var ids []string
+		plain.mu.Lock()
+		for id := range plain.eng().waiters {
+			ids = append(ids, id)
+		}
+		plain.mu.Unlock()
+		for _, id := range ids {
+			plain.mu.Lock()
+			kp := plain.entryKeyLocked(plain.eng().waiters[id], nil)
+			plain.mu.Unlock()
+			bounded.mu.Lock()
+			kb := bounded.entryKeyBoundLocked(bounded.eng().waiters[id], nil, 3_000)
+			bounded.mu.Unlock()
+			if kp.hrrn != kb.hrrn {
+				t.Fatalf("wait %v: %s priority differs (plain %v, bounded %v)", wait, id, kp.hrrn, kb.hrrn)
+			}
+		}
+	}
+	// one waiter: the median is its own size, so the rules agree
+	for _, order := range []string{"hrrn", "hrrn-bounded"} {
+		s := hrrnWaiterSet(t, order, now, hrrnSpec{"solo", 900 * time.Second, 200_000})
+		if h := headOf(s); h == nil || h.id != "solo" {
+			t.Fatalf("%s: a lone waiter must be the head, got %v", order, h)
+		}
+	}
+}
+
+// TestHRRNBoundedKeepsThePrefillAccounting: F5′ must carry F5's per-dispatch prefill
+// bookkeeping (the engine's PREFILL backlog that F7's gate and the F9 pools read). If it
+// did not, an F5-vs-F5′ comparison would differ in more than the entry order — a silent
+// confound — and F5′ combined with F7 would see a permanently empty backlog.
+func TestHRRNBoundedKeepsThePrefillAccounting(t *testing.T) {
+	for _, order := range []string{"hrrn", "hrrn-bounded"} {
+		s := fArmScheduler(t, func(c *Config) { c.EntryOrder = order })
+		now := goldenT0
+		s.mu.Lock()
+		s.now = now
+		s.mu.Unlock()
+		heads := []Head{{Member: "a", ReqID: "a-r1", Arrival: now, SizeBytes: bytesFor(10)}}
+		if _, i := s.PickFromHeadsEngine(heads, now); i < 0 {
+			t.Fatalf("%s: could not seat a", order)
+		}
+		s.DispatchedOn("a", "a-r1", "", keys(10, Hash(11)), bytesFor(10), now)
+		s.mu.Lock()
+		backlog := s.eng().prefillBacklog
+		pending := s.eng().members["a"].prefillPending
+		s.mu.Unlock()
+		if backlog <= 0 || pending <= 0 {
+			t.Fatalf("%s: prefill backlog = %d, member pending = %d, want both > 0 (the F5 accounting)", order, backlog, pending)
+		}
+		if backlog != 10*int64(defaultConfig().BlockSizeTokens) && pending != backlog {
+			t.Fatalf("%s: backlog %d != member pending %d", order, backlog, pending)
+		}
+	}
+}
+
+// TestMedianColdTokens pins the bound's definition: the LOWER median of the waiter
+// set's sizes, with a fully-warm waiter (0 uncached tokens) floored at one block exactly
+// as entryPriority floors its denominator, and 0 for an empty set.
+func TestMedianColdTokens(t *testing.T) {
+	mk := func(colds ...int64) map[string]*waiter {
+		m := map[string]*waiter{}
+		for i, c := range colds {
+			m[fmt.Sprintf("w%d", i)] = &waiter{id: fmt.Sprintf("w%d", i), coldTokens: c}
+		}
+		return m
+	}
+	for _, tc := range []struct {
+		name   string
+		colds  []int64
+		blocks int
+		want   int64
+	}{
+		{"empty", nil, 64, 0},
+		{"odd", []int64{200_000, 3_000, 8_000}, 64, 8_000},
+		{"even takes the LOWER median", []int64{200_000, 3_000, 8_000, 4_000}, 64, 4_000},
+		{"warm waiters floor at one block", []int64{0, 0, 200_000}, 64, 64},
+		{"all warm", []int64{0, 0}, 64, 64},
+	} {
+		if got := medianColdTokens(mk(tc.colds...), tc.blocks); got != tc.want {
+			t.Errorf("%s: median = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
 // ---- F6′ residue-driven release ----
 
 // TestResidueVictimOrderIsFairAndColdFirst is F6″:
@@ -527,6 +833,7 @@ func TestFArmKnobsOffKeepTheGolden(t *testing.T) {
 	for _, arm := range []func(*Config){
 		func(c *Config) { c.QuantumMode = "dyn-size" },                        // F3
 		func(c *Config) { c.EntryOrder = "hrrn" },                             // F5
+		func(c *Config) { c.EntryOrder = "hrrn-bounded" },                     // F5′
 		func(c *Config) { c.Residue = "tiebreak"; c.VictimOrder = "residue" }, // F6"
 		func(c *Config) { c.RotateWhenFree = true; c.QuantumCeiling = 16 },    // F7
 		func(c *Config) { c.RotationMode = "mlfq2" },                          // F9

@@ -192,6 +192,15 @@ type Config struct {
 	//	                   PREFILL SECONDS (cold tokens ÷ the run-time MEASURED
 	//	                   prefill rate). Small-first without starving big jobs: wait
 	//	                   grows without bound, so every head eventually wins.
+	//	"hrrn-bounded"   — F5′: the same ratio with s_eff = min(cold tokens, the live
+	//	                   MEDIAN cold tokens of the CURRENT waiters), recomputed once
+	//	                   per decision pass from the scheduler's own waiter pool.
+	//	                   Parameter-free, and it is what bounds F5's far tail: a
+	//	                   200K-token entry otherwise ages ~67x slower than a 3K one,
+	//	                   so its wait was measured at ~an hour (B1b) instead of the
+	//	                   ~10 min the median rate gives it. Small entries (below the
+	//	                   median) keep F5's ordering exactly; entries at or above it
+	//	                   age at the median rate, oldest first among themselves.
 	EntryOrder string `json:"entryOrder"`
 	// RotateWhenFree (F7): when true, a rotation-based eviction is allowed only
 	// while the engine's PREFILL BACKLOG (dispatched, no first token yet, in
@@ -452,6 +461,14 @@ func (c Config) quantum() int {
 // quantumFinite reports whether Q is finite (false = the pause arm P∞).
 func (c Config) quantumFinite() bool { return c.quantum() >= 0 }
 
+// hrrnOrder reports whether the entry order is an HRRN variant (F5 or F5′). Both need
+// the SAME per-dispatch prefill accounting, and treating them alike is what makes an
+// F5-vs-F5′ comparison differ in the entry order alone: an F5′ arm must not also lose
+// the PREFILL backlog bookkeeping that F7 and the F9 pools read.
+func (c Config) hrrnOrder() bool {
+	return c.EntryOrder == "hrrn" || c.EntryOrder == "hrrn-bounded"
+}
+
 func (c Config) validate() error {
 	if c.GroupBudgetFraction <= 0 || c.GroupBudgetFraction > 1 {
 		return fmt.Errorf("groupBudgetFraction must be in (0,1], got %v", c.GroupBudgetFraction)
@@ -482,9 +499,9 @@ func (c Config) validate() error {
 		return fmt.Errorf("quantumMode: invalid value %q (fixed|dyn-size)", c.QuantumMode)
 	}
 	switch c.EntryOrder {
-	case "", "newcomer-first", "hrrn":
+	case "", "newcomer-first", "hrrn", "hrrn-bounded":
 	default:
-		return fmt.Errorf("entryOrder: invalid value %q (newcomer-first|hrrn)", c.EntryOrder)
+		return fmt.Errorf("entryOrder: invalid value %q (newcomer-first|hrrn|hrrn-bounded)", c.EntryOrder)
 	}
 	if c.QuantumCeiling < 0 {
 		return fmt.Errorf("quantumCeiling must be >= 0 (0 = off), got %d", c.QuantumCeiling)
@@ -2033,11 +2050,11 @@ func (s *Scheduler) DispatchedOn(id, reqID, engine string, keys []Hash, sizeByte
 	// every one of them and the "uncached" estimate would read ZERO for every
 	// dispatch (measured: the gate never saw a single backlogged token).
 	prefillUncached := int64(0)
-	if s.cfg.RotateWhenFree || s.cfg.EntryOrder == "hrrn" || s.cfg.RotationMode == "mlfq2" {
+	if s.cfg.RotateWhenFree || s.cfg.hrrnOrder() || s.cfg.RotationMode == "mlfq2" {
 		prefillUncached = s.uncachedTokensLocked(g, keys)
 	}
 	onMain := g.index.SettleDispatchedAtLocked(id, reqID, keys, now)
-	if s.cfg.RotateWhenFree || s.cfg.EntryOrder == "hrrn" || s.cfg.RotationMode == "mlfq2" {
+	if s.cfg.RotateWhenFree || s.cfg.hrrnOrder() || s.cfg.RotationMode == "mlfq2" {
 		// F7's backlog input and F5's service estimate: the request's PREFILL WORK is
 		// its prompt tokens (the exact tier-A keys x block size), held against the
 		// engine until the first token arrives.
@@ -2105,7 +2122,7 @@ func (s *Scheduler) DispatchedOn(id, reqID, engine string, keys []Hash, sizeByte
 			m.coldEntry = int64(len(keys)) * int64(s.blockSize)
 			g.coldInFlight += m.coldEntry
 		}
-		if s.cfg.RotateWhenFree || s.cfg.EntryOrder == "hrrn" || s.cfg.RotationMode == "mlfq2" {
+		if s.cfg.RotateWhenFree || s.cfg.hrrnOrder() || s.cfg.RotationMode == "mlfq2" {
 			// F7's backlog input and F5/F9's service estimate: the request's PREFILL
 			// WORK is its prompt tokens (the exact tier-A keys, block-quantised), held
 			// against the engine until the first token arrives (ChunkAt releases it).
@@ -2521,10 +2538,14 @@ func (s *Scheduler) entryHeadLocked(g *engineGroup, seats map[string]int) *waite
 	if s.cfg.RotationMode == "mlfq2" {
 		return s.mlfq2HeadLocked(g, seats)
 	}
+	waiters := s.waitersLocked(g)
+	// F5′: ONE bound per decision pass, from the CURRENT waiter set — the same pool
+	// this loop orders. 0 (any other entry order) leaves every key as it was.
+	bound := s.entryColdBoundLocked(waiters)
 	var head *waiter
 	var headKey entryKey
-	for _, w := range s.waitersLocked(g) {
-		k := s.entryKeyLocked(w, seats)
+	for _, w := range waiters {
+		k := s.entryKeyBoundLocked(w, seats, bound)
 		// the key is a TOTAL order (id breaks every tie), so the map's
 		// iteration order cannot leak into the decision.
 		if head == nil || k.less(headKey) {
@@ -2543,8 +2564,12 @@ func (s *Scheduler) entryHeadLocked(g *engineGroup, seats map[string]int) *waite
 func (s *Scheduler) mlfq2HeadLocked(g *engineGroup, seats map[string]int) *waiter {
 	var short, long *waiter
 	var shortK, longK entryKey
-	for _, w := range s.waitersLocked(g) {
-		k := s.entryKeyLocked(w, seats)
+	waiters := s.waitersLocked(g)
+	// F5′ composes with F9 too: the bound is one per pass, over the pools' union (it
+	// is 0 unless the entry order is hrrn-bounded, so plain mlfq2 is unaffected).
+	bound := s.entryColdBoundLocked(waiters)
+	for _, w := range waiters {
+		k := s.entryKeyBoundLocked(w, seats, bound)
 		if s.promoted[w.id] {
 			if long == nil || k.less(longK) {
 				long, longK = w, k
@@ -2577,9 +2602,10 @@ func (s *Scheduler) mlfq2HeadLocked(g *engineGroup, seats map[string]int) *waite
 type entryKey struct {
 	seats int
 	isNew int
-	// hrrn is (wait + s)/s, or 0 when the ordering rule is not HRRN (in which case
-	// every key carries 0 and the field is inert — that is what keeps the pinned
-	// newcomer-first order byte-identical).
+	// hrrn is (wait + s)/s, or F5′'s min(cold, median)-bounded form of it, or 0 when
+	// the ordering rule is not HRRN at all (in which case every key carries 0 and the
+	// field is inert — that is what keeps the pinned newcomer-first order
+	// byte-identical).
 	hrrn  float64
 	since time.Time
 	id    string
@@ -2602,10 +2628,22 @@ func (k entryKey) less(o entryKey) bool {
 }
 
 func (s *Scheduler) entryKeyLocked(w *waiter, seats map[string]int) entryKey {
+	return s.entryKeyBoundLocked(w, seats, 0)
+}
+
+// entryKeyBoundLocked builds the key under F5′'s pass bound (coldBound = the live
+// median waiter size, 0 = unbounded). Direct callers get entryKeyLocked, which is the
+// unbounded key: the bound is a property of a decision PASS over a waiter set, not of
+// an individual waiter.
+func (s *Scheduler) entryKeyBoundLocked(w *waiter, seats map[string]int, coldBound int64) entryKey {
 	k := entryKey{since: w.since, id: w.id}
-	if s.cfg.EntryOrder == "hrrn" {
+	switch s.cfg.EntryOrder {
+	case "hrrn":
 		// F5: wait / cold_tokens (the measured rate cancels — see entryPriority).
 		k.hrrn = entryPriority(s.nowLocked().Sub(w.since).Seconds(), w.coldTokens, s.blockSize)
+	case "hrrn-bounded":
+		// F5′: wait / min(cold_tokens, median waiter size) — the far tail's fix.
+		k.hrrn = boundedEntryPriority(s.nowLocked().Sub(w.since).Seconds(), w.coldTokens, coldBound, s.blockSize)
 	}
 	switch s.cfg.SessionOrder {
 	case "lsf":

@@ -56,6 +56,31 @@ var emitterKeys = map[string][]string{
 	"PAT_KNOBS_BLOCK": {"eligibilityMode"},
 }
 
+// TestEntryOrderValuesMatchTheEmitter pins the ENUM VALUES the exp-ops renderer can put
+// into `entryOrder`. The key-level check above catches a removed FIELD; this catches a
+// removed VALUE, which fails just as hard at plugin init (validate() rejects it and the
+// EPP CrashLoops on every arm that renders it) but would otherwise only show up at the
+// first deploy of the arm that carries it. Keep the list in step with the entryOrder
+// comment in exp-ops/lib/common.sh.
+func TestEntryOrderValuesMatchTheEmitter(t *testing.T) {
+	// the values the emitter documents (FARM_KNOBS_BLOCK / configs/*.env)
+	emitted := []string{"newcomer-first", "hrrn", "hrrn-bounded"}
+	for _, v := range emitted {
+		c := defaultConfig()
+		c.EntryOrder = v
+		if err := c.validate(); err != nil {
+			t.Errorf("exp-ops can render entryOrder=%q but Config.validate rejects it: %v", v, err)
+		}
+	}
+	// ... and an unknown value must still fail closed instead of silently ordering by
+	// the default (a typo in an arm's env would otherwise measure the anchor twice).
+	c := defaultConfig()
+	c.EntryOrder = "hrrn-boundedd"
+	if err := c.validate(); err == nil {
+		t.Fatal("an unknown entryOrder must be rejected")
+	}
+}
+
 // TestConfigEmitterConformance fails when the emitter and Config disagree — in either
 // direction that can crash a deploy.
 func TestConfigEmitterConformance(t *testing.T) {

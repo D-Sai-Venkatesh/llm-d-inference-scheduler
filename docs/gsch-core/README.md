@@ -139,25 +139,19 @@ The wave's BALANCE gate reads the per-engine series every 15 s. A core arm must 
 The gate line to read on a `none` arm: `detector_pool_score == 0` for the whole window
 (the pool gate never closed) and `safety_fired == 0` everywhere (the backstop was off).
 
-## 4. Declared differences vs f0p (both measured on the replay)
+## 4. Declared differences vs f0p (each measured separately on the replay)
 
-1. **The budget victim's "never completed" tie-break is TOTAL (member id).** f0p read
-   map iteration order, so the archive build is not reproducible: 3 divergences in 4
-   replays of the same scenario+config. Evidence: `olderCompletion`'s comment and
-   `testdata/golden-f0p-core.txt` vs `golden-f0p-total.txt`.
-2. **The cold-entry valve never evicts.** f0p's admission loop fell through to eviction
-   when a head fit the BUDGET but the valve refused it — and eviction frees budget,
-   never the valve, so the loop evicted every eligible member and left the seats
-   cold-empty. Measured on the replay (`coldEntryCapTokens` = 640, one engine):
-   **3,220 valve-blocked passes, 20 evictions taken for nothing** → 0 with the fix;
-   served 1,201 → 1,253; 4,432 of 5,034 trace lines differ.
-   **REPLAY: 0 divergences at the shipped cap (131,072 tokens — the valve does not
-   bind there), 20 pointless evictions at a tiny cap. LIVE: measured by the anchor** —
-   f0p's live artifact shows `rotation_evictions_valve_blocked_total = 913,162`
-   passes, and every one that found an eligible victim evicted for nothing; those
-   evictions are indistinguishable from ordinary quantum-complete/idle exits in the
-   banked artifacts, so the live effect is UNKNOWN (bounded by the rotation exits,
-   ~40-45 % of exits). The single-pod core anchor arm measures it.
+The core's golden is the ARCHIVE build with f0p's config plus the four fixes below; it
+is reproduced byte for byte (`TestCoreEqualsF0P`). Per-fix counts are on the same 2,600 s
+replay, against `golden-f0p-total.txt` (the archive with only tie-break #0):
+
+| # | fix | effect on the replay |
+|---|---|---|
+| 0 | total "never completed" victim tie-break (member id) | the baseline's own correction: f0p read map iteration order and produced **3 different traces in 4 replays**. |
+| 1 | the cold-entry valve never evicts (a valve-held head waits) | **0 lines** at the shipped cap; at a binding cap, f0p took **20 evictions for nothing** (3,220 valve-blocked passes) and served 1,201 vs the core's 1,253 (**+4.3 %**). **Replay: 0 at the shipped cap, 20 at a tiny cap. Live: measured by the anchor** — f0p logged 913,162 valve-blocked passes live; those evictions look like ordinary exits in the banked artifacts, so the live effect is UNKNOWN (bounded by the rotation exits, ~40-45 % of exits). |
+| 2 | class-3 victims: unstarted/wanting members sort LAST | **0 lines** (this replay's class-3 set is entirely unstarted); the fix targets f0p's measured 53/54 zero-turn victims. |
+| 3 | a stale queue view never justifies an eviction (the C8 race) + Tick re-syncs from the last head snapshot | **14 lines**, +9 class-3 exits, served unchanged (1,231). |
+| 4 | mid-flight exits reach the exit hook; dead rotation in-flight branch deleted | **62 extra `EXIT reason=exiting` lines**, 0 decisions changed (accounting only). |
 
 ## 4b. Pre-flight gates (every core arm, before its window counts)
 

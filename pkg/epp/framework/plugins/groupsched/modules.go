@@ -137,6 +137,14 @@ type PressureCtx struct {
 	// Headless reports whether the member has no queued head, as EVIDENCE (false when
 	// the queue view is stale — see TenureCtx.Headless).
 	Headless func(m *member) bool
+	// QueueViewTrusted reports whether the queue view is recent enough that "this
+	// member has no queued head" means anything at all. When it is false, the classes
+	// that reason about HEAD PRESENCE (done and mid-quantum) are SKIPPED: the policy
+	// cannot tell an idle member from a busy one, so it must not reclaim a seat on a
+	// guess — that guess is exactly the C8 race (heads arriving just before a Tick,
+	// victims' heads then waiting 4.7-25 minutes, cold). Memory enforcement then waits
+	// for the next pass, which is at most one tick away.
+	QueueViewTrusted bool
 }
 
 // VictimChooser answers "who leaves when the engine is over its budget?".
@@ -175,6 +183,22 @@ func (BudgetValve) Victim(members []*member, ctx PressureCtx) (string, *member) 
 	}
 	if best != nil {
 		return "budget-noqueue", best
+	}
+	if !ctx.QueueViewTrusted {
+		// no trustworthy view of who has a queued head: classes (2) and (3) are guesses.
+		// Only members already on their way out can be named.
+		for _, m := range members {
+			if !ctx.Exiting(m.id) {
+				continue
+			}
+			if best == nil || olderCompletion(m, best) {
+				best = m
+			}
+		}
+		if best != nil {
+			return "budget-exiting", best
+		}
+		return "", nil
 	}
 	// class (3): mid-quantum. THE ORDER MATTERS: a member that has not served a turn
 	// in this residency, or that has a queued head right now, is the LAST choice —

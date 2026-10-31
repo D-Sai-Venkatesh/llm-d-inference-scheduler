@@ -458,9 +458,9 @@ type engineGroup struct {
 	// tier is THIS engine's CPU offload tier, as a model (tiershadow.go): nil when the
 	// deployment configures no tier. It is a per-engine fact like the index — a block
 	// in engine A's CPU tier is worthless to B — and it is consulted ONLY by the two
-	// readers that need it: the tier-aware admission estimate (hrrn-tier's denominator)
-	// and the shadow-validation metric. Dispatch, the budget and the cold valve never
-	// see it: offload adds no seats.
+	// readers that need it: the tier-aware cold estimate (hrrn-tier's denominator) and
+	// the shadow-validation metric. Dispatch, the budget and the cold valve never see
+	// it: offload adds no seats.
 	tier *tierShadow
 	// estTierCache caches the TIER-AWARE estimate keyed on BOTH mutation versions —
 	// the index's (a block arriving or leaving the GPU set changes the answer) and the
@@ -1201,12 +1201,11 @@ func (s *Scheduler) estimateTierCostCachedLocked(g *engineGroup, id string, size
 		g.estTierIndexVer, g.estTierTierVer = iv, tv
 	}
 	if e, ok := g.estTierCache[id]; ok && e.sizeBytes == sizeBytes {
-		return e.blocks
+		return s.mod.sizer.Tokens(e.blocks)
 	}
 	cold, _, _ := s.mod.sizer.TierCost(g.index, g.tier, id, sizeBytes)
-	t := s.mod.sizer.Tokens(cold)
-	g.estTierCache[id] = estEntry{sizeBytes: sizeBytes, blocks: t}
-	return t
+	g.estTierCache[id] = estEntry{sizeBytes: sizeBytes, blocks: cold}
+	return s.mod.sizer.Tokens(cold)
 }
 
 // ---- PreRequest (post-dispatch): the exact tier-A correction ----
@@ -2025,10 +2024,10 @@ func (s *Scheduler) RemoveEngine(engine string, now time.Time) int {
 // detail, so the pre-multi-pod reducer regex keeps matching unchanged.
 type Event struct {
 	T      time.Time `json:"t"`
-	Kind   string    `json:"kind"`   // SEAT | EXIT | EXITING | REBIND | AFFINITY-VIOLATION
+	Kind   string    `json:"kind"`   // SEAT | EXIT | EXITING | REBIND | AFFINITY-VIOLATION | SHADOW-VALIDATION
 	ID     string    `json:"id"`     // the session id
 	Engine string    `json:"engine"` // the engine label ("" single-mode group -> "single")
-	Detail string    `json:"detail"` // reason=... turns=... / kind=... wait=...
+	Detail string    `json:"detail"` // reason=... turns=... / kind=... wait=... / pred=... measured=... fairness_id=...
 	// Member is the fairness unit the event's id resolves to at emit time
 	// (the affinity-violation join needs member→engine-at-seat reconstructable
 	// from the artifacts alone).

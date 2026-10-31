@@ -34,12 +34,16 @@ limitations under the License.
 //     rejects block_size ≤ 0). The campaign engine runs 64-token blocks
 //     (40,183 × 64 = 2.57M) — a hardcoded default silently admitting 4×
 //     the cache was the first draft's S0-3.
-//   - PER-SESSION EXITING STATE: the non-exiting (budget) counter is the
-//     union over seated, non-exiting members — maintained as an
-//     invariant, not approximated by refcount tricks. MarkExiting is
-//     idempotent; updates on an exiting member never touch the budget
-//     counter; Unseat releases from the budget counter only what the
-//     session actually contributed.
+//   - PER-SESSION EXITING STATE: the budget counter is the union over
+//     seated members, EXITING ONES INCLUDED, maintained as an invariant,
+//     not approximated by refcount tricks. An exiting member is still
+//     holding its blocks — the engine pins them until the request drains —
+//     so charging the budget only for "non-exiting" members meant the
+//     budget forgot 14-18 % of the pool while the pool was still paying
+//     for it (measured on the multi-pod wave; preempt-rootcause §7.3).
+//     MarkExiting is idempotent and changes no counter: it marks "do not
+//     dispatch, do not re-seat", and the release happens exactly once, at
+//     Unseat/Forget.
 //   - ATOMIC TrySeat: fit and seat in one critical section (no TOCTOU
 //     between FitBlocks and seating).
 //   - O(Δ) COUNTER DIFFS: every mutation computes the set delta and
@@ -92,9 +96,9 @@ const minChunkBytes = 64
 type Hash uint64
 
 // BlockIndex is the group-level unique-block accounting: a reference
-// counter over the blocks of seated members, plus the same over seated,
-// non-exiting members (the budget counter — a draining member's blocks
-// do not block admissions).
+// counter over the blocks of seated members, plus the budget counter over
+// the same set (a draining member's blocks stay charged until it is
+// unseated, because the engine still holds them).
 //
 // Session records persist across residencies (Unseat keeps the record so
 // a re-seated multi-chain session counts its full set; Forget drops the
@@ -112,7 +116,7 @@ type BlockIndex struct {
 	version uint64
 
 	blocks   map[Hash]int // refcount over seated members' sets
-	blocksNE map[Hash]int // refcount over seated, non-exiting members
+	blocksNE map[Hash]int // refcount over seated members (exiting included: the budget's used side)
 
 	sessions map[string]*sessionBlocks
 	seated   map[string]struct{}
@@ -241,7 +245,7 @@ func (b *BlockIndex) Forget(id string) {
 		return
 	}
 	if _, isSeated := b.seated[id]; isSeated {
-		b.releaseLocked(s, !s.exiting)
+		b.releaseLocked(s)
 		delete(b.seated, id)
 	}
 	delete(b.sessions, id)
@@ -268,7 +272,7 @@ func (s *sessionBlocks) set() map[Hash]struct{} {
 // TrySeat seats a session atomically against a budget in BLOCKS: the
 // session's current set (its waiting requests — a newcomer's entry
 // request must be recorded via UpdateWaiting first) is costed against
-// the non-exiting group, and the seat happens only if
+// the budget group, and the seat happens only if
 // UniqueBlocksNE + cost <= budgetBlocks. Returns (ok, cost).
 //
 // The waiting request is NOT settled into the dispatch window here; the
@@ -321,8 +325,8 @@ func (b *BlockIndex) TrackLocked(id string, window int) *sessionBlocks {
 }
 
 // Unseat removes a session from the group (its record persists; its
-// blocks are released from both counters — the budget counter only for
-// what it still contributes there, which is nothing if it was exiting).
+// blocks are released from both counters — an exiting member's too, since
+// this is the moment it actually drains).
 func (b *BlockIndex) Unseat(id string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -333,20 +337,18 @@ func (b *BlockIndex) Unseat(id string) {
 	if _, isSeated := b.seated[id]; !isSeated {
 		return
 	}
-	b.releaseLocked(s, !s.exiting)
+	b.releaseLocked(s)
 	delete(b.seated, id)
 }
 
-// releaseLocked removes s's set from the all-seated counter and (if
-// countNE) from the budget counter. Refcount underflow is a programming
-// error and panics (the first draft's `c > 0` guards masked real bugs).
-func (b *BlockIndex) releaseLocked(s *sessionBlocks, countNE bool) {
+// releaseLocked removes s's set from both counters. Refcount underflow is a
+// programming error and panics (the first draft's `c > 0` guards masked real
+// bugs).
+func (b *BlockIndex) releaseLocked(s *sessionBlocks) {
 	b.version++ // R4: every mutation path bumps at its primitive
 	for h := range s.set() {
 		b.dec(b.blocks, h)
-		if countNE {
-			b.dec(b.blocksNE, h)
-		}
+		b.dec(b.blocksNE, h)
 	}
 }
 
@@ -362,11 +364,19 @@ func (b *BlockIndex) dec(m map[Hash]int, h Hash) {
 	}
 }
 
-// MarkExiting moves a member's blocks out of the budget (non-exiting)
-// counter while it remains seated and served. Idempotent.
+// MarkExiting marks a member "on its way out": it is not dispatched and not
+// re-seated, and it leaves at its next drain. Its blocks STAY on the budget's
+// used side until it is unseated — the engine pins them until the running
+// request finishes, so releasing them at the mark undercounts the pool for
+// exactly the interval the retiree is still consuming it. Idempotent, and no
+// counter moves (so the estimate cache needs no invalidation here).
 func (b *BlockIndex) MarkExiting(id string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.markExitingLocked(id)
+}
+
+func (b *BlockIndex) markExitingLocked(id string) {
 	s, ok := b.sessions[id]
 	if !ok || s.exiting {
 		return // idempotent
@@ -374,11 +384,7 @@ func (b *BlockIndex) MarkExiting(id string) {
 	if _, isSeated := b.seated[id]; !isSeated {
 		return // an unseated session is not exiting
 	}
-	b.version++ // R4: the exiting write
 	s.exiting = true
-	for h := range s.set() {
-		b.dec(b.blocksNE, h)
-	}
 }
 
 // ---- waiting / dispatch bookkeeping ----
@@ -387,8 +393,8 @@ func (b *BlockIndex) MarkExiting(id string) {
 // (tracked, seated or not), keyed by the request ID the caller uses at
 // dispatch — the scheduler never has to keep the body, and a rewritten
 // body is simply re-registered under its reqID. If seated, the session's
-// NEW blocks are counted into the group (the budget counter only while
-// non-exiting) — the growth re-check substrate (D13).
+// NEW blocks are counted into the group (both counters) — the growth
+// re-check substrate (D13).
 func (b *BlockIndex) UpdateWaiting(id, reqID string, body []byte) error {
 	hashes := b.HashBody(body)
 	b.mu.Lock()
@@ -458,30 +464,25 @@ func (b *BlockIndex) Cancel(id, reqID string) error {
 
 // applyDeltaLocked applies the counter diff between the session's
 // previous set and its current set: increments for new blocks, decrements
-// for gone blocks. The budget (non-exiting) counter participates only
-// while the session is seated and non-exiting.
+// for gone blocks. Both counters follow a SEATED session, exiting or not
+// (an exiting member's new turn is pinned by the engine like any other).
 func (b *BlockIndex) applyDeltaLocked(s *sessionBlocks, old map[Hash]struct{}) {
 	b.version++ // R4: bumps even when unseated (SetBlocks feeds estimates)
 	_, isSeated := b.seated[s.id]
 	if !isSeated {
 		return // unseated sessions' records are private
 	}
-	countNE := !s.exiting
 	cur := s.set()
 	for h := range cur {
 		if _, had := old[h]; !had {
 			b.blocks[h]++
-			if countNE {
-				b.blocksNE[h]++
-			}
+			b.blocksNE[h]++
 		}
 	}
 	for h := range old {
 		if _, has := cur[h]; !has {
 			b.dec(b.blocks, h)
-			if countNE {
-				b.dec(b.blocksNE, h)
-			}
+			b.dec(b.blocksNE, h)
 		}
 	}
 }
@@ -515,7 +516,7 @@ func (s *sessionBlocks) rebuildWaitSet() {
 // ---- queries ----
 
 // FitBlocks returns how many of the candidate's blocks are NOT already
-// held by the non-exiting group: the admission cost estimate. With
+// held by the budget group: the admission cost estimate. With
 // chained hashes the candidate's hashes are position-sensitive, so only
 // true prefix sharing discounts.
 func (b *BlockIndex) FitBlocks(hashes []Hash) int {
@@ -537,8 +538,8 @@ func (b *BlockIndex) UniqueBlocks() int {
 	return len(b.blocks)
 }
 
-// UniqueBlocksNE is the same over seated, non-exiting members — the
-// budget's enforcement counter (D6/D13).
+// UniqueBlocksNE is the same over seated members, exiting ones included —
+// the budget's enforcement counter (D6/D13).
 func (b *BlockIndex) UniqueBlocksNE() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -576,9 +577,7 @@ func (b *BlockIndex) checkInvariantLocked() {
 		s := b.sessions[id]
 		for h := range s.set() {
 			want[h]++
-			if !s.exiting {
-				wantNE[h]++
-			}
+			wantNE[h]++ // exiting members are charged until they drain
 		}
 	}
 	if !sameCounts(want, b.blocks) {
@@ -737,20 +736,7 @@ func (b *BlockIndex) ExitingLocked(id string) bool {
 }
 
 // MarkExitingLocked is MarkExiting under an already-held lock.
-func (b *BlockIndex) MarkExitingLocked(id string) {
-	s, ok := b.sessions[id]
-	if !ok || s.exiting {
-		return
-	}
-	if _, isSeated := b.seated[id]; !isSeated {
-		return
-	}
-	b.version++ // R4: the exiting write
-	s.exiting = true
-	for h := range s.set() {
-		b.dec(b.blocksNE, h)
-	}
-}
+func (b *BlockIndex) MarkExitingLocked(id string) { b.markExitingLocked(id) }
 
 // UnseatLocked is Unseat under an already-held lock.
 func (b *BlockIndex) UnseatLocked(id string) {
@@ -761,7 +747,7 @@ func (b *BlockIndex) UnseatLocked(id string) {
 	if _, isSeated := b.seated[id]; !isSeated {
 		return
 	}
-	b.releaseLocked(s, !s.exiting)
+	b.releaseLocked(s)
 	delete(b.seated, id)
 }
 
@@ -772,7 +758,7 @@ func (b *BlockIndex) ForgetLocked(id string) {
 		return
 	}
 	if _, isSeated := b.seated[id]; isSeated {
-		b.releaseLocked(s, !s.exiting)
+		b.releaseLocked(s)
 		delete(b.seated, id)
 	}
 	delete(b.sessions, id)
@@ -878,7 +864,7 @@ func (b *BlockIndex) LastSizeBytesLocked(id string) int64 {
 	return s.lastSizeBytes
 }
 
-// HasNELocked reports whether a hash is held by the non-exiting group
+// HasNELocked reports whether a hash is held by the budget group
 // (the estimate path's membership test).
 func (b *BlockIndex) HasNELocked(h Hash) bool {
 	_, ok := b.blocksNE[h]

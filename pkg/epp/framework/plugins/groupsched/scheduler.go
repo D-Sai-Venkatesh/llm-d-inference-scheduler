@@ -64,11 +64,10 @@ type Config struct {
 	// TTLSeconds is how long a headless, unseated record is remembered (the
 	// silence GC — a waiter with a live head is never forgotten).
 	TTLSeconds float64 `json:"ttlSeconds"`
-	// ColdEntryCapTokens staggers cold ENTRIES per engine: a new residency whose
-	// cold-prefill estimate would push the engine's outstanding cold charge over
-	// the cap waits for the next prefill slot. R11: one cold entry is ALWAYS
-	// allowed, so a session bigger than the cap stays seatable.
-	ColdEntryCapTokens int64 `json:"coldEntryCapTokens"`
+	// (The cold-entry stagger cap is NOT a knob: it is DERIVED per engine as the
+	// seat budget's own headroom — floor((1 - groupBudgetFraction) x
+	// num_gpu_blocks) blocks x blockSizeTokens — so the valve can only ever spend
+	// the margin the budget reserved for it. See engineGroup.coldCapTokens.)
 	// InFlightCap bounds one member's concurrent requests.
 	InFlightCap int `json:"inFlightCap"`
 	// BlockSizeTokens is the engine's KV block size in tokens (the token
@@ -122,7 +121,6 @@ func defaultConfig() Config {
 		Quantum:                 4,
 		IdleSeconds:             20,
 		TTLSeconds:              30,
-		ColdEntryCapTokens:      131072,
 		InFlightCap:             64,
 		BlockSizeTokens:         64,
 		CapacityLivenessSeconds: 120,
@@ -152,9 +150,6 @@ func (c Config) effective() Config {
 	}
 	if c.TTLSeconds == 0 {
 		c.TTLSeconds = def.TTLSeconds
-	}
-	if c.ColdEntryCapTokens == 0 {
-		c.ColdEntryCapTokens = def.ColdEntryCapTokens
 	}
 	if c.InFlightCap == 0 {
 		c.InFlightCap = def.InFlightCap
@@ -202,8 +197,8 @@ func (c Config) validate() error {
 	if c.IdleSeconds <= 0 || c.TTLSeconds <= 0 {
 		return fmt.Errorf("idleSeconds and ttlSeconds must be > 0")
 	}
-	if c.ColdEntryCapTokens <= 0 || c.InFlightCap <= 0 {
-		return fmt.Errorf("coldEntryCapTokens and inFlightCap must be > 0")
+	if c.InFlightCap <= 0 {
+		return fmt.Errorf("inFlightCap must be > 0")
 	}
 	if c.BlockSizeTokens <= 0 {
 		return fmt.Errorf("blockSizeTokens is required (the token processor's block size; got %d)", c.BlockSizeTokens)
@@ -414,6 +409,23 @@ type engineGroup struct {
 	}
 }
 
+// coldCapTokens is THIS engine's cold-ENTRY stagger cap, in tokens: the seat
+// budget's own headroom, floor((1 - fraction) x num_gpu_blocks) blocks x blockSize.
+// The valve staggers cold prefills INSIDE the margin the budget reserved for them,
+// which is why it needs no value of its own — with the budget at 0.95 of 40,183
+// blocks and 64-token blocks the cap is 2009 blocks = 128,576 tokens (the constant it
+// replaces was 131,072 in a unit the budget never used).
+//
+// 0 means "no measured capacity yet", and the places that call this are already
+// behind the capacity check (an engine without capacity takes no seats).
+func (g *engineGroup) coldCapTokens(fraction float64, blockSize int) int64 {
+	if g.numBlocks <= 0 || blockSize <= 0 {
+		return 0
+	}
+	headroomBlocks := int64((1 - fraction) * float64(g.numBlocks))
+	return headroomBlocks * int64(blockSize)
+}
+
 func newEngineGroup(id string, blockSizeTokens int) (*engineGroup, error) {
 	idx, err := NewBlockIndex(blockSizeTokens)
 	if err != nil {
@@ -548,6 +560,12 @@ type Scheduler struct {
 		// queueViewUntrusted counts budget-enforcement passes that ran with an
 		// untrusted queue view (the C8 guard skipped the head-presence classes).
 		queueViewUntrusted int64
+		// eventsDropped counts events the SEAT/EXIT ring wrapped past. The ring is
+		// bounded (memory), so on a long window the oldest events fall out of the
+		// DumpState tail; the stdout stream is the durable copy. A non-zero value here
+		// means "the dump's RecentEvents does not cover the window", which must be
+		// visible instead of inferred.
+		eventsDropped int64
 		// memberSources counts dispatches by the attribute the member id came from
 		// (the run's effective-member-source echo).
 		memberSources map[string]int64
@@ -770,6 +788,12 @@ func (s *Scheduler) BlockSizeMismatch() error {
 // HashTokens computes the chained token-block keys — the tier-A input
 // (CP2b): blockSizeTokens-token blocks, each key chained from the
 // previous, the cache salt folded into the first block.
+//
+// The TRAILING PARTIAL BLOCK IS COUNTED. The engine allocates a block for the last
+// tokens of a prompt whether or not they fill it, so a count of full blocks is short
+// by up to one block per request — an undercount in exactly the direction that costs
+// preemption headroom, and the one part of "token-exact block counting" that needs no
+// tokenizer (the tokens are already here).
 func (s *Scheduler) HashTokens(tokens []uint32, cacheSalt string, blockSizeTokens int) []Hash {
 	if blockSizeTokens <= 0 {
 		blockSizeTokens = s.blockSize
@@ -777,7 +801,7 @@ func (s *Scheduler) HashTokens(tokens []uint32, cacheSalt string, blockSizeToken
 	if blockSizeTokens <= 0 || len(tokens) == 0 {
 		return nil
 	}
-	n := len(tokens) / blockSizeTokens
+	n := (len(tokens) + blockSizeTokens - 1) / blockSizeTokens
 	out := make([]Hash, 0, n)
 	var parent uint64
 	salt := sha256.Sum256([]byte(cacheSalt))
@@ -787,7 +811,11 @@ func (s *Scheduler) HashTokens(tokens []uint32, cacheSalt string, blockSizeToken
 		var b [8]byte
 		binary.LittleEndian.PutUint64(b[:], saltSeed^parent)
 		h.Write(b[:])
-		for j := i * blockSizeTokens; j < (i+1)*blockSizeTokens; j++ {
+		end := (i + 1) * blockSizeTokens
+		if end > len(tokens) {
+			end = len(tokens)
+		}
+		for j := i * blockSizeTokens; j < end; j++ {
 			binary.LittleEndian.PutUint32(b[:4], tokens[j])
 			h.Write(b[:4])
 		}
@@ -1157,9 +1185,12 @@ func (s *Scheduler) DispatchedOn(id, reqID, engine string, keys []Hash, sizeByte
 			m.pendingBlocks = 0 // the exact keys are in NE now (D13 reconciles)
 		}
 		if !m.coldDone && m.coldEntry > 0 {
-			// refine the charge to the exact token count (R1: one unit)
+			// refine the charge to the exact token count (R1: one unit), still capped:
+			// the refinement arrives AFTER the admission check, so an uncapped
+			// refinement is exactly how the charge overran its own cap.
 			g.coldInFlight = max(g.coldInFlight-m.coldEntry, 0)
-			m.coldEntry = s.mod.sizer.Tokens(int64(len(keys)))
+			m.coldEntry = min(s.mod.sizer.Tokens(int64(len(keys))),
+				g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize))
 			g.coldInFlight += m.coldEntry
 		}
 	}
@@ -1573,8 +1604,14 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 		waitingSince: w.since,
 		fairnessID:   w.fairnessID,
 	}
-	// B6: ALL entries carry a cold charge (tokens, R1)
-	m.coldEntry = w.coldTokens
+	// B6: ALL entries carry a cold charge (tokens, R1), CAPPED at the engine's own
+	// stagger cap — the valve's job is to serialise cold prefills inside the budget's
+	// headroom, not to account the entry's whole footprint (the budget's pending
+	// charge does that). Capping is also what makes the cap an invariant: an entry
+	// bigger than the headroom charges the headroom, so an empty valve always admits
+	// exactly one entry (R11 falls out instead of being an exception that let the
+	// charge run 1.5x over its own cap for a quarter of the run).
+	m.coldEntry = min(w.coldTokens, g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize))
 	g.coldInFlight += m.coldEntry
 	// the budget counts the admission estimate (blocks) until the exact keys land
 	// at PreRequest
@@ -1632,7 +1669,9 @@ func (s *Scheduler) noteQueueViewUntrustedLocked() { s.counters.queueViewUntrust
 
 // enforceBudgetLocked is MEMORY PRESSURE on the growth path: while the engine's
 // accounted footprint (NE + pending estimates) is over its budget, take victims in
-// the valve's order until it fits or nothing is evictable.
+// the valve's order until it fits or nothing is evictable. NE counts EXITING members
+// too — they still hold their blocks — so a pass makes progress only by unseating
+// somebody, never by marking them.
 func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 	if g.budgetBlocks <= 0 {
 		return // no measured capacity yet for THIS engine: nothing to enforce
@@ -1653,6 +1692,12 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 			return
 		}
 		if victim.inflight > 0 {
+			if g.index.ExitingLocked(victim.id) {
+				// Already on its way out. Its blocks stay charged until it drains, so
+				// marking it again frees nothing: this pass is DONE (continuing would
+				// re-pick the same member and spin under the scheduler's mutex).
+				return
+			}
 			g.index.MarkExitingLocked(victim.id)
 			s.countExitLocked(g, "exiting")
 			// the series has to see it: the member is on its way out NOW (it drains, then
@@ -1852,6 +1897,7 @@ func (s *Scheduler) recordEvent(kind, id, detail string, now time.Time) {
 func (s *Scheduler) recordEventOn(ev Event) {
 	s.events = append(s.events, ev)
 	if len(s.events) > eventRingSize {
+		s.counters.eventsDropped += int64(len(s.events) - eventRingSize)
 		s.events = s.events[len(s.events)-eventRingSize:]
 	}
 	if s.onEvent != nil {
@@ -1918,6 +1964,10 @@ type Snapshot struct {
 	// passes are re-syncing less often than S.
 	QueueViewAgeSeconds float64 `json:"queueViewAgeSeconds"`
 	QueueViewUntrusted  int64   `json:"queueViewUntrustedPasses"`
+	// EventRingDropped is how many SEAT/EXIT events the bounded ring has wrapped past:
+	// the dump's RecentEvents covers the LAST eventRingSize events, and this says how
+	// much of the window lies before them.
+	EventRingDropped int64 `json:"eventRingDropped"`
 }
 
 // EngineSnapshot is ONE engine's group state: seats, waiters (accounted), the
@@ -1933,10 +1983,14 @@ type EngineSnapshot struct {
 	CapacityOK    bool   `json:"capacityOk"`
 	PendingBlocks int64  `json:"pendingBlocks"`
 	ColdInFlight  int64  `json:"coldInFlightTokens"`
-	BoundMembers  int    `json:"boundMembers"`
-	Served        int64  `json:"served"`
-	FCFSServed    int64  `json:"fcfsServed"`
-	ForcedSeats   int64  `json:"forcedSeats"`
+	// ColdCapTokens is the DERIVED cold-entry stagger cap (the budget's own
+	// headroom, in tokens). A scored run divides coldInFlightTokens by THIS, not by
+	// a constant from the arm's config: the cap moves with the engine.
+	ColdCapTokens int64 `json:"coldCapTokens"`
+	BoundMembers  int   `json:"boundMembers"`
+	Served        int64 `json:"served"`
+	FCFSServed    int64 `json:"fcfsServed"`
+	ForcedSeats   int64 `json:"forcedSeats"`
 	// Safety net: the live verdict, the fire EVENTS and the fired TIME, plus the
 	// scraped inputs it reads (the queue depth is reported, never decisive).
 	SafetyFiring       bool    `json:"safetyFiring"`
@@ -1976,6 +2030,7 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 		EngineGone:          s.counters.engineGone,
 		QueueViewAgeSeconds: s.queueEvidenceAgeSecondsLocked(),
 		QueueViewUntrusted:  s.counters.queueViewUntrusted,
+		EventRingDropped:    s.counters.eventsDropped,
 		Engines:             map[string]EngineSnapshot{}, Bindings: map[string]int{}}
 	if full {
 		snap.Config = s.cfg
@@ -2001,10 +2056,11 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 			BudgetBlocks: g.budgetBlocks, NumBlocks: g.numBlocks,
 			CapacityOK: g.numBlocks > 0, PendingBlocks: g.pendingTotal,
 			ColdInFlight: g.coldInFlight, Served: g.counters.served,
-			FCFSServed:   g.counters.fcfsServed,
-			ForcedSeats:  g.counters.forcedSeats,
-			BoundMembers: snap.Bindings[label],
-			SafetyFiring: st.Fired, SafetyFires: st.Fires,
+			ColdCapTokens: g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize),
+			FCFSServed:    g.counters.fcfsServed,
+			ForcedSeats:   g.counters.forcedSeats,
+			BoundMembers:  snap.Bindings[label],
+			SafetyFiring:  st.Fired, SafetyFires: st.Fires,
 			SafetyFiredSeconds: st.FiredSeconds, SafetySkips: g.counters.safetySkips,
 			SafetyKV: st.KV, SafetyWaitingQueue: st.Waiting,
 			EntryWaitP50:   p50(g.counters.entryWaits),

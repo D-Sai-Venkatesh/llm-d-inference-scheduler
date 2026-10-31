@@ -110,26 +110,39 @@ func (s *Scheduler) queuedPerSeatLocked(g *engineGroup) float64 {
 }
 
 // freeBudgetLocked is what the engine can still admit: its budget minus its
-// accounted footprint (NE blocks + the seat-time estimates not yet converted to
-// exact keys). Negative when the engine is over budget (enforcement is about to
-// catch up).
+// accounted footprint (NE blocks, EXITING members included — they still hold
+// them — plus the seat-time estimates not yet converted to exact keys). Negative
+// when the engine is over budget (enforcement is about to catch up).
 func (s *Scheduler) freeBudgetLocked(g *engineGroup) int64 {
 	return int64(g.budgetBlocks) - (int64(g.index.UniqueBlocksNELocked()) + g.pendingTotal)
 }
 
 // coldAllowsTokens is coldAllows against an EXPLICIT per-engine cost (the placement
 // candidate's own estimate), so the fit test and the valve agree on the number.
+//
+// THE CAP IS AN INVARIANT, not a threshold: the charge a seat will register is
+// min(cost, cap) (seatLocked), so the test is exactly "after this entry, is the
+// engine's outstanding cold charge inside its headroom?". Two consequences fall out
+// of that single rule:
+//
+//   - an EMPTY valve always admits one entry whatever its size (R11's liveness: a
+//     member bigger than the headroom still gets seated), because its capped charge
+//     is the headroom itself;
+//   - the charge can never exceed the cap, which it did in 20-30 % of the wave's
+//     samples when "one cold entry is always allowed" was an EXCEPTION to the cap
+//     instead of a consequence of it (measured 1.44-1.53x, preempt-rootcause §7.1).
 func (s *Scheduler) coldAllowsTokens(g *engineGroup, tokens int64) bool {
-	return g.coldInFlight == 0 || g.coldInFlight+tokens <= s.cfg.ColdEntryCapTokens
+	cap := g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize)
+	if cap <= 0 {
+		return true // no measured capacity: the admission pass already refuses these engines
+	}
+	return g.coldInFlight+min(tokens, cap) <= cap
 }
 
 // coldAllows staggers ALL cold entries IN ONE ENGINE (B6: re-entries too — WEKA
-// re-entries are fully cold), in TOKENS (R1). R11's rule: one cold entry is ALWAYS
-// allowed — a member bigger than the cap must be seatable when nothing cold is in
-// flight, or newcomers-first + hold-the-line deadlocks the queue on it forever.
-//
-// The cap is PER ENGINE, so the system-wide cold-entry concurrency is at most N, and
-// the "always one" clause keeps each engine's own queue live.
+// re-entries are fully cold), in TOKENS (R1). The cap is DERIVED (engineGroup.
+// coldCapTokens) and PER ENGINE, so the system-wide cold-entry concurrency is at
+// most N.
 func (s *Scheduler) coldAllows(g *engineGroup, w *waiter) bool {
 	return s.coldAllowsTokens(g, w.coldTokens)
 }

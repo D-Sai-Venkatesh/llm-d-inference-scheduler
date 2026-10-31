@@ -534,7 +534,12 @@ func (z IndexSizer) Cost(idx *BlockIndex, member string, sizeBytes int64) int64 
 	if delta < 0 {
 		delta = 0
 	}
-	return known + delta/4/int64(z.BlockSize)
+	// ROUNDED UP: a partial block still occupies a block. Truncating the division
+	// understates every head whose growth is not a whole block, in the same
+	// direction as (and on top of) the byte-to-token conversion this estimate is
+	// stuck with.
+	blockBytes := 4 * int64(z.BlockSize)
+	return known + (delta+blockBytes-1)/blockBytes
 }
 
 func (z IndexSizer) Tokens(blocks int64) int64 { return blocks * int64(z.BlockSize) }

@@ -62,7 +62,8 @@ func reproAligned(s string) []byte {
 }
 
 // R1: MarkExiting then Unseat must not steal the OTHER member's non-exiting
-// refcount on shared blocks.
+// refcount on shared blocks. Before the unseat the EXITING member is still charged
+// (it holds its blocks); the unseat is what releases them, and only its own.
 func TestReproNEStealOnUnseat(t *testing.T) {
 	sys := reproAligned(strings.Repeat("common ", 300)) // 3 shared chunks
 	ha := append(append([]byte{}, sys...), privChunks(1, 1024, 'A')...)
@@ -71,17 +72,17 @@ func TestReproNEStealOnUnseat(t *testing.T) {
 	reproSeat(t, idx, "a", ha)
 	reproSeat(t, idx, "b", hb)
 	idx.MarkExiting("a")
-	ne := idx.UniqueBlocksNE() // b alone: 3 shared + 1 private = 4
-	if ne != 4 {
-		t.Fatalf("NE before unseat: %d want 4", ne)
+	if ne := idx.UniqueBlocksNE(); ne != 5 { // 3 shared + a's 1 + b's 1
+		t.Fatalf("NE before unseat: %d want 5 (the exiting member is still charged)", ne)
 	}
 	idx.Unseat("a")
-	if idx.UniqueBlocksNE() != 4 {
-		t.Errorf("R1: unseating an exiting member removed b's shared blocks from NE: %d", idx.UniqueBlocksNE())
+	if got := idx.UniqueBlocksNE(); got != 4 { // b alone: 3 shared + 1 private
+		t.Errorf("R1: unseating an exiting member removed b's shared blocks from NE: %d want 4", got)
 	}
 }
 
-// R2: MarkExiting twice must be idempotent.
+// R2: MarkExiting twice must be idempotent — the mark moves no counter at all, so
+// a repeat cannot release b's shared refcounts.
 func TestReproMarkExitingTwice(t *testing.T) {
 	sys := reproAligned(strings.Repeat("common ", 300))
 	ha := append(append([]byte{}, sys...), privChunks(1, 1024, 'A')...)
@@ -91,21 +92,23 @@ func TestReproMarkExitingTwice(t *testing.T) {
 	reproSeat(t, idx, "b", hb)
 	idx.MarkExiting("a")
 	idx.MarkExiting("a")
-	if idx.UniqueBlocksNE() != 4 {
-		t.Errorf("R2: second MarkExiting(a) stole b's NE refcounts: NE=%d want 4", idx.UniqueBlocksNE())
+	if ne := idx.UniqueBlocksNE(); ne != 5 {
+		t.Errorf("R2: second MarkExiting(a) moved the budget counter: NE=%d want 5", ne)
 	}
 }
 
-// R3: an exiting member's new blocks must not be counted into NE.
+// R3: an exiting member's new blocks ARE charged — the engine pins them for the
+// running request whatever the bookkeeping calls the member.
 func TestReproExitingGrowsNE(t *testing.T) {
 	idx := reproIdx(t)
+	body := append(reproAligned("member a turn 1"), privChunks(3, 1024, 'Q')...)
 	reproSeat(t, idx, "a", reproAligned("member a turn 1"))
 	idx.MarkExiting("a")
-	if err := idx.UpdateWaiting("a", "r", append(reproAligned("member a turn 1"), privChunks(3, 1024, 'Q')...)); err != nil {
+	if err := idx.UpdateWaiting("a", "r", body); err != nil {
 		t.Fatal(err)
 	}
-	if idx.UniqueBlocksNE() != 0 {
-		t.Errorf("R3: exiting member's new waiting blocks counted against the budget: NE=%d want 0", idx.UniqueBlocksNE())
+	if got := idx.UniqueBlocksNE(); got != 4 {
+		t.Errorf("R3: exiting member's grown set is not fully charged: NE=%d want 4", got)
 	}
 }
 

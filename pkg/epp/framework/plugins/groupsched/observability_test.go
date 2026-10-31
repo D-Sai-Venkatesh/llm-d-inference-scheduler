@@ -92,9 +92,9 @@ func sampleValue(m *dto.Metric) float64 {
 // engines different free budget, so the assertion can tell the right answer ("the engine
 // placement would have picked") from the wrong one ("the first engine in the loop").
 func TestColdValveHeldIsAttributedToTheEngine(t *testing.T) {
-	cfg := defaultConfig()
-	cfg.ColdEntryCapTokens = 20_000 // tiny on purpose: 200 blocks of cold charge ~ 12.8K tokens
-	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
+	// capacity 1,000 blocks: the DERIVED cap is 50 blocks = 3,200 tokens, so a
+	// 300-block resident's cold charge fills it completely
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		var held []string
 		fx.s.onColdValveHeld = func(engine string) { held = append(held, engine) }
 
@@ -229,6 +229,63 @@ func TestQueueViewAgeAndUntrustedPassesAreVisible(t *testing.T) {
 		}
 		if snap.QueueViewAgeSeconds != 0 {
 			t.Fatalf("evidence age = %v s after a Pick, want 0", snap.QueueViewAgeSeconds)
+		}
+	})
+}
+
+// THE EVENT RING'S COVERAGE IS VISIBLE. The ring is bounded for memory, so on a long
+// window the OLDEST SEAT/EXIT events fall out of the DumpState tail while the stdout
+// stream keeps them. That is fine as long as it is a MEASUREMENT: event_ring_dropped_total
+// (and Snapshot.EventRingDropped) says how much of the window lies before the tail. It
+// exists because a wave arm's captured ring stopped at 17:23:37 with the window running
+// to 17:57 — and nothing in the artifacts said the ring had been cut.
+func TestEventRingWrapIsCounted(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		reg := prometheus.NewRegistry()
+		m := newGroupMetrics(fx.s)
+		if err := m.register(reg); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		// push more events than the ring holds through the ordinary seat/exit path
+		n := eventRingSize + 16
+		for i := 0; i < n; i++ {
+			fx.clock = fx.clock.Add(time.Millisecond)
+			fx.s.recordEventOn(Event{T: fx.clock, Kind: "SEAT", ID: "x", Engine: engineLabel(fx.ids[0])})
+		}
+		snap := fx.s.Snapshot()
+		if snap.EventRingDropped != 16 {
+			t.Fatalf("EventRingDropped = %d, want 16 (n = ring + 16)", snap.EventRingDropped)
+		}
+		if len(snap.RecentEvents) != eventRingSize {
+			t.Fatalf("RecentEvents holds %d events, want the ring bound %d", len(snap.RecentEvents), eventRingSize)
+		}
+		m.Refresh(0)
+		if got, ok := gatherValue(t, reg, subsystem+"_event_ring_dropped_total", nil); !ok || got != 16 {
+			t.Fatalf("event_ring_dropped_total = %v (present=%v), want 16", got, ok)
+		}
+		// the counter is monotone and never double-booked by a second Refresh
+		m.Refresh(0)
+		if got, _ := gatherValue(t, reg, subsystem+"_event_ring_dropped_total", nil); got != 16 {
+			t.Fatalf("event_ring_dropped_total = %v after a second Refresh, want 16 (delta pattern)", got)
+		}
+	})
+}
+
+// THE DERIVED VALVE CAP IS SCRAPEABLE PER ENGINE: a scorer that divides the cold charge
+// by its cap must read the cap from the arm, not from a constant copied out of a config.
+func TestColdCapIsExportedPerEngine(t *testing.T) {
+	forEnginesCap(t, defaultConfig(), 4000, func(t *testing.T, fx *engineSet) {
+		reg := prometheus.NewRegistry()
+		m := newGroupMetrics(fx.s)
+		if err := m.register(reg); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		m.Refresh(0)
+		want := float64(200 * 64) // 5 % of 4,000 blocks x 64 tokens
+		for _, id := range fx.ids {
+			if got, ok := gatherValue(t, reg, subsystem+"_cold_cap_tokens", map[string]string{"engine": id}); !ok || got != want {
+				t.Fatalf("cold_cap_tokens{engine=%s} = %v (present=%v), want %v", id, got, ok, want)
+			}
 		}
 	})
 }

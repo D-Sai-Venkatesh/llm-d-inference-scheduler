@@ -21,6 +21,8 @@ package groupsched
 //
 //	F3  quantumMode: fixed|dyn-size      per-member quantum scaled by footprint
 //	F5  entryOrder:  newcomer-first|hrrn  HRRN over the entry head (D1)
+//	F5′ entryOrder:  hrrn-bounded         HRRN whose DENOMINATOR is capped at the live
+//	                                     MEDIAN waiter size (bounded far tail)
 //	F6″ victimOrder:    residue             evict the COLDEST eligible member first
 //	F7  rotateWhenFree                    rotate only while prefill is not saturated
 //	F9  rotationMode: mlfq2 (+longQuantum) two pools, HRRN arbitration
@@ -37,7 +39,10 @@ package groupsched
 // run (prefill tokens per second from dispatch→first-token, the population median
 // footprint from the seated set).
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
 // prefillRateMinSamples is how many completed prefill observations an engine needs
 // before its measured rate is used at all. Below it the scheduler has no honest
@@ -253,6 +258,87 @@ func entryPriority(waitSeconds float64, coldTokens int64, blockSize int) float64
 		waitSeconds = 0
 	}
 	return waitSeconds / float64(den)
+}
+
+// ---- F5′: bounded HRRN (entryOrder "hrrn-bounded") ----
+//
+// THE MEASURED DEFECT OF PLAIN HRRN (B1b, 2026-11-01). F5 won the throughput race
+// (+25% tok/s, p10 +16%, the best >600 s fraction, newcomer waits DOWN) but its far
+// tail was broken: max entry wait 3,601 s and 20 stalled sessions. The mechanism is
+// arithmetic, not a tuning problem — wait/cold_tokens ages a 200K-token entry ~67x
+// slower than a 3K one, so the big entry's takeover bound is
+//
+//	small_ratio x cold_big      (hours, at the measured ratios)
+//
+// i.e. starvation-free in theory and an hour in practice.
+//
+// THE FIX (parameter-free). Replace the entry's OWN size in the denominator with
+//
+//	s_eff = min(cold_tokens, the live MEDIAN cold_tokens of the current waiters)
+//
+// Nothing else changes: no time constant, no threshold, no new state. The median is
+// the scheduler's OWN accounting over the waiter pool it already tracks (never a
+// cache read), recomputed once per decision pass, so the rule stays
+// dictate-don't-observe. What it buys:
+//
+//   - SMALL ENTRIES ARE UNTOUCHED. The even-set median is taken as the LOWER median,
+//     so an entry below it keeps its own size and small-first ordering inside the
+//     small class is exactly F5's.
+//   - LARGE ENTRIES AGE AT THE MEDIAN RATE, so their takeover bound becomes
+//     small_ratio x median instead of small_ratio x cold_big. At B1b's ratios that is
+//     ~600 s instead of ~40,000 s — bounded, and derived from the queue itself rather
+//     than from a constant somebody has to fit.
+//   - THE WAITERS SELF-REGULATE. If the queue fills with big entries the median rises
+//     and they age slowly TOGETHER (equal slowdown, oldest first among them); if it is
+//     mostly small entries the big one is served at the small class's rate. The bound
+//     is the population's own size, not a policy choice.
+//
+// The plain "hrrn" stays available unchanged: it is the comparison arm.
+
+// entryColdBoundLocked is the bound one decision pass uses: the live MEDIAN cold-token
+// size of its waiter set, or 0 when the ordering rule is not hrrn-bounded. 0 means
+// unbounded, so plain HRRN and every non-HRRN order are bit-for-bit unaffected.
+func (s *Scheduler) entryColdBoundLocked(waiters map[string]*waiter) int64 {
+	if s.cfg.EntryOrder != "hrrn-bounded" {
+		return 0
+	}
+	return medianColdTokens(waiters, s.blockSize)
+}
+
+// medianColdTokens is the LOWER median of the waiter set's cold-token sizes, each
+// floored at one block exactly as entryPriority floors its denominator (so a fully
+// WARM waiter — 0 uncached tokens — contributes the smallest possible size instead of
+// collapsing the median to zero and silently restoring unbounded HRRN). The lower
+// median is deliberate: every size BELOW it is then strictly below it, so
+// min(cold, median) can only bind on entries AT or ABOVE the median, and the small
+// class's ordering is provably untouched. 0 when nothing is waiting.
+func medianColdTokens(waiters map[string]*waiter, blockSize int) int64 {
+	if len(waiters) == 0 {
+		return 0
+	}
+	sizes := make([]int64, 0, len(waiters))
+	for _, w := range waiters {
+		n := w.coldTokens
+		if n <= 0 {
+			n = int64(blockSize)
+		}
+		sizes = append(sizes, n)
+	}
+	sort.Slice(sizes, func(i, j int) bool { return sizes[i] < sizes[j] })
+	return sizes[(len(sizes)-1)/2]
+}
+
+// boundedEntryPriority is entryPriority with the denominator capped at the pass's
+// bound: min(coldTokens, coldBound) holds a big job's age rate at the median waiter's,
+// so its priority grows at the MEDIAN rate instead of its own (much slower) one.
+// coldBound 0 (unbounded, or no bound computed for this pass) makes it EXACTLY
+// entryPriority — that equality is what keeps every other path pinned.
+func boundedEntryPriority(waitSeconds float64, coldTokens int64, coldBound int64, blockSize int) float64 {
+	den := coldTokens
+	if coldBound > 0 && coldBound < den {
+		den = coldBound
+	}
+	return entryPriority(waitSeconds, den, blockSize)
 }
 
 // nowLocked is the current decision pass's clock (never time.Now — a golden replay

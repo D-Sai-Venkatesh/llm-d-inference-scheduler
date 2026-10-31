@@ -139,7 +139,51 @@ The wave's BALANCE gate reads the per-engine series every 15 s. A core arm must 
 The gate line to read on a `none` arm: `detector_pool_score == 0` for the whole window
 (the pool gate never closed) and `safety_fired == 0` everywhere (the backstop was off).
 
-## 4. The wave (for the record)
+## 4. Declared differences vs f0p (both measured on the replay)
+
+1. **The budget victim's "never completed" tie-break is TOTAL (member id).** f0p read
+   map iteration order, so the archive build is not reproducible: 3 divergences in 4
+   replays of the same scenario+config. Evidence: `olderCompletion`'s comment and
+   `testdata/golden-f0p-core.txt` vs `golden-f0p-total.txt`.
+2. **The cold-entry valve never evicts.** f0p's admission loop fell through to eviction
+   when a head fit the BUDGET but the valve refused it — and eviction frees budget,
+   never the valve, so the loop evicted every eligible member and left the seats
+   cold-empty. Measured on the replay (`coldEntryCapTokens` = 640, one engine):
+   **3,220 valve-blocked passes, 20 evictions taken for nothing** → 0 with the fix;
+   served 1,201 → 1,253; 4,432 of 5,034 trace lines differ. On the shipped config
+   (cap 131,072 tokens) the valve does not bind and the trace is byte-identical.
+   f0p's own live artifact agrees on the magnitude: `final-epp.prom` shows
+   `rotation_evictions_valve_blocked_total = 913,162` passes.
+
+## 4b. Pre-flight gates (every core arm, before its window counts)
+
+* `llm_d_epp_group_detector_pool_score == 0` for the WHOLE window (the pool gate never
+  closed) and `safety_fired{engine} == 0` everywhere on a `safety: "none"` arm.
+* capacity learned within 120 s on EVERY engine: `num_gpu_blocks{engine} > 0` and
+  `capacity_missing{engine} == 0` on the first scrape after the window starts, and
+  `capacity_learned_total{via="live-detector"}` present per engine. (The flow
+  controller calls the detector on a TICKER, not only when work arrives —
+  `pkg/epp/flowcontrol/controller/internal/processor.go:270-271`, and even for an empty
+  pool at :486-488 — so the live capacity path runs while the stack is idle. The
+  endpoint-event and PreRequest paths remain as fast first attempts.)
+* pre-capacity pass-through is counted and must be ~0 over the window:
+  `llm_d_epp_group_fcfs_dispatches_total{engine="nocapacity"}`.
+* `llm_d_epp_group_filter_decisions_total{decision="pinned"}` ≫ `passthrough-*` (a run
+  whose decisions are all passthrough is NOT pinned).
+* `llm_d_epp_group_cold_valve_held_total{engine}` is REPORTING: on a cap-binding arm it
+  is the stagger's waiting cost, and it must never be accompanied by budget exits it
+  caused.
+* run-level safety: preemptions ≤ the FCFS arm's (hard fail if above).
+
+## 4c. Hot path
+
+The flow controller polls the detector at ~1 kHz. Measured on this build:
+`BenchmarkSaturationNoop` = 7.5 ns/op, 0 B/op, 0 allocs/op;
+`BenchmarkSaturationMemoryOnly` = 43 ns/op, 0 B/op, 0 allocs/op (the score is
+recomputed at most once per refresh interval, otherwise read from an atomic). The wave's
+report carries the EPP arrival-path p99 against B2a f0p's.
+
+## 5. The wave (for the record)
 
 `2 pods × {FCFS, core-Q4, core-Q8} × {c64, c128, c32}`, 45 min each, batched
 c64 → c128 → c32, plus **core-Q4 at N=1, c128, 45 min** as the matched anchor against

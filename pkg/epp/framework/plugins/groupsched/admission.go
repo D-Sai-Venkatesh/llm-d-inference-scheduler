@@ -52,12 +52,6 @@ import (
 	"time"
 )
 
-// debugSeat is a TEST-ONLY hook (nil in production) for tracing the admission loop.
-var debugSeat func(s *Scheduler, now time.Time, head *waiter, cand *seatChoice)
-
-// debugVictim is a TEST-ONLY hook for tracing the victim choice.
-var debugVictim func(s *Scheduler, now time.Time, g *engineGroup, reason string, victim *member)
-
 // coldTokensForEngine is one waiter's admission cost against ONE engine, in
 // tokens: the per-engine estimate frozen at sync time (each engine is costed
 // against its OWN index — the member's blocks are warm or cold PER ENGINE), with
@@ -219,9 +213,6 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 			return
 		}
 		cand := s.seatEngineLocked(head, now)
-		if debugSeat != nil {
-			debugSeat(s, now, head, cand)
-		}
 		if cand == nil || cand.g == nil {
 			return
 		}
@@ -248,9 +239,6 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 		// Nothing fits on the chosen engine: eviction is the only way a blocked head
 		// ever runs, and it is demand-driven (a head is waiting right now).
 		reason, victim := s.rotationVictimLocked(cand.g, now)
-		if debugVictim != nil {
-			debugVictim(s, now, cand.g, reason, victim)
-		}
 		if victim == nil {
 			return // this engine can free nothing; another pass will re-evaluate
 		}

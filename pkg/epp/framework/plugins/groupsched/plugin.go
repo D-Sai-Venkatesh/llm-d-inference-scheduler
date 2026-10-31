@@ -171,6 +171,11 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	} else {
 		fmt.Printf("group-scheduler: engine groups: SINGLE — one group sums every endpoint into one pool (correct only for one engine; the multi-pod arms set engineGroups=per-engine)\n")
 	}
+	if cfg.residueOn() {
+		fmt.Printf("group-scheduler: residue model: TIEBREAK — a per-engine shadow of vLLM's free-block queue (allocate from the head, free tail-block-first to the tail, live blocks never evictable) predicts the surviving PREFIX of a returning member's chain and breaks ties among FIT-PASSING engines only (never a ranker of two cold engines). Reconciled at settle against usage.cached_tokens; parameter-free (no clock, no threshold, no cache read).\n")
+	} else {
+		fmt.Printf("group-scheduler: residue model: OFF — the seat-time engine choice is fit → least relative backlog per seat → cheapest-victim engine.\n")
+	}
 	// E4a: the binding model is the ONE variable between the E3 and E4a arms, so
 	// the run artifact must state it in words as well as in the config echo.
 	if cfg.seatPin() {
@@ -195,6 +200,24 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// member-stable mode costs one map write per seat.
 	r.sched.onBind = func(member, engine string) { r.pins.set(member, engine) }
 	r.sched.onUnbind = func(member string) { r.pins.del(member) }
+	// E4b: the counterfactual export. Every seat-time engine choice reports the
+	// predicted surviving fraction and whether the MODEL decided it; every settle
+	// reports (predicted, actual) so the arm can score its own argmax post-hoc
+	// against usage.cached_tokens. An engine that drops to fit-only says so once.
+	r.sched.onResiduePick = func(engine string, predicted float64, decided bool) {
+		r.metrics.ObserveResiduePredicted(engineLabel(engine), predicted, decided)
+	}
+	r.sched.onResidueSettle = func(engine string, predicted, actual float64) {
+		r.metrics.ObserveResidueSettled(engineLabel(engine), predicted, actual)
+	}
+	r.sched.onValveBlockedEviction = func(engine string) {
+		r.metrics.ObserveValveBlockedEviction(engineLabel(engine))
+	}
+	r.sched.onResidueDisabled = func(engine string) {
+		r.metrics.SetResidueDisabled(engineLabel(engine))
+		fmt.Printf("group-scheduler: RESIDUE MODEL DISABLED on engine=%s — sustained prediction error above %.2f over >=%d reconciled requests. That engine is now ranked by fit → backlog only (never by residue). Cause is almost always a state the model cannot see: an engine restart, a second EPP replica, or traffic outside this EPP.\n",
+			engineLabel(engine), residueErrLimit, residueMinCalibration)
+	}
 	r.sched.onEngineGone = func(engine string, members int) {
 		r.metrics.ObserveEngineGone()
 		fmt.Printf("group-scheduler: ENGINE GONE %s — exited %d member(s) and dropped the group; their homing is released for re-placement\n",
@@ -814,10 +837,12 @@ func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.Infer
 	if !response.EndOfStream {
 		return
 	}
-	usage := struct{ Prompt, Cached int }{Prompt: response.Usage.PromptTokens}
+	promptTokens := response.Usage.PromptTokens
+	cachedTokens := 0
 	if response.Usage.PromptTokenDetails != nil {
-		usage.Cached = response.Usage.PromptTokenDetails.CachedTokens
+		cachedTokens = response.Usage.PromptTokenDetails.CachedTokens
 	}
+	completionTokens := response.Usage.CompletionTokens
 	// The settle's engine comes from the response's own endpoint metadata
 	// (F6: Settle without an endpoint silently folds B's keys into A's
 	// record). An empty metadata id keeps the binding.
@@ -825,7 +850,8 @@ func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.Infer
 	if target != nil && target.ID.String() != "" {
 		engine = target.ID.String()
 	}
-	r.sched.SettleOn(id, request.RequestID, engine, usage, response.TerminationCause == fwkrc.TerminationCauseNatural, time.Now())
+	r.sched.SettleOnUsage(id, request.RequestID, engine, promptTokens, cachedTokens, completionTokens,
+		response.TerminationCause == fwkrc.TerminationCauseNatural, time.Now())
 }
 
 // DumpState reports the group snapshot (§13).

@@ -181,3 +181,66 @@ func newFilterTestScheduler(t *testing.T, tweak func(*Config)) *GroupScheduler {
 	s.onUnbind = func(member string) { r.pins.del(member) }
 	return r
 }
+
+// TestFilterPinsTheFirstDispatchAfterSeating pins the ordering fact that makes
+// the E4 liveness gate meaningful: seating happens in Pick BEFORE the dispatch, so
+// the first request a member ever sends is already narrowed to its seat engine.
+// A "passthrough-unseated" rate that is not ~0 therefore means the policy is NOT
+// seating (the arm is not running the model at all), not that the pin lags.
+func TestFilterPinsTheFirstDispatchAfterSeating(t *testing.T) {
+	r := newFilterTestScheduler(t, nil)
+	a, b := epA(), epB()
+	if err := r.sched.SetNumBlocksFor(endpointKey(a), 64, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.sched.SetNumBlocksFor(endpointKey(b), 64, 1000); err != nil {
+		t.Fatal(err)
+	}
+	now := goldenT0
+	// the head is seated by the Pick pass, then dispatched.
+	if _, i := r.sched.PickFromHeadsEngine([]Head{{Member: "m1", ReqID: "r1", Arrival: now, SizeBytes: bytesFor(40)}}, now); i < 0 {
+		t.Fatal("the newcomer was not seated")
+	}
+	got := r.Filter(context.Background(), mpRequest("m1", "r1", 2), []fwksched.Endpoint{a, b})
+	if len(got) != 1 {
+		t.Fatalf("the FIRST dispatch after seating returned %d candidate(s), want 1 (already pinned)", len(got))
+	}
+}
+
+// TestFilterKeepsPinWhileExiting: a member MARKED EXITING (its in-flight requests
+// are still draining) keeps its pin until the actual exit — otherwise the tail of
+// its own residency would be thrown off-binding, cold, and counted as an affinity
+// violation.
+func TestFilterKeepsPinWhileExiting(t *testing.T) {
+	r := newFilterTestScheduler(t, nil)
+	a, b := epA(), epB()
+	if err := r.sched.SetNumBlocksFor(endpointKey(a), 64, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.sched.SetNumBlocksFor(endpointKey(b), 64, 1000); err != nil {
+		t.Fatal(err)
+	}
+	now := goldenT0
+	heads := []Head{{Member: "m1", ReqID: "r1", Arrival: now, SizeBytes: bytesFor(40)}}
+	engine, i := r.sched.PickFromHeadsEngine(heads, now)
+	if i < 0 {
+		t.Fatal("the newcomer was not seated")
+	}
+	r.sched.DispatchedOn("m1", "r1", engine, keys(20, Hash(5)), bytesFor(40), now)
+	// mark it EXITING with the request still in flight
+	r.sched.mu.Lock()
+	g := r.sched.groups[engine]
+	g.index.MarkExitingLocked("m1")
+	r.sched.mu.Unlock()
+	if got, ok := r.pins.get("m1"); !ok || got != engine {
+		t.Fatalf("pin while exiting = (%q,%v), want (%q,true) — the pin must survive until the actual exit", got, ok, engine)
+	}
+	if got := r.Filter(context.Background(), mpRequest("m1", "r2", 2), []fwksched.Endpoint{a, b}); len(got) != 1 {
+		t.Fatalf("an exiting member's dispatch returned %d candidate(s), want 1 (still pinned)", len(got))
+	}
+	// the drain completes ⇒ the pin goes with it
+	r.sched.SettleOn("m1", "r1", engine, struct{ Prompt, Cached int }{Prompt: 10, Cached: 10}, true, now.Add(time.Second))
+	if _, ok := r.pins.get("m1"); ok {
+		t.Fatal("the pin survived the drain-induced exit")
+	}
+}

@@ -168,6 +168,22 @@ type Config struct {
 	// endpoints the EPP already sees and are torn down on EventDelete.
 	EngineGroups string `json:"engineGroups"`
 
+	// ---- E4b knob (the parameter-free residue model) ----
+
+	// Residue selects whether the seat-time engine choice uses the scheduler's own
+	// RESIDUE MODEL (residue.go) as a TIE-BREAK among engines that already pass the
+	// fit gate:
+	//
+	//	"off"       — fit → least relative backlog per seat → cheapest-victim.
+	//	              DEFAULT, and what the E3 arm runs (the model is never built).
+	//	"tiebreak"  — among FITTING engines, prefer the one where the model says
+	//	              more of the member's chain is still resident; the backlog key
+	//	              decides when the model has nothing to say (two cold engines
+	//	              both read 0 — the model is NEVER a ranker of cold engines).
+	//	              E4 sets this; the per-engine self-model resets (restart /
+	//	              sustained mis-calibration) drop an engine to fit-only.
+	Residue string `json:"residue"`
+
 	// ---- E4a knob (the multi-pod binding model) ----
 
 	// BindingMode selects WHAT the member→engine binding IS, and with it where
@@ -223,6 +239,7 @@ func defaultConfig() Config {
 		CapacityLivenessSeconds: 120,
 		EngineGroups:            "single",
 		BindingMode:             "member-stable",
+		Residue:                 "off",
 	}
 }
 
@@ -274,6 +291,9 @@ func (c Config) effective() Config {
 	}
 	if c.BindingMode == "" {
 		c.BindingMode = def.BindingMode
+	}
+	if c.Residue == "" {
+		c.Residue = def.Residue
 	}
 	if c.BindingTTLSeconds == 0 {
 		c.BindingTTLSeconds = 20 * c.TTLSeconds
@@ -385,6 +405,11 @@ func (c Config) validate() error {
 	default:
 		return fmt.Errorf("bindingMode: invalid value %q (member-stable|seat)", c.BindingMode)
 	}
+	switch c.Residue {
+	case "", "off", "tiebreak":
+	default:
+		return fmt.Errorf("residue: invalid value %q (off|tiebreak)", c.Residue)
+	}
 	if c.BindingMode == "seat" && !c.perEngine() {
 		// seat=pin is a MULTI-POD model: under engineGroups=single there is one
 		// group, one binding target and nothing to pin, so the arm would measure
@@ -397,6 +422,9 @@ func (c Config) validate() error {
 // seatPin reports whether the binding follows the SEAT (E4a) rather than being
 // chosen at first sight and kept (E3).
 func (c Config) seatPin() bool { return c.BindingMode == "seat" }
+
+// residueOn reports whether the residue model ranks the fitting engines (E4b).
+func (c Config) residueOn() bool { return c.Residue == "tiebreak" }
 
 // reapSeconds is the effective confirmed-id reap bound (0 → default).
 func (c Config) reapSeconds() float64 {
@@ -529,8 +557,16 @@ type waiter struct {
 	// sizeBytes is the last seen head's wire size (the C4 refresh input).
 	sizeBytes int64
 	// coldTokens is the entry's cold-prefill estimate in TOKENS
-	// (R1: one unit everywhere — blocks x blockSize).
+	// (R1: one unit everywhere — blocks x blockSize). Under seat=pin it is the
+	// pool's BEST-CASE value (the minimum over engines) and serves the D1 / HRRN
+	// service input; the ADMISSION cost is the per-engine vector below.
 	coldTokens int64
+	// coldTokensByEngine is the per-engine admission cost, FROZEN at sync time for
+	// this decision pass (reviewer R2). Each entry comes from that engine's own
+	// index, so an engine that does not hold the member's blocks is costed as cold
+	// — which is the truth about that engine — instead of inheriting the pool's
+	// best case.
+	coldTokensByEngine map[string]int64
 }
 
 // ---- the per-engine group (PREREG-multipod-offload task 1) ----
@@ -568,6 +604,15 @@ type engineGroup struct {
 	// engine's cap, and it holds independently for each engine).
 	coldInFlight int64
 
+	// residue is THIS engine's shadow of the free-block queue (E4b). nil unless the
+	// arm turned the model on, so an off arm pays nothing at all.
+	residue *residueEngine
+	// resFlights holds the in-flight residue state per request id (the nodes the
+	// request holds, freed at settle in reverse position order).
+	resFlights map[string]residueHeld
+	// residueReported latches the one-shot "this engine dropped to fit-only" log.
+	residueReported bool
+
 	// estCache/estVersion cache waiter admission estimates keyed on the
 	// index's mutation version (M2: Picks run at ~1kHz; unchanged state
 	// must not recompute ~150 × ~1k-block history scans). Per engine
@@ -598,7 +643,7 @@ func newEngineGroup(id string, blockSizeTokens int, windowMode string) (*engineG
 	idx.SetWindowMode(windowMode)
 	g := &engineGroup{id: id, index: idx,
 		members: map[string]*member{}, waiters: map[string]*waiter{},
-		estCache: map[string]estEntry{}}
+		estCache: map[string]estEntry{}, resFlights: map[string]residueHeld{}}
 	g.counters.exits = map[string]int64{}
 	return g, nil
 }
@@ -634,6 +679,19 @@ type Scheduler struct {
 	// the external filter's).
 	onBind   func(member, engine string)
 	onUnbind func(member string)
+	// onResiduePick / onResidueSettle / onResidueDisabled are the E4b
+	// counterfactual export (nil-safe; nil in tests and when the model is off).
+	// onResiduePick fires per seat-time engine choice with the predicted surviving
+	// fraction and whether the model actually DECIDED it; onResidueSettle fires at
+	// each settle with (predicted, actual) so the arm can score its own argmax
+	// post-hoc against usage.cached_tokens.
+	onResiduePick     func(engine string, predicted float64, decided bool)
+	onResidueSettle   func(engine string, predicted, actual float64)
+	onResidueDisabled func(engine string)
+	// onValveBlockedEviction fires when a head would FIT an engine's budget but the
+	// cold-entry valve refuses it, so the loop's only way forward is an eviction
+	// (the C1 sizing signal; installed in BOTH binding models).
+	onValveBlockedEviction func(engine string)
 
 	// groups holds one engineGroup per engine, keyed by endpoint id. In
 	// single mode there is exactly one, keyed "".
@@ -774,6 +832,11 @@ func (s *Scheduler) groupForLocked(id string) (*engineGroup, error) {
 	g, err := newEngineGroup(id, s.blockSize, s.cfg.WindowMode)
 	if err != nil {
 		return nil, err
+	}
+	if s.cfg.residueOn() {
+		// capacity is unknown until the engine's metrics arrive; SetNumBlocksFor
+		// sizes the shadow and a capacity change voids it (a re-created pool).
+		g.residue = newResidueEngine(0)
 	}
 	s.groups[id] = g
 	s.rebuildGroupOrderLocked()
@@ -918,6 +981,11 @@ func (s *Scheduler) SetNumBlocksFor(engine string, blockSizeTokens, numBlocks in
 	}
 	g.numBlocks = numBlocks
 	g.budgetBlocks = int(s.cfg.GroupBudgetFraction * float64(numBlocks))
+	if g.residue != nil {
+		// the shadow's pool is the ENGINE's measured num_gpu_blocks (not the 95%
+		// budget): the free queue is the whole KV pool.
+		g.residue.setCapacity(numBlocks)
+	}
 	return nil
 }
 
@@ -1317,12 +1385,9 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 				w.since = h.Arrival
 			}
 			w.sizeBytes = h.SizeBytes
-			// The pool has no engine, so the cold estimate is the BEST CASE over
-			// the live engines (the cost if this head landed where most of its
-			// blocks already are): the cold-entry stagger wants the optimistic
-			// number (it bounds concurrent cold PREFILL, and the per-engine
-			// fit test re-costs the head against the engine actually chosen).
-			w.coldTokens = s.poolColdTokensLocked(h)
+			// per-engine admission costs, frozen for this pass (R2) + the pool
+			// best case as the service input.
+			s.setWaiterCostsLocked(w)
 			continue
 		}
 		g := s.homeEngineLocked(h.Member, now)
@@ -1342,7 +1407,10 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 			w.since = h.Arrival
 		}
 		w.sizeBytes = h.SizeBytes
-		w.coldTokens = s.estimateCostCachedLocked(g, h.Member, h.SizeBytes) * int64(s.blockSize) // tokens (R1)
+		// tokens (R1); under member-stable the scalar IS the admission cost because
+		// there is exactly one engine to cost against.
+		w.coldTokens = s.estimateCostCachedLocked(g, h.Member, h.SizeBytes) * int64(s.blockSize)
+		w.coldTokensByEngine = map[string]int64{g.id: w.coldTokens}
 	}
 	// vanished: members clear their waiting marker; waiters leave
 	for _, g := range s.activeGroupsLocked() {
@@ -1581,6 +1649,16 @@ func (s *Scheduler) DispatchedOn(id, reqID, engine string, keys []Hash, sizeByte
 	}
 	g.index.SetSizeLocked(id, sizeBytes) // the estimate baseline
 	onMain := g.index.SettleDispatchedAtLocked(id, reqID, keys, now)
+	if g.residue.usable() {
+		// E4b: model this admission. The exact tier-A keys ARE the prompt blocks,
+		// so the model is fed the truth about WHAT was asked for; only the hit/miss
+		// split is a prediction (reconciled at settle against usage.cached_tokens).
+		held := g.residue.dispatch(id, len(keys))
+		if g.resFlights == nil {
+			g.resFlights = map[string]residueHeld{}
+		}
+		g.resFlights[reqID] = held
+	}
 	if m, ok := g.members[id]; ok {
 		m.lastActivity = now
 		m.lastSizeBytes = sizeBytes
@@ -1671,6 +1749,13 @@ func (s *Scheduler) Settle(id, reqID string, usage struct{ Prompt, Cached int },
 // silently folded: the accounting stays with the binding the PreRequest
 // committed, and the counter is the run-level alarm.
 func (s *Scheduler) SettleOn(id, reqID, engine string, usage struct{ Prompt, Cached int }, natural bool, now time.Time) {
+	s.SettleOnUsage(id, reqID, engine, usage.Prompt, usage.Cached, 0, natural, now)
+}
+
+// SettleOnUsage is SettleOn with the completion token count, which the residue
+// model needs (decode allocates output blocks exactly like prompt blocks — they
+// are what a departed member leaves deepest in the free queue).
+func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cachedTokens, completionTokens int, natural bool, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastSeen[id] = now
@@ -1744,6 +1829,40 @@ func (s *Scheduler) SettleOn(id, reqID, engine string, usage struct{ Prompt, Cac
 	if !seated {
 		return
 	}
+	// E4b: reconcile the model against the engine's OWN outcome for this request
+	// (usage.cached_tokens is the OUTCOME of our decisions, not a cache read).
+	if g.residue.usable() {
+		bs := int64(s.blockSize)
+		hit := 0
+		if cachedTokens > 0 {
+			hit = int((int64(cachedTokens) + bs - 1) / bs)
+		}
+		pblk := 0
+		if promptTokens > 0 {
+			pblk = int((int64(promptTokens) + bs - 1) / bs)
+		}
+		oblk := 0
+		if completionTokens > 0 {
+			oblk = int((int64(completionTokens) + bs - 1) / bs)
+		}
+		held, had := g.resFlights[reqID]
+		if !had {
+			// no dispatch record (a settle we never saw dispatch: engine restart,
+			// multi-EPP traffic): rebuild the request's footprint from the outcome.
+			held = residueHeld{predHit: hit, full: pblk}
+		}
+		delete(g.resFlights, reqID)
+		pred, act := g.residue.settle(id, held, hit, oblk)
+		if s.onResidueSettle != nil {
+			s.onResidueSettle(g.id, pred, act)
+		}
+		if g.residue.disabled && !g.residueReported {
+			g.residueReported = true
+			if s.onResidueDisabled != nil {
+				s.onResidueDisabled(g.id)
+			}
+		}
+	}
 	m.resTurns++ // A8: every settled turn counts toward n_max
 	// the settled request was the tracked queued head: clear the marker
 	// (the next Pick re-establishes it if more heads remain — the TTL
@@ -1757,7 +1876,7 @@ func (s *Scheduler) SettleOn(id, reqID, engine string, usage struct{ Prompt, Cac
 	if !natural {
 		return
 	}
-	uncached := int64(usage.Prompt - usage.Cached)
+	uncached := int64(promptTokens - cachedTokens)
 	if uncached < 0 {
 		uncached = 0
 	}
@@ -1765,11 +1884,11 @@ func (s *Scheduler) SettleOn(id, reqID, engine string, usage struct{ Prompt, Cac
 		m.entryCost = uncached // the entry turn's cold cost (measured; may be 0 when fully warm)
 		m.entryRecorded = true
 	} else {
-		m.earned += int64(usage.Cached)
+		m.earned += int64(cachedTokens)
 	}
 	s.counters.resTurns = append(s.counters.resTurns, m.resTurns)
 	s.counters.uncachedTok += uncached
-	s.counters.totalTok += int64(usage.Prompt)
+	s.counters.totalTok += int64(promptTokens)
 	if s.counters.totalTok > 0 {
 		s.counters.refillShare = float64(s.counters.uncachedTok) / float64(s.counters.totalTok)
 	}
@@ -1928,6 +2047,12 @@ func (s *Scheduler) rotateEngineLocked(g *engineGroup, seatsP *map[string]int, n
 				seats[seatedSession]++
 			}
 			continue
+		}
+		if ne+estBlocks <= int64(g.budgetBlocks) && !s.coldAllows(g, head) && s.onValveBlockedEviction != nil {
+			// C1 sizing signal, identical in both binding models: the BUDGET would
+			// have taken this head, but the cold-entry valve refused it, so the loop's
+			// only way forward is an eviction.
+			s.onValveBlockedEviction(g.id)
 		}
 		if reason, victim := s.rotationVictimLocked(g, now); victim != nil {
 			if victim.inflight > 0 {
@@ -2270,25 +2395,16 @@ func (s *Scheduler) exitLocked(g *engineGroup, m *member, reason string, now tim
 	if !m.waitingSince.IsZero() {
 		pool := s.waitersLocked(g)
 		if pool != nil {
-			pool[m.id] = &waiter{id: m.id, session: m.session, since: m.waitingSince,
-				sizeBytes:  m.lastSizeBytes,
-				coldTokens: s.estimateCostLocked(poolGroupFor(s, g, m.id), m.id, m.lastSizeBytes) * int64(s.blockSize)}
+			w := &waiter{id: m.id, session: m.session, since: m.waitingSince, sizeBytes: m.lastSizeBytes}
+			if s.cfg.seatPin() {
+				s.setWaiterCostsLocked(w)
+			} else {
+				w.coldTokens = s.estimateCostLocked(g, m.id, m.lastSizeBytes) * int64(s.blockSize)
+				w.coldTokensByEngine = map[string]int64{g.id: w.coldTokens}
+			}
+			pool[m.id] = w
 		}
 	}
-}
-
-// poolGroupFor picks the engine a re-entering waiter's cold estimate is costed
-// against: the engine it just left in the member-stable model (its cache is
-// there), the first live engine in seat=pin (the pool has no owner, and the
-// seat-time fit test re-costs it against the engine actually chosen).
-func poolGroupFor(s *Scheduler, left *engineGroup, id string) *engineGroup {
-	if !s.cfg.seatPin() {
-		return left
-	}
-	if gs := s.activeGroupsLocked(); len(gs) > 0 {
-		return gs[0]
-	}
-	return left
 }
 
 // countExitLocked books an exit (or an exiting-mark) on the engine AND in
@@ -2298,6 +2414,31 @@ func (s *Scheduler) countExitLocked(g *engineGroup, reason string) {
 		g.counters.exits[reason]++
 	}
 	s.counters.exits[reason]++
+}
+
+// setWaiterCostsLocked fills a waiting head's admission costs: the per-engine
+// vector (each engine's OWN index estimate, frozen for the decision pass —
+// reviewer R2) and, under seat=pin, the pool's best-case scalar (the minimum,
+// used as the D1/HRRN service input, never as an admission cost).
+func (s *Scheduler) setWaiterCostsLocked(w *waiter) {
+	groups := s.activeGroupsLocked()
+	if len(groups) == 0 {
+		return
+	}
+	vec := make(map[string]int64, len(groups))
+	best := int64(-1)
+	for _, g := range groups {
+		e := s.estimateCostCachedLocked(g, w.id, w.sizeBytes) * int64(s.blockSize)
+		vec[g.id] = e
+		if best < 0 || e < best {
+			best = e
+		}
+	}
+	if best < 0 {
+		best = 0
+	}
+	w.coldTokensByEngine = vec
+	w.coldTokens = best
 }
 
 func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {

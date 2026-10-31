@@ -85,6 +85,26 @@ type groupMetrics struct {
 	// unseated is NOT a pinned arm, and that is the state the E3 external filter's
 	// silent-no-op class made invisible (PREREG-multipod-offload §E2).
 	filterDecisions *prometheus.CounterVec
+	// ---- E4b residue export (the arm scores its OWN argmax post-hoc) ----
+	//
+	// residuePredicted is the model's predicted surviving FRACTION at each
+	// seat-time engine choice; residueActual is the measured fraction at settle
+	// (usage.cached_tokens / prompt). A calibrated model puts the two in the same
+	// place; the gap IS the model's error, with no ground-truth cache read.
+	residuePredicted *prometheus.HistogramVec
+	residueActual    *prometheus.HistogramVec
+	// residueDecided counts seat choices the MODEL decided (it was the
+	// discriminating key), per engine; residueAgreed counts the rest. An arm whose
+	// decisions are all "agreed" cannot attribute any outcome to the model.
+	residueDecided *prometheus.CounterVec
+	residueResets  *prometheus.CounterVec
+	residueOff     *prometheus.GaugeVec
+	// valveBlockedEvictions counts rotations the cold-entry VALVE forced: the
+	// engine's budget would have admitted the head, the valve refused it, so the
+	// only way forward was to evict somebody. It is the C1 sizing signal (what the
+	// stagger costs in evictions), emitted in BOTH binding models so the
+	// member-stable and seat-pin arms stay comparable.
+	valveBlockedEvictions *prometheus.CounterVec
 	// affinityViolations counts requests that landed off their member's
 	// engine (from = the engine the member was charged to, to = the engine
 	// the framework actually picked). CORRECTNESS, not instrumentation.
@@ -165,13 +185,27 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "engines torn down by an endpoint delete event"})
 	g.filterDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "filter_decisions_total",
 		Help: "placement-Filter decisions by outcome (pinned | engine-not-a-candidate | passthrough-unseated | passthrough-anonymous | passthrough-single-candidate | passthrough-binding-mode)"}, []string{"decision"})
+	g.residuePredicted = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "residue_predicted_ratio",
+		Help: "predicted surviving FRACTION of the returning member's chain on the chosen engine (E4b, at seat time)", Buckets: residueBuckets}, engineLabels)
+	g.residueActual = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "residue_actual_ratio",
+		Help: "MEASURED surviving fraction at settle (usage.cached_tokens/prompt) — the model's outcome, not a cache read", Buckets: residueBuckets}, engineLabels)
+	g.residueDecided = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "residue_decided_total",
+		Help: "seat-time engine choices by whether the residue model DECIDED them (decision=model|agreed) and engine"}, []string{"engine", "decision"})
+	g.residueResets = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "residue_reset_total",
+		Help: "per-engine residue self-model resets (the model was voided and must rebuild)"}, []string{"engine", "reason"})
+	g.residueOff = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "residue_off",
+		Help: "1 when the residue model is disabled on this engine (sustained prediction error): it ranks by fit → backlog only"}, engineLabels)
+	g.valveBlockedEvictions = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "rotation_evictions_valve_blocked_total",
+		Help: "rotation steps where the cold-entry valve (not the budget) refused a head the budget would have taken, forcing an eviction"}, engineLabels)
 	fcfsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: "llm_d_epp_group", Name: "fcfs_dispatches_total",
 		Help: "pre-capacity FCFS pass-through dispatches, per engine"}, engineLabels)
 	for _, c := range []prometheus.Collector{g.seats, g.members, g.sessions, g.boundMembers,
 		g.coldInFlight, g.uniqueBlocks, g.neBlocks, g.budgetBlocks, g.capacity,
 		g.waiters, g.exits, g.residency, g.entryWait, g.refillShare, g.served, fcfsCounter,
 		g.capacityMissing, g.capacityLearned, g.pooledEndpoints, g.capacityHeterogeneous,
-		g.affinityViolations, g.rebinds, g.homings, g.rehomes, g.engineGone, g.filterDecisions} {
+		g.affinityViolations, g.rebinds, g.homings, g.rehomes, g.engineGone, g.filterDecisions,
+		g.residuePredicted, g.residueActual, g.residueDecided, g.residueResets, g.residueOff,
+		g.valveBlockedEvictions} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second
 			// plugin config in the same test binary) must not fail startup: the
@@ -313,6 +347,52 @@ func (g *groupMetrics) ObserveEngineGone() {
 
 // ObserveFilterDecision books one placement-Filter outcome (nil-safe: a unit-mode
 // run has no registrar and must still take the same code path).
+// residueBuckets spans the measured bimodality: cold members read 0.12-0.17 and
+// warm ones ~0.98, so the buckets must resolve both ends and the gap.
+var residueBuckets = []float64{0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0}
+
+func (g *groupMetrics) ObserveResiduePredicted(engine string, predicted float64, decided bool) {
+	if g == nil || g.residuePredicted == nil {
+		return
+	}
+	g.residuePredicted.WithLabelValues(engine).Observe(predicted)
+	d := "agreed"
+	if decided {
+		d = "model"
+	}
+	if g.residueDecided != nil {
+		g.residueDecided.WithLabelValues(engine, d).Inc()
+	}
+}
+
+func (g *groupMetrics) ObserveResidueSettled(engine string, predicted, actual float64) {
+	if g == nil || g.residueActual == nil {
+		return
+	}
+	g.residueActual.WithLabelValues(engine).Observe(actual)
+}
+
+func (g *groupMetrics) SetResidueDisabled(engine string) {
+	if g == nil || g.residueOff == nil {
+		return
+	}
+	g.residueOff.WithLabelValues(engine).Set(1)
+}
+
+func (g *groupMetrics) ObserveValveBlockedEviction(engine string) {
+	if g == nil || g.valveBlockedEvictions == nil {
+		return
+	}
+	g.valveBlockedEvictions.WithLabelValues(engine).Inc()
+}
+
+func (g *groupMetrics) ObserveResidueReset(engine, reason string) {
+	if g == nil || g.residueResets == nil {
+		return
+	}
+	g.residueResets.WithLabelValues(engine, reason).Inc()
+}
+
 func (g *groupMetrics) ObserveFilterDecision(decision string) {
 	if g == nil || g.filterDecisions == nil {
 		return

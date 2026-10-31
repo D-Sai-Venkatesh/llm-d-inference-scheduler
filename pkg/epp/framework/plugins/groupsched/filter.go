@@ -125,7 +125,13 @@ func (p *pinTable) size() int {
 //  4. UNSEATED member → pass through freely. This is the seat=pin model's
 //     defining property: an unseated member carries NO placement opinion, so its
 //     head is placed by the ordinary scorer and the engine it lands on becomes
-//     its seat (observed-endpoint-wins, PreRequest).
+//     its seat (observed-endpoint-wins, PreRequest). NOTE the pin is created at
+//     SEAT time (seatLocked → onBind), and the seat happens in Pick BEFORE the
+//     request dispatches, so a member's FIRST dispatch after being seated is
+//     ALREADY pinned — "passthrough-unseated" therefore covers only heads that
+//     are being dispatched while unseated (the R9/anonymous class and the
+//     pre-capacity class). Measured on a healthy E4 run it is ≈ 0, and that is an
+//     E4 liveliness gate in exp-ops (see the arm config's pre-flight).
 //  5. SEATED member → return ONLY the seat engine.
 //
 // NEVER RETURNS AN EMPTY LIST. If the seat engine is not among the candidates

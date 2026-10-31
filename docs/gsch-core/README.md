@@ -137,6 +137,8 @@ The wave's BALANCE gate reads the per-engine series every 15 s. A core arm must 
 | `llm_d_epp_group_engine_kv_usage{engine}` / `engine_waiting_queue{engine}` | the detector's raw input (REPORTING only on a `none` arm) |
 | `llm_d_epp_group_safety_fired{engine}` / `safety_fires_total{engine}` / `safety_fired_seconds_total{engine}` | the backstop's state (all zero on a `none` arm) |
 | `llm_d_epp_group_detector_stale_samples_total{engine}` | samples excluded as stale (proves the live read is fresh) |
+| `llm_d_epp_group_queue_view_age_seconds` | how old the queue-head EVIDENCE behind the view is, on the decision clock (−1 = nothing observed yet). It grows exactly while Picks stop (a closed pool gate), i.e. the window in which a head can be queued while `waitingSince` says otherwise — the C8 race's size, which is invisible in every other series |
+| `llm_d_epp_group_queue_view_untrusted_passes_total` | budget-enforcement passes that ran with that view older than `idleSeconds`, so the C8 guard skipped the head-presence victim classes. 0 on a healthy stack; nonzero means the enforcement passes are re-syncing less often than S |
 | `llm_d_epp_group_filter_decisions_total{decision}` | `pinned` vs `passthrough-*` (a run whose decisions are all passthrough is NOT pinned) |
 
 The gate line to read on a `none` arm: `detector_pool_score == 0` for the whole window
@@ -173,6 +175,36 @@ statically-linked `/app/epp` whose strings carry
 `most-free-budget`) and NONE of the removed series
 (`pat_eligible_*`, `residue_predicted_ratio`, `engine_gate_closed`, `pooled_endpoints`).
 
+## 4a1. THE SECOND DIGEST — the F5′ build (what B5/B6 run)
+
+    EPP_IMAGE_TAG=groupsched-197c658e
+    EPP_IMAGE_DIGEST=sha256:a87f55aa6df594ef6bb2598225c96baffb0252cbff012a2cc46e6d6f60374b0d   (OCI index, keeps the attestation)
+    EPP_IMAGE_DIGEST_AMD64=sha256:da65bc043c05b2e0e30f33cabd30be894b0dd5ef21ecd7ff3d52da1c0e2ea5cd
+    attestation manifest  sha256:71069e1491f4cfdd7922b9b08029a0ed428f018356e923afa19b486f3330b5a5 (unknown/unknown,
+                          vnd.docker.reference.digest = the amd64 manifest)
+
+Built from dsai/gsch-core HEAD `197c658e8d69ea71c9c52734eac05ecbe24ce1db` with a clean
+tree, by the same recipe as §4a0 (`docker buildx build --platform linux/amd64`,
+`--build-arg TARGETOS=linux TARGETARCH=amd64 COMMIT_SHA=<head> BUILD_REF=dsai/gsch-core
+LDFLAGS="-s -w"`, `--push`). Pull-back verification, same checks plus the F5′ marker: the
+linux/amd64 manifest unpacks to a 75.5 MB x86-64 statically-linked `/app/epp` whose build
+settings carry `CommitSHA=197c658e8d69ea71c9c52734eac05ecbe24ce1db` and
+`BuildRef=dsai/gsch-core`, whose strings carry `hrrn-bounded` (the new module) alongside
+`CORE policy`, `detector_pool_score`, `cold_valve_held_total`, `waiters_shared`,
+`most-free-budget`, `newcomer-first`, and NONE of the removed series
+(`pat_eligible_*`, `residue_predicted_ratio`, `engine_gate_closed`, `pooled_endpoints`,
+`mlfq2`, `rotateWhenFree`).
+
+**The two builds are decision-identical for every arm that does not select F5′.**
+`88e74f85 → 197c658e` changes one production file's behaviour (`modules.go`: the new
+`HrrnBounded` + the `EntryCtx` argument) and that change is inert at
+`entryOrder: "newcomer-first"` — `testdata/golden-f0p-bugfixes.txt` is reproduced byte for
+byte at BOTH commits (`TestCoreEqualsF0P` was run at each). So re-pinning a core arm from
+§4a0 to this digest does not move its decisions; the wave's already-run arms keep their
+recorded `groupsched-88e74f85` provenance, and the shipped configs
+(`core-q4.env`, `core-q8.env`, `core-q4-anchor-n1.env`) now pin this digest for anything
+run from here on, with the history stated inline in each file.
+
 ## 4b. Pre-flight gates (every core arm, before its window counts)
 
 * `llm_d_epp_group_detector_pool_score == 0` for the WHOLE window (the pool gate never
@@ -190,7 +222,15 @@ statically-linked `/app/epp` whose strings carry
   whose decisions are all passthrough is NOT pinned).
 * `llm_d_epp_group_cold_valve_held_total{engine}` is REPORTING: on a cap-binding arm it
   is the stagger's waiting cost, and it must never be accompanied by budget exits it
-  caused.
+  caused. **Its `engine` label is the engine the head WAITS for** (the one whose budget
+  would have admitted it while its valve refused it, most-free-budget first) — it read
+  `engine="single"` on a two-engine stack until 2026-11-01, because the admission loop
+  passed an empty engine id.
+* `llm_d_epp_group_queue_view_age_seconds` ≤ `idleSeconds` and
+  `queue_view_untrusted_passes_total` = 0 for the window: the C8 guard ("a stale queue
+  view never justifies an eviction") then never had to fire. A growing age with the
+  ticker running means the queue view is not being refreshed; a nonzero pass count means
+  victim choices are being made without head evidence — report it, do not chase it.
 * run-level safety: preemptions ≤ the FCFS arm's (hard fail if above).
 * **TTL exits are reported PER ARM at c32 and c64** (`llm_d_epp_group_exits_total{reason="ttl"}`):
   the silence TTL is inert at c128 (1-6 exits per arm) and the open question is whether
@@ -220,7 +260,9 @@ report carries the EPP arrival-path p99 against B2a f0p's.
 The queue module has a second implementation, selected by `CORE_ENTRY_ORDER=hrrn-bounded`
 (rendered as `entryOrder: "hrrn-bounded"` in `CORE_MODULE_BLOCK`; the emitter's block for
 that arm is the one in `config_conformance_test.go`). Nothing else in an arm moves: the
-F5′-vs-Q4 pair is the same build, the same parameters, one selector value apart.
+F5′-vs-Q4 pair is the same build, the same parameters, one selector value apart —
+`core-f5p-q4.env` is `core-q4.env` with that one line changed, and B5/B6 run
+`{core-q4, core-f5p-q4} × {c64, c128}` on the §4a1 digest, each pair same-hour.
 
 The rule is the archive's dd5350b5 F5′: priority = wait ÷ `min(this waiter's cold tokens,
 the LOWER-median cold tokens of the current waiters)`, every size floored at one block,
@@ -240,3 +282,10 @@ reproduces the archive build's F5′ trace byte for byte on the 2,600 s replay (
 c64 → c128 → c32, plus **core-Q4 at N=1, c128, 45 min** as the matched anchor against
 B2a f0p's first 45 minutes. Configs: `core-q4.env`, `core-q8.env`,
 `core-q4-anchor-n1.env` (this directory).
+
+Then **B5/B6**: `{core-q4, core-f5p-q4} × {c64, c128}` on the §4a1 digest, each pair
+same-hour — the entry-order question, one selector apart. Scored against the amended
+matched-work predictions (matched tokens +2-6 %, entry wait −10-15 %, newcomer p90 ≤
+anchor/3, per-thread goodput p10 +25-40 % at c128, starved = 0, max EW ≤ 1.5×), with
+tok/s and records reported but labelled "includes mix", and the path-flip and
+re-entry-TTFT observables read in both directions.

@@ -1944,6 +1944,14 @@ func (s *Scheduler) DispatchedOn(id, reqID, engine string, keys []Hash, sizeByte
 		}
 	}
 	g.index.SetSizeLocked(id, sizeBytes) // the estimate baseline
+	// F7's prefill charge MUST be measured BEFORE the keys are settled into the
+	// index: SettleDispatchedAtLocked records them, so afterwards the engine holds
+	// every one of them and the "uncached" estimate would read ZERO for every
+	// dispatch (measured: the gate never saw a single backlogged token).
+	prefillUncached := int64(0)
+	if s.cfg.RotateWhenFree || s.cfg.EntryOrder == "hrrn" || s.cfg.RotationMode == "mlfq2" {
+		prefillUncached = s.uncachedTokensLocked(g, keys)
+	}
 	onMain := g.index.SettleDispatchedAtLocked(id, reqID, keys, now)
 	if s.cfg.RotateWhenFree || s.cfg.EntryOrder == "hrrn" || s.cfg.RotationMode == "mlfq2" {
 		// F7's backlog input and F5's service estimate: the request's PREFILL WORK is
@@ -2018,7 +2026,11 @@ func (s *Scheduler) DispatchedOn(id, reqID, engine string, keys []Hash, sizeByte
 			// WORK is its prompt tokens (the exact tier-A keys, block-quantised), held
 			// against the engine until the first token arrives (ChunkAt releases it).
 			g.prefillBacklog = max(g.prefillBacklog-m.prefillPending, 0)
-			m.prefillPending = int64(len(keys)) * int64(s.blockSize)
+			// ESTIMATED UNCACHED work against THIS engine (reviewer RF7): prompt tokens
+			// would make the gate degenerate — one warm 50-100k-token turn at ~0.9 hit
+			// exceeds an 8,192-token step budget 6-12x while its real prefill is a few
+			// k, so the gate would sit closed and F7 would stop being load-adaptive.
+			m.prefillPending = prefillUncached
 			g.prefillBacklog += m.prefillPending
 		}
 	}
@@ -2032,7 +2044,7 @@ func (s *Scheduler) Chunk(id string) {
 	defer s.mu.Unlock()
 	if g := s.groupOfLocked(id); g != nil {
 		s.releaseColdLocked(g, id)
-		s.releasePrefillLocked(g, id, time.Time{})
+		s.releasePrefillLocked(g, id)
 	}
 }
 
@@ -2047,13 +2059,13 @@ func (s *Scheduler) ChunkAt(id string, now time.Time) {
 		return
 	}
 	s.releaseColdLocked(g, id)
-	s.releasePrefillLocked(g, id, now)
+	s.releasePrefillLocked(g, id)
 }
 
-// releasePrefillLocked ends a member's pending prefill (first token) and, when a
-// clock is supplied, books (dispatch→first-token, uncached prompt tokens) as a
-// prefill-RATE observation for that engine.
-func (s *Scheduler) releasePrefillLocked(g *engineGroup, id string, now time.Time) {
+// releasePrefillLocked ends a member's pending prefill at the FIRST TOKEN and
+// releases the charge F7's gate reads (the rate measurement this used to feed is
+// gone: HRRN's ordering is rate-free — see entryPriority).
+func (s *Scheduler) releasePrefillLocked(g *engineGroup, id string) {
 	m, ok := g.members[id]
 	if !ok || m.prefillPending <= 0 {
 		return
@@ -2061,25 +2073,6 @@ func (s *Scheduler) releasePrefillLocked(g *engineGroup, id string, now time.Tim
 	tokens := m.prefillPending
 	m.prefillPending = 0
 	g.prefillBacklog = max(g.prefillBacklog-tokens, 0)
-	if now.IsZero() {
-		return
-	}
-	// the dispatch time is the request's confirmation record; the oldest confirmed
-	// in-flight record is the closest we have to "when this prefill started" without
-	// a second per-request table.
-	var started time.Time
-	for _, rec := range m.inflightIDs {
-		if !rec.confirmed {
-			continue
-		}
-		if started.IsZero() || rec.since.Before(started) {
-			started = rec.since
-		}
-	}
-	if started.IsZero() || !now.After(started) {
-		return
-	}
-	s.notePrefillLocked(g, now.Sub(started).Seconds(), tokens)
 }
 
 func (s *Scheduler) releaseColdLocked(g *engineGroup, id string) {
@@ -2484,18 +2477,10 @@ func (s *Scheduler) mlfq2HeadLocked(g *engineGroup, seats map[string]int) *waite
 	case long == nil:
 		return short
 	}
-	sShort, okShort := s.estimatedPrefillSeconds(g, short)
-	sLong, okLong := s.estimatedPrefillSeconds(g, long)
-	if !okShort || !okLong {
-		// no measured rate yet: the pools cannot be compared on service time, so take
-		// the D1 order (and with it the pinned newcomer-first rule).
-		if shortK.less(longK) {
-			return short
-		}
-		return long
-	}
 	now := s.nowLocked()
-	if hrrn(now.Sub(short.since).Seconds(), sShort) >= hrrn(now.Sub(long.since).Seconds(), sLong) {
+	shortP := entryPriority(now.Sub(short.since).Seconds(), short.coldTokens, s.blockSize)
+	longP := entryPriority(now.Sub(long.since).Seconds(), long.coldTokens, s.blockSize)
+	if shortP >= longP {
 		return short
 	}
 	return long
@@ -2534,22 +2519,9 @@ func (k entryKey) less(o entryKey) bool {
 
 func (s *Scheduler) entryKeyLocked(w *waiter, seats map[string]int) entryKey {
 	k := entryKey{since: w.since, id: w.id}
-	if s.cfg.EntryOrder == "hrrn" && !w.since.IsZero() {
-		// F5: priority = (wait + s)/s with s the entry's own estimated prefill
-		// seconds. Without a measured rate yet (start of a run) every key gets the
-		// same 0 and the order degrades to the pinned newcomer-first rule — an
-		// honest "no data, no reordering" rather than a guess.
-		g := s.groupOfLocked(w.id)
-		if g == nil {
-			g = s.defaultGroupLocked()
-		}
-		if svc, ok := s.estimatedPrefillSeconds(g, w); ok {
-			wait := s.nowLocked().Sub(w.since).Seconds()
-			if wait < 0 {
-				wait = 0
-			}
-			k.hrrn = hrrn(wait, svc)
-		}
+	if s.cfg.EntryOrder == "hrrn" {
+		// F5: wait / cold_tokens (the measured rate cancels — see entryPriority).
+		k.hrrn = entryPriority(s.nowLocked().Sub(w.since).Seconds(), w.coldTokens, s.blockSize)
 	}
 	switch s.cfg.SessionOrder {
 	case "lsf":

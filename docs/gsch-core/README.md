@@ -177,33 +177,41 @@ statically-linked `/app/epp` whose strings carry
 
 ## 4a1. THE SECOND DIGEST — the F5′ build (what B5/B6 run)
 
-    EPP_IMAGE_TAG=groupsched-197c658e
-    EPP_IMAGE_DIGEST=sha256:a87f55aa6df594ef6bb2598225c96baffb0252cbff012a2cc46e6d6f60374b0d   (OCI index, keeps the attestation)
-    EPP_IMAGE_DIGEST_AMD64=sha256:da65bc043c05b2e0e30f33cabd30be894b0dd5ef21ecd7ff3d52da1c0e2ea5cd
-    attestation manifest  sha256:71069e1491f4cfdd7922b9b08029a0ed428f018356e923afa19b486f3330b5a5 (unknown/unknown,
+    EPP_IMAGE_TAG=groupsched-8397e9aa
+    EPP_IMAGE_DIGEST=sha256:6aff12ac8608506d2f53740bda705d0b753f2993991023324466d4179100c846   (OCI index, keeps the attestation)
+    EPP_IMAGE_DIGEST_AMD64=sha256:aa0a911d3670337822b55e5c1ed67696cd159bf28cb51c3d5001d697dc904a1c
+    attestation manifest  sha256:1bab5f1959b1265a49bdff0220249771631f035c9e70ca5418cf88375fbf3bf8 (unknown/unknown,
                           vnd.docker.reference.digest = the amd64 manifest)
 
-Built from dsai/gsch-core HEAD `197c658e8d69ea71c9c52734eac05ecbe24ce1db` with a clean
-tree, by the same recipe as §4a0 (`docker buildx build --platform linux/amd64`,
-`--build-arg TARGETOS=linux TARGETARCH=amd64 COMMIT_SHA=<head> BUILD_REF=dsai/gsch-core
-LDFLAGS="-s -w"`, `--push`). Pull-back verification, same checks plus the F5′ marker: the
-linux/amd64 manifest unpacks to a 75.5 MB x86-64 statically-linked `/app/epp` whose build
-settings carry `CommitSHA=197c658e8d69ea71c9c52734eac05ecbe24ce1db` and
-`BuildRef=dsai/gsch-core`, whose strings carry `hrrn-bounded` (the new module) alongside
-`CORE policy`, `detector_pool_score`, `cold_valve_held_total`, `waiters_shared`,
-`most-free-budget`, `newcomer-first`, and NONE of the removed series
-(`pat_eligible_*`, `residue_predicted_ratio`, `engine_gate_closed`, `pooled_endpoints`,
-`mlfq2`, `rotateWhenFree`).
+Built from dsai/gsch-core HEAD `8397e9aac9471cd67df547dd992a41524d0944d4` with a clean tree,
+by the same recipe as §4a0 (`docker buildx build --platform linux/amd64`, `--build-arg
+TARGETOS=linux TARGETARCH=amd64 COMMIT_SHA=<head> BUILD_REF=dsai/gsch-core LDFLAGS="-s -w"`,
+`--push`). Pull-back verification, same checks as §4a0 plus the markers this build adds: the
+linux/amd64 manifest unpacks to a 75.6 MB x86-64 statically-linked `/app/epp` whose build
+settings carry `CommitSHA=8397e9aac9471cd67df547dd992a41524d0944d4` and
+`BuildRef=dsai/gsch-core`, whose strings carry `hrrn-bounded`, `queue_view_age_seconds` and
+`queue_view_untrusted_passes_total` alongside `CORE policy`, `detector_pool_score`,
+`cold_valve_held_total`, `waiters_shared`, `most-free-budget`, `newcomer-first`, and NONE of
+the removed series (`pat_eligible_*`, `residue_predicted_ratio`, `engine_gate_closed`,
+`pooled_endpoints`, `mlfq2`, `rotateWhenFree`).
+
+It contains three commits on top of the wave's build: the F5′ module (`fd542c8d`), its
+equivalence golden and docs (`197c658e`), and the two observability fixes (`8397e9aa` —
+valve-held attribution, the C8 gauge/counter). An intermediate image of the module commit
+alone (`groupsched-197c658e`) was built and is SUPERSEDED: no arm used it, and it lacks the
+observability pair the B5/B6 pre-flight reads.
 
 **The two builds are decision-identical for every arm that does not select F5′.**
-`88e74f85 → 197c658e` changes one production file's behaviour (`modules.go`: the new
-`HrrnBounded` + the `EntryCtx` argument) and that change is inert at
-`entryOrder: "newcomer-first"` — `testdata/golden-f0p-bugfixes.txt` is reproduced byte for
-byte at BOTH commits (`TestCoreEqualsF0P` was run at each). So re-pinning a core arm from
+`88e74f85 → 8397e9aa` changes one production file's behaviour (`modules.go`: the new
+`HrrnBounded` + the `EntryCtx` argument); everything else added is inert at
+`entryOrder: "newcomer-first"` — a label fix and two new series. Evidence:
+`testdata/golden-f0p-bugfixes.txt` is reproduced byte for byte at BOTH commits
+(`TestCoreEqualsF0P` was run at each), and the F5′ equivalence golden
+(`TestHrrnBoundedEqualsTheArchiveF5P`) is byte-identical too. So re-pinning a core arm from
 §4a0 to this digest does not move its decisions; the wave's already-run arms keep their
-recorded `groupsched-88e74f85` provenance, and the shipped configs
-(`core-q4.env`, `core-q8.env`, `core-q4-anchor-n1.env`) now pin this digest for anything
-run from here on, with the history stated inline in each file.
+recorded `groupsched-88e74f85` provenance, and the shipped configs (`core-q4.env`,
+`core-q8.env`, `core-q4-anchor-n1.env`, `core-f5p-q4.env`) now pin this digest, with the
+history stated inline in each file.
 
 ## 4b. Pre-flight gates (every core arm, before its window counts)
 
@@ -271,6 +279,14 @@ newcomer class stays the outer key (the archive's `isNew`), so inside a class th
 replaces age ordering — a big entry ages at the MEDIAN rate, which bounds its takeover
 wait at `ratio × median` instead of `ratio × its own size` (the B1b far tail: max entry
 wait 3,601 s, 20 stalled sessions).
+
+**What the arm is and is not** (the phrasing that keeps the B5/B6 read honest): F5′ does
+NOT let a returning main thread catch up with newcomers — the newcomer class is still
+served first, and a long-waiting returner still waits behind every newcomer. What bounded
+HRRN changes is INSIDE a class: a big branch's wait is bounded at `ratio × median` instead
+of `ratio × its own size`, so small branches pass big ones in minutes rather than in
+hours. Read the per-class tables, not the aggregate: an aggregate improvement with the
+returner class unchanged is the expected shape, not a contradiction.
 
 Evidence that the core's rule IS the archive's rule: `TestHrrnBoundedEqualsTheArchiveF5P`
 reproduces the archive build's F5′ trace byte for byte on the 2,600 s replay (6,089 lines,

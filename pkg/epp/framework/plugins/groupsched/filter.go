@@ -16,24 +16,20 @@ limitations under the License.
 
 package groupsched
 
-// THE GROUP SCHEDULER'S OWN PLACEMENT FILTER (E4a, bindingMode "seat").
+// THE GROUP SCHEDULER'S OWN PLACEMENT FILTER.
 //
 // The framework splits "who may serve this request" (Filters, scheduling layer)
-// from "which queue to serve next" (the FairnessPolicy, flow-control layer). In
-// the E3 arm the pin lived entirely OUTSIDE the policy — session-affinity-filter,
-// an external Filter keyed on the branch identity, with its own TTL, its own
-// attribute plumbing and its own silent-no-op failure mode (the pilot-2 class: a
-// producer-name mismatch makes every request pass through and the arm measures
-// nothing). Under seat=pin the pin is a FACT the policy already holds: the member
-// IS seated on exactly one engine, so the policy can narrow the candidate set to
-// that engine itself. Two consequences the arm depends on:
+// from "which queue to serve next" (the FairnessPolicy, flow-control layer). The
+// pin is a fact the policy already holds: a member IS seated on exactly one engine,
+// so the policy narrows the candidate set to that engine itself. Two consequences
+// the model depends on:
 //
-//   - the E4 configs carry NO session-affinity-filter (one pin, one authority:
-//     two authorities is a second variable, and the E3 arm already showed they
-//     can disagree once per member at birth);
-//   - the narrowing reads the scheduler's OWN seat state, so it cannot be
-//     silently no-op: if the pin table is empty the arm is not seating anybody,
-//     which every other liveness gate already reports.
+//   - the configs carry NO external session-affinity-filter (one pin, one
+//     authority: two authorities is a second variable, and the earlier arm showed
+//     they can disagree once per member at birth);
+//   - the narrowing reads the scheduler's OWN seat state, so it cannot be silently
+//     no-op: if the pin table is empty the policy is not seating anybody, which
+//     every other liveness gate already reports.
 //
 // LOCK DISCIPLINE (hard requirement): Pick runs at ~1 kHz holding s.mu (the
 // scheduler's decision mutex). The Filter runs on every dispatch in the
@@ -57,12 +53,11 @@ import (
 // actually did (an arm whose decisions are all "passthrough-unseated" is not a
 // pinned arm).
 const (
-	filterPinned        = "pinned"                       // narrowed to the member's seat engine
-	filterNotCandidate  = "engine-not-a-candidate"       // the seat engine is not offered → pass ALL through
-	filterUnseated      = "passthrough-unseated"         // no seat yet: the member has no placement opinion
-	filterAnonymous     = "passthrough-anonymous"        // R9: never constrained
-	filterSingle        = "passthrough-single-candidate" // nothing to narrow
-	filterModelDisabled = "passthrough-binding-mode"     // member-stable: the pin is not ours
+	filterPinned       = "pinned"                       // narrowed to the member's seat engine
+	filterNotCandidate = "engine-not-a-candidate"       // the seat engine is not offered → pass ALL through
+	filterUnseated     = "passthrough-unseated"         // no seat yet: the member has no placement opinion
+	filterAnonymous    = "passthrough-anonymous"        // R9: never constrained
+	filterSingle       = "passthrough-single-candidate" // nothing to narrow
 )
 
 // pinTable is the lock-light mirror of the scheduler's member→engine SEAT
@@ -113,26 +108,21 @@ func (p *pinTable) size() int {
 	return n
 }
 
-// Filter narrows the candidate endpoints to the member's CURRENT SEAT ENGINE
-// (bindingMode=seat). Contract, in order:
+// Filter narrows the candidate endpoints to the member's CURRENT SEAT ENGINE.
+// Contract, in order:
 //
-//  1. NOT SEAT MODE → pass everything through. In member-stable mode (E3 and
-//     every legacy arm) placement is pinned by the external
-//     session-affinity-filter, and a second pin here would be a second variable.
-//  2. ≤1 candidate → pass through (nothing to narrow; still counted).
-//  3. ANONYMOUS request (no member resolved) → pass through freely (R9: the
-//     policy never tracks, seats or constrains anonymous traffic).
-//  4. UNSEATED member → pass through freely. This is the seat=pin model's
-//     defining property: an unseated member carries NO placement opinion, so its
-//     head is placed by the ordinary scorer and the engine it lands on becomes
-//     its seat (observed-endpoint-wins, PreRequest). NOTE the pin is created at
-//     SEAT time (seatLocked → onBind), and the seat happens in Pick BEFORE the
-//     request dispatches, so a member's FIRST dispatch after being seated is
-//     ALREADY pinned — "passthrough-unseated" therefore covers only heads that
-//     are being dispatched while unseated (the R9/anonymous class and the
-//     pre-capacity class). Measured on a healthy E4 run it is ≈ 0, and that is an
-//     E4 liveliness gate in exp-ops (see the arm config's pre-flight).
-//  5. SEATED member → return ONLY the seat engine.
+//  1. ≤1 candidate → pass through (nothing to narrow; still counted).
+//  2. ANONYMOUS request (no member resolved) → pass through freely (R9: the policy
+//     never tracks, seats or constrains anonymous traffic).
+//  3. UNSEATED member → pass through freely. This is the model's defining
+//     property: an unseated member carries NO placement opinion, so its head is
+//     placed by the ordinary scorer and the engine it lands on becomes its seat
+//     (observed-endpoint-wins, PreRequest). The pin is created at SEAT time
+//     (seatLocked → onBind), and the seat happens in Pick BEFORE the request
+//     dispatches, so a member's FIRST dispatch after being seated is ALREADY
+//     pinned — "passthrough-unseated" covers only heads dispatched while unseated
+//     (the anonymous and pre-capacity classes), which on a healthy run is ≈ 0.
+//  4. SEATED member → return ONLY the seat engine.
 //
 // NEVER RETURNS AN EMPTY LIST. If the seat engine is not among the candidates
 // (the EPP no longer offers it, or the picker's own view is narrower), the
@@ -142,15 +132,11 @@ func (p *pinTable) size() int {
 // counts an affinity violation, so the event is both survived and measured. A
 // silent request failure would be the worst possible failure mode here.
 func (r *GroupScheduler) Filter(_ context.Context, request *fwksched.InferenceRequest, pods []fwksched.Endpoint) []fwksched.Endpoint {
-	if !r.cfg.seatPin() {
-		r.metrics.ObserveFilterDecision(filterModelDisabled)
-		return pods
-	}
 	if len(pods) <= 1 {
 		r.metrics.ObserveFilterDecision(filterSingle)
 		return pods
 	}
-	member, _, _ := r.memberOf(request)
+	member, _ := r.memberOf(request)
 	if member == "" {
 		r.metrics.ObserveFilterDecision(filterAnonymous)
 		return pods

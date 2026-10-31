@@ -17,6 +17,8 @@ limitations under the License.
 package groupsched
 
 import (
+	"fmt"
+
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -78,6 +80,11 @@ type groupMetrics struct {
 	// from the first engine's: a heterogeneous pool must never silently
 	// inherit another engine's budget.
 	capacityHeterogeneous prometheus.Gauge
+	// filterDecisions books every dispatch the scheduling Filter saw, by what it
+	// did (pinned | passthrough-*). An arm whose decisions are all passthrough-
+	// unseated is NOT a pinned arm, and that is the state the E3 external filter's
+	// silent-no-op class made invisible (PREREG-multipod-offload §E2).
+	filterDecisions *prometheus.CounterVec
 	// affinityViolations counts requests that landed off their member's
 	// engine (from = the engine the member was charged to, to = the engine
 	// the framework actually picked). CORRECTNESS, not instrumentation.
@@ -156,14 +163,26 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "silent-member rehoming (rate-bounded defrag; a counter stub until it is wired)"})
 	g.engineGone = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "engine_gone_total",
 		Help: "engines torn down by an endpoint delete event"})
+	g.filterDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "filter_decisions_total",
+		Help: "placement-Filter decisions by outcome (pinned | engine-not-a-candidate | passthrough-unseated | passthrough-anonymous | passthrough-single-candidate | passthrough-binding-mode)"}, []string{"decision"})
 	fcfsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: "llm_d_epp_group", Name: "fcfs_dispatches_total",
 		Help: "pre-capacity FCFS pass-through dispatches, per engine"}, engineLabels)
 	for _, c := range []prometheus.Collector{g.seats, g.members, g.sessions, g.boundMembers,
 		g.coldInFlight, g.uniqueBlocks, g.neBlocks, g.budgetBlocks, g.capacity,
 		g.waiters, g.exits, g.residency, g.entryWait, g.refillShare, g.served, fcfsCounter,
 		g.capacityMissing, g.capacityLearned, g.pooledEndpoints, g.capacityHeterogeneous,
-		g.affinityViolations, g.rebinds, g.homings, g.rehomes, g.engineGone} {
+		g.affinityViolations, g.rebinds, g.homings, g.rehomes, g.engineGone, g.filterDecisions} {
 		if err := reg.Register(c); err != nil {
+			// A SECOND instantiation in one process (a config reload, or a second
+			// plugin config in the same test binary) must not fail startup: the
+			// series exist and belong to the first instance. Failing here meant a
+			// duplicate-metrics crash for a situation that is a duplicate
+			// configuration, not a broken build — and it made the runner's own
+			// config test unable to instantiate a second arm config.
+			if _, dup := err.(prometheus.AlreadyRegisteredError); dup {
+				fmt.Printf("group-scheduler: WARNING metrics already registered in this process — this instance will not emit its own series (one group scheduler per process is the supported configuration)\n")
+				continue
+			}
 			return err
 		}
 	}
@@ -290,6 +309,15 @@ func (g *groupMetrics) ObserveEngineGone() {
 	if g.engineGone != nil {
 		g.engineGone.Inc()
 	}
+}
+
+// ObserveFilterDecision books one placement-Filter outcome (nil-safe: a unit-mode
+// run has no registrar and must still take the same code path).
+func (g *groupMetrics) ObserveFilterDecision(decision string) {
+	if g == nil || g.filterDecisions == nil {
+		return
+	}
+	g.filterDecisions.WithLabelValues(decision).Inc()
 }
 
 // SetPooledEndpoints reports how many endpoints the single group is pooling

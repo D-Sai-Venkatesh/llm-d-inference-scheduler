@@ -167,6 +167,37 @@ type Config struct {
 	// The engine set is DISCOVERED, never configured: groups appear on the
 	// endpoints the EPP already sees and are torn down on EventDelete.
 	EngineGroups string `json:"engineGroups"`
+
+	// ---- E4a knob (the multi-pod binding model) ----
+
+	// BindingMode selects WHAT the member→engine binding IS, and with it where
+	// the pin comes from. It is the ONE variable between the E3 arm and the E4a
+	// arm (FULL-RECORD-FOR-REVIEWER §9-11; PREREG-multipod-offload):
+	//
+	//	"member-stable" — the E3 design. The engine is chosen ONCE, at FIRST
+	//	                 SIGHT of the member (least backlog per seat, round
+	//	                 robin tie-break), and never changes while the member is
+	//	                 active; waiters are PARTITIONED per engine (a waiter
+	//	                 only queues at the engine it was homed to); the binding
+	//	                 has its own TTL (BindingTTLSeconds) and OUTLIVES the
+	//                 member record, so a silent-then-returning member still
+	//                 finds its blocks; placement is pinned by the EXTERNAL
+	//                 session-affinity-filter. THE DEFAULT (golden-pinned
+	//                 byte-identically).
+	//
+	//	"seat"         — E4a: SEAT = PIN. The binding IS the member's CURRENT
+	//	                 SEAT: created when the member is seated on an engine,
+	//	                 dropped the moment it exits. No TTL, no pre-seat homing,
+	//	                 no residue — an unseated member carries no placement
+	//	                 opinion at all. Waiters live in ONE GLOBAL POOL (not
+	//	                 partitioned by engine: whichever engine has room takes
+	//	                 the global head), and the seat-time engine choice is
+	//	                 fit → least relative backlog per seat → cheapest-victim
+	//	                 engine (see seatEngineLocked — the E4b residue seam).
+	//	                 Placement is pinned by THIS plugin's own scheduling
+	//	                 Filter (filter.go), so the arm carries no external
+	//	                 session-affinity-filter.
+	BindingMode string `json:"bindingMode"`
 }
 
 func defaultConfig() Config {
@@ -191,6 +222,7 @@ func defaultConfig() Config {
 		SessionOrder:            "off",
 		CapacityLivenessSeconds: 120,
 		EngineGroups:            "single",
+		BindingMode:             "member-stable",
 	}
 }
 
@@ -239,6 +271,9 @@ func (c Config) effective() Config {
 	}
 	if c.EngineGroups == "" {
 		c.EngineGroups = def.EngineGroups
+	}
+	if c.BindingMode == "" {
+		c.BindingMode = def.BindingMode
 	}
 	if c.BindingTTLSeconds == 0 {
 		c.BindingTTLSeconds = 20 * c.TTLSeconds
@@ -345,8 +380,23 @@ func (c Config) validate() error {
 	default:
 		return fmt.Errorf("engineGroups: invalid value %q (single|per-engine)", c.EngineGroups)
 	}
+	switch c.BindingMode {
+	case "", "member-stable", "seat":
+	default:
+		return fmt.Errorf("bindingMode: invalid value %q (member-stable|seat)", c.BindingMode)
+	}
+	if c.BindingMode == "seat" && !c.perEngine() {
+		// seat=pin is a MULTI-POD model: under engineGroups=single there is one
+		// group, one binding target and nothing to pin, so the arm would measure
+		// the single-engine behaviour while claiming the seat model.
+		return fmt.Errorf("bindingMode=\"seat\" requires engineGroups=\"per-engine\" (the seat model only means something with more than one engine group; got %q)", c.EngineGroups)
+	}
 	return nil
 }
+
+// seatPin reports whether the binding follows the SEAT (E4a) rather than being
+// chosen at first sight and kept (E3).
+func (c Config) seatPin() bool { return c.BindingMode == "seat" }
 
 // reapSeconds is the effective confirmed-id reap bound (0 → default).
 func (c Config) reapSeconds() float64 {
@@ -577,6 +627,13 @@ type Scheduler struct {
 	onRehome       func(member, from, to string)
 	onEngineGone   func(engine string, members int)
 	onMemberSource func(source string)
+	// onBind / onUnbind are the PLACEMENT-PIN hooks (E4a): they fire when a
+	// member's engine binding is created or dropped, so the plugin's lock-light
+	// Filter table can follow the seats without ever touching s.mu. nil in
+	// tests and in member-stable mode (nothing to mirror there — the pin is
+	// the external filter's).
+	onBind   func(member, engine string)
+	onUnbind func(member string)
 
 	// groups holds one engineGroup per engine, keyed by endpoint id. In
 	// single mode there is exactly one, keyed "".
@@ -617,11 +674,30 @@ type Scheduler struct {
 	// bindingSeen is the homing's own last-activity clock (see
 	// Config.BindingTTLSeconds): the binding outlives the member RECORD, so it
 	// needs a lifetime of its own or every silent return re-homes off the
-	// placement filter's pin.
+	// placement filter's pin. UNUSED under bindingMode=seat (there the binding
+	// lives exactly as long as the seat).
 	bindingSeen map[string]time.Time
+
+	// gWaiters is the GLOBAL waiter pool (bindingMode=seat ONLY). In the
+	// member-stable model a waiter queues at the engine it was homed to
+	// (engineGroup.waiters — the partition is what makes "whichever engine
+	// frees a seat takes ITS head" well defined). Seat=pin has no pre-seat
+	// homing, so the pool cannot be partitioned: the waiting demand belongs to
+	// no engine until an engine seats it, and each rotate pass hands the
+	// global head to an engine that has room. nil outside seat mode (so a
+	// stray read is a nil-map read, never a silent cross-model mix).
+	gWaiters map[string]*waiter
 
 	// pickSeq synthesizes request ids for heads that lack one (M1).
 	pickSeq int64
+	// turnSeen / gapHistory are the per-member INTER-TURN GAP history (F4's
+	// own-median pause rule, DYN-PAUSE): turnSeen is the last arrival seen for
+	// the member, gapHistory the last gapHistoryLimit gaps between successive
+	// arrivals. Member-scoped (never engine- or seat-scoped): the gap is a
+	// property of the client's think time, and it must survive rotation, exit
+	// and re-entry — that is exactly the population the pause rule is about.
+	turnSeen   map[string]time.Time
+	gapHistory map[string][]float64
 	// homeSeq rotates the tie-break among equally-loaded engines at homing
 	// time. Round-robin rather than random: same anti-burst property (a
 	// burst of newcomers splits instead of racing to one engine) and it
@@ -672,7 +748,11 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 		everSeated: map[string]struct{}{}, lastSeen: map[string]time.Time{},
 		everSeatedSession: map[string]struct{}{}, recordSession: map[string]string{},
 		sessionRefs: map[string]int{}, bindings: map[string]string{},
-		bindingSeen: map[string]time.Time{}}
+		bindingSeen: map[string]time.Time{},
+		turnSeen:    map[string]time.Time{}, gapHistory: map[string][]float64{}}
+	if cfg.seatPin() {
+		s.gWaiters = map[string]*waiter{}
+	}
 	s.counters.exits = map[string]int64{}
 	s.counters.memberSources = map[string]int64{}
 	if _, err := s.groupForLocked(""); err != nil {
@@ -767,6 +847,43 @@ func (s *Scheduler) visibleEngineLocked(id string) bool {
 		return !s.cfg.perEngine()
 	}
 	return true
+}
+
+// waitersLocked is the waiter pool that engine g's admission loop serves:
+//
+//	bindingMode=member-stable — g's OWN map (the partition is structural: an
+//	    unseated member was homed at first sight, so its head belongs to one
+//	    engine and only that engine may seat it).
+//	bindingMode=seat — the ONE GLOBAL pool, the same map for every engine. A
+//	    waiter is not homed, so there is nothing for an engine to own; each
+//	    rotate pass offers the global head to an engine that has room.
+//
+// A map is a reference type on purpose: callers mutate it in place (insert /
+// delete) and both models share every call site. Returning nil is never valid
+// in seat mode (NewScheduler allocates the pool), and in member-stable mode a
+// nil g is a programming error the callers already guard.
+func (s *Scheduler) waitersLocked(g *engineGroup) map[string]*waiter {
+	if s.cfg.seatPin() {
+		return s.gWaiters
+	}
+	if g == nil {
+		return nil
+	}
+	return g.waiters
+}
+
+// waiterPoolSizeLocked is the total waiting-head count across every pool that
+// is live in the current mode (used by the liveness guards that must ask "is
+// ANYTHING waiting" without knowing the model).
+func (s *Scheduler) waiterPoolSizeLocked() int {
+	if s.cfg.seatPin() {
+		return len(s.gWaiters)
+	}
+	n := 0
+	for _, g := range s.groups {
+		n += len(g.waiters)
+	}
+	return n
 }
 
 // SetNumBlocks attaches the measured capacity (num_gpu_blocks from the
@@ -1086,8 +1203,12 @@ func (s *Scheduler) backlogPerSeatLocked(g *engineGroup) float64 {
 	}
 	// queued DEMAND on this engine: unseated waiters plus seated members that
 	// have a queued head (a resident waiting for a turn is backlog too — it is
-	// what the engine cannot serve yet).
-	backlog := len(g.waiters)
+	// what the engine cannot serve yet). Under seat=pin the unseated demand is
+	// the GLOBAL pool (a waiter belongs to no engine yet), so the numerator is
+	// the same for every engine and the denominator — the seats it holds — is
+	// what separates them: the engine with more seats per queued member is the
+	// one that should take the next head.
+	backlog := len(s.waitersLocked(g))
 	for _, m := range g.members {
 		if !m.waitingSince.IsZero() {
 			backlog++
@@ -1168,6 +1289,12 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 			continue
 		}
 		present[h.Member] = h.Arrival
+		// the F4 pause rule's input: the gap between successive TURNS of this
+		// member, measured on the head's own enqueue time (the truthful
+		// inter-arrival). It is a fact about the MEMBER, so it is recorded
+		// before the seated/waiter split — a re-entering member's history must
+		// survive its seat.
+		s.noteTurnArrivalLocked(h.Member, h.Arrival)
 		if g := s.groupOfLocked(h.Member); g != nil {
 			if m, seated := g.members[h.Member]; seated {
 				if m.waitingSince.IsZero() || h.Arrival.Before(m.waitingSince) {
@@ -1176,6 +1303,27 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 				m.lastActivity = now
 				continue
 			}
+		}
+		if s.cfg.seatPin() {
+			// SEAT=PIN: there is no pre-seat homing, so the waiter joins the ONE
+			// GLOBAL pool and its engine is decided at SEAT time (seatEngineLocked).
+			w, ok := s.gWaiters[h.Member]
+			if !ok {
+				w = &waiter{id: h.Member, newcomer: s.isNewcomerLocked(h.Member)}
+				s.gWaiters[h.Member] = w
+			}
+			w.session = sessionUnitOf(h.Session, h.Member)
+			if w.since.IsZero() || h.Arrival.Before(w.since) {
+				w.since = h.Arrival
+			}
+			w.sizeBytes = h.SizeBytes
+			// The pool has no engine, so the cold estimate is the BEST CASE over
+			// the live engines (the cost if this head landed where most of its
+			// blocks already are): the cold-entry stagger wants the optimistic
+			// number (it bounds concurrent cold PREFILL, and the per-engine
+			// fit test re-costs the head against the engine actually chosen).
+			w.coldTokens = s.poolColdTokensLocked(h)
+			continue
 		}
 		g := s.homeEngineLocked(h.Member, now)
 		if g == nil {
@@ -1203,12 +1351,27 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 				m.waitingSince = time.Time{}
 			}
 		}
-		for id := range g.waiters {
+	}
+	for _, wp := range s.waiterPoolsLocked() {
+		for id := range wp {
 			if _, ok := present[id]; !ok {
-				delete(g.waiters, id)
+				delete(wp, id)
 			}
 		}
 	}
+}
+
+// waiterPoolsLocked is every live waiter pool in the current mode: the engine
+// pools (member-stable) or the single global pool (seat=pin).
+func (s *Scheduler) waiterPoolsLocked() []map[string]*waiter {
+	if s.cfg.seatPin() {
+		return []map[string]*waiter{s.gWaiters}
+	}
+	out := make([]map[string]*waiter, 0, len(s.groups))
+	for _, g := range s.activeGroupsLocked() {
+		out = append(out, g.waiters)
+	}
+	return out
 }
 
 // homeEngineLocked resolves (and on first sight RECORDS) a member's engine.
@@ -1221,6 +1384,12 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 // so a burst of newcomers splits across the engines instead of racing to
 // one (and so every multi-engine run stays reproducible).
 func (s *Scheduler) homeEngineLocked(member string, now time.Time) *engineGroup {
+	if s.cfg.seatPin() {
+		// SEAT=PIN: there is NO pre-seat homing. An unseated member has no engine
+		// (its head is ordinary demand in the global pool) and a seated one is
+		// bound by its SEAT, which seatLocked/exitLocked create and drop.
+		return nil
+	}
 	if id, ok := s.bindings[member]; ok {
 		if g, ok := s.groups[id]; ok {
 			s.bindingSeen[member] = now // the homing is alive (virtual clock: never time.Now — a
@@ -1708,15 +1877,15 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 // cold-entry cap and its own victim set, so one engine's head-of-line can
 // never stall another's admission.
 func (s *Scheduler) rotateLocked(now time.Time) {
-	groups := s.activeGroupsLocked()
-	anyWaiters := false
-	for _, g := range groups {
-		if len(g.waiters) > 0 {
-			anyWaiters = true
-			break
-		}
+	if s.cfg.seatPin() {
+		// E4a: ONE global pool, one pool-wide admission loop whose per-head
+		// engine choice is the seat-time rule (seatpin.go). The member-stable
+		// model below stays per engine, where the pool really is partitioned.
+		s.rotateSeatPoolLocked(now)
+		return
 	}
-	if !anyWaiters {
+	groups := s.activeGroupsLocked()
+	if s.waiterPoolSizeLocked() == 0 {
 		return
 	}
 	// the LSF key's seat component is computed ONCE per rotate and kept
@@ -1805,7 +1974,7 @@ func (s *Scheduler) entryHeadLocked(g *engineGroup, seats map[string]int) *waite
 	}
 	var head *waiter
 	var headKey entryKey
-	for _, w := range g.waiters {
+	for _, w := range s.waitersLocked(g) {
 		k := s.entryKeyLocked(w, seats)
 		// the key is a TOTAL order (id breaks every tie), so the map's
 		// iteration order cannot leak into the decision.
@@ -2085,11 +2254,41 @@ func (s *Scheduler) exitLocked(g *engineGroup, m *member, reason string, now tim
 	// A7: a session with a queued head re-enters at its ORIGINAL
 	// waiting-since (FIFO survives the exit) — on the SAME engine (the
 	// binding survives rotation: its cache is there).
-	if !m.waitingSince.IsZero() {
-		g.waiters[m.id] = &waiter{id: m.id, session: m.session, since: m.waitingSince,
-			sizeBytes:  m.lastSizeBytes,
-			coldTokens: s.estimateCostLocked(g, m.id, m.lastSizeBytes) * int64(s.blockSize)}
+	//
+	// SEAT=PIN: the binding is dropped HERE (seat = pin: created at seat, dropped
+	// at exit) and the re-entering head goes back to the GLOBAL pool — its next
+	// seat is chosen fresh, by the fit/backlog rule, and may land on a different
+	// engine. That is the model, not a leak: a member that left its seat holds no
+	// placement claim until an engine seats it again.
+	if s.cfg.seatPin() {
+		delete(s.bindings, m.id)
+		delete(s.bindingSeen, m.id)
+		if s.onUnbind != nil {
+			s.onUnbind(m.id)
+		}
 	}
+	if !m.waitingSince.IsZero() {
+		pool := s.waitersLocked(g)
+		if pool != nil {
+			pool[m.id] = &waiter{id: m.id, session: m.session, since: m.waitingSince,
+				sizeBytes:  m.lastSizeBytes,
+				coldTokens: s.estimateCostLocked(poolGroupFor(s, g, m.id), m.id, m.lastSizeBytes) * int64(s.blockSize)}
+		}
+	}
+}
+
+// poolGroupFor picks the engine a re-entering waiter's cold estimate is costed
+// against: the engine it just left in the member-stable model (its cache is
+// there), the first live engine in seat=pin (the pool has no owner, and the
+// seat-time fit test re-costs it against the engine actually chosen).
+func poolGroupFor(s *Scheduler, left *engineGroup, id string) *engineGroup {
+	if !s.cfg.seatPin() {
+		return left
+	}
+	if gs := s.activeGroupsLocked(); len(gs) > 0 {
+		return gs[0]
+	}
+	return left
 }
 
 // countExitLocked books an exit (or an exiting-mark) on the engine AND in
@@ -2116,7 +2315,10 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 	} else if _, ok := s.bindings[w.id]; !ok {
 		s.bindings[w.id] = g.id
 	}
-	delete(g.waiters, w.id)
+	if s.onBind != nil {
+		s.onBind(w.id, g.id) // the placement pin's mirror (seatpin/filter)
+	}
+	s.deleteWaiterLocked(g, w.id)
 	m := &member{
 		id:            w.id,
 		engine:        g.id,
@@ -2227,6 +2429,7 @@ func (s *Scheduler) gcSilentRecordsLocked(now time.Time) {
 				g.index.ForgetLocked(id)
 			}
 			s.forgetEverSeatedLocked(id)
+			s.forgetTurnHistoryLocked(id) // F4's own-median input dies with the record
 			delete(s.lastSeen, id)
 		}
 	}
@@ -2234,12 +2437,18 @@ func (s *Scheduler) gcSilentRecordsLocked(now time.Time) {
 	// BindingTTLSeconds of silence, so a member that is evicted (or simply
 	// quiet for longer than the 30 s record TTL) returns to the engine that
 	// still holds its blocks — and to the engine the placement filter pinned.
-	bttl := time.Duration(s.cfg.BindingTTLSeconds * float64(time.Second))
-	for id, seen := range s.bindingSeen {
-		if now.Sub(seen) > bttl {
-			delete(s.bindingSeen, id)
-			delete(s.bindings, id)
-			s.counters.rehomes++ // silent-member rehoming: the binding is released
+	//
+	// SEAT=PIN: there is no such clock. The binding lives exactly as long as the
+	// seat, and exitLocked drops it, so a sweep here could only corrupt the
+	// model (it would rewrite the pin of a member whose seat is live).
+	if !s.cfg.seatPin() {
+		bttl := time.Duration(s.cfg.BindingTTLSeconds * float64(time.Second))
+		for id, seen := range s.bindingSeen {
+			if now.Sub(seen) > bttl {
+				delete(s.bindingSeen, id)
+				delete(s.bindings, id)
+				s.counters.rehomes++ // silent-member rehoming: the binding is released
+			}
 		}
 	}
 }
@@ -2254,12 +2463,20 @@ func (s *Scheduler) seatedAnywhereLocked(id string) bool {
 }
 
 func (s *Scheduler) waiterAnywhereLocked(id string) bool {
-	for _, g := range s.groups {
-		if _, ok := g.waiters[id]; ok {
+	for _, wp := range s.waiterPoolsLocked() {
+		if _, ok := wp[id]; ok {
 			return true
 		}
 	}
 	return false
+}
+
+// deleteWaiterLocked removes a waiter from the pool it lives in (the engine map
+// in member-stable mode, the one global pool under seat=pin).
+func (s *Scheduler) deleteWaiterLocked(g *engineGroup, id string) {
+	if pool := s.waitersLocked(g); pool != nil {
+		delete(pool, id)
+	}
 }
 
 func (s *Scheduler) isNewcomerLocked(id string) bool {
@@ -2344,8 +2561,13 @@ func (s *Scheduler) RemoveEngine(engine string, now time.Time) int {
 			n++
 		}
 	}
-	for id := range g.waiters {
-		delete(g.waiters, id)
+	if !s.cfg.seatPin() {
+		// The per-engine pools die with the engine (a waiter bound to it has no
+		// other home in the member-stable model). Under seat=pin the pool is
+		// GLOBAL and must SURVIVE a teardown: those heads can seat on a survivor.
+		for id := range g.waiters {
+			delete(g.waiters, id)
+		}
 	}
 	for member, id := range s.bindings {
 		if id == engine {
@@ -2576,6 +2798,13 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 		ne += es.NEBlocks
 	}
 	snap.Seats, snap.Waiters, snap.UniqueBlocks, snap.NEBlocks = seats, waiters, uniq, ne
+	if s.cfg.seatPin() {
+		// SEAT=PIN: the unseated demand lives in ONE global pool, so it belongs to
+		// no engine (the per-engine Waiters above are 0 by construction). The
+		// whole-policy number is still reported, so the run's liveness arithmetic
+		// (waiting vs seats) reads the same in both models.
+		snap.Waiters = len(s.gWaiters)
+	}
 	// BudgetBlocks is the whole-policy sum; with one engine (single mode, and
 	// every pre-split dump) it is exactly that engine's budget.
 	for _, id := range s.groupOrder {

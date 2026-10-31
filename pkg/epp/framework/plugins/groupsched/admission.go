@@ -39,11 +39,12 @@ package groupsched
 //     is total and every run is reproducible. Absent a fit, the head evicts on the
 //     engine that has an eligible victim.
 //
-//  4. THE BINDING LASTS ONLY WHILE SEATED. seatLocked creates it, exitLocked drops
-//     it, and nothing else touches it — so a member's next seat is chosen afresh,
-//     by the state of the engines at that moment. (No TTL, no pre-seat homing, no
-//     residue: there is nothing to keep warm between seats because the blocks die
-//     during the unseated interval — measured, not assumed.)
+//  4. THE BINDING LASTS ONLY WHILE SEATED. seatLocked creates it, exitLocked drops it,
+//     and nothing else touches it — so a member's next seat is chosen afresh, by the
+//     state of the engines at that moment. There is no TTL and no pre-seat homing:
+//     there is nothing to keep warm between seats, because the blocks die during the
+//     unseated interval (measured, not assumed — the unseated interval IS a
+//     multi-minute admission wait).
 //
 // At N=1 every rule above collapses to "the head goes to the only engine that
 // fits", which is exactly what the single-pod golden trace pins.

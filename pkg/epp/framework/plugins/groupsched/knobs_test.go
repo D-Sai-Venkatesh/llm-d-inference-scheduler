@@ -73,7 +73,7 @@ func TestQuantumEligibilityAfterBusyPeriods(t *testing.T) {
 	if m.busyPeriods != 2 {
 		t.Fatalf("busyPeriods = %d, want 2", m.busyPeriods)
 	}
-	if _, ok := s.eligibleLocked(m, now.Add(11*time.Second)); !ok {
+	if _, ok := s.eligibleLocked(s.eng(), m, now.Add(11*time.Second)); !ok {
 		t.Fatal("a must be rotation-eligible at Q=2 busy periods")
 	}
 	s.mu.Unlock()
@@ -108,13 +108,13 @@ func TestQuantumInfiniteNeverComplete(t *testing.T) {
 	s.mu.Lock()
 	m := s.eng().members["a"]
 	// 5s after the last settle: mid-quantum AND not silent — must stay seated
-	if reason, ok := s.eligibleLocked(m, now.Add(65*time.Second)); ok {
+	if reason, ok := s.eligibleLocked(s.eng(), m, now.Add(65*time.Second)); ok {
 		t.Fatalf("Q=∞ member became eligible: reason=%s", reason)
 	}
 	// silence (> S with no queued head) is STILL an exit under P∞ —
 	// the bounded rotation set, not squatting forever
 	m.waitingSince = time.Time{}
-	if reason, ok := s.eligibleLocked(m, now.Add(100*time.Second)); !ok || reason != "idle" {
+	if reason, ok := s.eligibleLocked(s.eng(), m, now.Add(100*time.Second)); !ok || reason != "idle" {
 		t.Fatalf("silent Q=∞ member must be idle-eligible, got ok=%v reason=%s", ok, reason)
 	}
 	s.mu.Unlock()
@@ -295,7 +295,7 @@ func TestC8WaitingMemberNotIdleEvictedWithoutPicks(t *testing.T) {
 	s.mu.Lock()
 	s.eng().members["a"].waitingSince = now
 	s.eng().members["a"].lastActivity = now.Add(-60 * time.Second) // stale beyond S
-	reason, ok := s.eligibleLocked(s.eng().members["a"], now)
+	reason, ok := s.eligibleLocked(s.eng(), s.eng().members["a"], now)
 	s.mu.Unlock()
 	if ok {
 		t.Fatalf("waiting member idle-eligible (reason=%s) — C8 regression: gate closure manufactures idle exits", reason)
@@ -484,7 +484,7 @@ func TestR2UnknownSettleRemovesNothing(t *testing.T) {
 	}
 	// and the member is NOT evictable as idle while the real record lives
 	s.mu.Lock()
-	_, eligible := s.eligibleLocked(s.eng().members["a"], now.Add(2*time.Second))
+	_, eligible := s.eligibleLocked(s.eng(), s.eng().members["a"], now.Add(2*time.Second))
 	s.mu.Unlock()
 	if eligible {
 		t.Fatal("member with a live in-flight record became rotation-eligible")

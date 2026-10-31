@@ -169,6 +169,51 @@ type Config struct {
 	// endpoints the EPP already sees and are torn down on EventDelete.
 	EngineGroups string `json:"engineGroups"`
 
+	// ---- F-arm knobs (single pod; every one defaults to today's behaviour) ----
+
+	// QuantumMode (rotationMode "quantum" only):
+	//
+	//	"fixed"    — Q busy periods for everybody (Q̄). DEFAULT.
+	//	"dyn-size" — F3: Q_i = max(1, round(Q̄ · blocks_i / median seated blocks)).
+	//	             Q̄ is the anchor's own Q, so the AVERAGE scale matches and only
+	//	             the size effect varies. Job sizes are bimodal, so one uniform Q
+	//	             is a compromise; a big member's slice should be longer (fewer
+	//	             cold re-prefills, and waste is proportional to chain size).
+	QuantumMode string `json:"quantumMode"`
+	// QuantumCeiling is the TENURE BOUND (completed busy periods) of every dynamic
+	// rule (F3/F6′/F7/F9). 0 = off (today's behaviour). A dynamic rule without a
+	// ceiling can starve; this is the fairness guarantee that lets the others run.
+	QuantumCeiling int `json:"quantumCeiling"`
+	// EntryOrder selects D1's head order:
+	//
+	//	"newcomer-first" — newcomers first, oldest within the class, then id.
+	//	                   DEFAULT (today's behaviour, A4/A7).
+	//	"hrrn"           — F5: priority (wait + s)/s with s the entry's own estimated
+	//	                   PREFILL SECONDS (cold tokens ÷ the run-time MEASURED
+	//	                   prefill rate). Small-first without starving big jobs: wait
+	//	                   grows without bound, so every head eventually wins.
+	EntryOrder string `json:"entryOrder"`
+	// ResidueRelease (F6′): "off" (default) | "on". When ON and waiters exist, a
+	// seated IDLE member whose predicted surviving fraction is below the warm/cold
+	// cut loses its seat — the seat protects nothing, so releasing it costs no
+	// cache. Requires the residue model (it is the same shadow, read for "are this
+	// member's blocks still there").
+	ResidueRelease string `json:"residueRelease"`
+	// RotateWhenFree (F7): when true, a rotation-based eviction is allowed only
+	// while the engine's PREFILL BACKLOG (dispatched, no first token yet, in
+	// TOKENS) is under MaxNumBatchedTokens. When prefill is saturated the slices
+	// lengthen instead — up to QuantumCeiling, which is why F7 always carries it.
+	RotateWhenFree bool `json:"rotateWhenFree"`
+	// MaxNumBatchedTokens is the engine's own per-step token budget: the
+	// denominator of F7's gate. It MUST equal the engine's
+	// --max-num-batched-tokens (the campaign stacks run 8192, from exp-ops
+	// _defaults.env VLLM_MAX_NUM_BATCHED_TOKENS); it is a WIRING FACT, not a knob of
+	// ours — the endpoint metrics do not carry it.
+	MaxNumBatchedTokens int `json:"maxNumBatchedTokens"`
+	// LongQuantum (F9, rotationMode "mlfq2"): Q_l, the long pool's slice length in
+	// busy periods. 0 → 8 (the B1a winner sets the value).
+	LongQuantum int `json:"longQuantum"`
+
 	// ---- per-engine gating (both arms: the multi-pod gate coupling fix) ----
 
 	// EngineGate applies the saturation gate PER ENGINE, at head selection:
@@ -277,6 +322,10 @@ func defaultConfig() Config {
 		BindingMode:             "member-stable",
 		Residue:                 "off",
 		ResidueReconcile:        "off",
+		QuantumMode:             "fixed",
+		EntryOrder:              "newcomer-first",
+		ResidueRelease:          "off",
+		MaxNumBatchedTokens:     8192,
 		EngineGate:              "off",
 		SatKvThreshold:          0.80,
 		SatQueueThreshold:       5,
@@ -338,6 +387,18 @@ func (c Config) effective() Config {
 	if c.ResidueReconcile == "" {
 		c.ResidueReconcile = def.ResidueReconcile
 	}
+	if c.QuantumMode == "" {
+		c.QuantumMode = def.QuantumMode
+	}
+	if c.EntryOrder == "" {
+		c.EntryOrder = def.EntryOrder
+	}
+	if c.ResidueRelease == "" {
+		c.ResidueRelease = def.ResidueRelease
+	}
+	if c.MaxNumBatchedTokens == 0 {
+		c.MaxNumBatchedTokens = def.MaxNumBatchedTokens
+	}
 	if c.EngineGate == "" {
 		c.EngineGate = def.EngineGate
 	}
@@ -387,9 +448,33 @@ func (c Config) validate() error {
 		c.RotationMode = "ledger"
 	}
 	switch c.RotationMode {
-	case "ledger", "quantum":
+	case "ledger", "quantum", "mlfq2":
 	default:
-		return fmt.Errorf("rotationMode: invalid value %q (ledger|quantum)", c.RotationMode)
+		return fmt.Errorf("rotationMode: invalid value %q (ledger|quantum|mlfq2)", c.RotationMode)
+	}
+	switch c.QuantumMode {
+	case "", "fixed", "dyn-size":
+	default:
+		return fmt.Errorf("quantumMode: invalid value %q (fixed|dyn-size)", c.QuantumMode)
+	}
+	switch c.EntryOrder {
+	case "", "newcomer-first", "hrrn":
+	default:
+		return fmt.Errorf("entryOrder: invalid value %q (newcomer-first|hrrn)", c.EntryOrder)
+	}
+	switch c.ResidueRelease {
+	case "", "off", "on":
+	default:
+		return fmt.Errorf("residueRelease: invalid value %q (off|on)", c.ResidueRelease)
+	}
+	if c.QuantumCeiling < 0 {
+		return fmt.Errorf("quantumCeiling must be >= 0 (0 = off), got %d", c.QuantumCeiling)
+	}
+	if c.MaxNumBatchedTokens < 0 {
+		return fmt.Errorf("maxNumBatchedTokens must be >= 0, got %d", c.MaxNumBatchedTokens)
+	}
+	if c.ResidueRelease == "on" && !c.residueOn() {
+		return fmt.Errorf("residueRelease=\"on\" requires residue=\"tiebreak\" (F6' reads the same per-engine shadow)")
 	}
 	if c.ValveMode == "" {
 		c.ValveMode = "on"
@@ -676,6 +761,10 @@ type member struct {
 	awaitingEngine bool
 	// waitingSince is the member's oldest queued head (B5: kept oldest).
 	waitingSince time.Time
+	// prefillPending is this member's prefill work in TOKENS for its dispatches that
+	// have not produced a first token yet (F7's backlog input; released at
+	// StartOfStream, exactly like the cold charge).
+	prefillPending int64
 	// fairnessID is the last fairness id (queue key) this member was seen with —
 	// the join key for its SEAT/EXIT events (see Head.FairnessID).
 	fairnessID string
@@ -764,6 +853,14 @@ type engineGroup struct {
 	resFlights map[string]residueHeld
 	// residueReported latches the one-shot "this engine dropped to fit-only" log.
 	residueReported bool
+	// prefillRate is the MEASURED prefill rate (tokens/s) for this engine and
+	// prefillSamples how many observations it rests on (F5's s, and nothing else).
+	prefillRate    float64
+	prefillSamples int
+	// prefillBacklog is the engine's EPP-side prefill backlog in TOKENS: dispatched
+	// requests with no first token yet (F7's gate). Derived per pass from the
+	// members' pending prefill charges, like coldInFlight.
+	prefillBacklog int64
 
 	// estCache/estVersion cache waiter admission estimates keyed on the
 	// index's mutation version (M2: Picks run at ~1kHz; unchanged state
@@ -776,6 +873,9 @@ type engineGroup struct {
 		served      int64 // dispatches served on this engine
 		fcfsServed  int64 // pre-capacity FCFS dispatches counted here
 		gateSkipped int64 // heads the size-aware gate turned away
+		// engineGateSkipped counts dispatches the PER-ENGINE saturation gate held
+		// back (G1: the pool gate applied to one engine).
+		engineGateSkipped int64
 		// forcedSeats counts seats taken OVER budget by an affinity
 		// reconciliation (the observed endpoint wins; enforcement catches
 		// up on the next pass). Must be ~0 in a healthy run.
@@ -844,6 +944,9 @@ type Scheduler struct {
 	// cold-entry valve refuses it, so the loop's only way forward is an eviction
 	// (the C1 sizing signal; installed in BOTH binding models).
 	onValveBlockedEviction func(engine string)
+	// onEngineGateSkip fires when the per-engine saturation gate holds a dispatch
+	// back (G1).
+	onEngineGateSkip func(engine string)
 
 	// groups holds one engineGroup per engine, keyed by endpoint id. In
 	// single mode there is exactly one, keyed "".
@@ -906,6 +1009,14 @@ type Scheduler struct {
 
 	// pickSeq synthesizes request ids for heads that lack one (M1).
 	pickSeq int64
+	// now is the virtual clock of the CURRENT decision pass (set at the top of every
+	// public decision entry point). The ordering layer needs "how long has this head
+	// waited" and must not call time.Now: a golden replay has to be reproducible.
+	now time.Time
+	// promoted is the MLFQ-2 class of a member (F9): true once it has outlived its
+	// first busy period. It is MEMBER-scoped and survives rotation and exit — the
+	// class is a property of the job, not of the seat.
+	promoted map[string]bool
 	// turnSeen / gapHistory are the per-member INTER-TURN GAP history (F4's
 	// own-median pause rule, DYN-PAUSE): turnSeen is the last arrival seen for
 	// the member, gapHistory the last gapHistoryLimit gaps between successive
@@ -965,7 +1076,8 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 		everSeatedSession: map[string]struct{}{}, recordSession: map[string]string{},
 		sessionRefs: map[string]int{}, bindings: map[string]string{},
 		bindingSeen: map[string]time.Time{},
-		turnSeen:    map[string]time.Time{}, gapHistory: map[string][]float64{}}
+		turnSeen:    map[string]time.Time{}, gapHistory: map[string][]float64{},
+		promoted: map[string]bool{}}
 	if cfg.seatPin() {
 		s.gWaiters = map[string]*waiter{}
 	}
@@ -1311,6 +1423,7 @@ func (s *Scheduler) PickFromHeads(heads []Head, now time.Time) int {
 func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.now = now
 	s.deriveLocked() // derive-don't-accumulate: recomputed, never trusted across paths
 	s.reapInflightLocked(now)
 	s.syncWaitersLocked(heads, now)
@@ -1349,6 +1462,20 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 			continue
 		}
 		if m.inflight >= s.cfg.InFlightCap {
+			continue
+		}
+		if s.saturatingLocked(g) {
+			// THE PER-ENGINE DISPATCH GATE (reviewer G1): a saturated engine holds its
+			// own DISPATCHES too, not just its admissions. Gating only seats would let a
+			// saturated engine's running KV grow past the threshold unbounded — the
+			// preemption hazard the 80% gate exists to prevent (G90's failure mode) —
+			// and it would not be the detector's semantics de-averaged: the detector
+			// gates EVERY dispatch, so this must too. First-fit, like the size-aware
+			// gate's skip: the head stays queued and another engine's heads dispatch.
+			g.counters.engineGateSkipped++
+			if s.onEngineGateSkip != nil {
+				s.onEngineGateSkip(g.id)
+			}
 			continue
 		}
 		perEngine[g.id] = append(perEngine[g.id], cand{i, h, g.id})
@@ -1818,6 +1945,15 @@ func (s *Scheduler) DispatchedOn(id, reqID, engine string, keys []Hash, sizeByte
 	}
 	g.index.SetSizeLocked(id, sizeBytes) // the estimate baseline
 	onMain := g.index.SettleDispatchedAtLocked(id, reqID, keys, now)
+	if s.cfg.RotateWhenFree || s.cfg.EntryOrder == "hrrn" || s.cfg.RotationMode == "mlfq2" {
+		// F7's backlog input and F5's service estimate: the request's PREFILL WORK is
+		// its prompt tokens (the exact tier-A keys x block size), held against the
+		// engine until the first token arrives.
+		if m, ok := g.members[id]; ok {
+			m.prefillPending = int64(len(keys)) * int64(s.blockSize)
+			g.prefillBacklog += m.prefillPending
+		}
+	}
 	if g.residue.usable() {
 		// E4b: model this admission. The exact tier-A keys ARE the prompt blocks,
 		// so the model is fed the truth about WHAT was asked for; only the hit/miss
@@ -1877,17 +2013,73 @@ func (s *Scheduler) DispatchedOn(id, reqID, engine string, keys []Hash, sizeByte
 			m.coldEntry = int64(len(keys)) * int64(s.blockSize)
 			g.coldInFlight += m.coldEntry
 		}
+		if s.cfg.RotateWhenFree || s.cfg.EntryOrder == "hrrn" || s.cfg.RotationMode == "mlfq2" {
+			// F7's backlog input and F5/F9's service estimate: the request's PREFILL
+			// WORK is its prompt tokens (the exact tier-A keys, block-quantised), held
+			// against the engine until the first token arrives (ChunkAt releases it).
+			g.prefillBacklog = max(g.prefillBacklog-m.prefillPending, 0)
+			m.prefillPending = int64(len(keys)) * int64(s.blockSize)
+			g.prefillBacklog += m.prefillPending
+		}
 	}
 }
 
-// Chunk is the first response chunk: prefill complete — the cold-entry
-// charge is released HERE (B3: not at end of decode), exactly once.
+// Chunk is the first response chunk: prefill complete — the cold-entry charge is
+// released HERE (B3: not at end of decode), exactly once. It carries no clock, so it
+// cannot feed the prefill-RATE measurement (see ChunkAt).
 func (s *Scheduler) Chunk(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if g := s.groupOfLocked(id); g != nil {
 		s.releaseColdLocked(g, id)
+		s.releasePrefillLocked(g, id, time.Time{})
 	}
+}
+
+// ChunkAt is Chunk WITH the first-token clock: it is the only observation point for
+// the prefill rate F5/F9 measure (time from dispatch to first token), so the live
+// path calls this and a test that drives a virtual clock calls it too.
+func (s *Scheduler) ChunkAt(id string, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g := s.groupOfLocked(id)
+	if g == nil {
+		return
+	}
+	s.releaseColdLocked(g, id)
+	s.releasePrefillLocked(g, id, now)
+}
+
+// releasePrefillLocked ends a member's pending prefill (first token) and, when a
+// clock is supplied, books (dispatch→first-token, uncached prompt tokens) as a
+// prefill-RATE observation for that engine.
+func (s *Scheduler) releasePrefillLocked(g *engineGroup, id string, now time.Time) {
+	m, ok := g.members[id]
+	if !ok || m.prefillPending <= 0 {
+		return
+	}
+	tokens := m.prefillPending
+	m.prefillPending = 0
+	g.prefillBacklog = max(g.prefillBacklog-tokens, 0)
+	if now.IsZero() {
+		return
+	}
+	// the dispatch time is the request's confirmation record; the oldest confirmed
+	// in-flight record is the closest we have to "when this prefill started" without
+	// a second per-request table.
+	var started time.Time
+	for _, rec := range m.inflightIDs {
+		if !rec.confirmed {
+			continue
+		}
+		if started.IsZero() || rec.since.Before(started) {
+			started = rec.since
+		}
+	}
+	if started.IsZero() || !now.After(started) {
+		return
+	}
+	s.notePrefillLocked(g, now.Sub(started).Seconds(), tokens)
 }
 
 func (s *Scheduler) releaseColdLocked(g *engineGroup, id string) {
@@ -1993,6 +2185,11 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 		if removed && removedMain && m.mainInflight == 0 {
 			m.busyPeriods++
 			m.lastCompletion = now
+			// F9's ONLY promotion rule: a member that outlived its first busy period is
+			// long-lived. Recorded globally so the class survives rotation and exit.
+			if m.busyPeriods >= 1 {
+				s.promoted[m.id] = true
+			}
 		}
 	}
 	if !seated {
@@ -2065,37 +2262,6 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 
 // ---- rotation (§7) ----
 
-// eligibleLocked is the LEGACY ledger rule (rotationMode "ledger"):
-// paid / idle / nmax. The C8 fix is always-on: a member with a live
-// queued head is never idle (its lastActivity cannot be refreshed when
-// Picks stop — gate closure used to manufacture idle exits).
-func (s *Scheduler) eligibleLocked(m *member, now time.Time) (string, bool) {
-	if m.inflight > 0 {
-		return "", false
-	}
-	if s.cfg.RotationMode == "quantum" {
-		// the busy-period quantum: eligible when Q busy periods are
-		// complete (never, under Q=∞ — the pause arm) or on silence.
-		if s.cfg.quantumFinite() && m.busyPeriods >= s.cfg.quantum() {
-			return "quantum-complete", true
-		}
-		if s.silentLocked(m, now) {
-			return "idle", true
-		}
-		return "", false
-	}
-	if m.resTurns >= 1 && m.earned >= int64(s.cfg.Rho)*max(m.entryCost, 1) {
-		return "paid", true
-	}
-	if s.silentLocked(m, now) {
-		return "idle", true
-	}
-	if m.resTurns >= s.cfg.nMax() {
-		return "nmax", true
-	}
-	return "", false
-}
-
 // silentLocked is the idle test with the C8 fix: silent means no
 // activity AND no queued head (a waiting member wants to run).
 func (s *Scheduler) silentLocked(m *member, now time.Time) bool {
@@ -2110,13 +2276,15 @@ func (s *Scheduler) silentLocked(m *member, now time.Time) bool {
 // anywhere cannot persist past the next decision point. Per engine.
 func (s *Scheduler) deriveLocked() {
 	for _, g := range s.groups {
-		var cold, pend int64
+		var cold, pend, pre int64
 		for _, m := range g.members {
 			cold += m.coldEntry
 			pend += m.pendingBlocks
+			pre += m.prefillPending
 		}
 		g.coldInFlight = cold
 		g.pendingTotal = pend
+		g.prefillBacklog = pre
 	}
 }
 
@@ -2273,6 +2441,9 @@ func (s *Scheduler) entryHeadLocked(g *engineGroup, seats map[string]int) *waite
 	if seats == nil && s.cfg.SessionOrder == "lsf" {
 		seats = s.sessionSeatCountsLocked() // a direct caller (tests) gets a fresh count
 	}
+	if s.cfg.RotationMode == "mlfq2" {
+		return s.mlfq2HeadLocked(g, seats)
+	}
 	var head *waiter
 	var headKey entryKey
 	for _, w := range s.waitersLocked(g) {
@@ -2286,11 +2457,61 @@ func (s *Scheduler) entryHeadLocked(g *engineGroup, seats map[string]int) *waite
 	return head
 }
 
-// entryKey is the D1 ordering key. seats/isNew are 0-or-1 ranks (lower =
-// first) so the comparison is plain lexicographic.
+// mlfq2HeadLocked is F9's SEAT SPLIT: the short pool and the long pool each have a
+// D1 head, and the seat goes to whichever head has the HIGHER HRRN response ratio
+// (wait + s)/s. That is the load-adaptivity, and it is parameter-free: the ratio
+// uses the measured prefill rate and the head's own cold tokens, and wait grows
+// without bound, so neither pool can be starved by the other — the starvation
+// argument is HRRN's, not a quota.
+func (s *Scheduler) mlfq2HeadLocked(g *engineGroup, seats map[string]int) *waiter {
+	var short, long *waiter
+	var shortK, longK entryKey
+	for _, w := range s.waitersLocked(g) {
+		k := s.entryKeyLocked(w, seats)
+		if s.promoted[w.id] {
+			if long == nil || k.less(longK) {
+				long, longK = w, k
+			}
+			continue
+		}
+		if short == nil || k.less(shortK) {
+			short, shortK = w, k
+		}
+	}
+	switch {
+	case short == nil:
+		return long
+	case long == nil:
+		return short
+	}
+	sShort, okShort := s.estimatedPrefillSeconds(g, short)
+	sLong, okLong := s.estimatedPrefillSeconds(g, long)
+	if !okShort || !okLong {
+		// no measured rate yet: the pools cannot be compared on service time, so take
+		// the D1 order (and with it the pinned newcomer-first rule).
+		if shortK.less(longK) {
+			return short
+		}
+		return long
+	}
+	now := s.nowLocked()
+	if hrrn(now.Sub(short.since).Seconds(), sShort) >= hrrn(now.Sub(long.since).Seconds(), sLong) {
+		return short
+	}
+	return long
+}
+
+// entryKey is the D1 ordering key. seats/isNew are 0-or-1 ranks (lower = first)
+// so the comparison is plain lexicographic; hrrn is F5's response ratio, compared
+// DESCENDING (higher priority first) after the session ranks, so the two layers
+// compose instead of replacing each other.
 type entryKey struct {
 	seats int
 	isNew int
+	// hrrn is (wait + s)/s, or 0 when the ordering rule is not HRRN (in which case
+	// every key carries 0 and the field is inert — that is what keeps the pinned
+	// newcomer-first order byte-identical).
+	hrrn  float64
 	since time.Time
 	id    string
 }
@@ -2302,6 +2523,9 @@ func (k entryKey) less(o entryKey) bool {
 	if k.isNew != o.isNew {
 		return k.isNew < o.isNew
 	}
+	if k.hrrn != o.hrrn {
+		return k.hrrn > o.hrrn // higher response ratio first
+	}
 	if !k.since.Equal(o.since) {
 		return k.since.Before(o.since)
 	}
@@ -2310,6 +2534,23 @@ func (k entryKey) less(o entryKey) bool {
 
 func (s *Scheduler) entryKeyLocked(w *waiter, seats map[string]int) entryKey {
 	k := entryKey{since: w.since, id: w.id}
+	if s.cfg.EntryOrder == "hrrn" && !w.since.IsZero() {
+		// F5: priority = (wait + s)/s with s the entry's own estimated prefill
+		// seconds. Without a measured rate yet (start of a run) every key gets the
+		// same 0 and the order degrades to the pinned newcomer-first rule — an
+		// honest "no data, no reordering" rather than a guess.
+		g := s.groupOfLocked(w.id)
+		if g == nil {
+			g = s.defaultGroupLocked()
+		}
+		if svc, ok := s.estimatedPrefillSeconds(g, w); ok {
+			wait := s.nowLocked().Sub(w.since).Seconds()
+			if wait < 0 {
+				wait = 0
+			}
+			k.hrrn = hrrn(wait, svc)
+		}
+	}
 	switch s.cfg.SessionOrder {
 	case "lsf":
 		sess := sessionUnitOf(w.session, w.id)
@@ -2386,6 +2627,18 @@ func (s *Scheduler) coldAllows(g *engineGroup, w *waiter) bool {
 // borrow another engine's idleness to justify an eviction, and an idle
 // engine must not spend a decision on waiters bound elsewhere.
 func (s *Scheduler) rotationVictimLocked(g *engineGroup, now time.Time) (string, *member) {
+	// F6′: a seat whose blocks are already gone protects nothing — release it first,
+	// because it costs no cache to take. (Needs the residue model: it reads the same
+	// shadow as E4b.)
+	if s.cfg.ResidueRelease == "on" {
+		if reason, m := s.residueReleaseVictimLocked(g, now); m != nil {
+			return reason, m
+		}
+	}
+	// F7: when the engine's PREFILL is already the bottleneck, a rotation's cold
+	// re-prefill costs the whole pool — so hold, unless this member has hit the
+	// tenure ceiling (the guarantee that stops holding from becoming starvation).
+	gated := s.prefillSaturatedLocked(g)
 	var best *member
 	var bestReason string
 	bestHasWaiting := false
@@ -2393,9 +2646,12 @@ func (s *Scheduler) rotationVictimLocked(g *engineGroup, now time.Time) (string,
 		if g.index.ExitingLocked(m.id) {
 			continue
 		}
-		reason, ok := s.eligibleLocked(m, now)
+		reason, ok := s.eligibleLocked(g, m, now)
 		if !ok {
 			continue
+		}
+		if gated && !s.ceilingReachedLocked(g, m) {
+			continue // F7: prefill saturated — lengthen slices, up to the ceiling
 		}
 		hasWaiting := !m.waitingSince.IsZero()
 		var better bool
@@ -2418,6 +2674,9 @@ func (s *Scheduler) rotationVictimLocked(g *engineGroup, now time.Time) (string,
 	if best != nil {
 		return bestReason, best
 	}
+	// F7's gate closes the DEMAND-DRIVEN rotation above, never the engine-idle
+	// liveness rule below: a completely idle engine with a blocked waiter is a stall,
+	// and prefill that is not running cannot be saturated by our own choice.
 	// engine-idle rule: no member in flight AND no member dispatchable
 	// (A1's livelock guard) while a waiter is blocked
 	idle := true
@@ -2711,6 +2970,7 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 func (s *Scheduler) Tick(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.now = now
 	s.deriveLocked() // derive-don't-accumulate, every decision point
 	s.reapInflightLocked(now)
 	for _, g := range s.activeGroupsLocked() {

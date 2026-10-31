@@ -105,6 +105,11 @@ type groupMetrics struct {
 	// stagger costs in evictions), emitted in BOTH binding models so the
 	// member-stable and seat-pin arms stay comparable.
 	valveBlockedEvictions *prometheus.CounterVec
+	// engineGateSkips counts DISPATCHES the per-engine saturation gate held back
+	// (engineGate=per-engine): the pool gate applied to one engine. Together with
+	// engineGateClosed it is the "the gate is per-engine now" evidence in the run.
+	engineGateSkips  *prometheus.CounterVec
+	engineGateClosed *prometheus.GaugeVec
 	// affinityViolations counts requests that landed off their member's
 	// engine (from = the engine the member was charged to, to = the engine
 	// the framework actually picked). CORRECTNESS, not instrumentation.
@@ -197,6 +202,10 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "1 when the residue model is disabled on this engine (sustained prediction error): it ranks by fit → backlog only"}, engineLabels)
 	g.valveBlockedEvictions = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "rotation_evictions_valve_blocked_total",
 		Help: "rotation steps where the cold-entry valve (not the budget) refused a head the budget would have taken, forcing an eviction"}, engineLabels)
+	g.engineGateSkips = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "engine_gate_skipped_total",
+		Help: "dispatches (and seats) the per-engine saturation gate held back, by engine"}, engineLabels)
+	g.engineGateClosed = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "engine_gate_closed",
+		Help: "1 when THIS engine's own saturation_e >= 1 (the per-engine gate is closed for it)"}, engineLabels)
 	fcfsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: "llm_d_epp_group", Name: "fcfs_dispatches_total",
 		Help: "pre-capacity FCFS pass-through dispatches, per engine"}, engineLabels)
 	for _, c := range []prometheus.Collector{g.seats, g.members, g.sessions, g.boundMembers,
@@ -205,7 +214,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.capacityMissing, g.capacityLearned, g.pooledEndpoints, g.capacityHeterogeneous,
 		g.affinityViolations, g.rebinds, g.homings, g.rehomes, g.engineGone, g.filterDecisions,
 		g.residuePredicted, g.residueActual, g.residueDecided, g.residueResets, g.residueOff,
-		g.valveBlockedEvictions} {
+		g.valveBlockedEvictions, g.engineGateSkips, g.engineGateClosed} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second
 			// plugin config in the same test binary) must not fail startup: the
@@ -377,6 +386,13 @@ func (g *groupMetrics) SetResidueDisabled(engine string) {
 		return
 	}
 	g.residueOff.WithLabelValues(engine).Set(1)
+}
+
+func (g *groupMetrics) ObserveEngineGateSkip(engine string) {
+	if g == nil || g.engineGateSkips == nil {
+		return
+	}
+	g.engineGateSkips.WithLabelValues(engine).Inc()
 }
 
 func (g *groupMetrics) ObserveValveBlockedEviction(engine string) {

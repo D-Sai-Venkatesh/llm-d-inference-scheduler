@@ -1,39 +1,39 @@
-  SEAT id=m00 engine=engine-a kind=newcomer wait=0.000
+  SEAT id=m00 engine=engine-a kind=newcomer wait=0.000 fairness_id=-
 t=5 PICK id=m00 engine=engine-a blocks=14
   BOUND id=m00 engine=engine-a
-  SEAT id=m01 engine=engine-b kind=newcomer wait=0.000
+  SEAT id=m01 engine=engine-b kind=newcomer wait=0.000 fairness_id=-
 t=6 PICK id=m01 engine=engine-b blocks=14
   BOUND id=m01 engine=engine-b
-  SEAT id=m02 engine=engine-a kind=newcomer wait=0.000
+  SEAT id=m02 engine=engine-a kind=newcomer wait=0.000 fairness_id=-
 t=7 PICK id=m02 engine=engine-a blocks=14
   BOUND id=m02 engine=engine-a
-  SEAT id=m03 engine=engine-b kind=newcomer wait=0.000
+  SEAT id=m03 engine=engine-b kind=newcomer wait=0.000 fairness_id=-
 t=8 PICK id=m03 engine=engine-b blocks=14
   BOUND id=m03 engine=engine-b
-  SEAT id=m04 engine=engine-a kind=newcomer wait=0.000
+  SEAT id=m04 engine=engine-a kind=newcomer wait=0.000 fairness_id=-
 t=9 PICK id=m04 engine=engine-a blocks=14
   BOUND id=m04 engine=engine-a
-  SEAT id=m05 engine=engine-b kind=newcomer wait=0.000
+  SEAT id=m05 engine=engine-b kind=newcomer wait=0.000 fairness_id=-
 t=10 PICK id=m05 engine=engine-b blocks=14
   BOUND id=m05 engine=engine-b
-  SEAT id=m06 engine=engine-a kind=newcomer wait=0.000
+  SEAT id=m06 engine=engine-a kind=newcomer wait=0.000 fairness_id=-
 t=11 PICK id=m06 engine=engine-a blocks=14
   BOUND id=m06 engine=engine-a
-  SEAT id=m07 engine=engine-b kind=newcomer wait=0.000
+  SEAT id=m07 engine=engine-b kind=newcomer wait=0.000 fairness_id=-
 t=12 PICK id=m07 engine=engine-b blocks=14
   BOUND id=m07 engine=engine-b
-  SEAT id=m08 engine=engine-a kind=newcomer wait=0.000
+  SEAT id=m08 engine=engine-a kind=newcomer wait=0.000 fairness_id=-
 t=13 PICK id=m08 engine=engine-a blocks=14
   BOUND id=m08 engine=engine-a
-  SEAT id=m09 engine=engine-b kind=newcomer wait=0.000
+  SEAT id=m09 engine=engine-b kind=newcomer wait=0.000 fairness_id=-
 t=14 PICK id=m09 engine=engine-b blocks=14
   BOUND id=m09 engine=engine-b
-  SEAT id=m10 engine=engine-b kind=newcomer wait=0.000
+  SEAT id=m10 engine=engine-b kind=newcomer wait=0.000 fairness_id=-
 t=15 PICK id=m00 engine=engine-a blocks=22
   BOUND id=m00 engine=engine-a
 t=15 PICK id=m10 engine=engine-b blocks=14
   BOUND id=m10 engine=engine-b
-  SEAT id=m11 engine=engine-a kind=newcomer wait=0.000
+  SEAT id=m11 engine=engine-a kind=newcomer wait=0.000 fairness_id=-
 t=16 PICK id=m11 engine=engine-a blocks=14
   BOUND id=m11 engine=engine-a
 t=16 PICK id=m01 engine=engine-b blocks=22

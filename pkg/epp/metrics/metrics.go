@@ -154,12 +154,16 @@ func Reset() {
 	LlmdDataLayerExtractErrorsTotal.Reset()
 }
 
-// RecordRequestCounter records the number of requests.
-func RecordRequestCounter(modelName, targetModelName, fairnessID string, priority int) {
+// RecordRequestCounter records the number of requests, labelled with the endpoint
+// the request was actually dispatched to (host:port; "" when it never reached one).
+// The target_endpoint label is what lets a run derive PER-ENGINE request rates from
+// the EPP's own series instead of joining spans — without it, "which engine served
+// this" is only knowable from the trace pipeline.
+func RecordRequestCounter(modelName, targetModelName, fairnessID string, priority int, targetEndpoint string) {
 	modelName, targetModelName = boundModels(modelName, targetModelName)
 	fairnessID = boundFairnessID(fairnessID)
 	prioStr := strconv.Itoa(priority)
-	llmdRequestCounter.WithLabelValues(modelName, targetModelName, fairnessID, prioStr).Inc()
+	llmdRequestCounter.WithLabelValues(modelName, targetModelName, fairnessID, prioStr, targetEndpoint).Inc()
 }
 
 // RecordRequestErrCounter records the number of error requests.

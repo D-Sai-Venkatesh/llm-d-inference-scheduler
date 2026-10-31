@@ -47,9 +47,9 @@ func TestPreAdmitModelLabelsSurvivesFlood(t *testing.T) {
 
 	PreAdmitModelLabels("llama-70b", "llama-70b-canary")
 	for i := 0; i < 1000; i++ {
-		RecordRequestCounter(fmt.Sprintf("junk-%d", i), "target", "fairness", 0)
+		RecordRequestCounter(fmt.Sprintf("junk-%d", i), "target", "fairness", 0, "")
 	}
-	RecordRequestCounter("llama-70b", "llama-70b-canary", "fairness", 0)
+	RecordRequestCounter("llama-70b", "llama-70b-canary", "fairness", 0, "")
 
 	series := promtestutil.CollectAndCount(llmdRequestCounter)
 	require.LessOrEqualf(t, series, testCap+2, "cardinality must stay bounded, got %d series", series)
@@ -72,7 +72,7 @@ func TestRecordRequestCounterBoundsModelCardinality(t *testing.T) {
 	})
 
 	for i := 0; i < 1000; i++ {
-		RecordRequestCounter(fmt.Sprintf("model-%d", i), "target", "fairness", 0)
+		RecordRequestCounter(fmt.Sprintf("model-%d", i), "target", "fairness", 0, "")
 	}
 
 	count := promtestutil.CollectAndCount(llmdRequestCounter)
@@ -139,7 +139,7 @@ func TestFairnessLabelBoundOnRequestMetrics(t *testing.T) {
 	})
 
 	for i := 0; i < 100; i++ {
-		RecordRequestCounter("model-a", "model-a", fmt.Sprintf("tenant-%d", i), 0)
+		RecordRequestCounter("model-a", "model-a", fmt.Sprintf("tenant-%d", i), 0, "")
 	}
 
 	require.Equal(t, testCap+1, promtestutil.CollectAndCount(llmdRequestCounter),

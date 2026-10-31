@@ -196,6 +196,10 @@ func (d *Detector) Saturation(_ context.Context, candidates []datalayer.Endpoint
 
 	var totalScore float64
 	staleCount := 0
+	// minScore carries the minimum over the endpoints that HAVE fresh metrics. It is
+	// seeded from the first fresh endpoint so a legitimate 0.0 cannot be mistaken for
+	// "no sample yet".
+	minScore := -1.0
 	for _, e := range candidates {
 		podMetrics := e.GetMetrics()
 
@@ -216,12 +220,29 @@ func (d *Detector) Saturation(_ context.Context, candidates []datalayer.Endpoint
 		kvRatio := podMetrics.KVCacheUsagePercent / d.config.KVCacheUtilThreshold
 
 		// Roofline Analysis: The pod is saturated if either resource is exhausted.
-		totalScore += max(qRatio, kvRatio)
+		score := max(qRatio, kvRatio)
+		totalScore += score
+		if minScore < 0 || score < minScore {
+			minScore = score
+		}
 	}
 
 	metrics.RecordFlowControlStaleEndpoints(d.typedName.Name, staleCount)
 	if staleCount > 0 {
 		d.maybeLogStaleEndpoints(staleCount, len(candidates))
+	}
+
+	// AGGREGATION (default mean = the behaviour every banked single-pod run produced).
+	// "min" gates the pool only when EVERY endpoint with fresh metrics is saturated, so
+	// one saturated engine can no longer be hidden by an idle sibling (the mean) and
+	// the gate stops reacting to pool-level load. An endpoint with no fresh metrics is
+	// excluded from the min (it can neither open nor close the gate); with no fresh
+	// endpoint at all the pool scores 1.0 (fail-closed, same as the mean path).
+	if d.config.Aggregation == AggregationMin {
+		if minScore < 0 {
+			return 1.0
+		}
+		return minScore
 	}
 
 	// Under ignore, stale endpoints are out of the average; if every candidate is stale the pool

@@ -20,5 +20,5 @@
 #                       member-stable cannot produce (TestSeatPinMultiEngineGolden)
 31051d4ddc7b3ac22d248e1e50ac435c17e27d953c5d6ffef8abfa8b50addcf1  golden.txt
 5671d20c6052cd26147fe96f974cd65ad18935baf680c5c55c42a44ee77324f3  golden-legacy.txt
-c0c0319ee48e6bd86fb5ca3b314093aeb5bacc1aefe951aec5ba9f576a77a2d8  golden-multipod.txt
-fff15714ec5fd9c5f6ad40846a33931aef91d04d37ac1eae0be09bd74c901a51  golden-e4a.txt
+23f1d72967256770ba8a3d4c1591fc0fbc8dbf4f1a6668d1f6e86206f8e5e14b  golden-multipod.txt
+e093bc6e9ae35f4c06345d7c0a6154781101caa006e2f8c1f8fe8e2a85ae1f48  golden-e4a.txt

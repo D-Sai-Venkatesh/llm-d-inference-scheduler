@@ -545,7 +545,7 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				reqCtx.reqHeaderResp = s.generateRequestHeaderResponse(ctx, reqCtx)
 				reqCtx.reqBodyResp = envoy.GenerateRequestBodyResponses(reqCtx.Request.RawBody)
 				fairnessID, priority := extractFairnessAndPriority(reqCtx)
-				metrics.RecordRequestCounter(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, reqCtx.Priority)
+				metrics.RecordRequestCounter(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, reqCtx.Priority, reqCtx.TargetEndpoint)
 				metrics.RecordRequestSizes(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority, reqCtx.RequestSize)
 
 				if parseResult.SkipResponseProcessing {

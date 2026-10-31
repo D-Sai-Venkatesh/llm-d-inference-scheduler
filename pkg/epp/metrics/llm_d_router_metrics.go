@@ -33,6 +33,13 @@ var (
 	llmdEndpointLabels                       = []string{"endpoint_name", "namespace", "port"}
 	modelLabelsWithFairnessPriority          = append(append([]string{}, modelLabels...), "fairness_id", "priority")
 	modelLabelsWithFairnessPriorityStreaming = append(append([]string{}, modelLabelsWithFairnessPriority...), "streaming")
+	// modelLabelsWithTarget carries the endpoint the request was DISPATCHED to
+	// (host:port) in addition to the identity labels. Only request_total gets it:
+	// it is the one series whose whole purpose is counting dispatches, and joining
+	// it to the engine is what makes per-endpoint request rates derivable from the
+	// EPP's own metrics instead of the span join. An empty value means the request
+	// never reached a picked endpoint (rejected / no candidates).
+	modelLabelsWithTarget = append(append([]string{}, modelLabelsWithFairnessPriority...), "target_endpoint")
 )
 
 // --- llm-d Inference Objective Metrics ---
@@ -43,7 +50,7 @@ var (
 			Name:      "request_total",
 			Help:      metricsutil.HelpMsgWithStability("Total number of processed requests.", compbasemetrics.ALPHA),
 		},
-		modelLabelsWithFairnessPriority,
+		modelLabelsWithTarget,
 	)
 
 	llmdRequestErrCounter = prometheus.NewCounterVec(

@@ -260,6 +260,7 @@ func (r *GroupScheduler) runTicker(ctx context.Context) {
 		case <-ticker.C:
 			now := time.Now()
 			r.pollCapacity(now)
+			r.pushEngineLoad(now)
 			r.sched.Tick(now)
 			r.metrics.Refresh()
 		}
@@ -641,6 +642,43 @@ func endpointKey(ep metricsSource) string {
 	return fmt.Sprint(ep)
 }
 
+// pushEngineLoad feeds the PER-ENGINE saturation gate (engineGate=per-engine) from
+// the endpoint metrics the plugin already polls. The policy never scrapes and never
+// blocks; it receives one snapshot per engine per tick and applies the DETECTOR'S
+// OWN FORMULA per engine (max(waiting/queueThreshold, kv/kvThreshold) >= 1).
+//
+// A vanished endpoint's snapshot is cleared, because a stale "saturated" flag on an
+// engine the EPP no longer sees would keep a live sibling's gate closed forever.
+func (r *GroupScheduler) pushEngineLoad(now time.Time) {
+	if !r.cfg.engineGating() {
+		return
+	}
+	r.capMu.Lock()
+	type target struct {
+		key string
+		ep  metricsSource
+	}
+	targets := make([]target, 0, len(r.endpoints))
+	for key, st := range r.endpoints {
+		if st == nil || st.ep == nil {
+			continue
+		}
+		targets = append(targets, target{key: key, ep: st.ep})
+	}
+	r.capMu.Unlock()
+	sort.Slice(targets, func(i, j int) bool { return targets[i].key < targets[j].key })
+	seen := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		m := t.ep.GetMetrics()
+		if m == nil {
+			continue
+		}
+		seen[t.key] = struct{}{}
+		r.sched.SetEngineLoad(t.key, m.KVCacheUsagePercent, m.WaitingQueueSize, now)
+	}
+	r.sched.ForgetEngineLoadsExcept(seen)
+}
+
 // pollCapacity is the METRICS-POLL FALLBACK (WAVE-1 item 1), run on the
 // ticker while the capacity is unknown: re-read every remembered endpoint's
 // metrics (the datalayer refreshes them in place on the same object) and take
@@ -718,11 +756,12 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 			return true
 		}
 		member, scope, source := "", "", ""
-		reqID, size := "", int64(0)
+		reqID, size, fid := "", int64(0), ""
 		if req := h.OriginalRequest(); req != nil {
 			if ir := req.InferenceRequest(); ir != nil {
 				member, scope, source = r.memberOf(ir)
 				reqID = ir.RequestID
+				fid = ir.FairnessID // the wire-level identity (the queue key)
 				size = int64(ir.RequestSizeBytes)
 				if size <= 0 {
 					size = int64(req.ByteSize())
@@ -730,7 +769,8 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 			}
 		}
 		queues = append(queues, q)
-		heads = append(heads, Head{Member: member, Session: scope, Source: source, ReqID: reqID, Arrival: h.EnqueueTime(), SizeBytes: size})
+		heads = append(heads, Head{Member: member, Session: scope, Source: source,
+			FairnessID: fid, ReqID: reqID, Arrival: h.EnqueueTime(), SizeBytes: size})
 		return true
 	})
 	if len(heads) == 0 {

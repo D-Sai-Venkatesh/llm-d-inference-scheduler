@@ -139,16 +139,14 @@ func TestEmptyBodyNoPhantomBlock(t *testing.T) {
 	}
 }
 
-// ---- S0-1: exiting state (the review's R1/R2/R3) ----
+// ---- S0-1: exiting state (the review's R1/R2/R3, restated for the charged-drain rule) ----
 
 func TestExitingUnseatDoesNotStealNE(t *testing.T) {
 	// R1: a and b share 3 chunks; MarkExiting(a) then Unseat(a) must
 	// leave b's budget contribution intact.
 	idx := newIdx(t)
 	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
-	neB := 0
 	mustSeat(t, idx, "b", body(3, 2, 'N'), 1000)
-	_ = neB
 	neBoth := idx.UniqueBlocksNE() // 3 shared + 1 + 2 = 6
 	if neBoth != 6 {
 		t.Fatalf("NE both: %d want 6", neBoth)
@@ -160,35 +158,61 @@ func TestExitingUnseatDoesNotStealNE(t *testing.T) {
 	}
 }
 
+// An exiting member's blocks STAY on the used side until it drains: mark the
+// member, and the budget still pays for its blocks (the engine pins them until the
+// running request finishes). Releasing them at the mark was the accounting bug the
+// multi-pod wave measured at 14-18 % of the pool.
+func TestExitingMemberStaysChargedUntilUnseat(t *testing.T) {
+	idx := newIdx(t)
+	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
+	before := idx.UniqueBlocksNE()
+	idx.MarkExiting("a")
+	if got := idx.UniqueBlocksNE(); got != before {
+		t.Fatalf("NE after MarkExiting: %d want %d (the blocks are still held)", got, before)
+	}
+	idx.Unseat("a")
+	if got := idx.UniqueBlocksNE(); got != 0 {
+		t.Fatalf("NE after the drain (Unseat): %d want 0", got)
+	}
+	idx.checkInvariantLocked()
+}
+
+// MarkExiting changes no counter, so repeating it cannot double-release anything.
 func TestMarkExitingIdempotent(t *testing.T) {
 	idx := newIdx(t)
 	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
+	ne := idx.UniqueBlocksNE()
 	idx.MarkExiting("a")
 	idx.MarkExiting("a")
 	idx.MarkExiting("a")
-	if got := idx.UniqueBlocksNE(); got != 0 {
-		t.Fatalf("R2: NE after triple MarkExiting: %d want 0", got)
+	if got := idx.UniqueBlocksNE(); got != ne {
+		t.Fatalf("R2: NE after triple MarkExiting: %d want %d", got, ne)
 	}
 	if got := idx.UniqueBlocks(); got != 4 {
 		t.Fatalf("still seated+counted: %d want 4", got)
 	}
+	idx.checkInvariantLocked()
 }
 
-func TestExitingMemberUpdatesDoNotTouchNE(t *testing.T) {
+// An exiting member's growth is pinned by the engine like anyone else's, so it is
+// charged: the retiree's next turn is real KV, and the budget must see it.
+func TestExitingMemberGrowthStaysCharged(t *testing.T) {
 	idx := newIdx(t)
 	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
 	mustSeat(t, idx, "b", body(3, 2, 'N'), 1000)
 	idx.MarkExiting("a")
-	// a grows while exiting: new waiting blocks must NOT enter the budget
+	before := idx.UniqueBlocksNE()
+	// a grows while exiting: the new blocks enter both counters
 	if err := idx.UpdateWaiting("a", "r", body(0, 2, 'Q')); err != nil {
 		t.Fatal(err)
 	}
 	if err := idx.SettleDispatched("a", "r", body(0, 2, 'Q')); err != nil {
 		t.Fatal(err)
 	}
-	if got := idx.UniqueBlocksNE(); got != 5 {
-		t.Fatalf("R3: NE after exiting member growth: %d want 5", got)
+	if got := idx.UniqueBlocksNE(); got != idx.UniqueBlocks() || got <= before-2 {
+		t.Fatalf("R3: NE after exiting member growth: %d (union %d) want the exiting member fully charged", got, idx.UniqueBlocks())
 	}
+	idx.checkInvariantLocked()
 }
 
 // ---- seating semantics ----

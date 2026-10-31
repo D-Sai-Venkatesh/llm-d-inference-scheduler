@@ -367,6 +367,7 @@ func TestBudgetValvePrefersTheDoneMember(t *testing.T) {
 func TestNoEvictionWhileInFlight(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 400, 2*time.Second)
+		fx.s.Chunk("m") // m's prefill landed (its turn keeps decoding); the cold slot is free
 		fx.seatOne(t, "m2", 400, time.Second)
 		// m's first turn is still running when its second (grown) head is served
 		i := fx.pick(head("m", time.Millisecond, bytesFor(700)))
@@ -387,19 +388,100 @@ func TestNoEvictionWhileInFlight(t *testing.T) {
 	})
 }
 
+// AN EXITING MEMBER'S BLOCKS STAY ON THE USED SIDE UNTIL IT DRAINS. Marking a
+// member exiting says "do not dispatch, do not re-seat" — it says nothing about the
+// engine, which keeps the member's blocks pinned until the running request finishes.
+// Excluding them from the budget at the mark was a plain accounting bug: the budget
+// then believed it had 14-18 % of the pool free while the pool was still paying for
+// it (measured on the multi-pod wave).
+func TestExitingMemberStaysOnTheUsedSideUntilDrain(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		for i := range fx.ids {
+			fx.seatOne(t, fmt.Sprintf("m%d", i), 400, time.Duration(5+i)*time.Second)
+		}
+		min, g := fx.member(t, "m0")
+		fx.s.mu.Lock()
+		// in flight and marked exiting (the mid-flight pressure class)
+		min.inflightIDs = map[string]inflightRec{"r-m0": {since: fx.clock, confirmed: true}}
+		min.inflight = 1
+		freeBefore := fx.s.freeBudgetLocked(g)
+		neBefore := g.index.UniqueBlocksNELocked()
+		g.index.MarkExitingLocked("m0")
+		neAfter := g.index.UniqueBlocksNELocked()
+		freeAfter := fx.s.freeBudgetLocked(g)
+		fx.s.mu.Unlock()
+		if neAfter != neBefore {
+			t.Fatalf("marking a member exiting released %d blocks from the used side (NE %d -> %d)",
+				neBefore-neAfter, neBefore, neAfter)
+		}
+		if freeAfter != freeBefore {
+			t.Fatalf("the mark freed budget (free %d -> %d): the engine still holds those blocks",
+				freeBefore, freeAfter)
+		}
+		// the drain is what releases them
+		settle(fx.s, "m0", 400, 400)
+		fx.s.mu.Lock()
+		defer fx.s.mu.Unlock()
+		if _, seated := g.members["m0"]; seated {
+			t.Fatal("a drained exiting member must leave")
+		}
+		if got := g.index.UniqueBlocksNELocked(); got >= neBefore {
+			t.Fatalf("the drain did not release the member's blocks: NE %d want < %d", got, neBefore)
+		}
+	})
+}
+
+// An exiting member that cannot be freed must END the enforcement pass: marking is
+// idempotent and its blocks stay charged, so re-picking it would spin the loop
+// forever under the scheduler's mutex.
+func TestExitingVictimDoesNotSpinEnforcement(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		fx.seatOne(t, "m", 900, 2*time.Second)
+		m, g := fx.member(t, "m")
+		fx.s.mu.Lock()
+		m.inflightIDs = map[string]inflightRec{"r-m": {since: fx.clock, confirmed: true}}
+		m.inflight = 1
+		g.index.MarkExitingLocked("m")
+		// way over budget with the only member already exiting
+		g.budgetBlocks = 100
+		fx.s.mu.Unlock()
+		// The enforcement pass runs BEFORE Tick's queue re-sync, so a clock this far
+		// ahead leaves the queue view untrustworthy — the one path that names an
+		// already-exiting member as the victim.
+		fx.clock = fx.clock.Add(60 * time.Second)
+		done := make(chan struct{})
+		go func() {
+			fx.s.Tick(fx.clock)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("Tick spun: an exiting in-flight victim was re-picked forever")
+		}
+		if !fx.s.Seated("m") {
+			t.Fatal("the exiting member must still be seated (it drains, it is not evicted)")
+		}
+	})
+}
+
 // The cold-entry valve: one cold entry is ALWAYS allowed (R11); a second waits until
 // the first's prefill completes — and the cap is PER ENGINE, so at N=2 the second
 // oversized entry may seat immediately on the sibling engine.
+//
+// The cap is DERIVED from the engine: 10,000 blocks at 0.95 leaves 500 blocks of
+// headroom = 32,000 tokens, so a 1,000-block entry is twice the cap and still fits
+// the budget by a mile — the valve, not the budget, is the binding constraint.
 func TestColdEntryValveIsPerEngine(t *testing.T) {
-	cfg := defaultConfig()
-	cfg.ColdEntryCapTokens = 640 // 10 blocks worth of tokens
-	// the budget must be huge: the cold cap is the binding constraint here
-	forEnginesCap(t, cfg, 100000, func(t *testing.T, fx *engineSet) {
-		big := bytesFor(20000) // a 20k-block session, far over the cap
+	forEnginesCap(t, defaultConfig(), 10000, func(t *testing.T, fx *engineSet) {
+		big := bytesFor(1000) // twice the derived cap (500 blocks), far inside the budget
+		if got, want := fx.g().coldCapTokens(0.95, 64), int64(500*64); got != want {
+			t.Fatalf("derived cold cap: %d want %d", got, want)
+		}
 		if i := fx.pick(head("big1", time.Second, big)); i != 0 {
 			t.Fatal("a big newcomer must be seated when nothing cold is in flight (R11)")
 		}
-		dispatch(t, fx.s, "big1", keys(20000, 1), big)
+		dispatch(t, fx.s, "big1", keys(1000, 1), big)
 		h2 := []Head{head("big2", time.Second, big)}
 		i := fx.pick(h2...)
 		if len(fx.ids) == 1 {
@@ -498,6 +580,22 @@ func TestNoStarvation(t *testing.T) {
 			waiters = append(waiters, fmt.Sprintf("w%d", i))
 		}
 		gotSeat := map[string]bool{}
+		// The synthetic head list has to rotate: with the cold-entry cap derived from
+		// the engine (50 blocks here) a seam is only admitted while the engine's cold
+		// slot is free, and a slot is freed when the seated member's head RUNS. Two
+		// heads with the same synthetic arrival let one member win every Pick, so the
+		// other stayed seated-but-never-dispatched and the test measured that artifact
+		// instead of starvation. The least-served member gets the oldest head.
+		served := map[string]int{}
+		maxServed := func() int {
+			m := 0
+			for _, n := range served {
+				if n > m {
+					m = n
+				}
+			}
+			return m
+		}
 		seatedCount := func() int {
 			n := 0
 			for _, id := range waiters {
@@ -510,14 +608,17 @@ func TestNoStarvation(t *testing.T) {
 		}
 		allHeads := func() []Head {
 			hs := make([]Head, 0, len(waiters)+3)
+			age := func(id string) time.Duration {
+				return time.Duration(maxServed()+1-served[id]) * time.Millisecond
+			}
 			for _, id := range []string{"m0", "m1", "m2"} {
 				if fx.s.Seated(id) {
-					hs = append(hs, head(id, 10*time.Millisecond, bytesFor(300)))
+					hs = append(hs, head(id, age(id), bytesFor(300)))
 				}
 			}
 			for i, id := range waiters {
 				if fx.s.Seated(id) {
-					hs = append(hs, head(id, 5*time.Millisecond, bytesFor(300)))
+					hs = append(hs, head(id, age(id), bytesFor(300)))
 				} else {
 					hs = append(hs, head(id, time.Duration(len(waiters)-i)*100*time.Millisecond, bytesFor(300)))
 				}
@@ -535,6 +636,7 @@ func TestNoStarvation(t *testing.T) {
 				if id != "" && fx.s.Seated(id) {
 					dispatch(t, fx.s, id, keys(300, Hash(uint64(id[len(id)-1]))), bytesFor(300))
 					settle(fx.s, id, 300, 300)
+					served[id]++
 				}
 			}
 			fx.tick(time.Second)
@@ -624,9 +726,10 @@ func TestLeakedColdChargeVanishesOnDerive(t *testing.T) {
 		fx.g().coldInFlight += 999999
 		fx.s.deriveLocked()
 		got := fx.g().coldInFlight
+		cap := fx.g().coldCapTokens(fx.s.cfg.GroupBudgetFraction, fx.s.blockSize)
 		fx.s.mu.Unlock()
-		if got > fx.s.cfg.ColdEntryCapTokens {
-			t.Fatalf("the derived cold charge must replace the leak, got %d", got)
+		if got > cap {
+			t.Fatalf("the derived cold charge must replace the leak, got %d (cap %d)", got, cap)
 		}
 	})
 }

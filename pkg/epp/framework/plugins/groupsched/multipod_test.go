@@ -44,6 +44,9 @@ func TestT1SeatGoesToTheMostFreeBudget(t *testing.T) {
 		}
 		// engine-a is 300 blocks fuller than engine-b, so b has more free budget
 		fx.seatOn(t, fx.ids[0], "big", 300, 3*time.Second)
+		// the resident's prefill lands, so its engine's cold-entry slot is free again
+		// (the derived cap is 5 % of the engine, and an outstanding prefill owns it)
+		fx.s.Chunk("big")
 		h := head("m", time.Second, bytesFor(100))
 		e, i := fx.pickEngine(h)
 		if i != 0 {
@@ -121,6 +124,7 @@ func TestT3e4RegressionNoLockInOnQueueDepth(t *testing.T) {
 		for i := 0; i < 4; i++ {
 			id := fmt.Sprintf("s%d", i)
 			fx.seatOne(t, id, 100, time.Duration(10+i)*time.Second)
+			fx.s.Chunk(id) // each resident's prefill has landed: its cold slot is free
 			m, _ := fx.member(t, id)
 			fx.s.mu.Lock()
 			m.waitingSince = fx.clock.Add(-time.Duration(5+i) * time.Second)
@@ -134,10 +138,14 @@ func TestT3e4RegressionNoLockInOnQueueDepth(t *testing.T) {
 		fx.s.Tick(fx.clock)
 		before := fx.s.Snapshot()
 		for i := 0; i < 6; i++ {
-			h := head(fmt.Sprintf("q%d", i), time.Duration(60-i)*time.Second, bytesFor(50))
+			id := fmt.Sprintf("q%d", i)
+			h := head(id, time.Duration(60-i)*time.Second, bytesFor(50))
 			if _, j := fx.pickEngine(h); j < 0 {
 				t.Fatalf("head %d must be seated: 3 %% KV and a deep waiting queue are not saturation", i)
 			}
+			// the head is dispatched by the same pass: its prefill lands, which is what
+			// frees the engine's single cold-entry slot for the next newcomer
+			fx.s.Chunk(id)
 		}
 		after := fx.s.Snapshot()
 		if after.Seats <= before.Seats {
@@ -416,6 +424,13 @@ func TestMultiEngineGoldenProperties(t *testing.T) {
 		if es.NEBlocks > es.BudgetBlocks {
 			t.Fatalf("engine %s is over its budget at the end of the run (%d > %d)", es.ID, es.NEBlocks, es.BudgetBlocks)
 		}
+		// the derived cold-entry cap is per engine and the charge never exceeds it
+		if es.ColdCapTokens <= 0 {
+			t.Fatalf("engine %s has no derived cold-entry cap", es.ID)
+		}
+		if es.ColdInFlight > es.ColdCapTokens {
+			t.Fatalf("engine %s: cold charge %d exceeds its derived cap %d", es.ID, es.ColdInFlight, es.ColdCapTokens)
+		}
 	}
 	if seats != snapTwo.Seats {
 		t.Fatalf("the whole-policy seat count must be the per-engine sum (%d vs %d)", seats, snapTwo.Seats)
@@ -426,17 +441,19 @@ func TestMultiEngineGoldenProperties(t *testing.T) {
 // engine's BUDGET but is held by the cold-entry valve WAITS for the prefill slot.
 // Evicting members frees budget, never the valve, so every eviction taken on such a
 // pass was wasted — and the engine's seats sat cold-empty until the prefill finished.
+//
+// The cap is derived per engine (5 % of 10,000 blocks = 500 blocks = 32,000 tokens),
+// so a 600-block resident fills its engine's whole cold slot while leaving 8,900
+// blocks of budget free: the valve is the only thing holding the next head.
 func TestColdValveHeldHeadNeverEvicts(t *testing.T) {
-	cfg := defaultConfig()
-	cfg.ColdEntryCapTokens = 640 // 10 blocks of cold charge: binds immediately
-	forEnginesCap(t, cfg, 100000, func(t *testing.T, fx *engineSet) {
-		// ONE resident per ENGINE seats (its cold charge alone exceeds the cap, and the
+	forEnginesCap(t, defaultConfig(), 10000, func(t *testing.T, fx *engineSet) {
+		// ONE resident per ENGINE seats (its cold charge alone fills the cap, and the
 		// placement spreads them one per engine because a closed valve is not a
 		// candidate), and their prefills stay in flight (no Chunk), so EVERY engine's
 		// valve has no room for another entry
 		for i := range fx.ids {
 			id := fmt.Sprintf("res%d", i)
-			fx.seatOne(t, id, 500, time.Duration(5+i)*time.Second)
+			fx.seatOne(t, id, 600, time.Duration(5+i)*time.Second)
 		}
 		before := fx.s.Snapshot()
 		// each resident has a queued turn (so nobody is a rotation victim) and a big
@@ -477,9 +494,7 @@ func TestColdValveHeldHeadNeverEvicts(t *testing.T) {
 // AT N=2 THE HEAD MOVES TO THE SIBLING rather than waiting: engine A's valve refuses
 // it, engine B both fits by budget AND allows it.
 func TestColdValveHeldHeadSeatsOnTheSibling(t *testing.T) {
-	cfg := defaultConfig()
-	cfg.ColdEntryCapTokens = 640
-	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		if len(fx.ids) < 2 {
 			t.Skip("needs two engines: the sibling is the point")
 		}

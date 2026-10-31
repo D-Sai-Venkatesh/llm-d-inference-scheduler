@@ -484,9 +484,11 @@ func TestCoreMatchesF0PUpToTheFixes(t *testing.T) {
 		t.Fatalf("f0p baseline golden missing: %v", err)
 	}
 	want := norm(string(raw))
-	// measured: line 1,017 is the first place a declared fix changes a decision
-	// (t=395, a class-3 exit that the stale-view guard creates).
-	const shared = 1000
+	// measured: line 745 is the first place a declared fix changes a decision (t=333,
+	// an admission fix 5 — the charged drain — refuses). The shared prefix is pinned one
+	// line short of it, so the test fails the moment ANY change moves the first
+	// divergence earlier.
+	const shared = 744
 	limit := shared
 	if len(got) < limit || len(want) < limit {
 		t.Fatalf("trace shorter than the pinned shared prefix (%d lines)", shared)

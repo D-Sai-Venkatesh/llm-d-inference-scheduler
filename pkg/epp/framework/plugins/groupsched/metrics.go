@@ -46,6 +46,7 @@ type groupMetrics struct {
 	budgetBlocks *prometheus.GaugeVec
 	waiters      *prometheus.GaugeVec
 	coldInFlight *prometheus.GaugeVec
+	coldCap      *prometheus.GaugeVec
 	capacity     *prometheus.GaugeVec
 	// waitersShared is the SHARED waiter queue's size (one number, no engine label,
 	// because a waiter belongs to no engine until one seats it).
@@ -62,13 +63,17 @@ type groupMetrics struct {
 	// Refresh adds the DELTA, so the series has exactly one source of truth (the
 	// scheduler's own count) and nothing can be double-booked or forgotten.
 	queueViewUntrustedLast int64
-	exits                  *prometheus.CounterVec
-	residency              *prometheus.HistogramVec
-	entryWait              *prometheus.HistogramVec
-	reentryWait            *prometheus.HistogramVec
-	refillShare            prometheus.Gauge
-	served                 *prometheus.CounterVec
-	fcfs                   *prometheus.CounterVec
+	// eventRingDropped / eventRingDroppedLast are the same delta pattern for the ring's
+	// wrap count.
+	eventRingDropped     prometheus.Counter
+	eventRingDroppedLast int64
+	exits                *prometheus.CounterVec
+	residency            *prometheus.HistogramVec
+	entryWait            *prometheus.HistogramVec
+	reentryWait          *prometheus.HistogramVec
+	refillShare          prometheus.Gauge
+	served               *prometheus.CounterVec
+	fcfs                 *prometheus.CounterVec
 
 	capacityMissing *prometheus.GaugeVec
 	capacityLearned *prometheus.CounterVec
@@ -123,13 +128,15 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.uniqueBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "unique_blocks",
 		Help: "distinct blocks the engine's index holds for this policy"}, engineLabels)
 	g.neBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "ne_blocks",
-		Help: "distinct blocks held by NON-EXITING seated members (the budget's used side)"}, engineLabels)
+		Help: "distinct blocks charged to this engine's budget: every seated member's set, exiting members included until they drain"}, engineLabels)
 	g.budgetBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "budget_blocks",
 		Help: "seat budget in blocks (groupBudgetFraction x this engine's num_gpu_blocks)"}, engineLabels)
 	g.waiters = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "waiters",
 		Help: "waiting heads ACCOUNTED to this engine (0 by construction: the queue is shared; see waiters_shared)"}, engineLabels)
 	g.coldInFlight = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "cold_inflight_tokens",
 		Help: "outstanding cold-entry charge in tokens against this engine's stagger cap"}, engineLabels)
+	g.coldCap = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "cold_cap_tokens",
+		Help: "DERIVED cold-entry stagger cap in tokens: floor((1-groupBudgetFraction) x this engine's num_gpu_blocks) x blockSizeTokens"}, engineLabels)
 	g.capacity = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "num_gpu_blocks",
 		Help: "measured KV capacity in blocks for this engine"}, engineLabels)
 	g.waitersShared = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "waiters_shared",
@@ -138,6 +145,8 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "age of the queue-head snapshot the 'has a queued head' evidence comes from, on the decision clock (-1 = no snapshot yet, always > idleSeconds = the evidence is untrustworthy)"})
 	g.queueViewUntrusted = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "queue_view_untrusted_passes_total",
 		Help: "budget-enforcement passes whose victim choice ran with a queue view older than idleSeconds (the C8 guard skipped the head-presence classes)"})
+	g.eventRingDropped = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "event_ring_dropped_total",
+		Help: "SEAT/EXIT events the bounded ring has wrapped past (the DumpState tail no longer covers the whole window; the stdout event stream still does)"})
 	g.exits = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "exits_total",
 		Help: "member exits by reason"}, []string{"engine", "reason"})
 	g.residency = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "residency_turns",
@@ -186,11 +195,11 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "heads the cold-entry valve held back (the budget would have admitted them; they WAIT, nothing is evicted)"}, engineLabels)
 
 	for _, c := range []prometheus.Collector{g.seats, g.uniqueBlocks, g.neBlocks, g.budgetBlocks,
-		g.waiters, g.coldInFlight, g.capacity, g.waitersShared, g.exits, g.residency, g.entryWait,
+		g.waiters, g.coldInFlight, g.coldCap, g.capacity, g.waitersShared, g.exits, g.residency, g.entryWait,
 		g.reentryWait, g.refillShare, g.served, g.fcfs, g.capacityMissing, g.capacityLearned,
 		g.safetyFired, g.safetyFires, g.safetyFiredSeconds, g.safetySkips, g.engineKV, g.engineWaiting,
 		g.poolScore, g.staleSamples, g.capacityHeterogeneous, g.filterDecisions, g.affinityViolations, g.rebinds, g.engineGone,
-		g.coldValveHeld, g.queueViewAge, g.queueViewUntrusted} {
+		g.coldValveHeld, g.queueViewAge, g.queueViewUntrusted, g.eventRingDropped} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second
 			// plugin config in the same test binary) must not fail startup: the series
@@ -233,6 +242,7 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 		g.capacity.WithLabelValues(label).Set(float64(es.NumBlocks))
 		g.waiters.WithLabelValues(label).Set(float64(es.Waiters))
 		g.coldInFlight.WithLabelValues(label).Set(float64(es.ColdInFlight))
+		g.coldCap.WithLabelValues(label).Set(float64(es.ColdCapTokens))
 		g.served.WithLabelValues(label).Add(0)
 		g.fcfs.WithLabelValues("nocapacity").Add(0)
 		g.safetySkips.WithLabelValues(label).Add(0)
@@ -261,7 +271,7 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 		}
 		delete(g.known, label)
 		for _, vec := range []*prometheus.GaugeVec{g.seats, g.uniqueBlocks, g.neBlocks,
-			g.budgetBlocks, g.capacity, g.waiters, g.coldInFlight, g.safetyFired,
+			g.budgetBlocks, g.capacity, g.waiters, g.coldInFlight, g.coldCap, g.safetyFired,
 			g.engineKV, g.engineWaiting} {
 			vec.DeleteLabelValues(label)
 		}
@@ -271,6 +281,10 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 	if d := snap.QueueViewUntrusted - g.queueViewUntrustedLast; d > 0 {
 		g.queueViewUntrusted.Add(float64(d))
 		g.queueViewUntrustedLast = snap.QueueViewUntrusted
+	}
+	if d := snap.EventRingDropped - g.eventRingDroppedLast; d > 0 {
+		g.eventRingDropped.Add(float64(d))
+		g.eventRingDroppedLast = snap.EventRingDropped
 	}
 	g.poolScore.Set(math.Float64frombits(poolScoreBits))
 	g.refillShare.Set(snap.RefillShare)

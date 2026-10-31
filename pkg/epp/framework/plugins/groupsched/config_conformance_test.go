@@ -49,7 +49,6 @@ package groupsched
 //	  quantum: 4
 //	  idleSeconds: 20
 //	  ttlSeconds: 30
-//	  coldEntryCapTokens: 131072
 //	  inFlightCap: 64
 //	  blockSizeTokens: 64
 //	  capacityLivenessSeconds: 120
@@ -105,7 +104,6 @@ var emittedBlocks = []emittedBlock{
 quantum: 4
 idleSeconds: 20
 ttlSeconds: 30
-coldEntryCapTokens: 131072
 inFlightCap: 64
 blockSizeTokens: 64
 capacityLivenessSeconds: 120

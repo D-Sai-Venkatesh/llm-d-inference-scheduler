@@ -116,12 +116,17 @@ func e4aScenario(t *testing.T, simEnd int) (string, Snapshot, *Scheduler) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// engine-a is deliberately TIGHT (570 blocks of budget) and engine-b roomy
-	// (1520): re-entry must NOT be a coin flip.
-	if err := s.SetNumBlocksFor("engine-a", 64, 700); err != nil { // budget 665
+	// The two engines are the SAME size — the campaign's real shape (a
+	// heterogeneous pool is an alarm: capacity_heterogeneous must read 0). The
+	// seat-time rule therefore differentiates on mass (free budget) and on the
+	// member's own queued demand, never on a capacity advantage; the RESEAT
+	// behaviour itself is pinned by TestSeatPinReseatOnDifferentEngine, where it
+	// can be engineered deterministically instead of waiting for the scenario to
+	// produce it.
+	if err := s.SetNumBlocksFor("engine-a", 64, 900); err != nil { // budget 855
 		t.Fatal(err)
 	}
-	if err := s.SetNumBlocksFor("engine-b", 64, 1600); err != nil { // budget 1520
+	if err := s.SetNumBlocksFor("engine-b", 64, 900); err != nil { // budget 855
 		t.Fatal(err)
 	}
 
@@ -288,11 +293,6 @@ func TestSeatPinMultiEngineGolden(t *testing.T) {
 		}
 		t.Fatal("the E4a trace diverges (length)")
 	}
-	// the golden must actually CONTAIN the behaviour the arm exists to show:
-	// a member seated on a different engine than one of its previous seats.
-	if !strings.Contains(got, "RESEAT") {
-		t.Fatal("the E4a golden has no RESEAT line: the scenario no longer demonstrates that a re-entry's seat may land on a different engine")
-	}
 	// and the pin must hold: no member is charged to an engine it is not seated on.
 	if snap.AffinityViolations != 0 {
 		t.Fatalf("affinity violations = %d in a seat=pin run with no injected violation, want 0", snap.AffinityViolations)
@@ -385,59 +385,67 @@ func TestSeatPinGlobalWaiterPool(t *testing.T) {
 	}
 }
 
-// TestSeatPinSeatChoiceFitLeastBacklog is the seat-time rule's first two levels:
-// a FITTING engine is preferred over an unfitting one, and among fitting engines
-// the one with the LOWER relative backlog per seat wins.
+// TestSeatPinSeatChoiceLadder is the seat-time rule, level by level:
 //
-// Under seat=pin the UNSEATED demand is global, so "relative backlog" separates
-// engines by what each still has room for: the same queued demand divided by the
-// seats an engine already holds plus its queued residents. Both halves are
-// exercised below.
-func TestSeatPinSeatChoiceFitLeastBacklog(t *testing.T) {
+//	fit → least own queued demand per seat → MORE free budget → fewer seats → id.
+//
+// The free-budget key is the reviewer's R1: a seat COUNT balances member count
+// while mass is what the KV budget holds, and count-vs-mass is the measured
+// asymmetry (E1 0.977/0.683 with symmetric logical splits).
+func TestSeatPinSeatChoiceLadder(t *testing.T) {
 	s, err := NewScheduler(e4aCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetNumBlocksFor("engine-a", 64, 400); err != nil {
+	if err := s.SetNumBlocksFor("engine-a", 64, 400); err != nil { // budget 380
 		t.Fatal(err)
 	}
-	if err := s.SetNumBlocksFor("engine-b", 64, 4000); err != nil {
+	if err := s.SetNumBlocksFor("engine-b", 64, 4000); err != nil { // budget 3800
 		t.Fatal(err)
 	}
 	now := goldenT0
-	w := &waiter{id: "m1", since: now, sizeBytes: bytesFor(60), coldTokens: 60 * 64}
-	// (a) FIT: an empty pool ties at 0, so the id order decides.
+	w := &waiter{id: "m1", since: now, sizeBytes: bytesFor(60), coldTokens: 60 * 64,
+		coldTokensByEngine: map[string]int64{"engine-a": 60 * 64, "engine-b": 60 * 64}}
+
+	// (a) FREE BUDGET decides first: both idle, engine-b has far more mass room.
 	if c := s.seatEngineLocked(w, now); c == nil || !c.fits {
 		t.Fatalf("expected a fitting candidate, got %+v", c)
-	} else if c.g.id != "engine-a" {
-		t.Fatalf("tie-break chose %q, want engine-a (id order)", c.g.id)
+	} else if c.g.id != "engine-b" {
+		t.Fatalf("free-budget tie-break chose %q, want engine-b (3800 free vs 380)", c.g.id)
 	}
-	// (b) FIT + BACKLOG: give engine-a residents with QUEUED heads. Those are the
-	// per-engine part of the backlog numerator, so engine-a's relative backlog
-	// rises above engine-b's and the choice must move.
+
+	// (b) BACKLOG outranks free budget: give engine-b a resident with a queued head.
 	s.mu.Lock()
-	ga := s.groups["engine-a"]
-	for i := 0; i < 4; i++ {
-		id := fmt.Sprintf("a%d", i)
-		if ok, _ := ga.index.TrySeatLocked(id, ga.budgetBlocks); !ok {
-			s.mu.Unlock()
-			t.Fatalf("could not seat %s on engine-a", id)
-		}
-		ga.members[id] = &member{id: id, engine: "engine-a", seatTime: now, lastActivity: now,
-			waitingSince: now}
+	gb := s.groups["engine-b"]
+	if ok, _ := gb.index.TrySeatLocked("b0", gb.budgetBlocks); !ok {
+		s.mu.Unlock()
+		t.Fatal("could not seat b0")
 	}
+	gb.members["b0"] = &member{id: "b0", engine: "engine-b", seatTime: now, lastActivity: now, waitingSince: now}
 	c := s.seatEngineLocked(w, now)
-	gaBacklog := s.backlogPerSeatLocked(ga)
 	s.mu.Unlock()
-	if c == nil || c.g.id != "engine-b" {
-		t.Fatalf("with engine-a's residents queued the choice must move to engine-b, got %+v", c)
+	if c == nil || c.g.id != "engine-a" {
+		t.Fatalf("a queued resident on engine-b must hand the seat to engine-a, got %+v", c)
 	}
-	if c.backlogPerSeat >= gaBacklog {
-		t.Fatalf("chosen backlog/seat %.2f is not below engine-a's %.2f", c.backlogPerSeat, gaBacklog)
+
+	// (c) ID ORDER when everything else ties.
+	eq, err := NewScheduler(e4aCfg())
+	if err != nil {
+		t.Fatal(err)
 	}
-	// (c) FIT PREFERENCE: a head too big for engine-a's budget must skip it even
-	// though engine-a is the id-order favourite and currently the least backlogged.
-	big := &waiter{id: "big", since: now, sizeBytes: bytesFor(12000), coldTokens: 2000 * 64}
+	for _, id := range []string{"engine-a", "engine-b"} {
+		if err := eq.SetNumBlocksFor(id, 64, 1000); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c := eq.seatEngineLocked(w, now); c == nil || c.g.id != "engine-a" {
+		t.Fatalf("a total tie must break on engine id (engine-a), got %+v", c)
+	}
+
+	// (d) FIT PREFERENCE: a head too big for engine-a must skip it, whatever the
+	// other keys say.
+	big := &waiter{id: "big", since: now, sizeBytes: bytesFor(12000),
+		coldTokensByEngine: map[string]int64{"engine-a": 2000 * 64, "engine-b": 2000 * 64}}
 	s.mu.Lock()
 	cb := s.seatEngineLocked(big, now)
 	s.mu.Unlock()
@@ -552,5 +560,68 @@ func TestE4aVsE3OneVariableDiff(t *testing.T) {
 	}
 	if got, pooled, per := ms(e4a); got != 0 || pooled != 1 || per != 0 {
 		t.Fatalf("E4a (seat): %d binding(s) before any seat, %d pooled and %d partitioned waiter(s), want 0, 1, 0", got, pooled, per)
+	}
+}
+
+// TestSeatPinReseatOnDifferentEngine is the seat=pin fact member-stable cannot
+// produce: a member's NEXT seat may be on a different engine than its previous
+// one, because the binding is the SEAT and nothing else. (In member-stable the
+// engine is chosen at first sight and kept for bindingTtlSeconds, so a returning
+// member lands where it was homed.)
+func TestSeatPinReseatOnDifferentEngine(t *testing.T) {
+	s, err := NewScheduler(e4aCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNumBlocksFor("engine-a", 64, 900); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNumBlocksFor("engine-b", 64, 900); err != nil {
+		t.Fatal(err)
+	}
+	now := goldenT0
+	heads := func(since time.Time) []Head {
+		return []Head{{Member: "m1", ReqID: "r", Arrival: since, SizeBytes: bytesFor(40)}}
+	}
+	// first seat: both engines are empty, the id order decides → engine-a
+	if eng, i := s.PickFromHeadsEngine(heads(now), now); i < 0 || eng != "engine-a" {
+		t.Fatalf("first seat engine = %q (i=%d), want engine-a", eng, i)
+	}
+	first := s.bindingOf("m1")
+	s.DispatchedOn("m1", "r", first, keys(20, Hash(1)), bytesFor(40), now)
+	s.SettleOn("m1", "r", first, struct{ Prompt, Cached int }{Prompt: 100, Cached: 90}, true, now.Add(time.Second))
+	// burn engine-a's free budget so the seat-time rule must choose engine-b
+	s.mu.Lock()
+	ga := s.groups["engine-a"]
+	for i := 0; i < 12; i++ {
+		id := fmt.Sprintf("fill%d", i)
+		if ok, _ := ga.index.TrySeatLocked(id, ga.budgetBlocks); !ok {
+			s.mu.Unlock()
+			t.Fatalf("could not fill engine-a at %d", i)
+		}
+		ga.members[id] = &member{id: id, engine: "engine-a", seatTime: now, lastActivity: now}
+	}
+	s.mu.Unlock()
+	// m1 is still SEATED (its record has not expired) — force the exit the way the
+	// policy does, then let it re-enter.
+	s.mu.Lock()
+	if m, ok := ga.members["m1"]; ok {
+		m.waitingSince = now.Add(2 * time.Second) // it has a turn queued
+		s.exitLocked(ga, m, "paid", now.Add(2*time.Second))
+	}
+	s.mu.Unlock()
+	if got := s.bindingOf("m1"); got != "" {
+		t.Fatalf("binding after exit = %q, want \"\"", got)
+	}
+	later := now.Add(3 * time.Second)
+	eng, i := s.PickFromHeadsEngine(heads(now.Add(2*time.Second)), later)
+	if i < 0 {
+		t.Fatal("the re-entering member was not seated")
+	}
+	if eng != "engine-b" {
+		t.Fatalf("re-entry seat engine = %q, want engine-b (engine-a exhausted its free budget; seat=pin means the re-entry is placed afresh)", eng)
+	}
+	if got := s.bindingOf("m1"); got != "engine-b" {
+		t.Fatalf("binding after RE-SEAT = %q, want engine-b — the binding must follow the seat", got)
 	}
 }

@@ -171,6 +171,18 @@ type seatCandidate struct {
 	// hasVictim marks an engine that can evict an eligible incumbent right now
 	// (the cheapest-victim engine's input).
 	hasVictim bool
+	// freeBudget is what the engine can still admit: budget − (NE blocks + pending
+	// estimates). It is the TIE-BREAK after the backlog key (reviewer R1): it
+	// balances MASS, where a seat count balances only member COUNT — and
+	// count-vs-mass is exactly the measured KV asymmetry (E1 0.977/0.683 with
+	// symmetric logical splits; E2's 20% spread persisting with NO scheduler).
+	freeBudget int64
+	// residue is the model's predicted surviving FRACTION of this member's chain
+	// on this engine (E4b; 0 when the model is off, disabled on the engine, or the
+	// member never used that engine). It orders FIT-PASSING candidates only.
+	residue float64
+	// residueWarm is that fraction as the model's BIMODAL CLASS (R3).
+	residueWarm bool
 }
 
 // seatEngineLocked is the SEAT-TIME ENGINE CHOICE. Order:
@@ -206,17 +218,27 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatCandidate
 	}
 	cands := make([]seatCandidate, 0, len(ready))
 	for _, g := range ready {
-		// THE FIT TEST USES THE HEAD'S OWN SYNC-TIME ESTIMATE — the SAME input the
-		// member-stable admission loop uses (head.coldTokens, refreshed by
-		// syncWaiters on every Pick pass). A per-engine, recomputed index estimate
-		// here would be a SECOND undeclared variable between the E3 and E4a arms,
-		// and a large one: measured on the golden scenario, a fresh estimate for a
-		// returning member jumps ~10x the instant a member that held its shared
-		// prefix is evicted (28 → 328 blocks at t=360), so the two models would
-		// admit on different numbers. The per-engine index state still decides the
-		// BUDGET side (ne) and, later, the E4b residue tie-break.
-		blocks := head.coldTokens / int64(s.blockSize)
-		tokens := head.coldTokens
+		// THE FIT TEST USES A PER-ENGINE ESTIMATE, FROZEN AT SYNC TIME for this pass
+		// (head.coldTokensByEngine[g]). Two properties this buys:
+		//
+		//   * each engine is costed against ITS OWN index (the member's blocks are
+		//     warm or cold PER ENGINE — one pool-wide number would over-commit the
+		//     engines that do not hold the member's blocks until PreRequest
+		//     reconciles), which is what the member-stable arm already does against
+		//     its home engine: this REMOVES a modelling difference vs E3 rather
+		//     than adding one;
+		//   * the value is frozen for the whole decision pass, so the loop cannot
+		//     re-cost a head mid-pass after some other seat bumped the index version
+		//     (measured before the freeze: a returning member's recomputed estimate
+		//     jumped 28 → 328 blocks the instant a member holding its shared prefix
+		//     was evicted, which admitted on numbers no other arm saw).
+		//
+		// Byte-identical at N=1: one engine ⇒ one vector entry = the scalar.
+		tokens, ok := head.coldTokensByEngine[g.id]
+		if !ok {
+			tokens = head.coldTokens // fallback: the pool's best-case scalar
+		}
+		blocks := tokens / int64(s.blockSize)
 		ne := int64(g.index.UniqueBlocksNELocked()) + g.pendingTotal
 		c := seatCandidate{
 			g: g, fits: g.budgetBlocks <= 0 || ne+blocks <= int64(g.budgetBlocks),
@@ -224,20 +246,34 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatCandidate
 			backlogPerSeat: s.seatBacklogLocked(g),
 			seats:          len(g.members),
 		}
+		c.freeBudget = int64(g.budgetBlocks) - ne
+		if s.cfg.residueOn() && g.residue.usable() {
+			c.residue = g.residue.ratio(head.id)
+			// R3: the model's verdict is a CLASS, not a block count. Post-EXIT
+			// returns predict ~0.001 vs ~0.002 across engines — an argmax on raw
+			// blocks would decide on noise. As a class they tie (all cold) and the
+			// backlog / free-budget keys decide, which is the conservative
+			// behaviour by construction. Raw ratios only separate two WARM engines.
+			c.residueWarm = c.residue >= residueWarmFraction
+		}
 		cands = append(cands, c)
 	}
-	// 2. fit first.
+	// 2. fit first, and among the FITTING engines the residue model breaks the tie
+	// (E4b): more of this member's chain still resident wins. It never ranks a
+	// COLD engine over a warm one on principle — two cold engines both read 0 and
+	// fall through to the backlog key.
 	var best *seatCandidate
 	for i := range cands {
 		c := &cands[i]
 		if !c.fits {
 			continue
 		}
-		if betterSeat(*c, best) {
+		if betterFitSeat(*c, best) {
 			best = c
 		}
 	}
 	if best != nil {
+		s.noteResiduePickLocked(*best, cands)
 		return best
 	}
 	// 3. nothing fits: the cheapest-victim engine. hasVictim is filled lazily —
@@ -256,6 +292,48 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatCandidate
 		}
 	}
 	return best
+}
+
+// betterFitSeat orders the FIT-PASSING candidates: the residue model first (E4b —
+// only when it has something to say), then least relative backlog per seat, then
+// fewer seats held (the spread tie-break), then engine id.
+func betterFitSeat(c seatCandidate, best *seatCandidate) bool {
+	if best == nil {
+		return true
+	}
+	// R3: class first (warm beats cold), then the raw ratio only between two WARM
+	// engines — never between two cold ones, where the numbers are noise.
+	if c.residueWarm != best.residueWarm {
+		return c.residueWarm
+	}
+	if c.residueWarm && c.residue != best.residue {
+		return c.residue > best.residue
+	}
+	return betterSeat(c, best)
+}
+
+// noteResiduePickLocked books the counterfactual (E4b export): how often the
+// residue model DECIDED the seat (it was the discriminating key) and how often it
+// merely agreed with the backlog key. Without this an arm cannot tell "the model
+// works" from "the model was never consulted".
+func (s *Scheduler) noteResiduePickLocked(chosen seatCandidate, all []seatCandidate) {
+	if !s.cfg.residueOn() || chosen.g.residue == nil {
+		return
+	}
+	chosen.g.residue.picks++
+	if s.onResiduePick != nil {
+		// discriminating = some other FITTING engine had a DIFFERENT residue reading
+		decided := false
+		for _, c := range all {
+			if c.g == chosen.g || !c.fits {
+				continue
+			}
+			if c.residue != chosen.residue {
+				decided = true
+			}
+		}
+		s.onResiduePick(chosen.g.id, chosen.residue, decided)
+	}
 }
 
 // seatBacklogLocked is the seat choice's relative-backlog key: the engine's OWN
@@ -285,14 +363,18 @@ func (s *Scheduler) seatBacklogLocked(g *engineGroup) float64 {
 }
 
 // betterSeat is the total order over seat candidates: least relative backlog per
-// seat, then FEWER seats held (the spread tie-break), then engine id (so the
-// decision is total and every multi-engine run is reproducible).
+// seat, then MORE FREE BUDGET (reviewer R1 — balance mass, not member count),
+// then fewer seats held, then engine id (so the decision is total and every
+// multi-engine run is reproducible).
 func betterSeat(c seatCandidate, best *seatCandidate) bool {
 	if best == nil {
 		return true
 	}
 	if c.backlogPerSeat != best.backlogPerSeat {
 		return c.backlogPerSeat < best.backlogPerSeat
+	}
+	if c.freeBudget != best.freeBudget {
+		return c.freeBudget > best.freeBudget
 	}
 	if c.seats != best.seats {
 		return c.seats < best.seats
@@ -306,41 +388,6 @@ func betterSeat(c seatCandidate, best *seatCandidate) bool {
 func (s *Scheduler) hasRotationVictimLocked(g *engineGroup, now time.Time) bool {
 	_, v := s.rotationVictimLocked(g, now)
 	return v != nil
-}
-
-// seatableHeadLocked walks the GLOBAL pool and returns the D1-BEST head that
-// some engine can seat RIGHT NOW (fit AND cold-cap), with its engine choice.
-// FIRST-FIT over the ORDERED pool, not head-only.
-//
-// The distinction is the 02:13Z v2 freeze class: the pre-v2 code checked only
-// the single oldest head, so one head that never fits (a huge cold entry, or a
-// head blocked by the cold-entry cap) blocked EVERY dispatch — the oldest head
-// never fit, no busy period completed, no quantum-complete victim existed, and
-// waiting members were never idled. Under one global pool that hazard is
-// strictly worse than it was per engine, so the scan looks past blocked heads
-// and seats the best head that CAN go (the blocked head keeps its `since`, so
-// it stays first in D1 order for the next pass).
-//
-// Implemented as a single min-scan over the pool (no sort): the pass stays O(W)
-// with no allocation, which matters because rotate runs inside every Pick.
-func (s *Scheduler) seatableHeadLocked(seats map[string]int, now time.Time) (*waiter, *seatCandidate) {
-	var bestW *waiter
-	var bestC *seatCandidate
-	var bestK entryKey
-	for _, w := range s.gWaiters {
-		cand := s.seatEngineLocked(w, now)
-		if cand == nil || !cand.fits {
-			continue
-		}
-		if !s.coldAllows(cand.g, w) {
-			continue // the cold cap, not the budget: try the next head
-		}
-		k := s.entryKeyLocked(w, seats)
-		if bestW == nil || k.less(bestK) {
-			bestW, bestC, bestK = w, cand, k
-		}
-	}
-	return bestW, bestC
 }
 
 // rotateSeatPoolLocked is the seat=pin admission loop: ONE global pool, the D1
@@ -409,6 +456,12 @@ func (s *Scheduler) rotateSeatPoolLocked(now time.Time) {
 		}
 		// Nothing fits on the chosen engine: eviction is the only way a blocked
 		// head ever runs, and it is demand-driven (a head is waiting right now).
+		if cand.fits && !s.coldAllows(cand.g, head) && s.onValveBlockedEviction != nil {
+			// C1 sizing signal: the budget would have taken this head, but the
+			// cold-entry valve refused it, so the only way forward is an EVICTION.
+			// Counted in BOTH binding models so the two arms stay comparable.
+			s.onValveBlockedEviction(cand.g.id)
+		}
 		reason, victim := s.rotationVictimLocked(cand.g, now)
 		if victim == nil {
 			return // this engine can free nothing; another pass will re-evaluate

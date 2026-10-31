@@ -1018,74 +1018,60 @@ t=380 PICK id=m10 engine=engine-b blocks=629
   BOUND id=m10 engine=engine-b
 t=381 PICK id=m00 engine=engine-a blocks=651
   BOUND id=m00 engine=engine-a
-  EXIT id=m02 engine=engine-a reason=paid turns=42
-  EXIT id=m04 engine=engine-a reason=paid turns=42
 t=381 PICK id=m11 engine=engine-a blocks=629
   BOUND id=m11 engine=engine-a
 t=382 PICK id=m01 engine=engine-b blocks=651
   BOUND id=m01 engine=engine-b
-  SEAT id=m02 engine=engine-b kind=re-entry wait=0.000
-  RESEAT id=m02 prev=engine-a seat=engine-b
-t=383 PICK id=m02 engine=engine-b blocks=651
-  BOUND id=m02 engine=engine-b
+t=383 PICK id=m02 engine=engine-a blocks=651
+  BOUND id=m02 engine=engine-a
 t=384 PICK id=m03 engine=engine-b blocks=651
   BOUND id=m03 engine=engine-b
-  SEAT id=m04 engine=engine-b kind=re-entry wait=0.000
-  RESEAT id=m04 prev=engine-a seat=engine-b
-t=385 PICK id=m04 engine=engine-b blocks=651
-  BOUND id=m04 engine=engine-b
+t=385 PICK id=m04 engine=engine-a blocks=651
+  BOUND id=m04 engine=engine-a
+t=386 PICK id=m00 engine=engine-a blocks=673
+  BOUND id=m00 engine=engine-a
 t=386 PICK id=m05 engine=engine-b blocks=651
   BOUND id=m05 engine=engine-b
 t=387 PICK id=m06 engine=engine-a blocks=651
   BOUND id=m06 engine=engine-a
 t=387 PICK id=m01 engine=engine-b blocks=673
   BOUND id=m01 engine=engine-b
-  EXIT id=m00 engine=engine-a reason=exiting-drain turns=43
-  SEAT id=m00 engine=engine-b kind=re-entry wait=2.000
-  RESEAT id=m00 prev=engine-a seat=engine-b
-t=388 PICK id=m00 engine=engine-b blocks=673
-  BOUND id=m00 engine=engine-b
-t=388 PICK id=m02 engine=engine-b blocks=673
-  BOUND id=m02 engine=engine-b
+t=388 PICK id=m02 engine=engine-a blocks=673
+  BOUND id=m02 engine=engine-a
+t=388 PICK id=m07 engine=engine-b blocks=651
+  BOUND id=m07 engine=engine-b
 t=389 PICK id=m08 engine=engine-a blocks=651
   BOUND id=m08 engine=engine-a
-t=389 PICK id=m07 engine=engine-b blocks=651
-  BOUND id=m07 engine=engine-b
-t=390 PICK id=m03 engine=engine-b blocks=673
+t=389 PICK id=m03 engine=engine-b blocks=673
   BOUND id=m03 engine=engine-b
-t=390 PICK id=m04 engine=engine-b blocks=673
-  BOUND id=m04 engine=engine-b
-t=391 PICK id=m09 engine=engine-b blocks=651
+t=390 PICK id=m04 engine=engine-a blocks=673
+  BOUND id=m04 engine=engine-a
+t=390 PICK id=m09 engine=engine-b blocks=651
   BOUND id=m09 engine=engine-b
 t=391 PICK id=m05 engine=engine-b blocks=673
   BOUND id=m05 engine=engine-b
+t=391 PICK id=m10 engine=engine-b blocks=651
+  BOUND id=m10 engine=engine-b
 t=392 PICK id=m06 engine=engine-a blocks=673
   BOUND id=m06 engine=engine-a
-  EXIT id=m11 engine=engine-a reason=paid turns=42
-  SEAT id=m11 engine=engine-a kind=re-entry wait=0.000
 t=392 PICK id=m11 engine=engine-a blocks=651
   BOUND id=m11 engine=engine-a
-t=393 PICK id=m10 engine=engine-b blocks=651
-  BOUND id=m10 engine=engine-b
+t=393 PICK id=m07 engine=engine-b blocks=673
+  BOUND id=m07 engine=engine-b
 t=394 PICK id=m08 engine=engine-a blocks=673
   BOUND id=m08 engine=engine-a
-t=394 PICK id=m07 engine=engine-b blocks=673
-  BOUND id=m07 engine=engine-b
-t=396 PICK id=m09 engine=engine-b blocks=673
+t=395 PICK id=m09 engine=engine-b blocks=673
   BOUND id=m09 engine=engine-b
+t=396 PICK id=m10 engine=engine-b blocks=673
+  BOUND id=m10 engine=engine-b
 t=397 PICK id=m11 engine=engine-a blocks=673
   BOUND id=m11 engine=engine-a
-t=398 PICK id=m10 engine=engine-b blocks=673
-  BOUND id=m10 engine=engine-b
+t=398 PICK id=m00 engine=engine-a blocks=696
+  BOUND id=m00 engine=engine-a
 t=399 PICK id=m01 engine=engine-b blocks=696
   BOUND id=m01 engine=engine-b
-t=400 PICK id=m00 engine=engine-b blocks=696
-  BOUND id=m00 engine=engine-b
-t=400 PICK id=m02 engine=engine-b blocks=696
-  BOUND id=m02 engine=engine-b
+t=400 PICK id=m02 engine=engine-a blocks=696
+  BOUND id=m02 engine=engine-a
 SNAPSHOT served=531 violations=0 rebinds=0 waiters=0 seats=12
-ENGINE engine-a seats=3 ne=0 budget=665 bound=3 served=259
-ENGINE-EXITS engine-a exiting=4
-ENGINE-EXITS engine-a exiting-drain=1
-ENGINE-EXITS engine-a paid=3
-ENGINE engine-b seats=9 ne=744 budget=1520 bound=9 served=272
+ENGINE engine-a seats=6 ne=726 budget=855 bound=6 served=266
+ENGINE engine-b seats=6 ne=726 budget=855 bound=6 served=265

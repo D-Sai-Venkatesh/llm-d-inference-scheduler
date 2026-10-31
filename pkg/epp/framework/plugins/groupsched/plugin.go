@@ -113,12 +113,17 @@ type GroupScheduler struct {
 	// detectorScore is the pool saturation last handed to the flow controller, as
 	// math.Float64bits (read at ~1 kHz by the detector, written once per Saturation).
 	detectorScore atomic.Uint64
-	// samples is the LIVE per-engine metric view, published copy-on-write by
-	// Saturation (which the framework hands the datastore endpoint objects) and read
-	// by the ticker. It is the only metrics path in the core: a remembered endpoint
-	// handle carries a construction-time CLONE (fwksched.NewEndpoint → metrics.Clone()),
-	// so a gate fed from one freezes the moment dispatches stop — the E-wave latch.
+	// samples is the LIVE per-engine metric view, published copy-on-write by the ticker
+	// and used for the capacity path and the series. It is the only metrics path in the
+	// core: a remembered endpoint handle carries a construction-time CLONE
+	// (fwksched.NewEndpoint → metrics.Clone()), so a gate fed from one freezes the
+	// moment dispatches stop — the E-wave latch.
 	samples atomic.Pointer[map[string]engineSample]
+	// candidates is the LIVE endpoint set the framework last offered to Saturation
+	// (stored only when it changes).
+	candidates atomic.Pointer[[]fwkdl.Endpoint]
+	// scoreAt is when the pool score was last recomputed (UnixNano).
+	scoreAt atomic.Int64
 
 	// pins mirrors the scheduler's member→engine SEAT binding so the Filter can
 	// read it WITHOUT taking s.mu (see filter.go's lock discipline). The
@@ -204,8 +209,8 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// The pin table follows the SEATS: one map write per seat, one delete per exit.
 	r.sched.onBind = func(member, engine string) { r.pins.set(member, engine) }
 	r.sched.onUnbind = func(member string) { r.pins.del(member) }
-	r.sched.onValveBlockedEviction = func(engine string) {
-		r.metrics.ObserveValveBlockedEviction(engineLabel(engine))
+	r.sched.onColdValveHeld = func(engine string) {
+		r.metrics.ObserveColdValveHeld(engineLabel(engine))
 	}
 	r.sched.onEngineGone = func(engine string, members int) {
 		r.metrics.ObserveEngineGone()
@@ -622,10 +627,11 @@ func endpointKey(ep metricsSource) string {
 // A vanished endpoint's snapshot is cleared, because a stale verdict on an engine the
 // EPP no longer sees would keep it idle forever.
 func (r *GroupScheduler) pushEngineLoad(now time.Time) {
-	samples := r.liveSamples()
+	samples := r.sampleCandidates(now)
 	if samples == nil {
-		return // nothing published yet (no Saturation call has run)
+		return // the framework has not offered a candidate set yet
 	}
+	r.publishSamples(samples)
 	if r.metrics != nil {
 		for engine, sm := range samples {
 			if sm.stale {
@@ -723,15 +729,71 @@ func (r *GroupScheduler) pollCapacity(now time.Time) {
 // scheduler for the per-engine holds and exports them as series), so a metric that
 // changes with NO dispatch is still seen — the latch class has a regression test.
 func (r *GroupScheduler) Saturation(_ context.Context, candidates []fwkdl.Endpoint) float64 {
+	// HOT PATH. Two things must never happen here: taking the scheduler's mutex, and
+	// allocating per call (~1 kHz). So:
+	//   1. the candidate SET is stored only when it CHANGES (an interface-value
+	//      compare, no allocation) — the ticker samples from it;
+	//   2. when the safety module is a noop (the default) the answer is a constant 0,
+	//      with no sampling at all;
+	//   3. with the memory-only module on, the score is recomputed at most once per
+	//      framework refresh interval and otherwise read from the atomic — the metric
+	//      it reads is scraped at that cadence anyway, so a faster recompute would be
+	//      re-reading the same numbers.
+	changed := r.storeCandidates(candidates)
 	if r.sched.mod.safety.Name() == "none" {
 		r.detectorScore.Store(math.Float64bits(0))
-		if len(candidates) > 0 {
-			r.publishSamples(r.readSamples(candidates, time.Now()))
-		}
 		return 0
 	}
 	now := time.Now()
-	samples := r.readSamples(candidates, now)
+	if !changed && now.Sub(time.Unix(0, r.scoreAt.Load())) < r.staleAfter() {
+		// nothing new to look at: the atomic answer stands (the metric it reads is
+		// scraped at this cadence anyway)
+		return math.Float64frombits(r.detectorScore.Load())
+	}
+	r.scoreAt.Store(now.UnixNano())
+	pool := r.poolScore(r.sampleCandidates(now))
+	r.detectorScore.Store(math.Float64bits(pool))
+	return pool
+}
+
+// storeCandidates keeps the LIVE endpoint set (the datastore mutates these objects in
+// place, so a stored slice is a live view, unlike a plugin's remembered endpoint clone).
+// It is a no-op when the set is unchanged — one compare per call, no allocation.
+func (r *GroupScheduler) storeCandidates(cands []fwkdl.Endpoint) bool {
+	if prev := r.candidates.Load(); prev != nil && sameEndpoints(*prev, cands) {
+		return false
+	}
+	cp := append([]fwkdl.Endpoint(nil), cands...)
+	r.candidates.Store(&cp)
+	return true
+}
+
+// sameEndpoints compares two candidate sets by identity (the interface values hold
+// pointers to the datastore's endpoint objects).
+func sameEndpoints(a, b []fwkdl.Endpoint) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// sampleCandidates reads every candidate's LIVE metrics (the ticker calls this at 1 Hz
+// for the capacity path and the series).
+func (r *GroupScheduler) sampleCandidates(now time.Time) map[string]engineSample {
+	if p := r.candidates.Load(); p != nil {
+		return r.readSamples(*p, now)
+	}
+	return nil
+}
+
+// poolScore is MIN over the fresh engines of kv/threshold (the flow controller's pool
+// gate); 0 when nothing is usable (OPEN).
+func (r *GroupScheduler) poolScore(samples map[string]engineSample) float64 {
 	pool := -1.0
 	for _, s := range samples {
 		if s.stale {
@@ -743,10 +805,8 @@ func (r *GroupScheduler) Saturation(_ context.Context, candidates []fwkdl.Endpoi
 		}
 	}
 	if pool < 0 {
-		pool = 0 // no usable engine: OPEN (the budget is the primary control)
+		return 0
 	}
-	r.detectorScore.Store(math.Float64bits(pool))
-	r.publishSamples(samples)
 	return pool
 }
 

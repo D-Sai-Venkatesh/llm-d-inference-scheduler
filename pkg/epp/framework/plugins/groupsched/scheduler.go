@@ -458,10 +458,11 @@ type Scheduler struct {
 	// s.mu. nil in tests.
 	onBind   func(member, engine string)
 	onUnbind func(member string)
-	// onValveBlockedEviction fires when a head would FIT an engine's budget but
-	// the cold-entry valve refuses it, so the loop's only way forward is an
-	// eviction (the sizing signal: what the stagger costs in evictions).
-	onValveBlockedEviction func(engine string)
+	// onColdValveHeld fires when the cold-entry valve HOLDS a head that would fit an
+	// engine's budget. The head WAITS (the valve opens when that engine's cold prefill
+	// produces its first token); nothing is evicted for it. This is the sizing signal:
+	// how often the stagger makes demand wait.
+	onColdValveHeld func(engine string)
 	// onSafetyFire fires when an engine's safety net OPENS (a fire event).
 	onSafetyFire func(engine string)
 

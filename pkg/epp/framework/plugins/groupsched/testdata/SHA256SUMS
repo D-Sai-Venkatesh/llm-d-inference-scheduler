@@ -20,6 +20,10 @@
 # Regenerate only with a reason: go test -run TestCoreEqualsF0P -update-golden writes
 # the CORE's trace — which is the right thing to do only if the archive's behaviour
 # was deliberately changed, and then the commit message must say why.
-
+# golden-f0p-valvefix-tinycap.txt — the SECOND declared difference: the cold-valve fix
+# on a replay where the valve BINDS (cap 640 tokens). f0p took 20 evictions for nothing
+# on this scenario; the core takes 0, and serves 1,201 -> 1,253 dispatches. Produced by
+# the archive build with the total tie-break AND the valve fix (TestCoreEqualsF0PWithTheValveFix).
 f3b667e87003a38e74026f0a6e3c6dc6809772c9dc3fda7c3fd0c121c347aa70  golden-f0p-core.txt
 643c75490f1fd34cd551be978e6b4fffbc735473a15e305b9d5431d5e17f3aa8  golden-f0p-total.txt
+bb77da7744b37b098fa6e5954a081ddc159b5ce82a0e1cdce137c056c718de2b  golden-f0p-valvefix-tinycap.txt

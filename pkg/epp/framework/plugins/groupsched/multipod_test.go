@@ -421,3 +421,80 @@ func TestMultiEngineGoldenProperties(t *testing.T) {
 		t.Fatalf("the whole-policy seat count must be the per-engine sum (%d vs %d)", seats, snapTwo.Seats)
 	}
 }
+
+// THE COLD VALVE NEVER EVICTS (the defect the core fixes): a head that fits an
+// engine's BUDGET but is held by the cold-entry valve WAITS for the prefill slot.
+// Evicting members frees budget, never the valve, so every eviction taken on such a
+// pass was wasted — and the engine's seats sat cold-empty until the prefill finished.
+func TestColdValveHeldHeadNeverEvicts(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.ColdEntryCapTokens = 640 // 10 blocks of cold charge: binds immediately
+	forEnginesCap(t, cfg, 100000, func(t *testing.T, fx *engineSet) {
+		// ONE resident per ENGINE seats (its cold charge alone exceeds the cap, and the
+		// placement spreads them one per engine because a closed valve is not a
+		// candidate), and their prefills stay in flight (no Chunk), so EVERY engine's
+		// valve has no room for another entry
+		for i := range fx.ids {
+			id := fmt.Sprintf("res%d", i)
+			fx.seatOne(t, id, 500, time.Duration(5+i)*time.Second)
+		}
+		before := fx.s.Snapshot()
+		// each resident has a queued turn (so nobody is a rotation victim) and a big
+		// cold head waits behind them — one that FITS the budget easily
+		for i := range fx.ids {
+			m, _ := fx.member(t, fmt.Sprintf("res%d", i))
+			fx.s.mu.Lock()
+			m.waitingSince = fx.clock.Add(-time.Second)
+			m.lastActivity = fx.clock
+			m.inflight = 0
+			fx.s.mu.Unlock()
+		}
+		for attempt := 0; attempt < 4; attempt++ {
+			h := head(fmt.Sprintf("cold%d", attempt), time.Second, bytesFor(900))
+			_, i := fx.pickEngine(h)
+			if i >= 0 {
+				t.Fatalf("attempt %d: a valve-held head must not be dispatched, got %d", attempt, i)
+			}
+		}
+		after := fx.s.Snapshot()
+		if after.Seats != before.Seats {
+			t.Fatalf("THE VALVE MUST NEVER EVICT: seats moved %d -> %d for a head that only the valve held",
+				before.Seats, after.Seats)
+		}
+		if len(after.Exits) != len(before.Exits) {
+			t.Fatalf("no exit may be booked for a valve-held head: %v -> %v", before.Exits, after.Exits)
+		}
+		// R11 liveness: the valve opens when the residents' prefills complete
+		for i := range fx.ids {
+			fx.s.Chunk(fmt.Sprintf("res%d", i))
+		}
+		if _, i := fx.pickEngine(head("coldX", time.Second, bytesFor(900))); i < 0 {
+			t.Fatal("R11: once the cold prefills land, the waiting head must be seatable")
+		}
+	})
+}
+
+// AT N=2 THE HEAD MOVES TO THE SIBLING rather than waiting: engine A's valve refuses
+// it, engine B both fits by budget AND allows it.
+func TestColdValveHeldHeadSeatsOnTheSibling(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.ColdEntryCapTokens = 640
+	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
+		if len(fx.ids) < 2 {
+			t.Skip("needs two engines: the sibling is the point")
+		}
+		// one engine takes the first cold entry (fits AND allowed: nothing cold in
+		// flight there), so ITS valve is now closed while the sibling's is open
+		fx.seatOne(t, "coldA", 300, 5*time.Second)
+		engA := fx.s.bindings["coldA"]
+		// the next head fits the budget on both; A's valve refuses it and B's allows
+		h := head("next", time.Second, bytesFor(50))
+		_, i := fx.pickEngine(h)
+		if i < 0 {
+			t.Fatal("the head must seat (on the SIBLING), not wait")
+		}
+		if got := fx.s.bindings["next"]; got == engA {
+			t.Fatalf("the head was refused by %s's cold valve and must go to the sibling, not %s", engA, got)
+		}
+	})
+}

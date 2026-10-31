@@ -117,8 +117,9 @@ func TestDetectorDefaultsToNotSaturated(t *testing.T) {
 		if got := p.Saturation(context.Background(), livePods(eps...)); got != 0 {
 			t.Fatalf("N=%d: the default detector must answer 0 (not saturated), got %v", n, got)
 		}
-		// it still PUBLISHES what it read (the instrumentation has to exist even when
-		// nothing is gated: a run states what would have happened)
+		// it still SAMPLES what it read on the ticker (the instrumentation has to exist
+		// even when nothing is gated: a run states what would have happened)
+		p.pushEngineLoad(time.Now())
 		if got := len(p.liveSamples()); got != n {
 			t.Fatalf("N=%d: the detector must publish one sample per engine, got %d", n, got)
 		}
@@ -224,5 +225,54 @@ func TestCapacityLearnedFromLiveSamples(t *testing.T) {
 	a, b := snap.Engines[engineLabel(engineID(0))], snap.Engines[engineLabel(engineID(1))]
 	if a.BudgetBlocks != 950 || b.BudgetBlocks != 1900 {
 		t.Fatalf("per-engine budgets wrong: a=%d b=%d", a.BudgetBlocks, b.BudgetBlocks)
+	}
+}
+
+// BENCHMARK: the flow controller polls the detector at ~1 kHz, so Saturation must be a
+// couple of loads and NO allocation on the default (noop) path.
+//
+//	go test -run xxx -bench BenchmarkSaturation -benchmem ./pkg/epp/framework/plugins/groupsched/
+func BenchmarkSaturationNoop(b *testing.B) {
+	cfg := defaultConfig()
+	s, err := NewScheduler(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	p := &GroupScheduler{cfg: cfg, sched: s, metrics: newGroupMetrics(s), pins: newPinTable(),
+		endpoints: map[string]*endpointState{}, hetero: map[string]struct{}{}}
+	now := time.Now()
+	eps := make([]fwkdl.Endpoint, 0, 2)
+	for i := 0; i < 2; i++ {
+		eps = append(eps, liveEndpoint(engineID(i), 0.5, 10, 64, 1000, now))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := p.Saturation(context.Background(), eps); got != 0 {
+			b.Fatalf("noop detector must answer 0, got %v", got)
+		}
+	}
+}
+
+// The ALTERNATIVE path is rate-limited: at ~1 kHz only one recompute per refresh
+// interval happens, so its cost is amortised to ~nothing per call.
+func BenchmarkSaturationMemoryOnly(b *testing.B) {
+	cfg := defaultConfig()
+	cfg.Safety = "budget-fraction"
+	s, err := NewScheduler(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	p := &GroupScheduler{cfg: cfg, sched: s, metrics: newGroupMetrics(s), pins: newPinTable(),
+		endpoints: map[string]*endpointState{}, hetero: map[string]struct{}{}}
+	now := time.Now()
+	eps := make([]fwkdl.Endpoint, 0, 2)
+	for i := 0; i < 2; i++ {
+		eps = append(eps, liveEndpoint(engineID(i), 0.5, 10, 64, 1000, now))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.Saturation(context.Background(), eps)
 	}
 }

@@ -116,6 +116,12 @@ func (s *Scheduler) freeBudgetLocked(g *engineGroup) int64 {
 	return int64(g.budgetBlocks) - (int64(g.index.UniqueBlocksNELocked()) + g.pendingTotal)
 }
 
+// coldAllowsTokens is coldAllows against an EXPLICIT per-engine cost (the placement
+// candidate's own estimate), so the fit test and the valve agree on the number.
+func (s *Scheduler) coldAllowsTokens(g *engineGroup, tokens int64) bool {
+	return g.coldInFlight == 0 || g.coldInFlight+tokens <= s.cfg.ColdEntryCapTokens
+}
+
 // coldAllows staggers ALL cold entries IN ONE ENGINE (B6: re-entries too — WEKA
 // re-entries are fully cold), in TOKENS (R1). R11's rule: one cold entry is ALWAYS
 // allowed — a member bigger than the cap must be seatable when nothing cold is in
@@ -124,7 +130,7 @@ func (s *Scheduler) freeBudgetLocked(g *engineGroup) int64 {
 // The cap is PER ENGINE, so the system-wide cold-entry concurrency is at most N, and
 // the "always one" clause keeps each engine's own queue live.
 func (s *Scheduler) coldAllows(g *engineGroup, w *waiter) bool {
-	return g.coldInFlight == 0 || g.coldInFlight+w.coldTokens <= s.cfg.ColdEntryCapTokens
+	return s.coldAllowsTokens(g, w.coldTokens)
 }
 
 // seatChoice is the PLACEMENT module's answer bound back to the engine.
@@ -165,10 +171,15 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatChoice {
 		tokens := coldTokensForEngine(head, g, s.blockSize)
 		blocks := tokens / int64(s.blockSize)
 		free := s.freeBudgetLocked(g)
+		budgetFits := blocks <= free
 		gg := g
 		cands = append(cands, EngineCandidate{
 			Engine: gg.id, CostTokens: tokens, CostBlocks: blocks,
-			FreeBudget: free, Fits: blocks <= free,
+			FreeBudget: free, BudgetFits: budgetFits,
+			// FITS = budget AND cold valve: a head the valve holds must wait for the
+			// valve, never evict for it (the defect this replaces evicted every
+			// eligible member on the engine and left the seats cold-empty).
+			Fits:      budgetFits && s.coldAllowsTokens(g, tokens),
 			HasVictim: func() bool { return s.hasRotationVictimLocked(gg, now) },
 		})
 		owners = append(owners, gg)
@@ -180,6 +191,22 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatChoice {
 	return &seatChoice{g: owners[idx], costTokens: cands[idx].CostTokens,
 		costBlocks: cands[idx].CostBlocks, freeBudget: cands[idx].FreeBudget,
 		fits: cands[idx].Fits}
+}
+
+// coldValveHolds reports whether the ONLY thing keeping this head out is the
+// cold-entry valve: some engine has the budget for it and the valve refuses.
+func (s *Scheduler) coldValveHolds(head *waiter, now time.Time) bool {
+	for _, g := range s.activeGroupsLocked() {
+		if g.numBlocks <= 0 || s.safetyFiredLocked(g) {
+			continue
+		}
+		tokens := coldTokensForEngine(head, g, s.blockSize)
+		if tokens/int64(s.blockSize) <= s.freeBudgetLocked(g) && !s.coldAllowsTokens(g, tokens) {
+			return true
+		}
+	}
+	_ = now
+	return false
 }
 
 // hasRotationVictimLocked reports whether an engine can evict somebody right now
@@ -214,9 +241,16 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 		}
 		cand := s.seatEngineLocked(head, now)
 		if cand == nil || cand.g == nil {
+			// nothing to do this pass. If the reason is the cold-entry valve holding a
+			// head that WOULD fit the budget, book it: the head waits for the prefill
+			// slot, and that is a measurable cost of the stagger (never a reason to
+			// evict — see EngineCandidate.Fits).
+			if s.onColdValveHeld != nil && s.coldValveHolds(head, now) {
+				s.onColdValveHeld("")
+			}
 			return
 		}
-		if cand.fits && s.coldAllows(cand.g, head) {
+		if cand.fits {
 			// the chosen engine's own cost replaces the pool's best-case scalar: the
 			// cold charge, the pending blocks and the budget all belong to THAT
 			// engine from here on.
@@ -231,13 +265,10 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 			}
 			continue
 		}
-		if cand.fits && !s.coldAllows(cand.g, head) && s.onValveBlockedEviction != nil {
-			// the budget would have taken this head, but the cold-entry valve refused
-			// it, so the only way forward is an EVICTION (the sizing signal).
-			s.onValveBlockedEviction(cand.g.id)
-		}
-		// Nothing fits on the chosen engine: eviction is the only way a blocked head
-		// ever runs, and it is demand-driven (a head is waiting right now).
+		// Nothing fits BY BUDGET on the chosen engine (a valve-held head never reaches
+		// here — the chooser answers "wait" for it): eviction is the only way a
+		// budget-blocked head ever runs, and it is demand-driven (a head is waiting
+		// right now).
 		reason, victim := s.rotationVictimLocked(cand.g, now)
 		if victim == nil {
 			return // this engine can free nothing; another pass will re-evaluate

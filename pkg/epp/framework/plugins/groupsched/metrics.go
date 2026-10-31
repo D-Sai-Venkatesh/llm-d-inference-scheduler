@@ -87,10 +87,11 @@ type groupMetrics struct {
 	affinityViolations *prometheus.CounterVec
 	rebinds            prometheus.Counter
 	engineGone         prometheus.Counter
-	// valveBlockedEvictions counts rotations the cold-entry VALVE forced: the budget
-	// would have admitted the head, the valve refused it, so the only way forward was
-	// to evict somebody. It is the sizing signal (what the stagger costs).
-	valveBlockedEvictions *prometheus.CounterVec
+	// coldValveHeld counts heads the cold-entry VALVE held back: the budget would have
+	// admitted the head, the valve refused it, so the head WAITED for the engine's
+	// prefill slot. Nothing is evicted for it (the sizing signal: what the stagger
+	// costs in waiting).
+	coldValveHeld *prometheus.CounterVec
 
 	known map[string]struct{}
 }
@@ -165,15 +166,15 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "seat moves repaired by the observed endpoint winning"})
 	g.engineGone = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "engine_gone_total",
 		Help: "engines torn down by an endpoint delete"})
-	g.valveBlockedEvictions = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "rotation_evictions_valve_blocked_total",
-		Help: "rotations the cold-entry valve forced (the budget would have admitted the head)"}, engineLabels)
+	g.coldValveHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "cold_valve_held_total",
+		Help: "heads the cold-entry valve held back (the budget would have admitted them; they WAIT, nothing is evicted)"}, engineLabels)
 
 	for _, c := range []prometheus.Collector{g.seats, g.uniqueBlocks, g.neBlocks, g.budgetBlocks,
 		g.waiters, g.coldInFlight, g.capacity, g.waitersShared, g.exits, g.residency, g.entryWait,
 		g.reentryWait, g.refillShare, g.served, g.fcfs, g.capacityMissing, g.capacityLearned,
 		g.safetyFired, g.safetyFires, g.safetyFiredSeconds, g.safetySkips, g.engineKV, g.engineWaiting,
 		g.poolScore, g.staleSamples, g.capacityHeterogeneous, g.filterDecisions, g.affinityViolations, g.rebinds, g.engineGone,
-		g.valveBlockedEvictions} {
+		g.coldValveHeld} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second
 			// plugin config in the same test binary) must not fail startup: the series
@@ -372,10 +373,10 @@ func (g *groupMetrics) ObserveFCFS(label string) {
 	g.fcfs.WithLabelValues(label).Inc()
 }
 
-// ObserveValveBlockedEviction counts a rotation the cold-entry valve forced.
-func (g *groupMetrics) ObserveValveBlockedEviction(engine string) {
-	if g == nil || g.valveBlockedEvictions == nil {
+// ObserveColdValveHeld counts a head the cold-entry valve held back.
+func (g *groupMetrics) ObserveColdValveHeld(engine string) {
+	if g == nil || g.coldValveHeld == nil {
 		return
 	}
-	g.valveBlockedEvictions.WithLabelValues(engineLabel(engine)).Inc()
+	g.coldValveHeld.WithLabelValues(engineLabel(engine)).Inc()
 }

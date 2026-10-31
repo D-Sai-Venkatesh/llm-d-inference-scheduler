@@ -224,7 +224,16 @@ type EngineCandidate struct {
 	CostBlocks int64
 	// FreeBudget is what the engine can still admit (budget − accounted footprint).
 	FreeBudget int64
-	// Fits reports CostBlocks <= FreeBudget.
+	// BudgetFits reports CostBlocks <= FreeBudget.
+	BudgetFits bool
+	// Fits reports BudgetFits AND that the COLD-ENTRY VALVE allows this head on this
+	// engine. Both halves matter, and keeping them apart is the fix for a real defect
+	// (inherited from f0p): a head that fits by budget but is held by the valve must
+	// WAIT, because evicting members frees budget and never frees the valve — the old
+	// loop therefore evicted every eligible member on the engine and left the seats
+	// empty until the cold prefill finished (measured on f0p's final-epp.prom:
+	// 913,162 valve-blocked passes, and every one that found a victim evicted for
+	// nothing).
 	Fits bool
 	// HasVictim is LAZY (it costs a scan): may the engine evict an eligible
 	// incumbent right now?
@@ -238,11 +247,15 @@ type EngineChooser interface {
 	Choose(cands []EngineCandidate) int
 }
 
-// MostFreeBudget is the default: among the engines where the head FITS, the one with
-// the MOST FREE BUDGET; ties → lowest engine id. If nothing fits, the engine that can
-// free a seat by an eligible rotation (again most free budget first) — eviction is
-// demand-driven, and doing it on the least-pressured engine gives up the least warm
-// state per unit of demand.
+// MostFreeBudget is the default: among the engines where the head FITS (budget AND the
+// cold valve), the one with the MOST FREE BUDGET; ties → lowest engine id.
+//
+//   - If NOTHING fits but some engine fits BY BUDGET (i.e. the cold-entry valve is
+//     holding the head), the answer is "wait": the valve opens by itself when that
+//     engine's cold prefill produces its first token, and no eviction can hurry it.
+//   - Only when nothing fits by BUDGET either is eviction the way forward: the engine
+//     that can free a seat by an eligible rotation, again most free budget first
+//     (evicting on the least-pressured engine gives up the least warm state).
 type MostFreeBudget struct{}
 
 func (MostFreeBudget) Name() string { return "most-free-budget" }
@@ -259,6 +272,12 @@ func (MostFreeBudget) Choose(cands []EngineCandidate) int {
 	}
 	if best >= 0 {
 		return best
+	}
+	// the cold valve is holding this head somewhere: WAIT, never evict (see Fits)
+	for i := range cands {
+		if cands[i].BudgetFits {
+			return -1
+		}
 	}
 	for i := range cands {
 		if cands[i].HasVictim == nil || !cands[i].HasVictim() {

@@ -486,3 +486,44 @@ func TestCoreMatchesF0PUpToItsOwnNondeterminism(t *testing.T) {
 	}
 	t.Logf("the core matches the RAW f0p trace for its first %d lines; the archive diverges from ITSELF from line %d (map-order victim tie-break)", limit, shared+1)
 }
+
+// TestCoreEqualsF0PWithTheValveFix pins the SECOND declared difference — the cold-valve
+// fix — on a replay where the valve actually BINDS (coldEntryCapTokens = 640 tokens =
+// 10 blocks; the R11 "one cold entry is always allowed" shape).
+//
+// The defect (inherited from f0p): a head that fits an engine's BUDGET but is held by
+// the cold-entry valve fell through to the eviction step. Eviction frees budget and
+// never frees the valve, so the loop evicted every eligible member on that engine and
+// left the seats cold-empty until the prefill finished. Measured on f0p itself, this
+// scenario: 3,220 valve-blocked passes, **20 evictions taken for nothing**; with the
+// fix, 0. Quantified effect on the whole replay: served 1,201 → 1,253 (+4.3 %), exits
+// 116 → 117, and 4,432 of 5,034 trace lines differ.
+//
+// On the SHIPPED config the valve does not bind and the trace is byte-identical to
+// f0p (TestCoreEqualsF0P), so no banked number moves.
+func TestCoreEqualsF0PWithTheValveFix(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.ColdEntryCapTokens = 640
+	got := runGoldenScenarioFull(t, 2600, cfg)
+	want, err := os.ReadFile(filepath.Join("testdata", "golden-f0p-valvefix-tinycap.txt"))
+	if err != nil {
+		t.Fatalf("valve-fix golden missing: %v", err)
+	}
+	if got != string(want) {
+		gotL := strings.Split(got, "\n")
+		wantL := strings.Split(string(want), "\n")
+		for i := 0; i < len(gotL) || i < len(wantL); i++ {
+			var a, b string
+			if i < len(gotL) {
+				a = gotL[i]
+			}
+			if i < len(wantL) {
+				b = wantL[i]
+			}
+			if a != b {
+				t.Fatalf("core/valve-fix divergence at line %d:\n  core: %s\n  want: %s", i+1, a, b)
+			}
+		}
+		t.Fatal("core/valve-fix divergence (length)")
+	}
+}

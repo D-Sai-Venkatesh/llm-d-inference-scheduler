@@ -72,6 +72,13 @@ not "equal up to the gate". Running the core with `safety: "budget-fraction"` is
 one configuration that may legitimately diverge, and then the divergence IS the net's
 measured effect.
 
+`testdata/golden-f0p-valvefix-tinycap.txt` is the SECOND declared difference — the
+cold-valve fix (`TestCoreEqualsF0PWithTheValveFix`) — on a replay where the valve
+BINDS (`coldEntryCapTokens` = 640 tokens): f0p took **20 evictions for nothing** on
+this scenario, the core takes 0, and the run serves 1,201 → 1,253 dispatches (+4.3 %).
+On the SHIPPED config the valve does not bind and the trace is byte-identical to f0p,
+so no banked number moves.
+
 ## 3. Constants
 
 Everything the code still holds as a number, with its origin. A number that cannot be

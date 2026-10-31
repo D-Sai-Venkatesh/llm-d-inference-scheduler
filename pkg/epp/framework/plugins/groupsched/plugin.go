@@ -108,7 +108,7 @@ type GroupScheduler struct {
 	capMu     sync.Mutex
 	endpoints map[string]*endpointState // endpoint id -> handle + acquisition state
 	hetero    map[string]struct{}       // engines already reported as capacity-heterogeneous
-	// ---- the placement pin (E4a, bindingMode=seat) ----
+	// ---- the placement pin (the seat binding mirror) ----
 	//
 	// detectorScore is the pool saturation last handed to the flow controller, as
 	// math.Float64bits (read at ~1 kHz by the detector, written once per Saturation).

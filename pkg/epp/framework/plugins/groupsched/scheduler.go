@@ -498,6 +498,10 @@ type Scheduler struct {
 
 	// pickSeq synthesizes request ids for heads that lack one (M1).
 	pickSeq int64
+	// queueViewAt is when the queue-head snapshot was last reconciled
+	// (syncWaitersLocked) — the evidence clock behind "this member has no queued
+	// head". A stale view must never justify an eviction (the C8 race).
+	queueViewAt time.Time
 	// now is the virtual clock of the CURRENT decision pass (set at the top of
 	// every public decision entry point). Nothing here calls time.Now: a golden
 	// replay has to be reproducible.
@@ -508,6 +512,9 @@ type Scheduler struct {
 	// multi-engine run reproducible.
 	homeSeq int64
 	events  []Event
+	// lastHeads is the most recent queue-head snapshot (Pick's view), kept so the
+	// ticker's admission pass can re-sync the same evidence instead of guessing.
+	lastHeads []Head
 
 	counters struct {
 		entryWaits   []float64
@@ -932,6 +939,8 @@ func (s *Scheduler) FCFSServed() (int64, string) {
 // vanished leaves it, and every seated member's waiting-since tracks its oldest
 // queued head (the victim preference's input).
 func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
+	s.queueViewAt = now
+	s.lastHeads = heads
 	present := map[string]time.Time{}
 	for _, h := range heads {
 		if h.Member == "" {
@@ -1362,17 +1371,25 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 // Q is a number, not a mode. Q4 and Q8 are the same code with Config.Quantum 4 and 8;
 // there is no ceiling, no per-member scaling and no pool split.
 func (s *Scheduler) eligibleLocked(m *member, now time.Time) (string, bool) {
-	return s.mod.tenure.Eligible(m, TenureCtx{Now: now, IdleSeconds: s.cfg.IdleSeconds})
+	return s.mod.tenure.Eligible(m, s.tenureCtxLocked(now))
+}
+
+// tenureCtxLocked is the read-only view the TENURE module gets (with the queue view's
+// age, so "no queued head" is evidence rather than a guess).
+func (s *Scheduler) tenureCtxLocked(now time.Time) TenureCtx {
+	return TenureCtx{Now: now, IdleSeconds: s.cfg.IdleSeconds,
+		QueueView: s.queueViewAt, QueueViewSet: !s.queueViewAt.IsZero()}
 }
 
 // pressureCtxLocked is the read-only view the PRESSURE module gets of ONE engine.
 func (s *Scheduler) pressureCtxLocked(g *engineGroup, now time.Time) PressureCtx {
-	tctx := TenureCtx{Now: now, IdleSeconds: s.cfg.IdleSeconds}
+	tctx := s.tenureCtxLocked(now)
 	return PressureCtx{
 		Now:            now,
 		Exiting:        g.index.ExitingLocked,
 		RotationVictim: func() (string, *member) { return s.rotationVictimLocked(g, now) },
 		Silent:         tctx.Silent,
+		Headless:       tctx.Headless,
 	}
 }
 
@@ -1590,6 +1607,12 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 		if victim.inflight > 0 {
 			g.index.MarkExitingLocked(victim.id)
 			s.countExitLocked(g, "exiting")
+			// the series has to see it: the member is on its way out NOW (it drains, then
+			// exits as "exiting-drain"), and counting it only in the snapshot left
+			// llm_d_epp_group_exits_total{reason="exiting"} permanently at zero.
+			if s.onExit != nil {
+				s.onExit(engineLabel(g.id), "exiting", victim.resTurns)
+			}
 			continue
 		}
 		s.exitLocked(g, victim, reason, now)
@@ -1620,6 +1643,11 @@ func (s *Scheduler) Tick(now time.Time) {
 	// last sync; rotation waits are minutes. Headless, unseated records are GC'd by
 	// lastSeen (silence, not queue age).
 	s.gcSilentRecordsLocked(now)
+	// BUG 3 (the C8 race): Tick calls the admission loop WITHOUT a queue sync, so a
+	// head that arrived since the last Pick left its member looking headless. Re-sync
+	// from the LAST head snapshot (a candidate set is what Pick sees; it is refreshed on
+	// every decision pass, and Tick's rotate uses it so the two paths agree), then seat.
+	s.syncWaitersLocked(s.lastHeads, now)
 	s.rotateLocked(now)
 }
 

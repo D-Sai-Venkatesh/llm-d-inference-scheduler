@@ -682,3 +682,118 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// BUG 2: the MID-QUANTUM victim order never takes a seat back from a member that has
+// not served a turn in this residency while a member that HAS served one is available.
+func TestClass3VictimPrefersAServedMember(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		// two residents, both with a queued head (so class 2 finds nothing), neither
+		// eligible by the tenure rule
+		fx.seatOne(t, "served", 200, 9*time.Second)
+		settle(fx.s, "served", 200, 200) // served one turn
+		fx.seatOne(t, "fresh", 200, 8*time.Second)
+		for _, id := range []string{"served", "fresh"} {
+			m, _ := fx.member(t, id)
+			fx.s.mu.Lock()
+			m.waitingSince = fx.clock.Add(-time.Second)
+			m.lastActivity = fx.clock
+			m.inflight = 0
+			m.busyPeriods = 0
+			fx.s.mu.Unlock()
+		}
+		var reason string
+		var victim *member
+		fx.s.mu.Lock()
+		fx.s.queueViewAt = fx.clock // a trustworthy queue view (both have heads)
+		reason, victim = fx.s.budgetVictimLocked(fx.g(), fx.clock)
+		fx.s.mu.Unlock()
+		if victim == nil {
+			t.Fatal("a victim must exist")
+		}
+		if victim.id == "fresh" {
+			t.Fatalf("BUG 2: a member that has served ZERO turns must not be taken before one that has (reason=%s)", reason)
+		}
+		if victim.id != "served" {
+			t.Fatalf("expected the served member, got %s", victim.id)
+		}
+	})
+}
+
+// BUG 3 (the C8 race): a head that arrives just before a Tick protects its member, and
+// a STALE queue view must never justify an idle eviction.
+func TestStaleQueueViewNeverIdleEvicts(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		fx.seatOne(t, "m", 200, time.Second)
+		settle(fx.s, "m", 200, 200)
+		// (a) a head arrives, Pick sees it, then a Tick lands just after -> protected
+		fx.pick(head("m", time.Second, bytesFor(200)))
+		fx.tick(25 * time.Second) // silence past S, but the head is queued
+		if !fx.s.Seated("m") {
+			t.Fatal("BUG 3: a head present at the last sync must protect its member from an idle eviction")
+		}
+		// (b) no Pick has run for longer than S (the flow controller's gate is closed):
+		// the queue view is stale, so silence is NOT evidence and nothing may be evicted
+		fx.s.mu.Lock()
+		m := fx.g().members["m"]
+		m.waitingSince = time.Time{} // the flag went stale exactly as in the race
+		m.lastActivity = fx.clock.Add(-time.Hour)
+		fx.s.mu.Unlock()
+		fx.tick(5 * time.Minute) // Tick re-syncs from the LAST snapshot (which has the head)
+		if !fx.s.Seated("m") {
+			t.Fatal("BUG 3: a stale queue view must never justify an idle eviction")
+		}
+	})
+}
+
+// BUG 4(a): a mid-flight exit reaches the exit HOOK (the metric series), not only the
+// snapshot. BUG 4(b): a rotation victim is never a member with something in flight.
+func TestExitingIsCountedAndRotationNeverPicksInflight(t *testing.T) {
+	cfg := defaultConfig()
+	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
+		var hooked []string
+		fx.s.onExit = func(engine, reason string, turns int) { hooked = append(hooked, reason) }
+		// a member filling most of the budget, in flight
+		fx.seatOne(t, "run", 800, 5*time.Second)
+		// over budget by growth: the pressure module takes the mid-flight class
+		fx.s.mu.Lock()
+		m := fx.g().members["run"]
+		m.waitingSince = time.Time{}
+		m.lastActivity = fx.clock.Add(-time.Hour) // silent, so class 2 has a victim...
+		fx.s.mu.Unlock()
+		// ...but the member is in flight, so class 2 skips it: force class 4 by making
+		// every member in flight and the engine over budget
+		fx.dispatchBig(t, "run", 400)
+		fx.s.mu.Lock()
+		fx.s.enforceBudgetLocked(fx.g(), fx.clock)
+		fx.s.mu.Unlock()
+		// (b) the rotation never returns an in-flight member
+		fx.s.mu.Lock()
+		_, rv := fx.s.rotationVictimLocked(fx.g(), fx.clock)
+		fx.s.mu.Unlock()
+		if rv != nil && rv.inflight > 0 {
+			t.Fatal("BUG 4(b): a rotation victim must never have requests in flight")
+		}
+		// (a) every booked exit reason reaches the hook
+		found := false
+		for _, r := range hooked {
+			if r == "exiting" || r == "budget-exiting" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("BUG 4(a): a mid-flight exit must reach the exit hook, got %v", hooked)
+		}
+	})
+}
+
+// dispatchBig grows a member's footprint with an extra request (the pressure path's
+// trigger), through the public API.
+func (fx *engineSet) dispatchBig(t *testing.T, id string, blocks int) {
+	t.Helper()
+	h := head(id, time.Second, bytesFor(blocks))
+	h.ReqID = "r-" + id + "-grow"
+	if i := fx.pick(h); i < 0 {
+		t.Fatalf("the member's growth head must dispatch, got %d", i)
+	}
+	fx.s.Dispatched(id, h.ReqID, keys(blocks, seedFor(id)+97), bytesFor(blocks), fx.clock)
+}

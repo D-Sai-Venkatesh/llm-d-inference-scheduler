@@ -273,11 +273,9 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 		if victim == nil {
 			return // this engine can free nothing; another pass will re-evaluate
 		}
-		if victim.inflight > 0 {
-			cand.g.index.MarkExitingLocked(victim.id)
-			s.countExitLocked(cand.g, "exiting")
-			return
-		}
+		// NOTE: a rotation victim is never in flight — the tenure rule refuses in-flight
+		// members — so there is no mid-flight exit to handle here (the mid-flight class
+		// lives in the PRESSURE module, which does reach running members).
 		s.exitLocked(cand.g, victim, reason, now)
 	}
 }

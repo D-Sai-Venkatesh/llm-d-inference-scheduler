@@ -208,6 +208,36 @@ type Config struct {
 	// busy periods. 0 → 8 (the B1a winner sets the value).
 	LongQuantum int `json:"longQuantum"`
 
+	// ---- PAT knob (B2: the pause-aligned tenure) ----
+
+	// EligibilityMode selects the exit-eligibility MODEL — WHO may be rotated. It is
+	// orthogonal to VictimOrder (who goes FIRST among the eligible):
+	//
+	//	"off" — the existing models (rotationMode's busy-period quantum / mlfq2, or the
+	//	        legacy ledger rule). DEFAULT, golden-pinned.
+	//	"pat" — PAT, the PAUSE-ALIGNED TENURE. A member is rotation-eligible iff
+	//	        (a) it has completed its FAIR SHARE (Q_fair = the quantum, 4 busy
+	//	            periods by default) AND it is IDLE (no queued turn, nothing in
+	//	            flight) AND its residue class is COLD — the parameter-free residue
+	//	            model (residue.go) predicts under half of its chain still resident,
+	//	            i.e. the PAUSE OUTLIVED THE CACHE, a fact derived from block
+	//	            ALLOCATIONS (no clock, no threshold, no cache read); OR
+	//	        (b) it reaches the safety CEILING (quantumCeiling; 8 busy periods — the
+	//	            B1a measured-safe knee — when unset).
+	//
+	// WHY IT SHOULD DOMINATE A FIXED Q8: a long-pausing member returns COLD under BOTH
+	// rules, so the cold tokens it costs are the same either way — but under Q8 it holds
+	// its seat idle through the pause while a waiter queues. PAT rotates at the
+	// CACHE-DEAD moment instead of at the 8th busy period (which may be WARM), so the
+	// seat serves a waiter during the pause at ZERO cache cost. And nothing is released
+	// BEFORE fair share: that is the fairness guarantee the removed F6′ lacked.
+	//
+	// FAIL-CLOSED PAIRS (validated at startup, never silently degraded): "pat" requires
+	// rotationMode="quantum" (Q_fair IS the quantum — the same Q the anchor runs),
+	// residue="tiebreak" (the COLD class is the model's, and the shadow is only built
+	// when it is on) and victimOrder="residue" (F6″'s order is PAT's own victim order).
+	EligibilityMode string `json:"eligibilityMode"`
+
 	// ---- per-engine gating (both arms: the multi-pod gate coupling fix) ----
 
 	// EngineGate applies the saturation gate PER ENGINE, at head selection:
@@ -319,6 +349,7 @@ func defaultConfig() Config {
 		QuantumMode:             "fixed",
 		EntryOrder:              "newcomer-first",
 		MaxNumBatchedTokens:     8192,
+		EligibilityMode:         "off",
 		EngineGate:              "off",
 		SatKvThreshold:          0.80,
 		SatQueueThreshold:       5,
@@ -397,6 +428,9 @@ func (c Config) effective() Config {
 	}
 	if c.SatQueueThreshold == 0 {
 		c.SatQueueThreshold = def.SatQueueThreshold
+	}
+	if c.EligibilityMode == "" {
+		c.EligibilityMode = def.EligibilityMode
 	}
 	if c.BindingTTLSeconds == 0 {
 		c.BindingTTLSeconds = 20 * c.TTLSeconds
@@ -548,6 +582,38 @@ func (c Config) validate() error {
 	default:
 		return fmt.Errorf("residue: invalid value %q (off|tiebreak)", c.Residue)
 	}
+	switch c.EligibilityMode {
+	case "", "off", "pat":
+	default:
+		return fmt.Errorf("eligibilityMode: invalid value %q (off|pat)", c.EligibilityMode)
+	}
+	if c.EligibilityMode == "pat" {
+		// PAT reads its three inputs from knobs that already exist, and a silent
+		// fallback would turn the arm into a differently-named Q-arm. All three pairs
+		// are therefore startup failures.
+		if c.RotationMode != "quantum" {
+			return fmt.Errorf("eligibilityMode=\"pat\" requires rotationMode=\"quantum\" (Q_fair IS the quantum; got %q)", c.RotationMode)
+		}
+		if !c.residueOn() {
+			return fmt.Errorf("eligibilityMode=\"pat\" requires residue=\"tiebreak\" (the COLD class is the residue model's verdict, and the shadow is only built when it is on)")
+		}
+		if c.VictimOrder != "residue" {
+			return fmt.Errorf("eligibilityMode=\"pat\" requires victimOrder=\"residue\" (PAT's victim order among the eligible IS F6″'s; got %q)", c.VictimOrder)
+		}
+		if c.QuantumCeiling > 0 {
+			// The ceiling is a CAP, and a cap below the fair share would release members
+			// BEFORE their share — the one thing PAT guarantees never happens. (For the
+			// per-member rules a low cap is meaningful: it only trims the members whose
+			// own base is above it.)
+			q := c.quantum()
+			if q < 0 {
+				return fmt.Errorf("eligibilityMode=\"pat\" needs a finite quantumBusyPeriods (Q_fair is the fair share; got %d)", q)
+			}
+			if c.QuantumCeiling < q {
+				return fmt.Errorf("eligibilityMode=\"pat\" with quantumCeiling=%d below the fair share Q_fair=%d would release members before their share (the ceiling caps, it cannot undercut the base)", c.QuantumCeiling, q)
+			}
+		}
+	}
 	if c.BindingMode == "seat" && !c.perEngine() {
 		// seat=pin is a MULTI-POD model: under engineGroups=single there is one
 		// group, one binding target and nothing to pin, so the arm would measure
@@ -571,6 +637,9 @@ func (c Config) residueReconcile() bool { return c.ResidueReconcile == "settle" 
 
 // engineGating reports whether admission is gated per engine.
 func (c Config) engineGating() bool { return c.EngineGate == "per-engine" }
+
+// patOn reports whether PAT (the pause-aligned tenure) is the eligibility model.
+func (c Config) patOn() bool { return c.EligibilityMode == "pat" }
 
 // reapSeconds is the effective confirmed-id reap bound (0 → default).
 func (c Config) reapSeconds() float64 {
@@ -699,6 +768,11 @@ type Head struct {
 
 type member struct {
 	id string
+	// patReason is PAT's eligibility LATCH (eligibilityMode "pat" only): the reason
+	// this member currently IS rotation-eligible under PAT, "" when it is not. It
+	// exists so the two mechanism counters book MEMBERS BECOMING ELIGIBLE (a
+	// transition) instead of one increment per decision pass over the same member.
+	patReason string
 	// engine is the engineGroup id this member is HOMED to (the same value
 	// as the identity-level binding; kept on the record so a dump shows the
 	// binding without a second lookup).
@@ -952,6 +1026,11 @@ type Scheduler struct {
 	// onEngineGateSkip fires when the per-engine saturation gate holds a dispatch
 	// back (G1).
 	onEngineGateSkip func(engine string)
+	// onPatEligible fires when a member BECOMES rotation-eligible under PAT (a
+	// transition, not a decision pass), carrying the rule that made it eligible — it
+	// is how the mechanism stays countable in the artifacts (nil-safe; nil in tests
+	// and in every non-PAT arm).
+	onPatEligible func(engine, reason string)
 
 	// groups holds one engineGroup per engine, keyed by endpoint id. In
 	// single mode there is exactly one, keyed "".

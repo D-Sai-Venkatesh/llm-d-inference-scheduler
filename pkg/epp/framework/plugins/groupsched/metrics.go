@@ -122,7 +122,22 @@ type groupMetrics struct {
 	rebinds            prometheus.Counter
 	homings            *prometheus.CounterVec
 	rehomes            prometheus.Counter
-	engineGone         prometheus.Counter
+	// engineGone is the per-endpoint teardown counter.
+	engineGone prometheus.Counter
+	// ---- PAT export (eligibilityMode "pat": the mechanism must be countable) ----
+	//
+	// Two counters, one per eligibility REASON, incremented when a member BECOMES
+	// rotation-eligible (a transition per residency, not per decision pass):
+	//
+	//	pat_eligible_fair_share_cold_total — rule (a): the member had served its fair
+	//	    share, was idle, and its pause had OUTLIVED ITS CACHE. This is the arm's
+	//	    early-exit mechanism; without it PAT ran as Q8.
+	//	pat_eligible_ceiling_total — rule (b): the member ran to the safety ceiling.
+	//	    A large value next to a small fair-share count means this workload had few
+	//	    cache-dead pauses (members stayed warm through their gaps), which is a
+	//	    statement about the traffic, not about the rule.
+	patEligibleFairShareCold *prometheus.CounterVec
+	patEligibleCeiling       *prometheus.CounterVec
 
 	sched *Scheduler
 	// known tracks the engine label values already instantiated, so Refresh
@@ -193,6 +208,10 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "silent-member rehoming (rate-bounded defrag; a counter stub until it is wired)"})
 	g.engineGone = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "engine_gone_total",
 		Help: "engines torn down by an endpoint delete event"})
+	g.patEligibleFairShareCold = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "pat_eligible_fair_share_cold_total",
+		Help: "members that became rotation-eligible under PAT rule (a): fair share served, idle, and the pause OUTLIVED THE CACHE (residue class COLD, from allocations)"}, engineLabels)
+	g.patEligibleCeiling = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "pat_eligible_ceiling_total",
+		Help: "members that became rotation-eligible under PAT rule (b): the safety ceiling (quantumCeiling, default 8 busy periods = the measured Q8 knee)"}, engineLabels)
 	g.filterDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "filter_decisions_total",
 		Help: "placement-Filter decisions by outcome (pinned | engine-not-a-candidate | passthrough-unseated | passthrough-anonymous | passthrough-single-candidate | passthrough-binding-mode)"}, []string{"decision"})
 	g.residuePredicted = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "residue_predicted_ratio",
@@ -223,7 +242,8 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.capacityMissing, g.capacityLearned, g.pooledEndpoints, g.capacityHeterogeneous,
 		g.affinityViolations, g.rebinds, g.homings, g.rehomes, g.engineGone, g.filterDecisions,
 		g.residuePredicted, g.residueActual, g.residueDecided, g.residueResets, g.residueOff,
-		g.valveBlockedEvictions, g.engineGateSkips, g.engineGateClosed, g.engineKV, g.engineWaiting} {
+		g.valveBlockedEvictions, g.engineGateSkips, g.engineGateClosed, g.engineKV, g.engineWaiting,
+		g.patEligibleFairShareCold, g.patEligibleCeiling} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second
 			// plugin config in the same test binary) must not fail startup: the
@@ -293,8 +313,12 @@ func (g *groupMetrics) Refresh() {
 		}
 		for _, reason := range []string{"paid", "idle", "nmax", "exiting", "engine-idle",
 			"quantum-complete", "ttl", "exiting-drain", "budget-idle", "budget-noqueue",
-			"budget-exiting", "engine-gone"} {
+			"budget-exiting", "engine-gone", reasonPatFairShareCold, reasonPatCeiling} {
 			g.exits.WithLabelValues(label, reason).Add(0)
+		}
+		if g.patEligibleFairShareCold != nil {
+			g.patEligibleFairShareCold.WithLabelValues(label).Add(0)
+			g.patEligibleCeiling.WithLabelValues(label).Add(0)
 		}
 	}
 	// an engine that disappeared must not keep its last gauge value
@@ -420,6 +444,25 @@ func (g *groupMetrics) ObserveValveBlockedEviction(engine string) {
 		return
 	}
 	g.valveBlockedEvictions.WithLabelValues(engine).Inc()
+}
+
+// ObservePatEligible books one member's TRANSITION into PAT-eligibility, on the counter
+// of the rule that made it eligible. Nil-safe: a unit-mode run has no registrar and
+// must take the same code path.
+func (g *groupMetrics) ObservePatEligible(engine, reason string) {
+	if g == nil {
+		return
+	}
+	switch reason {
+	case reasonPatFairShareCold:
+		if g.patEligibleFairShareCold != nil {
+			g.patEligibleFairShareCold.WithLabelValues(engine).Inc()
+		}
+	case reasonPatCeiling:
+		if g.patEligibleCeiling != nil {
+			g.patEligibleCeiling.WithLabelValues(engine).Inc()
+		}
+	}
 }
 
 func (g *groupMetrics) ObserveResidueReset(engine, reason string) {

@@ -87,33 +87,78 @@ func TestDynamicQuantumScalesWithFootprint(t *testing.T) {
 	}
 }
 
-// TestTenureCeilingBoundsDynamicQuantum is the fairness guarantee: with a ceiling
-// set, the dynamic quantum can NEVER exceed it — that is what stops a big member's
-// scaled slice from being unbounded.
-func TestTenureCeilingBoundsDynamicQuantum(t *testing.T) {
+// TestTenureCeilingCapsButDoesNotOverrideDynamicQuantum is the fairness guarantee
+// WITH the B1b precedence fix (ruled 2026-10-31): the ceiling CAPS the scaled quantum
+// (min(base, ceiling)) and never replaces it, so small members keep their short slice
+// and only the members whose own base is above the ceiling are trimmed.
+//
+// The previous version of this test asserted the opposite ("the ceiling overrides the
+// scaled quantum") — i.e. it codified the bug that turned F3 into a Q8 replicate.
+func TestTenureCeilingCapsButDoesNotOverrideDynamicQuantum(t *testing.T) {
 	s := fArmScheduler(t, func(c *Config) {
 		c.QuantumMode = "dyn-size"
 		c.QuantumCeiling = 6
 	})
 	now := goldenT0
-	for i := 0; i < 5; i++ { // five tiny members so the MEDIAN is 1, not the mean
-		seatWithBlocks(t, s, fmt.Sprintf("tiny%d", i), 1, now.Add(time.Duration(i)*time.Second))
+	// footprints 10/20/20/20/40/200 => MEDIAN 20, Q̄ = 4 => bases 2, 4, 8 and 40.
+	for i, blocks := range []int{10, 20, 20, 20, 40} {
+		seatWithBlocks(t, s, fmt.Sprintf("m%d", i), blocks, now.Add(time.Duration(i)*time.Second))
 	}
 	seatWithBlocks(t, s, "huge", 200, now.Add(20*time.Second))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m := s.eng().members["huge"]
-	if got := s.dynQuantumLocked(s.eng(), m); got < 100 {
-		t.Fatalf("test premise: the scaled quantum should be huge, got %d", got)
+	g := s.eng()
+	if got := s.medianFootprintLocked(g); got != 20 {
+		t.Fatalf("test premise: median footprint = %d, want 20", got)
 	}
-	if q, bounded := s.quantumBoundLocked(s.eng(), m); !bounded || q != 6 {
-		t.Fatalf("ceiling bound = (%d,%v), want (6,true) — the ceiling overrides the scaled quantum", q, bounded)
+	// (member, base, eligibility bound): dyn-size VARIES below the ceiling and is
+	// only truncated where its own base exceeds it.
+	for _, tc := range []struct {
+		id    string
+		base  int
+		bound int
+	}{
+		{"m0", 2, 2},    // 10 blocks: 4 x 10/20
+		{"m1", 4, 4},    // 20 blocks: the median
+		{"m4", 8, 6},    // 40 blocks: base 8, capped by the ceiling
+		{"huge", 40, 6}, // 200 blocks: a huge slice, still capped
+	} {
+		m := g.members[tc.id]
+		if base, bounded := s.eligibilityBaseLocked(g, m); !bounded || base != tc.base {
+			t.Fatalf("%s: base quantum = (%d,%v), want (%d,true) — the ceiling must not REPLACE the base", tc.id, base, bounded, tc.base)
+		}
+		if q, bounded := s.quantumBoundLocked(g, m); !bounded || q != tc.bound {
+			t.Fatalf("%s: eligibility bound = (%d,%v), want (%d,true) = min(base, ceiling)", tc.id, q, bounded, tc.bound)
+		}
 	}
-	if !s.ceilingReachedLocked(s.eng(), &member{id: "huge", busyPeriods: 6}) {
+	// ceilingReached compares against the CEILING itself (what F7's gate may not block)
+	if !s.ceilingReachedLocked(g, &member{id: "huge", busyPeriods: 6}) {
 		t.Fatal("6 busy periods must reach a ceiling of 6")
 	}
-	if s.ceilingReachedLocked(s.eng(), &member{id: "huge", busyPeriods: 5}) {
+	if s.ceilingReachedLocked(g, &member{id: "huge", busyPeriods: 5}) {
 		t.Fatal("5 busy periods must not reach a ceiling of 6")
+	}
+}
+
+// TestFixedQuantumIsUnchangedByACeilingAboveIt: a ceiling at or above the fixed Q
+// changes nothing — the base fires first, which is the default-PAT-adjacent case and
+// the reason the fix is safe for every banked arm that carried no ceiling.
+func TestFixedQuantumIsUnchangedByACeilingAboveIt(t *testing.T) {
+	s := fArmScheduler(t, func(c *Config) { c.QuantumCeiling = 8 }) // Q = 4
+	now := goldenT0
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g := s.eng()
+	m := &member{id: "m", engine: "engine-a", seatTime: now, lastActivity: now}
+	if q, bounded := s.quantumBoundLocked(g, m); !bounded || q != 4 {
+		t.Fatalf("eligibility bound = (%d,%v), want (4,true)", q, bounded)
+	}
+	m.busyPeriods = 4
+	if reason, ok := s.eligibleLocked(g, m, now); !ok || reason != "quantum-complete" {
+		t.Fatalf("a Q4-complete member = (%q,%v), want eligible at 4 with an 8 ceiling", reason, ok)
+	}
+	if s.ceilingReachedLocked(g, m) {
+		t.Fatal("4 busy periods must not reach a ceiling of 8")
 	}
 }
 
@@ -252,18 +297,27 @@ func TestResidueVictimOrderIsFairAndColdFirst(t *testing.T) {
 
 // ---- F7 rotate-when-free ----
 
-// TestRotateWhenFreeHoldsWhilePrefillSaturated: the gate blocks rotation evictions
-// when prefill is saturated, and the tenure ceiling still evicts (no starvation).
+// TestRotateWhenFreeHoldsWhilePrefillSaturated is F7's actual intent, restated after
+// the B1b precedence fix (ruled 2026-10-31):
+//
+//	prefill FREE       -> members are eligible at the BASE quantum (Q = 4 here), i.e. F7
+//	                      takes Q4's slice exactly when the freed slice cannot be reused;
+//	prefill SATURATED  -> rotation is HELD — past the base, not at it — until the tenure
+//	                      ceiling, so the slices lengthen to Q8 and then stop.
+//
+// Before the fix the base bound WAS the ceiling (16), so the "hold" started at 16 and the
+// free-prefill half rotated at 16 as well: F7 was Q16-with-a-gate, i.e. an uninterpretable
+// arm rather than a Pareto improvement.
 func TestRotateWhenFreeHoldsWhilePrefillSaturated(t *testing.T) {
 	s := fArmScheduler(t, func(c *Config) {
 		c.RotateWhenFree = true
-		c.QuantumCeiling = 16
+		c.QuantumCeiling = 8
 		c.MaxNumBatchedTokens = 8192
 	})
 	now := goldenT0
 	s.mu.Lock()
 	g := s.eng()
-	// two idle, rotation-eligible members (they are quantum-complete at Q=4)
+	// two idle members that have served their BASE share (Q = 4)
 	for _, id := range []string{"old", "older"} {
 		g.members[id] = &member{id: id, engine: "engine-a", seatTime: now, lastActivity: now,
 			busyPeriods: 4, resTurns: 4}
@@ -282,9 +336,18 @@ func TestRotateWhenFreeHoldsWhilePrefillSaturated(t *testing.T) {
 	if victim != nil {
 		t.Fatalf("rotation fired (%q) while prefill was saturated: %+v", reason, victim)
 	}
-	// the CEILING still fires: give a member 16 busy periods
+	// the HOLD extends to the ceiling: at 7 busy periods (base 4, ceiling 8) the
+	// saturated engine still refuses to rotate
 	s.mu.Lock()
-	g.members["old"].busyPeriods = 16
+	g.members["old"].busyPeriods = 7
+	reason, victim = s.rotationVictimLocked(g, now)
+	s.mu.Unlock()
+	if victim != nil {
+		t.Fatalf("rotation fired at 7 busy periods while saturated (%q): the gate must hold up to the ceiling (8)", reason)
+	}
+	// the CEILING still fires: give a member 8 busy periods
+	s.mu.Lock()
+	g.members["old"].busyPeriods = 8
 	reason, victim = s.rotationVictimLocked(g, now)
 	s.mu.Unlock()
 	if victim == nil || victim.id != "old" {
@@ -307,6 +370,33 @@ func TestRotateWhenFreeHoldsWhilePrefillSaturated(t *testing.T) {
 
 // TestPrefillBacklogDecrementsAtFirstToken is F7's tracking correctness: the
 // backlog falls at StartOfStream (ChunkAt), NOT at EndOfStream.
+// TestRotateWhenFreeRotatesAtTheBaseQuantum: with prefill FREE the same Q4-complete
+// member is eligible at once — F7's other half, which the precedence bug removed.
+func TestRotateWhenFreeRotatesAtTheBaseQuantum(t *testing.T) {
+	s := fArmScheduler(t, func(c *Config) {
+		c.RotateWhenFree = true
+		c.QuantumCeiling = 8
+		c.MaxNumBatchedTokens = 8192
+	})
+	now := goldenT0
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g := s.eng()
+	g.members["q4"] = &member{id: "q4", engine: "engine-a", seatTime: now, lastActivity: now,
+		busyPeriods: 4, resTurns: 4, lastCompletion: now}
+	g.members["busy"] = &member{id: "busy", engine: "engine-a", seatTime: now, lastActivity: now,
+		inflight: 1, prefillPending: 1024} // in flight, but prefill is NOT over budget
+	g.waiters["w"] = &waiter{id: "w", since: now}
+	s.deriveLocked()
+	if s.prefillSaturatedLocked(g) {
+		s.mu.Unlock()
+		t.Fatalf("fixture: prefill backlog %d must be under the %d-token budget", g.prefillBacklog, s.cfg.MaxNumBatchedTokens)
+	}
+	if reason, victim := s.rotationVictimLocked(g, now); victim == nil || victim.id != "q4" {
+		t.Fatalf("with prefill FREE a Q4-complete member must be rotatable, got %v (%q)", victim, reason)
+	}
+}
+
 func TestPrefillBacklogDecrementsAtFirstToken(t *testing.T) {
 	s := fArmScheduler(t, func(c *Config) { c.RotateWhenFree = true })
 	now := goldenT0

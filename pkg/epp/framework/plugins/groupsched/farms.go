@@ -45,19 +45,35 @@ import "time"
 // rather than dividing by a guess.
 const prefillRateMinSamples = 3
 
-// quantumBoundLocked is a member's tenure bound in completed busy periods, or
-// (bound=false) "unbounded". Precedence:
+// ---- the two tenure quantities: the rule's BASE and the hard CEILING ----
 //
-//  1. quantumCeiling > 0 — the FAIRNESS GUARANTEE of every dynamic rule: whatever
-//     else is going on, nobody holds a seat longer than this many busy periods.
-//  2. rotationMode != quantum / mlfq2 — the ledger model does not use a quantum.
-//  3. quantumMode dyn-size — Q_i = max(1, round(Q̄ · blocks_i / median blocks)).
-//     Q̄ is the anchor's own Q (so the AVERAGE scale matches and only the SIZE
-//     effect varies): a big member gets a longer slice, a small one a shorter one.
-//  4. otherwise the fixed Q.
-func (s *Scheduler) quantumBoundLocked(g *engineGroup, m *member) (int, bool) {
-	if s.cfg.QuantumCeiling > 0 {
-		return s.cfg.QuantumCeiling, true
+// THE CEILING IS A CAP, NEVER AN OVERRIDE (the B1b precedence bug, ruled 2026-10-31).
+// When this code returned `quantumCeiling` as THE bound for any rule that had one, the
+// rule's own base quantum never applied: F3 (dyn-size) released every member at the
+// ceiling (dyn-size = Q8 exactly) and F7's "rotate at Q4 while prefill is free" half
+// never ran either (F7 ≈ Q8 + a minor idle-hold). Both arms then read as Q8 replicates
+// — an uninterpretable arm, not a wrong one. The two quantities are therefore separate:
+//
+//   base    — the tenure THIS rule releases a member at (the fixed Q, the footprint-
+//             scaled Q_i, the pool's Q_s/Q_l, PAT's fair share Q_fair).
+//   ceiling — the hard bound nobody may exceed (Config.QuantumCeiling; for PAT the
+//             measured-safe knee when unset). 0 = none.
+//
+// and the eligibility bound is min(base, ceiling).
+
+// eligibilityBaseLocked is the tenure the member's OWN eligibility rule releases at:
+// the fixed Q, the dyn-size Q_i (F3), the pool quantum (F9) or PAT's fair share. It
+// answers "when does this rule fire?", which is a different question from
+// tenureCeilingLocked's "when must it fire anyway?".
+func (s *Scheduler) eligibilityBaseLocked(g *engineGroup, m *member) (int, bool) {
+	if s.cfg.patOn() {
+		// PAT's rule (a) fires at the FAIR SHARE (Q_fair = the quantum); its rule (b) is
+		// the ceiling and lives in tenureCeilingLocked. Reporting the fair share here is
+		// what makes "nothing is released before fair share" checkable from one number.
+		if q, bounded := s.patFairShare(); bounded {
+			return q, true
+		}
+		return 0, false
 	}
 	switch s.cfg.RotationMode {
 	case "quantum":
@@ -70,14 +86,46 @@ func (s *Scheduler) quantumBoundLocked(g *engineGroup, m *member) (int, bool) {
 		q := s.cfg.quantum()
 		return q, q >= 0
 	case "mlfq2":
-		// long pool: Q_l is the tenure bound; a member still in the SHORT pool is
-		// bounded by Q_s = 1 busy period (promotion, not eviction).
+		// long pool: Q_l is the slice; a member still in the SHORT pool is bounded by
+		// Q_s = 1 busy period (promotion, not eviction).
 		if s.mlffqLongLocked(m) {
 			return s.longQuantum(), true
 		}
 		return 1, true
 	}
-	return 0, false
+	return 0, false // the ledger model does not use a quantum
+}
+
+// tenureCeilingLocked is the HARD bound in completed busy periods, 0 = none. It is what
+// F7's hold-gate may not block and what PAT's rule (b) fires on — the fairness guarantee
+// of every dynamic rule, measured against the ceiling ITSELF and never against a
+// min() bound (otherwise a member capped down to 3 would "reach the ceiling" at 3).
+func (s *Scheduler) tenureCeilingLocked() int {
+	if s.cfg.patOn() {
+		return s.patCeiling() // explicit quantumCeiling, else the measured 8-knee
+	}
+	if s.cfg.QuantumCeiling > 0 {
+		return s.cfg.QuantumCeiling
+	}
+	return 0
+}
+
+// quantumBoundLocked is the member's ELIGIBILITY bound in completed busy periods, or
+// (bound=false) "unbounded": min(base, ceiling). The ceiling caps the base; it never
+// replaces it — that distinction is the whole fix.
+func (s *Scheduler) quantumBoundLocked(g *engineGroup, m *member) (int, bool) {
+	base, bounded := s.eligibilityBaseLocked(g, m)
+	ceiling := s.tenureCeilingLocked()
+	if ceiling <= 0 {
+		return base, bounded
+	}
+	if !bounded {
+		return ceiling, true // an unbounded rule is bounded by the ceiling alone
+	}
+	if ceiling < base {
+		return ceiling, true // the cap binds
+	}
+	return base, true
 }
 
 // dynQuantumLocked is F3: the member's quantum scaled by its FOOTPRINT relative to
@@ -239,9 +287,15 @@ func (s *Scheduler) prefillSaturatedLocked(g *engineGroup) bool {
 // nmax) unless rotationMode says quantum or mlfq2, with the C8 fix always-on: a
 // member with a live queued head is never idle (its lastActivity cannot be
 // refreshed when Picks stop, so gate closure used to manufacture idle exits).
+// eligibilityMode "pat" substitutes PAT's rule (pat.go) for the whole model.
 func (s *Scheduler) eligibleLocked(g *engineGroup, m *member, now time.Time) (string, bool) {
 	if m.inflight > 0 {
 		return "", false
+	}
+	if s.cfg.patOn() {
+		// PAT (pat.go) replaces the whole eligibility model — not the victim order, and
+		// not anything downstream of it.
+		return s.patEligibleLocked(g, m)
 	}
 	switch s.cfg.RotationMode {
 	case "quantum", "mlfq2":
@@ -271,9 +325,18 @@ func (s *Scheduler) eligibleLocked(g *engineGroup, m *member, now time.Time) (st
 	return "", false
 }
 
-// ceilingReachedLocked reports whether a member has hit the tenure ceiling — the
-// one eviction F7's gate may not block (nobody starves).
+// ceilingReachedLocked reports whether a member has hit the tenure CEILING itself — the
+// one eviction F7's gate may not block (nobody starves). It compares against the ceiling
+// and not against the eligibility bound: a member whose base was capped down must still
+// be able to run to the ceiling when the gate holds the base back.
+//
+// With NO ceiling configured there is nothing to escape to, so the rule's own base is
+// the only bound there is — which keeps F7-without-a-ceiling exactly a fixed-Q arm
+// instead of an unbounded hold (the starvation the ceiling exists to prevent).
 func (s *Scheduler) ceilingReachedLocked(g *engineGroup, m *member) bool {
-	q, bounded := s.quantumBoundLocked(g, m)
+	if c := s.tenureCeilingLocked(); c > 0 {
+		return m.busyPeriods >= c
+	}
+	q, bounded := s.eligibilityBaseLocked(g, m)
 	return bounded && m.busyPeriods >= q
 }

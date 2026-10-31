@@ -194,6 +194,14 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	} else {
 		fmt.Printf("group-scheduler: CORE policy — safety: MEMORY-ONLY net per engine, fires at measured kv >= %v (the budget's own fraction; no queue term), holds that engine's own dispatches and new seats, never influences placement\n", cfg.GroupBudgetFraction)
 	}
+	// The CPU offload tier is a DEPLOYMENT FACT, so the echo states whether this arm has
+	// one at all: a run artifact then says whether `entryOrder: hrrn-tier` was actually
+	// tier-aware or was F5′ under another name.
+	if n := cfg.tierBlocks(); n > 0 {
+		fmt.Printf("group-scheduler: CORE policy — offload: CPU tier shadow ON, %d blocks per engine (cpuTierBytes %d / kvBlockBytes %d) — restorable tokens count as cached for entryOrder=%s; the tier adds no seats (the budget and the valve stay GPU-only)\n", n, cfg.CpuTierBytes, cfg.KvBlockBytes, cfg.EntryOrder)
+	} else {
+		fmt.Printf("group-scheduler: CORE policy — offload: NO CPU tier configured (cpuTierBytes 0) — no tier shadow; entryOrder hrrn-tier degenerates to F5′ exactly (see TestHrrnTierNoTierEqualsF5P)\n")
+	}
 	// The observation hooks are installed UNCONDITIONALLY: the metrics they
 	// feed are nil-safe, and a unit-mode run (no handle) must record the same
 	// accounting as a live one — the affinity-violation and engine-gone
@@ -211,6 +219,11 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	r.sched.onUnbind = func(member string) { r.pins.del(member) }
 	r.sched.onColdValveHeld = func(engine string) {
 		r.metrics.ObserveColdValveHeld(engineLabel(engine))
+	}
+	// The tier shadow's VALIDATION pairs: prediction at seat, measurement at the turn's
+	// settle (see the SHADOW-VALIDATION event for the joinable, per-id record).
+	r.sched.onShadowValidation = func(engine string, predicted, measured float64) {
+		r.metrics.ObserveShadowValidation(engine, predicted, measured)
 	}
 	r.sched.onEngineGone = func(engine string, members int) {
 		r.metrics.ObserveEngineGone()

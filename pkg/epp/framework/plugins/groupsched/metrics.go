@@ -110,6 +110,21 @@ type groupMetrics struct {
 	// costs in waiting).
 	coldValveHeld *prometheus.CounterVec
 
+	// ---- the CPU-tier shadow (piece 1) and its VALIDATION (piece 3) ----
+	//
+	// shadowBlocks / shadowCapacity are the model's own state per engine: a shadow
+	// pinned at capacity is the tier's steady state, a shadow far below it means the
+	// store traffic the tier was sized for never arrived.
+	shadowBlocks   *prometheus.GaugeVec
+	shadowCapacity *prometheus.GaugeVec
+	// shadowPairs is the VALIDATION matrix: for every seated return, the PREDICTED
+	// resident fraction and the MEASURED cached/prompt, each binned to ten parts (bins
+	// 0..10). The 11x11 matrix is what an AUC is computed from at analysis time (bin i
+	// vs bin j ordering, summed); a single counter or a mean could not express it, and a
+	// histogram per side would lose the JOINT distribution the AUC needs. Cardinality
+	// is bounded by construction (11 x 11 per engine).
+	shadowPairs *prometheus.CounterVec
+
 	known map[string]struct{}
 }
 
@@ -193,13 +208,21 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "engines torn down by an endpoint delete"})
 	g.coldValveHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "cold_valve_held_total",
 		Help: "heads the cold-entry valve held back (the budget would have admitted them; they WAIT, nothing is evicted)"}, engineLabels)
+	g.shadowBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "tier_shadow_blocks",
+		Help: "blocks this engine's CPU-tier SHADOW believes are stored in the offload tier (0 = no tier configured)"}, engineLabels)
+	g.shadowCapacity = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "tier_shadow_capacity_blocks",
+		Help: "the tier shadow's capacity in blocks (cpuTierBytes / kvBlockBytes), the deployment's tier size"}, engineLabels)
+	g.shadowPairs = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_shadow_pairs_total",
+		Help: "seated returns with a SHADOW-VALIDATION pair: predicted resident fraction and measured cached/prompt, each in ten bins (0..10) — the AUC's input"},
+		[]string{"engine", "pred_bin", "meas_bin"})
 
 	for _, c := range []prometheus.Collector{g.seats, g.uniqueBlocks, g.neBlocks, g.budgetBlocks,
 		g.waiters, g.coldInFlight, g.coldCap, g.capacity, g.waitersShared, g.exits, g.residency, g.entryWait,
 		g.reentryWait, g.refillShare, g.served, g.fcfs, g.capacityMissing, g.capacityLearned,
 		g.safetyFired, g.safetyFires, g.safetyFiredSeconds, g.safetySkips, g.engineKV, g.engineWaiting,
 		g.poolScore, g.staleSamples, g.capacityHeterogeneous, g.filterDecisions, g.affinityViolations, g.rebinds, g.engineGone,
-		g.coldValveHeld, g.queueViewAge, g.queueViewUntrusted, g.eventRingDropped} {
+		g.coldValveHeld, g.queueViewAge, g.queueViewUntrusted, g.eventRingDropped,
+		g.shadowBlocks, g.shadowCapacity, g.shadowPairs} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second
 			// plugin config in the same test binary) must not fail startup: the series
@@ -243,6 +266,8 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 		g.waiters.WithLabelValues(label).Set(float64(es.Waiters))
 		g.coldInFlight.WithLabelValues(label).Set(float64(es.ColdInFlight))
 		g.coldCap.WithLabelValues(label).Set(float64(es.ColdCapTokens))
+		g.shadowBlocks.WithLabelValues(label).Set(float64(es.TierShadowBlocks))
+		g.shadowCapacity.WithLabelValues(label).Set(float64(es.TierCapacityBlocks))
 		g.served.WithLabelValues(label).Add(0)
 		g.fcfs.WithLabelValues("nocapacity").Add(0)
 		g.safetySkips.WithLabelValues(label).Add(0)
@@ -272,7 +297,7 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 		delete(g.known, label)
 		for _, vec := range []*prometheus.GaugeVec{g.seats, g.uniqueBlocks, g.neBlocks,
 			g.budgetBlocks, g.capacity, g.waiters, g.coldInFlight, g.coldCap, g.safetyFired,
-			g.engineKV, g.engineWaiting} {
+			g.engineKV, g.engineWaiting, g.shadowBlocks, g.shadowCapacity} {
 			vec.DeleteLabelValues(label)
 		}
 	}
@@ -414,4 +439,29 @@ func (g *groupMetrics) ObserveColdValveHeld(engine string) {
 		return
 	}
 	g.coldValveHeld.WithLabelValues(engineLabel(engine)).Inc()
+}
+
+// ObserveShadowValidation books ONE shadow-validation pair: the predicted resident
+// fraction the tier shadow made at seat time and the measured cached/prompt the engine
+// reported for the turn that seat was for. Both sides are binned to ten parts so the
+// scrape carries the JOINT distribution — which is what an AUC needs and what two
+// separate histograms cannot reconstruct.
+func (g *groupMetrics) ObserveShadowValidation(engine string, predicted, measured float64) {
+	if g == nil || g.shadowPairs == nil {
+		return
+	}
+	g.shadowPairs.WithLabelValues(engine, fracBin(predicted), fracBin(measured)).Inc()
+}
+
+// fracBin is the shared binning for the validation matrix: a fraction in [0,1] to one
+// of eleven labels (0..10), saturating outside the range rather than panicking on a
+// measured value above 1 (an engine may report cached > prompt under a broken counter).
+func fracBin(f float64) string {
+	switch {
+	case f <= 0:
+		return "0"
+	case f >= 1:
+		return "10"
+	}
+	return fmt.Sprintf("%d", int(f*10))
 }

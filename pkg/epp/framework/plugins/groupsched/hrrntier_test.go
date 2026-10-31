@@ -459,7 +459,7 @@ func TestTierShadowValidationPairsPredictionWithMeasurement(t *testing.T) {
 				continue
 			}
 			found = true
-			for _, want := range []string{"pred=1.0000", "measured=0.9000", "fairness_id=fb-m", "prompt=100", "cached=90"} {
+			for _, want := range []string{"pred=1.0000", "measured=0.9000", "pred_blocks=100", "fairness_id=fb-m", "prompt=100", "cached=90"} {
 				if !strings.Contains(ev.Detail, want) {
 					t.Errorf("SHADOW-VALIDATION detail %q is missing %q", ev.Detail, want)
 				}
@@ -568,4 +568,55 @@ func TestTierConfiguredIsShadowNeutralForTheOtherArms(t *testing.T) {
 			t.Fatalf("trace length differs under entryOrder=%s with a tier configured", tc.entry)
 		})
 	}
+}
+
+// TestTierShadowValidationIncludesColdReturns pins the pair population's HONESTY: a return
+// the shadow says is COLD (prediction 0.0) must still produce a validation pair. Keeping
+// only the warm predictions (a `resident > 0` filter) would bias the population toward the
+// cases the model gets right and flatter the AUC — the one number this arm is gated on.
+func TestTierShadowValidationIncludesColdReturns(t *testing.T) {
+	forEngines(t, tierConfig(50), func(t *testing.T, fx *engineSet) {
+		type pair struct{ predicted, measured float64 }
+		var pairs []pair
+		fx.s.onShadowValidation = func(_ string, predicted, measured float64) {
+			pairs = append(pairs, pair{predicted, measured})
+		}
+		fx.tighten(t) // one engine takes every seat, so both members share one tier
+		fx.seatOne(t, "cold-return", 100, time.Second)
+		g := fx.s.groups[fx.s.bindings["cold-return"]]
+		settle(fx.s, "cold-return", 100, 100)
+		// a SECOND member's settle overflows the 50-block tier, evicting cold-return's copy
+		fx.seatOne(t, "other", 100, time.Second)
+		if got := fx.s.bindings["other"]; got != g.id {
+			t.Fatalf("premise: 'other' must share the tier's engine, got %s want %s", got, g.id)
+		}
+		settle(fx.s, "other", 100, 100)
+		chain := keys(100, seedFor("cold-return"))
+		for _, h := range chain {
+			if g.tier.Holds(h) {
+				t.Fatal("premise: cold-return's copy must have been evicted (the tier held 50 of its 100 blocks)")
+			}
+		}
+		// it comes back: the prediction must be 0.0 and it must STILL be paired.
+		fx.s.mu.Lock()
+		fx.s.exitLocked(g, g.members["cold-return"], "test", fx.clock)
+		fx.s.mu.Unlock()
+		h := Head{Member: "cold-return", ReqID: "r-cold-2", Arrival: fx.clock.Add(-20 * time.Second),
+			SizeBytes: bytesFor(100), FairnessID: "fb-cold"}
+		if i := fx.pick(h); i < 0 {
+			t.Fatal("the returning member must be seated")
+		}
+		m, _ := fx.member(t, "cold-return")
+		if !m.predSet || m.predResident != 0 {
+			t.Fatalf("a COLD return's prediction = %v (set=%v), want 0.0 and set", m.predResident, m.predSet)
+		}
+		dispatch(t, fx.s, "cold-return", chain, bytesFor(100))
+		settle(fx.s, "cold-return", 100, 5)
+		if len(pairs) != 1 {
+			t.Fatalf("got %d validation pairs, want 1 — a cold return's prediction must not be dropped", len(pairs))
+		}
+		if pairs[0].predicted != 0 || pairs[0].measured != 0.05 {
+			t.Fatalf("pair = (%v, %v), want (0, 0.05)", pairs[0].predicted, pairs[0].measured)
+		}
+	})
 }

@@ -488,3 +488,47 @@ func TestPatEvictsOnlyTheCacheDeadMemberEndToEnd(t *testing.T) {
 		t.Fatal("cache-warm run: the waiter must NOT be seated by evicting a warm member")
 	}
 }
+
+// TestPatKeepsTheTTLExitForFinishedThreads is the reviewer's condition on PAT: the
+// legacy TTL exit in Tick is the LIVENESS GUARD for FINISHED threads (a WEKA thread is
+// mostly a single-request sub-agent leaf — ~62 % of them — that never comes back), and
+// it must keep firing in PAT mode. PAT's own eligibility deliberately carries no
+// idleSeconds clock (that clock released members at 20 s whether or not their cache had
+// survived, the rotate-at-a-warm-moment behaviour PAT exists to remove), so if TTL went
+// with it a young, finished member would hold a seat until a ceiling it can never reach
+// — a SEAT LEAK. This test is the proof that it does not.
+func TestPatKeepsTheTTLExitForFinishedThreads(t *testing.T) {
+	s := patScheduler(t, nil)
+	now := goldenT0
+	// a finished single-request leaf: one completed busy period, nothing in flight, no
+	// queued turn — and BELOW fair share (Q_fair = 4), so PAT's own rule can never fire.
+	s.mu.Lock()
+	m := patMember(s, "leaf", 1, now.Add(time.Second), now)
+	m.lastActivity = now
+	s.mu.Unlock()
+
+	ttl := time.Duration(s.cfg.TTLSeconds * float64(time.Second))
+	if ttl <= 0 {
+		t.Fatalf("test premise: ttlSeconds = %v, want > 0", ttl)
+	}
+
+	// INSIDE the TTL the leaf keeps its seat (the guard must not fire early).
+	s.Tick(now.Add(ttl - time.Second))
+	if !s.Seated("leaf") {
+		t.Fatalf("the finished leaf lost its seat inside the TTL (%v) — TTL fired early", ttl)
+	}
+	// PAST the TTL it is released, by the TTL reason and by no rotation reason.
+	s.Tick(now.Add(ttl + time.Second))
+	if s.Seated("leaf") {
+		t.Fatal("a finished thread idle past ttlSeconds still holds a seat under PAT — the TTL liveness guard was lost")
+	}
+	exits := s.Snapshot().Exits
+	if exits["ttl"] != 1 {
+		t.Fatalf("exits = %v, want exactly one \"ttl\" exit (the liveness guard, not a rotation)", exits)
+	}
+	for _, r := range []string{reasonPatFairShareCold, reasonPatCeiling, "quantum-complete", "idle"} {
+		if exits[r] != 0 {
+			t.Fatalf("exits = %v, want no %q exit — below fair share only the TTL may release a young member", exits, r)
+		}
+	}
+}

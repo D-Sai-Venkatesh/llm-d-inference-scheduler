@@ -173,9 +173,22 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	}
 	// F-arms: echo each knob in words when it is NOT at its default, so a run's
 	// artifacts state which rotation policy actually ran.
-	fmt.Printf("group-scheduler: rotation policy: mode=%s quantum=%d quantumMode=%s ceiling=%d entryOrder=%s victimOrder=%s rotateWhenFree=%v maxNumBatchedTokens=%d longQuantum=%d\n",
+	fmt.Printf("group-scheduler: rotation policy: mode=%s quantum=%d quantumMode=%s ceiling=%d entryOrder=%s victimOrder=%s rotateWhenFree=%v maxNumBatchedTokens=%d longQuantum=%d eligibilityMode=%s\n",
 		cfg.RotationMode, cfg.quantum(), cfg.QuantumMode, cfg.QuantumCeiling, cfg.EntryOrder,
-		cfg.VictimOrder, cfg.RotateWhenFree, cfg.MaxNumBatchedTokens, cfg.LongQuantum)
+		cfg.VictimOrder, cfg.RotateWhenFree, cfg.MaxNumBatchedTokens, cfg.LongQuantum, cfg.EligibilityMode)
+	if cfg.patOn() {
+		// PAT is an adaptive rule whose output (which member, which reason) is invisible
+		// in the config text, so state it in words: the two eligibility rules, the three
+		// inputs they read and the one constant that is NOT a policy knob (the ceiling is
+		// the measured Q8 knee).
+		q, bounded := sched.patFairShare()
+		fair := "unbounded (quantumBusyPeriods=-1: only the ceiling can fire)"
+		if bounded {
+			fair = fmt.Sprintf("%d busy periods (the quantum)", q)
+		}
+		fmt.Printf("group-scheduler: eligibility model: PAT — PAUSE-ALIGNED TENURE. Eligible iff (a) FAIR SHARE served (%s) AND idle (no queued turn, nothing in flight) AND residue class COLD (the parameter-free model predicts under half the chain resident: the pause OUTLIVED THE CACHE, derived from block ALLOCATIONS — no clock, no threshold, no cache read), or (b) the safety CEILING (%d busy periods, the measured-safe knee) is reached. Nothing is released before fair share; the victim order among the eligible is F6″'s (coldest class, then raw ratio, then oldest last completion, then id). Counters: llm_d_epp_group_pat_eligible_fair_share_cold_total / _pat_eligible_ceiling_total.\n",
+			fair, sched.patCeiling())
+	}
 	if cfg.residueOn() {
 		fmt.Printf("group-scheduler: residue model: TIEBREAK — a per-engine shadow of vLLM's free-block queue (allocate from the head, free tail-block-first to the tail, live blocks never evictable) predicts the surviving PREFIX of a returning member's chain and breaks ties among FIT-PASSING engines only (never a ranker of two cold engines). Reconciled at settle against usage.cached_tokens; parameter-free (no clock, no threshold, no cache read).\n")
 	} else {
@@ -220,6 +233,11 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	}
 	r.sched.onValveBlockedEviction = func(engine string) {
 		r.metrics.ObserveValveBlockedEviction(engineLabel(engine))
+	}
+	// PAT: one increment per member that BECOMES eligible, on the counter of the rule
+	// that made it eligible — the mechanism's visibility in the run's artifacts.
+	r.sched.onPatEligible = func(engine, reason string) {
+		r.metrics.ObservePatEligible(engineLabel(engine), reason)
 	}
 	r.sched.onResidueDisabled = func(engine string) {
 		r.metrics.SetResidueDisabled(engineLabel(engine))

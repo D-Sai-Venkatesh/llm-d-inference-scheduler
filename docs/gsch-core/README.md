@@ -379,6 +379,52 @@ the `exiting-drain` share of `exits_total` inside the replay's own band (~24 %, 
 per engine. Baselines: no-fix 2.2 % marks/dispatch and 4.9 % exiting-drain share; cascade
 81 % / 85 %; fixed replay 3.0 % / 24 %.
 
+## 4a5. THE SIXTH DIGEST — the EXECUTION BUDGET (2026-11-01, one digest for everything new)
+
+    EPP_IMAGE_TAG=groupsched-17a10e8c
+    EPP_IMAGE_DIGEST=sha256:f71edae25dca386ce5ea499bede3d435274e6b7f323fd56d06a3e4665b92db92   (OCI index, keeps the attestation)
+    EPP_IMAGE_DIGEST_AMD64=sha256:303d16eb313379a006315a4d277c98e10efb967f44730bb7e285b2230a8f48c6
+    attestation manifest  sha256:af57df8d39ca906ccf1d70f99388145c36c28b10ef70d8f52ff39df4544ffd09 (unknown/unknown,
+                          vnd.docker.reference.digest = the amd64 manifest)
+
+Built from dsai/gsch-core HEAD `17a10e8cd1b75e955d98f3819fb7f6e389853b01` with a clean tree,
+by the same recipe as §4a0-§4a4 (`docker buildx build --platform linux/amd64`,
+`--build-arg TARGETOS=linux TARGETARCH=amd64 COMMIT_SHA=<head> BUILD_REF=dsai/gsch-core
+LDFLAGS="-s -w"`, `-f Dockerfile.epp`, `--push`). Pull-back verification: the linux/amd64
+manifest unpacks to a 75,649,186-byte x86-64 statically-linked stripped `/app/epp`
+(sha256 `ed183aadba40cb661f636a9049c5d01c556b13f252f6b2b181a6fa339c2ed1dc`) whose build
+settings carry `CommitSHA=17a10e8cd1b75e955d98f3819fb7f6e389853b01`,
+`BuildRef=dsai/gsch-core`, `CGO_ENABLED=0`, `GOARCH=amd64`, `GOOS=linux`; strings carry
+everything §4a4 carries (incl. `gpu-plus-tier`, `hrrn-tier`, `cold_cap_tokens`,
+`exiting_*`) PLUS this build's own markers — `execution-budget`, `executionBudget`,
+`running_blocks`, `execution_budget_blocks`, `dispatch_holds_total`,
+`dispatch_held_turns_total`, `dispatch_held_seconds`, `cold_valve_held_gated_total`,
+`gate_charge_hold_seconds` — and NONE of the removed series (`pat_eligible_*`,
+`residue_predicted_ratio`, `engine_gate_closed`, `pooled_endpoints`, `mlfq2`,
+`rotateWhenFree`), no `coldEntryCapTokens`, no `residueRelease`.
+
+**ONE DIGEST FROM HERE:** everything new runs on it. It carries TWO commits on top of §4a4
+(`b9540fb9`): `005eb1dc` (the EXECUTION BUDGET — the DISPATCH module, §4g) and `17a10e8c`
+(the interaction MEASURED: held-turn count and duration, the valve share attributable to a
+held turn's charge, and the charge's age). Both are default-OFF: the selector's default is
+`none`, so a **default-config arm is behaviourally identical to §4a4** — the goldens are
+byte-identical (`TestCoreEqualsF0P`, `TestGoldenHashesPinned`, testdata untouched, and
+`TestExecutionBudgetOnChangesNothingWhenItNeverBinds` proves the module moves nothing where
+the running set always fits). The only thing a default arm gains is the new series, which
+read 0.
+
+New series (per engine): `running_blocks`, `execution_budget_blocks` (0 = no gate wired),
+`dispatch_holds_total`, `dispatch_held_turns_total`, `dispatch_held_seconds`,
+`cold_valve_held_gated_total`, `gate_charge_hold_seconds`.
+
+**PRE-RUN GATE for the two-budget arm** (c64, `core-q4-offload-tierbudget ‖
+core-q4-offload-tierbudget-execbudget`, same digest): `running_blocks /
+execution_budget_blocks <= 1` for the whole window on the exec arm (the gate working);
+`cold_valve_held_gated_total` and `gate_charge_hold_seconds` reported, and the admission
+rate (`entry_wait_seconds_count`) within ~2x of the tierbudget arm's — outside that, the
+interaction is what starved admissions and the refinement is §4g's (suspend a held turn's
+charge while it is held).
+
 ## 4b. Pre-flight gates (every core arm, before its window counts)
 
 * `llm_d_epp_group_detector_pool_score == 0` for the WHOLE window (the pool gate never

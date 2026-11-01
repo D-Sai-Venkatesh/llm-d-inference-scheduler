@@ -278,6 +278,26 @@ func TestResolve_RetryOfStillQueuedTurn(t *testing.T) {
 	assert.NotEqual(t, queued.ID, dup.ID)
 }
 
+// TestResolve_S2ExactKeyIncludesThePartialBlock: S2's key is (token count, last
+// hash INCLUDING the partial block), so a same-length request whose tail differs
+// is not a retry — it is a sibling, and it forks.
+func TestResolve_S2ExactKeyIncludesThePartialBlock(t *testing.T) {
+	ix := newTestIndex()
+	tip := tokens(1, 2*testBlockSize+10)
+	first := turn(ix, clockZero, arr(t, "", nil, "r1", tip))
+	require.Equal(t, OutcomeNew, first.Outcome)
+
+	// Same token length, different tail (inside the tip's partial block): the
+	// tolerance still matches the branch, but the bodies differ, so S2 must not
+	// call it a retry.
+	other := append(append([]uint32{}, tip[:len(tip)-5]...), tokens(9, 5)...)
+	res := turn(ix, clockZero.Add(time.Second), arr(t, "", nil, "r2", other))
+	assert.Equal(t, OutcomeForked, res.Outcome, "a differing tail is a sibling, not a retry")
+	assert.False(t, res.Retry)
+	assert.NotEqual(t, first.ID, res.ID)
+	requireInvariants(t, ix)
+}
+
 // TestResolve_StickyBusyGuard: H1 — the request carries the tip's reply, so the
 // busy tip is proven complete and the request continues.
 func TestResolve_StickyBusyGuard(t *testing.T) {

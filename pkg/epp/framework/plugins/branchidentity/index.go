@@ -687,8 +687,11 @@ func (ix *branchIndex) Snapshot(now time.Time) branchTable {
 // A request still in flight cannot have its reply in anyone's history, so the
 // content proves the tip completed even when the busy flag is stale.
 //
-// The test is sound only because a match proves the tip's token prefix: message
-// index msgCount in the request IS the first message past the tip.
+// The index is the tip's message count, which is exactly "the first message past
+// the tip" whenever the match verifies the tip's whole prompt. When the tail
+// tolerance absorbed a divergence instead, the request is a near-duplicate of the
+// tip and the index can be off by the messages inside that window; the error then
+// errs toward continuing — the safe direction (see the package doc).
 //
 // (Measured caveat, design H2: a framework that spawns a child after the parent's
 // assistant tool-call turn puts that message into the child's history too, where

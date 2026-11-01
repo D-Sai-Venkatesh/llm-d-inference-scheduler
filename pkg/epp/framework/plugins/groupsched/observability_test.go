@@ -289,3 +289,66 @@ func TestColdCapIsExportedPerEngine(t *testing.T) {
 		}
 	})
 }
+
+// THE EXITING LEDGER ON THE WIRE (2026-11-01 late, the reviewer's ask: "this leak class
+// must be visible at T+5"). (iii) made the used side include members that are already
+// leaving, so "how much of it is leaving, how many are leaving, and how long has the
+// oldest been leaving" are the three numbers that separate an engine that is BUSY from an
+// engine whose drains have stopped — a distinction the batch-1 anchor had to reconstruct
+// from the event log and the residency histogram because no gauge carried it.
+//
+// The gauges must be readable AT THE MOMENT OF THE MARK (before any drain), and must go
+// back to zero when the member leaves (a gauge that only ever rises is a counter wearing
+// the wrong name).
+func TestExitingLedgerIsVisiblePerEngine(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		fx.tighten(t)
+		fx.seatOne(t, "keep", 400, 5*time.Second)
+		fx.s.Chunk("keep")
+		fx.seatOne(t, "gone", 300, 5*time.Second)
+		m, g := fx.member(t, "gone")
+
+		reg := prometheus.NewRegistry()
+		mtr := newGroupMetrics(fx.s)
+		if err := mtr.register(reg); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		mtr.Refresh(0)
+		if got, ok := gatherValue(t, reg, subsystem+"_exiting_members", map[string]string{"engine": engineLabel(g.id)}); !ok || got != 0 {
+			t.Fatalf("a settled engine reports %v exiting members (present=%v), want 0", got, ok)
+		}
+
+		// the mark (the pressure valve's mid-flight class)
+		fx.s.mu.Lock()
+		m.inflightIDs = map[string]inflightRec{"r-gone": {since: fx.clock, confirmed: true}}
+		m.inflight = 1
+		g.index.MarkExitingLocked("gone")
+		m.exitingSince = fx.clock
+		fx.s.mu.Unlock()
+
+		fx.tick(7 * time.Second) // the decision clock advances; the drain has not (one request in flight)
+		mtr.Refresh(0)
+		if got, ok := gatherValue(t, reg, subsystem+"_exiting_members", map[string]string{"engine": engineLabel(g.id)}); !ok || got != 1 {
+			t.Fatalf("exiting_members = %v (present=%v), want 1", got, ok)
+		}
+		if got, ok := gatherValue(t, reg, subsystem+"_exiting_blocks", map[string]string{"engine": engineLabel(g.id)}); !ok || got != 300 {
+			t.Fatalf("exiting_blocks = %v (present=%v), want 300 (the member's own footprint)", got, ok)
+		}
+		if got, ok := gatherValue(t, reg, subsystem+"_exiting_oldest_age_seconds", map[string]string{"engine": engineLabel(g.id)}); !ok || got < 7 {
+			t.Fatalf("exiting_oldest_age_seconds = %v (present=%v), want >= 7", got, ok)
+		}
+		// and the used side still counts them: the two views are visible side by side
+		if got, ok := gatherValue(t, reg, subsystem+"_ne_blocks", map[string]string{"engine": engineLabel(g.id)}); !ok || got != 700 {
+			t.Fatalf("ne_blocks = %v (present=%v), want 700 (admission still sees the exiting blocks)", got, ok)
+		}
+
+		// the drain: the ledger empties
+		fx.s.SettleOnUsage("gone", "r-gone", g.id, 300, 0, 0, false, fx.clock)
+		mtr.Refresh(0)
+		for _, name := range []string{"_exiting_members", "_exiting_blocks", "_exiting_oldest_age_seconds"} {
+			if got, ok := gatherValue(t, reg, subsystem+name, map[string]string{"engine": engineLabel(g.id)}); !ok || got != 0 {
+				t.Fatalf("%s = %v (present=%v) after the drain, want 0", name, got, ok)
+			}
+		}
+	})
+}

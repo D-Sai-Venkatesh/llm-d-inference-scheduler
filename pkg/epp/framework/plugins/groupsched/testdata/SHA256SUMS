@@ -20,8 +20,8 @@
 # Both fix-bearing traces were regenerated when the three ACCOUNTING fixes landed
 # (README §2 rows 5-7); the recipe that rebuilds them, including the per-fix patches and
 # the divergence counts, is docs/gsch-core/golden-f5p-recipe.md.
-7a6ef1a0509003bf7b9427e904fb9e000c3a536d0dd9c714fcff8f3b9be70cc4  golden-f0p-bugfixes.txt
+14e19914a25f00e02b2f0b4deaafb19e7626302bdce1b38b2be8d7b3e1cb9c98  golden-f0p-bugfixes.txt
 f3b667e87003a38e74026f0a6e3c6dc6809772c9dc3fda7c3fd0c121c347aa70  golden-f0p-core.txt
 643c75490f1fd34cd551be978e6b4fffbc735473a15e305b9d5431d5e17f3aa8  golden-f0p-total.txt
-93635406db669b3bfc1dce0a73df2a9827cb820f96e91e930cdf755d73615568  golden-f5p-archive.txt
-d79e0419b02e3e322550d949c376d9596cbc893fe412cc623a08ab0584b32efd  golden-hrrn-tier.txt
+da0ad67d456eac0fd0fd0cf54b3dd23f4b3696898fbf5393f64ef80490d5e24c  golden-f5p-archive.txt
+b994cdcc6744e0bb127143b181dd19ecb4b4774ce0e2d2b8ee3207ee1f5abafd  golden-hrrn-tier.txt

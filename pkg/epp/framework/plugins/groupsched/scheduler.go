@@ -354,6 +354,12 @@ type member struct {
 	awaitingEngine bool
 	// waitingSince is the member's oldest queued head (B5: kept oldest).
 	waitingSince time.Time
+	// exitingSince is when this member was marked exiting (the mid-flight class): the
+	// age of a retiree is the time between "nothing more will be admitted for it" and
+	// "its blocks are off the budget", i.e. how long the engine pays for a seat it has
+	// already written off. Zero on a member that is not exiting (a fresh residency is a
+	// fresh struct, so the flag never has to be cleared).
+	exitingSince time.Time
 	// fairnessID is the last fairness id (queue key) this member was seen with —
 	// the join key for its SEAT/EXIT events (see Head.FairnessID).
 	fairnessID string
@@ -970,6 +976,7 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 	s.now = now
 	s.headsObservedAt = now // a Pick is the only FRESH observation of the queue
 	s.reapInflightLocked(now)
+	s.drainExitingLocked(now)
 	s.syncWaitersLocked(heads, now)
 	groups := s.activeGroupsLocked()
 	for _, g := range groups {
@@ -1571,6 +1578,48 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 	}
 }
 
+// drainExitingLocked is the RELEASE POINT's reconciliation: every member that is on its
+// way out AND has nothing in flight is unseated here, at a decision point, instead of
+// only on the settle that happened to take its in-flight count to zero.
+//
+// (iii) left an exiting member's blocks charged to the budget until Unseat/Forget, which
+// is correct (the engine pins them) and unforgiving: the release must not depend on WHICH
+// path brought the count down. Settle is not the only one. reapInflightLocked drops an id
+// whose termination was never observed (a client cancel the framework's forced
+// EndOfStream never reached the plugin for, an error before the first chunk), and the
+// member can also reach zero with a queued head still in the queue view — and then
+// NOTHING releases it: rotation refuses an exiting member (it is already leaving), the
+// pressure valve refuses it, and the TTL's idle test needs "no queued turn", which is
+// exactly what an oversubscribed engine never gives it (measured: 97-112 heads waiting in
+// the shared queue at c128). The member would sit there, undispatchable and charged,
+// forever: the engine looks permanently full, TrySeat refuses every seat, marking frees
+// nothing — that engine stops serving, silently.
+//
+// Releasing on the DERIVED condition (exiting AND drained) at every decision point makes
+// the invariant hold by construction, whatever path zeroed the count. It releases exactly
+// what the settle would have released, one pass later at worst.
+func (s *Scheduler) drainExitingLocked(now time.Time) {
+	for _, g := range s.activeGroupsLocked() {
+		var ids []string
+		for id, m := range g.members {
+			if m.inflight == 0 && g.index.ExitingLocked(id) {
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		// deterministic order: this writes EXIT events, and the event stream's order has
+		// to be reproducible in the artifacts
+		sort.Strings(ids)
+		for _, id := range ids {
+			if m, ok := g.members[id]; ok {
+				s.exitLocked(g, m, "exiting-drain", now)
+			}
+		}
+	}
+}
+
 // eligibleLocked asks the TENURE module whether a resident may be released: Q — the
 // one rotation value — in COMPLETED BUSY PERIODS, or S of silence.
 //
@@ -1851,15 +1900,37 @@ func (s *Scheduler) noteQueueViewUntrustedLocked() { s.counters.queueViewUntrust
 
 // enforceBudgetLocked is MEMORY PRESSURE on the growth path: while the engine's
 // accounted footprint (NE + pending estimates) is over its budget, take victims in
-// the valve's order until it fits or nothing is evictable. NE counts EXITING members
-// too — they still hold their blocks — so a pass makes progress only by unseating
-// somebody, never by marking them.
+// the valve's order until it fits or nothing is evictable.
+//
+// TWO VIEWS OF ONE ACCOUNTING, and the difference between them is the whole of this
+// function. Both ask about the same footprint — every seated member's blocks, exiting
+// members included, because the engine pins them until the request drains (iii):
+//
+//	ADMISSION (freeBudgetLocked, TrySeat): the exiting blocks are OCCUPIED. A head
+//	  that would only fit if the retirees' blocks were free waits — that is what makes
+//	  (iii) correct instead of optimistic.
+//	ENFORCEMENT (here): the exiting blocks are NOT A REASON TO EVICT MORE. They are
+//	  already leaving, at their own drain; marking another member neither frees them
+//	  sooner nor frees anything now. So a pass measures
+//	  over = NE + pending − (exiting blocks + their pending estimates) and stops as
+//	  soon as the overage is entirely made of members already on their way out.
+//
+// WITHOUT THE SECOND VIEW the two are the same number, and marking becomes free of
+// consequences for the loop: it marks a victim, the footprint does not move, it marks
+// the next in-flight member, and the next — on EVERY pass, and passes are every Pick.
+// Measured on the live batch-1 anchor (99a47617 vs 88e74f85, c128, identical config):
+// 2,520 mid-flight marks against 87 (29x), bursts of up to 46 members marked in one
+// second, residency turns per seat 2.26 → 0.59, the rotating exits it displaced
+// (quantum-complete 532 → 44, idle 298 → 14), re-entry waits up to a 220 s p50 and
+// the cache destruction behind them (refill share 31.7 % → 44.5 %): −23 % of the
+// served rate and TTFT p50 2.6 s → 95 s. The class of the pass's victims is unchanged;
+// what changes is that a pass is DONE once what is over is already leaving.
 func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 	if g.budgetBlocks <= 0 {
 		return // no measured capacity yet for THIS engine: nothing to enforce
 	}
 	countedStale := false
-	for int64(g.index.UniqueBlocksNELocked())+g.pendingTotal > int64(g.budgetBlocks) {
+	for s.overBudgetLocked(g) > 0 {
 		if !countedStale && !s.queueViewTrustedLocked(now) {
 			// ONE per engine-pass: this pass will choose victims with a queue view too old
 			// to tell a busy member from an idle one, so the C8 guard drops the
@@ -1881,6 +1952,7 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 				return
 			}
 			g.index.MarkExitingLocked(victim.id)
+			victim.exitingSince = now
 			s.countExitLocked(g, "exiting")
 			// the series has to see it: the member is on its way out NOW (it drains, then
 			// exits as "exiting-drain"), and counting it only in the snapshot left
@@ -1894,6 +1966,31 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 	}
 }
 
+// overBudgetLocked is enforcement's view of the overage, in blocks: how much of the
+// engine's accounted footprint is NOT already on its way out. >= 0; 0 means this pass
+// has nothing left to do (everything over the budget is a member that is draining).
+//
+// The exiting member's PENDING estimate is excused too: a member can be marked between
+// its seat and its PreRequest, and its blocks are then in pendingTotal rather than in
+// NE. Excusing one and not the other would leave the pass churning on an estimate that
+// is already leaving.
+func (s *Scheduler) overBudgetLocked(g *engineGroup) int64 {
+	over := int64(g.index.UniqueBlocksNELocked()) + g.pendingTotal - int64(g.budgetBlocks)
+	if over <= 0 {
+		return 0
+	}
+	excused := int64(g.index.ExitingBlocksLocked())
+	for id, m := range g.members {
+		if m.pendingBlocks != 0 && g.index.ExitingLocked(id) {
+			excused += m.pendingBlocks
+		}
+	}
+	if over-excused <= 0 {
+		return 0
+	}
+	return over - excused
+}
+
 // ---- lifecycle (§8): the ~1s ticker ----
 
 func (s *Scheduler) Tick(now time.Time) {
@@ -1902,6 +1999,7 @@ func (s *Scheduler) Tick(now time.Time) {
 	s.now = now
 	s.deriveLocked() // derive-don't-accumulate, every decision point
 	s.reapInflightLocked(now)
+	s.drainExitingLocked(now)
 	for _, g := range s.activeGroupsLocked() {
 		s.settleNetLocked(g, now)
 		s.enforceBudgetLocked(g, now)
@@ -2173,10 +2271,18 @@ type EngineSnapshot struct {
 	// headroom, in tokens). A scored run divides coldInFlightTokens by THIS, not by
 	// a constant from the arm's config: the cap moves with the engine.
 	ColdCapTokens int64 `json:"coldCapTokens"`
-	BoundMembers  int   `json:"boundMembers"`
-	Served        int64 `json:"served"`
-	FCFSServed    int64 `json:"fcfsServed"`
-	ForcedSeats   int64 `json:"forcedSeats"`
+	// The EXITING ledger (the enforcement view's own inputs, per engine): members on
+	// their way out, the blocks of the used side they still hold, and how long the
+	// oldest one has been leaving. Read together they say whether an engine is busy or
+	// stuck: exiting_blocks inside ne_blocks is a drain in progress, and an oldest age
+	// that only grows is a drain that is not happening.
+	ExitingMembers    int     `json:"exitingMembers"`
+	ExitingBlocks     int     `json:"exitingBlocks"`
+	ExitingOldestAgeS float64 `json:"exitingOldestAgeSeconds"`
+	BoundMembers      int     `json:"boundMembers"`
+	Served            int64   `json:"served"`
+	FCFSServed        int64   `json:"fcfsServed"`
+	ForcedSeats       int64   `json:"forcedSeats"`
 	// Safety net: the live verdict, the fire EVENTS and the fired TIME, plus the
 	// scraped inputs it reads (the queue depth is reported, never decisive).
 	SafetyFiring       bool    `json:"safetyFiring"`
@@ -2244,8 +2350,20 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 		g := s.groups[id]
 		label := engineLabel(id)
 		st := s.safetyStateLocked(g, s.now)
+		exitingMembers, exitingOldest := 0, time.Duration(0)
+		for id, m := range g.members {
+			if !g.index.ExitingLocked(id) {
+				continue
+			}
+			exitingMembers++
+			if age := s.now.Sub(m.exitingSince); age > exitingOldest {
+				exitingOldest = age
+			}
+		}
 		es := EngineSnapshot{ID: label, Seats: len(g.members),
-			UniqueBlocks: g.index.UniqueBlocks(), NEBlocks: g.index.UniqueBlocksNE(),
+			ExitingMembers: exitingMembers, ExitingBlocks: g.index.ExitingBlocksLocked(),
+			ExitingOldestAgeS: exitingOldest.Seconds(),
+			UniqueBlocks:      g.index.UniqueBlocks(), NEBlocks: g.index.UniqueBlocksNE(),
 			BudgetBlocks: g.budgetBlocks, NumBlocks: g.numBlocks,
 			CapacityOK: g.numBlocks > 0, PendingBlocks: g.pendingTotal,
 			ColdInFlight: g.coldInFlight, Served: g.counters.served,

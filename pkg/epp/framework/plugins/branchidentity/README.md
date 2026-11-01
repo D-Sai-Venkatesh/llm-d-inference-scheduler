@@ -97,8 +97,11 @@ A branch is a **KV-cache lineage**, so the identity is the tokens the engine wou
 `x-llm-d-inference-fairness-id` still wins when present (an explicit override) and is counted
 (`explicit_override_total`). **A render failure never fails the request**: the request gets its own
 branch (a NEW keyed by the request, never a continuation) and `render_failure_total` names it. The
-arrival render carries identity's **own timeout** (`renderTimeoutSeconds`, default 10s) rather than
-inheriting the token producer's.
+arrival render carries **no time constant of its own**: it runs under the request's context, bounded
+by the render backend's own `timeout` (the token producer's, the deployment value) and by the client
+abandoning the request. A shorter identity-specific bound was tried and removed — under an arrival
+burst or a loaded sidecar it fires on requests that are merely slow, and a timed-out render mints a
+false NEW branch, i.e. an identity we invented because we gave up.
 
 ## The arrival record (a published output)
 
@@ -147,11 +150,10 @@ plugins:
   - type: branch-identity
     parameters:
       blockSizeTokens: 64           # = the prefix scorer's B; the output is in ITS hash space
-      tokenProducer:                # the SAME render backend the token-producer plugin uses
+      tokenProducer:                # REQUIRED — the SAME render backend the token-producer plugin uses
         modelName: meta-llama/Llama-3.1-8B-Instruct
         vllm:
           url: http://127.0.0.1:8000
-      renderTimeoutSeconds: 10      # identity's own bound on the arrival render
       markerTtlSeconds: 3600        # marker horizon = the client request timeout (NOT the queue GC)
       sweepSeconds: 60              # cap enforcement tick
       maxBranches: 100000           # the only eviction path
@@ -162,12 +164,16 @@ plugins:
       # logRequests: false                # INSTRUMENT: one JSON line per request (see below)
 ```
 
-**`tokenProducer` is the real-token requirement.** Without it the plugin builds the tokenizer's
-`estimate` backend (byte packing), which turns the identity back into a byte-space key — the
-retired v1 behaviour. The plugin announces that at startup:
+**`tokenProducer` is the real-token requirement, and it FAILS CLOSED.** The identity is a
+token-space key, so a plugin without this block — or with one that selects the tokenizer's `estimate`
+backend (byte packing) — **refuses to start**, naming `tokenProducer` in the error. There is no
+warning-and-continue path: the estimate backend would silently turn the identity back into a
+byte-space key, which is the retired v1 behaviour, and a wave whose arm ran that way is
+indistinguishable from a correct one in its artifacts. The effective config (the block included) is
+echoed at startup so a run's arm is verifiable from its own log:
 
 ```
-branch-identity: WARNING token producer backend is "estimate" — identity is a token-space key, so an arm must render (modelName/vllm)
+branch-identity: effective config {"blockSizeTokens":64,"tokenProducer":{...},...}
 ```
 
 It must be the *same* backend (model, endpoint, salt) the `token-producer` plugin uses, or the
@@ -249,7 +255,8 @@ engine's chat template (`transformers.apply_chat_template`); the harness injects
 | branches, v2 (tokens) | 943 |
 | **old branches split into 2+ new** | **0** |
 | **new branches merging 2+ old** | **37** (36 pairs, 1 triple) → 38 fewer branches |
-| merge class | 37 × tail tolerance; every merge point's divergence is **68–71 tokens from the tip's end**, i.e. inside the tip's **last full block** — the block the one-full-block tolerance absorbs and a partial-block-only tolerance would NOT |
+| merge class | **the declared LAST-BLOCK MERGE class** — all 37 are the one-full-block tolerance continuing a request into a branch it used to start, NOT a split: every merge point's divergence is **68–71 tokens from the tip's end**, i.e. inside the tip's **last full block**, the block the tolerance absorbs and a partial-block-only tolerance would NOT |
+| of the 37, same ground-truth thread | **37 / 37** — every merge stays inside one conversation (no cross-thread merge) |
 | class (i) tool/thinking splits | 0 (the corpus has no tool blocks) |
 | class (iii) sub-block tips | 0 (smallest request is 136 tokens) |
 | class (iv) render failures | 0 |
@@ -276,12 +283,21 @@ That window records no `in_tokens`, so the render could not be cross-checked aga
 there (the template is still applied to the real bodies); the a0 window, which does record them,
 renders at a constant −2.
 
+**Metrics, re-run after the F1–F3 fixes: unchanged.** The re-run reproduces the table above exactly
+(same 0 splits, same 37 last-block merges, same 2,577/2,577 continuity, 0 determinism mismatches),
+which is the expected outcome and a check on F1: the re-chain applies to multi-prompt requests only
+(`multi_prompt_requests_total` is 0 on both windows), so a single-prompt corpus cannot move.
+
 **Declared classes, for reference** — (i) tools/thinking now count, so a mid-thread tool-set change
 or a re-rendered history splits the branch (exactly where the KV cache splits); (ii) the tip's
 trailing partial block is not verified; (iii) a tip shorter than one full block is not continuable
 and re-keys once; (iv) a render failure at arrival is a NEW branch plus a counter; (v) an
 end-of-tip variance that crosses a block edge — closed *by construction* by the one-full-block
-tolerance.
+tolerance. **Plus one class that is the OPPOSITE of (v): the LAST-BLOCK MERGE** — a request that
+used to start its own branch, whose divergence sits in its predecessor's last full block, is
+CONTINUED into that branch. That is the tolerance working on its design target, it moves in the
+safe direction (a shared queue, never a re-fragmented conversation), and it is what the 37 WEKA
+differences are: classified, not a defect, and never a split.
 
 ## Known limits
 
@@ -291,7 +307,11 @@ tolerance.
 - **Multi-prompt slack.** For a multi-prompt request the tolerance applies to the *concatenated*
   chain, so the unverified region can exceed 2B−1 tokens (an earlier prompt's blocks are interior
   and stay verified, the last prompt's tail is what is unverified). Single-prompt chat is unaffected;
-  cross-protocol continuation is not a requirement.
+  cross-protocol continuation is not a requirement. A later prompt's blocks are **re-chained** onto
+  the chain before them (the prefix scorer seeds each prompt independently, which would make a
+  prompt shared by two requests a set of shared keys — tips `[A,C]` and `[B,C]` would then continue
+  one another). Single-prompt requests keep prefixhash's hashes verbatim, so their ids are unchanged
+  by that re-chain.
 - **A stale re-send is not a continuation... unless it is one block short of the tip.** A request
   that is a proper prefix of its branch's tip (a client re-sending an earlier turn after the branch
   advanced) matches only if the tip is at most one full block longer; then it continues the branch

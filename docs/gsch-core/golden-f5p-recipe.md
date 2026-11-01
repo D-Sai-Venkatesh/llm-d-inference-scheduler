@@ -6,14 +6,17 @@ committed bytes, and step 3 is the check that makes the recipe auditable — the
 patched archive regenerates the existing `golden-f0p-bugfixes.txt` byte for byte, so the
 patch used here is the one the other goldens came from.*
 
-**Two patch layers.** Layer A (`#0`-`#4`) is the original four-fix patch and is unchanged.
-Layer B (`#5`-`#7`, §3) is the ACCOUNTING BATCH: three more declared fixes, applied on top
-of Layer A. Both fix-bearing goldens were regenerated through BOTH layers, and the archive
+**Three patch layers.** Layer A (`#0`-`#4`) is the original four-fix patch and is
+unchanged. Layer B (`#5`-`#7`, §3) is the ACCOUNTING BATCH: three more declared fixes,
+applied on top of Layer A. Layer C (`#8`, §4) is the ENFORCEMENT-CASCADE BATCH: the fix
+that ends the mass-eviction cascade (iii) created, plus the release-point reconciliation.
+Both fix-bearing goldens were regenerated through ALL THREE layers, and the archive
 reproduces them byte for byte — so the traces the core is pinned to are still traces an
 independent implementation produced, not the core's own output.
 
-Current pins: `golden-f0p-bugfixes.txt` 4,709 lines / 989 dispatches ·
-`golden-f5p-archive.txt` 5,267 lines / 1,299 dispatches.
+Current pins: `golden-f0p-bugfixes.txt` 4,871 lines / 1,182 dispatches ·
+`golden-f5p-archive.txt` 5,465 lines / 1,500 dispatches. (Before Layer C: 4,709 / 989 and
+5,267 / 1,299.)
 
 ## The steps
 
@@ -408,3 +411,82 @@ of both it is still F5′ ahead.) This scenario is NOT the B1b load shape (its w
 minutes), so it says nothing about the far tail: **B5/B6 on the cluster measure that**
 (c64 and c128, core-Q4 ‖ core-F5′-Q4). What the replay proves is narrower and exact: the
 core's rule IS the archive's rule, decision for decision.
+
+## 4. Layer C — the enforcement cascade (`#8`, 2026-11-01 late)
+
+Applied to the Layer-A+B worktree with `git apply`, validated the same way (step 3: the
+patched tree still regenerates the PREVIOUS goldens byte for byte before the new fix is
+added, then the new traces are taken from it).
+
+**What it fixes.** Layer B's fix 5 made an exiting member's blocks stay on the used side
+until it drains (correct), which also made MARKING FREE: an enforcement pass that marked a
+mid-flight victim measured the same over-budget number afterwards and marked the next
+in-flight member, on every pass. Measured live on the batch-1 anchor (identical config,
+c128, 99a47617 vs 88e74f85): 2,520 mid-flight marks against 87, turns per residency
+2.26 → 0.59, quantum-complete exits 532 → 44, refill share 31.7 % → 44.5 %, served −23 %,
+TTFT p50 2.6 s → 95 s (and, as the fix itself working, preemptions 11 → 0).
+
+**The archive-side form.** The archive measures the excused amount as the UNION of the
+exiting members' sets plus their pending estimates, computed at the pass; the core keeps
+the same quantity as a maintained, dedup-exact refcount (`blocksExit`) checked by the
+index invariant. Two independent implementations of one rule, and they agree byte for byte
+on both traces — which is the equivalence this layer claims.
+
+```diff
+--- a/pkg/epp/framework/plugins/groupsched/scheduler.go
++++ b/pkg/epp/framework/plugins/groupsched/scheduler.go
+@@ enforceBudgetLocked (FIX 8) @@
+-	for int64(g.index.UniqueBlocksNELocked())+g.pendingTotal > int64(g.budgetBlocks) {
++	for {
++		// FIX 8 — ENFORCEMENT'S OWN VIEW: NE counts the exiting members' blocks (FIX 5),
++		// but blocks that are ALREADY on their way out are not a reason to evict MORE.
++		over := int64(g.index.UniqueBlocksNELocked()) + g.pendingTotal -
++			int64(g.budgetBlocks) - s.exitingChargeLocked(g)
++		if over <= 0 {
++			return
++		}
+ 		reason, victim := s.budgetVictimLocked(g, now)
++@@ lifecycle @@
++// exitingChargeLocked is FIX 8's input: the accounted footprint that belongs to members
++// already on their way out (the union of their sets + their pending estimates).
++func (s *Scheduler) exitingChargeLocked(g *engineGroup) int64 {
++	seen := make(map[Hash]struct{})
++	var pend int64
++	for id, m := range g.members {
++		if !g.index.ExitingLocked(id) {
++			continue
++		}
++		for h := range g.index.SessionSetLocked(id) {
++			seen[h] = struct{}{}
++		}
++		pend += m.pendingBlocks
++	}
++	return int64(len(seen)) + pend
++}
+
+--- a/pkg/epp/framework/plugins/groupsched/blockindex.go
++++ b/pkg/epp/framework/plugins/groupsched/blockindex.go
+@@ FIX 8 @@
++// SessionSetLocked is one session's block set, so the excused amount can be measured as
++// a UNION (the core keeps it as the dedup-exact blocksExit refcount).
++func (b *BlockIndex) SessionSetLocked(id string) map[Hash]struct{} {
++	if s, ok := b.sessions[id]; ok {
++		return s.set()
++	}
++	return nil
++}
+```
+
+**FIX 8b (the release-point reconciliation) has NO archive-side hunk**: it changes no
+decision on any replay (0 differing lines), it only releases an exiting member whose
+in-flight count reached zero without a settle. It is proven by unit paths in the core
+(`chargeddrain_test.go`), not by a trace.
+
+**Measured, per fix, on the 2,600 s replay** (lines differing from the 4,709-line 5-7
+trace; the second number is the F5′ arm):
+
+| # | fix | lines | dispatches | mid-flight marks | quantum-complete |
+|---|---|---|---|---|---|
+| — | Layer A+B (the previous golden) | — | 989 / 1,299 | 103 / 118 | 11 / 21 |
+| 8 | enforcement's own view | **3,965 / 4,521** | **1,182 / 1,500** | **48 / 37** | **25 / 54** |
+| 8b | the release-point reconciliation | **0 / 0** | 0 | 0 | 0 |

@@ -44,10 +44,19 @@ type groupMetrics struct {
 	uniqueBlocks *prometheus.GaugeVec
 	neBlocks     *prometheus.GaugeVec
 	budgetBlocks *prometheus.GaugeVec
-	waiters      *prometheus.GaugeVec
-	coldInFlight *prometheus.GaugeVec
-	coldCap      *prometheus.GaugeVec
-	capacity     *prometheus.GaugeVec
+	// The EXITING ledger: the enforcement view's inputs, per engine. (iii) made the
+	// used side include members that are already leaving, so "how much of it is
+	// leaving" is a first-class number: without these three, an engine that is busy
+	// and an engine whose drains have stopped look the same in every other series —
+	// which is exactly the leak class the batch-1 anchor had to be diagnosed from the
+	// event log and the residency histogram instead of from a gauge.
+	exitingMembers *prometheus.GaugeVec
+	exitingBlocks  *prometheus.GaugeVec
+	exitingOldest  *prometheus.GaugeVec
+	waiters        *prometheus.GaugeVec
+	coldInFlight   *prometheus.GaugeVec
+	coldCap        *prometheus.GaugeVec
+	capacity       *prometheus.GaugeVec
 	// waitersShared is the SHARED waiter queue's size (one number, no engine label,
 	// because a waiter belongs to no engine until one seats it).
 	waitersShared prometheus.Gauge
@@ -142,6 +151,12 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "seated members (residencies) on this engine"}, engineLabels)
 	g.uniqueBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "unique_blocks",
 		Help: "distinct blocks the engine's index holds for this policy"}, engineLabels)
+	g.exitingMembers = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "exiting_members",
+		Help: "members on this engine that have been marked exiting and still hold their seat until their in-flight requests drain"}, engineLabels)
+	g.exitingBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "exiting_blocks",
+		Help: "distinct blocks of this engine's ne_blocks that belong to exiting members: the part of the used side that is already leaving (admission still refuses it, enforcement no longer evicts for it)"}, engineLabels)
+	g.exitingOldest = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "exiting_oldest_age_seconds",
+		Help: "how long this engine's OLDEST exiting member has been on its way out (a value that only grows is a drain that is not happening)"}, engineLabels)
 	g.neBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "ne_blocks",
 		Help: "distinct blocks charged to this engine's budget: every seated member's set, exiting members included until they drain"}, engineLabels)
 	g.budgetBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "budget_blocks",
@@ -217,7 +232,8 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		[]string{"engine", "pred_bin", "meas_bin"})
 
 	for _, c := range []prometheus.Collector{g.seats, g.uniqueBlocks, g.neBlocks, g.budgetBlocks,
-		g.waiters, g.coldInFlight, g.coldCap, g.capacity, g.waitersShared, g.exits, g.residency, g.entryWait,
+		g.waiters, g.coldInFlight, g.coldCap, g.capacity, g.waitersShared,
+		g.exitingMembers, g.exitingBlocks, g.exitingOldest, g.exits, g.residency, g.entryWait,
 		g.reentryWait, g.refillShare, g.served, g.fcfs, g.capacityMissing, g.capacityLearned,
 		g.safetyFired, g.safetyFires, g.safetyFiredSeconds, g.safetySkips, g.engineKV, g.engineWaiting,
 		g.poolScore, g.staleSamples, g.capacityHeterogeneous, g.filterDecisions, g.affinityViolations, g.rebinds, g.engineGone,
@@ -266,6 +282,9 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 		g.waiters.WithLabelValues(label).Set(float64(es.Waiters))
 		g.coldInFlight.WithLabelValues(label).Set(float64(es.ColdInFlight))
 		g.coldCap.WithLabelValues(label).Set(float64(es.ColdCapTokens))
+		g.exitingMembers.WithLabelValues(label).Set(float64(es.ExitingMembers))
+		g.exitingBlocks.WithLabelValues(label).Set(float64(es.ExitingBlocks))
+		g.exitingOldest.WithLabelValues(label).Set(es.ExitingOldestAgeS)
 		g.shadowBlocks.WithLabelValues(label).Set(float64(es.TierShadowBlocks))
 		g.shadowCapacity.WithLabelValues(label).Set(float64(es.TierCapacityBlocks))
 		g.served.WithLabelValues(label).Add(0)
@@ -296,6 +315,7 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 		}
 		delete(g.known, label)
 		for _, vec := range []*prometheus.GaugeVec{g.seats, g.uniqueBlocks, g.neBlocks,
+			g.exitingMembers, g.exitingBlocks, g.exitingOldest,
 			g.budgetBlocks, g.capacity, g.waiters, g.coldInFlight, g.coldCap, g.safetyFired,
 			g.engineKV, g.engineWaiting, g.shadowBlocks, g.shadowCapacity} {
 			vec.DeleteLabelValues(label)

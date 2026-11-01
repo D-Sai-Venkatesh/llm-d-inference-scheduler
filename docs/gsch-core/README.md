@@ -328,6 +328,53 @@ CONFIGURED the default and F5′ arms reproduce their own goldens byte for byte
 differs by the DEPLOYMENT, not by the shadow. The arm's own trace is
 `testdata/golden-hrrn-tier.txt` (4,774 lines, 1,020 dispatches).
 
+## 4a4. THE FIFTH DIGEST — the ENFORCEMENT-CASCADE build (2026-11-01 late)
+
+    EPP_IMAGE_TAG=groupsched-b9540fb9
+    EPP_IMAGE_DIGEST=sha256:8e9a90ac85cc479f28426f535a174b2b5f429bab365c7889c013011a625d825b   (OCI index, keeps the attestation)
+    EPP_IMAGE_DIGEST_AMD64=sha256:c032527af73c36e287f88205baa0702055cb20706ade58c4ae3a216f5caf44ad
+    attestation manifest  sha256:122f35ae05a0afddf40439bddaf2e4c4a2c4f390790a221678bba37c522c5590 (unknown/unknown,
+                          vnd.docker.reference.digest = the amd64 manifest)
+
+Built from dsai/gsch-core HEAD `b9540fb972a52a55a8cec6f70e390b4c25c63d12` with a clean tree,
+by the same recipe as §4a0-§4a3 (`docker buildx build --platform linux/amd64`,
+`--build-arg TARGETOS=linux TARGETARCH=amd64 COMMIT_SHA=<head> BUILD_REF=dsai/gsch-core
+LDFLAGS="-s -w"`, `-f Dockerfile.epp`, `--push`). Pull-back verification: the linux/amd64
+manifest unpacks to a 75,624,610-byte x86-64 statically-linked stripped `/app/epp` whose build
+settings carry `CommitSHA=b9540fb972a52a55a8cec6f70e390b4c25c63d12`, `BuildRef=dsai/gsch-core`,
+`CGO_ENABLED=0`, `GOARCH=amd64`, `GOOS=linux`; strings carry everything §4a3 carries (`CORE
+policy`, `detector_pool_score`, `cold_valve_held_total`, `waiters_shared`, `most-free-budget`,
+`newcomer-first`, `hrrn-bounded`, `hrrn-tier`, `cpuTierBytes`, `kvBlockBytes`,
+`tier_shadow_blocks`, `tier_shadow_capacity_blocks`, `tier_shadow_pairs_total`,
+`SHADOW-VALIDATION`, `cold_cap_tokens`, `event_ring_dropped_total`, `gpu-plus-tier`) PLUS the
+three series this build adds — `exiting_members`, `exiting_blocks`,
+`exiting_oldest_age_seconds` (wire names `llm_d_epp_group_exiting_*`) — and NONE of the
+removed series (`pat_eligible_*`, `residue_predicted_ratio`, `engine_gate_closed`,
+`pooled_endpoints`, `mlfq2`, `rotateWhenFree`), no `coldEntryCapTokens`, no `residueRelease`.
+(Strings read with `grep -a` or `strings -a`: BSD `strings` without `-a` skips Go's rodata and
+reports every marker absent — the first pass of this verification did exactly that.)
+
+What it contains on top of §4a3 (ONE commit, `b9540fb9`, on top of the tier-budget head
+`d962c5f3`): fix 8 (TWO VIEWS of one accounting — an exiting member's blocks are OCCUPIED for
+admission and NOT A REASON TO EVICT MORE for enforcement) and fix 8b (the release point
+reconciled at every decision point; safety, 0 golden lines), plus the three gauges above.
+This is ONE digest for the whole night: the accounting batch, the tier shadow, hrrn-tier,
+gpu-plus-tier and the cascade fix. Every default stays golden-neutral per pair — each arm
+still differs from its anchor by exactly its one declared line — and the wave pins ALL of
+tonight's arms to it in one operation (the batch-1 re-run pair, the four tb-* arms, and the
+core-q4 OFF arm).
+
+Declared difference (§4 rows 8/8b, recipe §4): f0p 4,709 -> 4,871 lines / 989 -> 1,182
+dispatches, F5' 5,267 -> 5,465 / 1,299 -> 1,500, tier arm 1,020 -> 1,212; mid-flight marks
+103 -> 48 / 118 -> 37 / 102 -> 36 and quantum-complete exits restored 11 -> 25 / 21 -> 54 /
+13 -> 34, i.e. the cascade (2,520 marks for 3,104 dispatches, 29x the no-fix arm) is gone.
+
+**PRE-RUN GATE (new, from the three series + the exit mix):** marks-per-dispatch <= 5 % and
+the `exiting-drain` share of `exits_total` inside the replay's own band (~24 %, NOT <= 10 % —
+10 % is below a healthy replay), and `exiting_oldest_age_seconds` must not climb monotonically
+per engine. Baselines: no-fix 2.2 % marks/dispatch and 4.9 % exiting-drain share; cascade
+81 % / 85 %; fixed replay 3.0 % / 24 %.
+
 ## 4b. Pre-flight gates (every core arm, before its window counts)
 
 * `llm_d_epp_group_detector_pool_score == 0` for the WHOLE window (the pool gate never

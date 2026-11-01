@@ -93,8 +93,10 @@ const (
 // chain is a request's identity in the prefix scorer's hash space.
 type chain struct {
 	// blocks holds every block hash in order: the per-prompt chains
-	// concatenated, each prompt's trailing partial block included. All prompts
-	// count (the faithful mapping of v1's strings.Join).
+	// concatenated, each prompt's trailing partial block included, and every
+	// block of a LATER prompt re-chained onto the chain before it (see
+	// identityChain) so a prompt shared by two requests is not a set of shared
+	// keys. All prompts count (the faithful mapping of v1's strings.Join).
 	//
 	// A multi-prompt request's earlier prompts keep their interior partial block
 	// in the chain. That is stricter than the tip tolerance below, not looser in

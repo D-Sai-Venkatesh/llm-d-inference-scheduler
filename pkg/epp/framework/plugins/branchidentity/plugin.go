@@ -24,6 +24,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
+
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
@@ -85,11 +87,6 @@ const (
 	defaultSweepSeconds = 60
 	// defaultMaxBranches is the table cap (the only eviction path).
 	defaultMaxBranches = 100000
-	// defaultRenderTimeoutSeconds bounds the ARRIVAL-time render. Identity carries
-	// its own bound rather than inheriting the producer's: the producer's timeout
-	// protects a dispatch phase that may fall back to a default, while a request
-	// must not enter the fairness path without an identity for longer than this.
-	defaultRenderTimeoutSeconds = 10
 )
 
 // defaultSessionHeaders are the client session headers read for scoping, in
@@ -108,14 +105,11 @@ type Parameters struct {
 	// scorer's block size. Zero selects the default (64).
 	BlockSizeTokens int `json:"blockSizeTokens,omitempty"`
 	// TokenProducer configures the render backend that supplies the request's
-	// real tokens, in the token-producer plugin's own parameter language. The
-	// identity is a token-space key, so an arm wants the render backend here; the
-	// estimate backend is accepted (tests, and the byte-space fallback) and is
-	// announced on startup.
+	// real tokens, in the token-producer plugin's own parameter language. It is
+	// REQUIRED: the identity is a token-space key, so a plugin without this block
+	// has no identity to derive and refuses to start (the estimate backend it
+	// would otherwise build is a byte-space key — the retired v1 behaviour).
 	TokenProducer json.RawMessage `json:"tokenProducer,omitempty"`
-	// RenderTimeoutSeconds bounds the arrival-time render. Zero selects the
-	// default (10s).
-	RenderTimeoutSeconds float64 `json:"renderTimeoutSeconds,omitempty"`
 	// MarkerTTLSeconds bounds how long an outstanding marker (arrival or in
 	// flight) that never settles keeps its branch busy. It must be at least the
 	// client's request timeout. There is no branch TTL: branches are retained (no
@@ -196,11 +190,8 @@ func (p *Parameters) validate() error {
 	if p.BlockSizeTokens < 0 {
 		return fmt.Errorf("blockSizeTokens must be > 0, got %d", p.BlockSizeTokens)
 	}
-	if p.RenderTimeoutSeconds == 0 {
-		p.RenderTimeoutSeconds = defaultRenderTimeoutSeconds
-	}
-	if p.RenderTimeoutSeconds < 0 {
-		return fmt.Errorf("renderTimeoutSeconds must be > 0, got %v", p.RenderTimeoutSeconds)
+	if len(p.TokenProducer) == 0 {
+		return fmt.Errorf("tokenProducer is required: the identity is a token-space key and must be rendered (modelName/vllm)")
 	}
 	if p.MarkerTTLSeconds == 0 {
 		p.MarkerTTLSeconds = p.QueuedTTLSeconds
@@ -246,10 +237,9 @@ type Plugin struct {
 	// producer renders the request's real tokens (the token producer, as a
 	// library); tokenize is the call site, so a test can substitute a
 	// deterministic renderer.
-	producer      *tokenizer.Producer
-	tokenize      func(ctx context.Context, request *fwksched.InferenceRequest) error
-	blockSize     int
-	renderTimeout time.Duration
+	producer  *tokenizer.Producer
+	tokenize  func(ctx context.Context, request *fwksched.InferenceRequest) error
+	blockSize int
 
 	markerTTL      time.Duration
 	sweep          time.Duration
@@ -290,13 +280,19 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to build the token producer of the '%s' plugin: %w", PluginType, err)
 	}
+	// FAIL CLOSED: a non-rendering backend leaves the identity in byte space, which
+	// is the retired v1 key. A missing block is caught in validate(); this catches a
+	// block that parses but selects no renderer.
+	if producer.BackendName() != tokenizer.BackendVLLM {
+		return nil, fmt.Errorf("invalid parameters of the '%s' plugin: tokenProducer selected the %q backend — "+
+			"identity is a token-space key, so the block must render (modelName/vllm)", PluginType, producer.BackendName())
+	}
 
 	p := &Plugin{
 		typedName:      typedName,
 		producer:       producer,
 		tokenize:       producer.Tokenize,
 		blockSize:      params.BlockSizeTokens,
-		renderTimeout:  time.Duration(params.RenderTimeoutSeconds * float64(time.Second)),
 		markerTTL:      time.Duration(params.MarkerTTLSeconds * float64(time.Second)),
 		sweep:          time.Duration(params.SweepSeconds * float64(time.Second)),
 		forkOnBusy:     params.ForkOnBusy == nil || *params.ForkOnBusy,
@@ -315,10 +311,6 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// its artifacts.
 	if echo, err := json.Marshal(params); err == nil {
 		fmt.Printf("%s: effective config %s\n", PluginType, echo)
-	}
-	if producer.BackendName() != tokenizer.BackendVLLM {
-		fmt.Printf("%s: WARNING token producer backend is %q — identity is a token-space key, so an arm must render (modelName/vllm)\n",
-			PluginType, producer.BackendName())
 	}
 
 	if handle != nil {
@@ -405,21 +397,24 @@ func (p *Plugin) RequestHeader(ctx context.Context, request *fwksched.InferenceR
 }
 
 // chainFor renders the request's tokens and hashes them into its identity chain.
-// ok is false when the request has no identity: a render error or timeout, or a
-// body that renders to no tokens.
+// ok is false when the request has no identity: a render error, or a body that
+// renders to no tokens.
+//
+// The render runs under the REQUEST's context and carries no time constant of its
+// own: it is bounded by the backend's own render timeout (the token producer's
+// `timeout`) and by the client abandoning the request. A separate, shorter bound
+// here would turn an arrival burst or a loaded sidecar into a false NEW branch —
+// an identity we mint because we gave up, not because the content was new.
 func (p *Plugin) chainFor(ctx context.Context, request *fwksched.InferenceRequest) (chain, bool) {
-	renderCtx, cancel := context.WithTimeout(ctx, p.renderTimeout)
-	defer cancel()
-
 	start := p.now()
-	err := p.tokenize(renderCtx, request)
+	err := p.tokenize(ctx, request)
 	p.metrics.observeRender(p.now().Sub(start))
 	if err != nil {
 		return chain{}, false
 	}
 
 	start = p.now()
-	c := identityChain(renderCtx, request, p.blockSize)
+	c := identityChain(ctx, request, p.blockSize)
 	p.metrics.observeChain(p.now().Sub(start))
 	if len(c.blocks) == 0 {
 		return chain{}, false
@@ -433,14 +428,37 @@ func (p *Plugin) chainFor(ctx context.Context, request *fwksched.InferenceReques
 // identityChain hashes a tokenized request into its identity chain, in the prefix
 // scorer's own block-hash space (model + cache salt seeded, chained). ALL prompts
 // count: their chains are concatenated in order.
+//
+// MULTI-PROMPT RE-CHAIN (F1). prefixhash seeds each prompt independently from the
+// model and cache salt and chains within the prompt, which is right for the prefix
+// scorer: its keys must match the engine's, and the engine hashes each sequence
+// (each prompt) from its own start. But the identity chain is ONE flat chain over
+// the concatenation, so an independently seeded prompt would put the same block
+// keys in every request carrying that prompt: tips [A,C] and [B,C] with |A|=|B|
+// would share the keys of C and look like a continuation of one another — a false
+// continuation, the direction that hurts here (it merges two conversations' queue
+// keys). So beyond the FIRST prompt the chain CONTINUES: every block of a later
+// prompt is re-chained onto the previous block's id, id_i = H(block_i, id_{i-1}),
+// exactly the chaining prefixhash already applies inside a prompt. A single-prompt
+// request — every prompt of the WEKA and agentic corpora as measured — is
+// untouched: it keeps prefixhash's hashes verbatim.
 func identityChain(ctx context.Context, request *fwksched.InferenceRequest, blockSize int) chain {
 	hashes, promptTokens := prefixhash.GetBlockHashesWithPromptTokens(ctx, request, blockSize, maxChainBlocks)
 	if len(hashes) == 0 {
 		return chain{}
 	}
-	c := chain{blocks: make([]prefixhash.BlockHash, 0, len(hashes))}
+	total := 0
 	for _, prompt := range hashes {
-		c.blocks = append(c.blocks, prompt...)
+		total += len(prompt)
+	}
+	c := chain{blocks: make([]prefixhash.BlockHash, 0, total)}
+	for i, prompt := range hashes {
+		for _, h := range prompt {
+			if i > 0 {
+				h = rechainBlock(h, c.blocks[len(c.blocks)-1])
+			}
+			c.blocks = append(c.blocks, h)
+		}
 	}
 	for _, n := range promptTokens {
 		c.tokens += n
@@ -451,6 +469,16 @@ func identityChain(ctx context.Context, request *fwksched.InferenceRequest, bloc
 		c.fullBlocks--
 	}
 	return c
+}
+
+// rechainBlock continues a block chain across a prompt boundary: the block's own
+// hash, chained onto the previous block's id, in the same 16-byte serialization
+// prefixhash uses between two blocks of one prompt.
+func rechainBlock(h, prev prefixhash.BlockHash) prefixhash.BlockHash {
+	var buf [16]byte
+	prefixhash.PutBlockHash(buf[:8], h)
+	prefixhash.PutBlockHash(buf[8:], prev)
+	return prefixhash.BlockHash(xxhash.Sum64(buf[:]))
 }
 
 // tokenizedPrompts is the number of prompts the render produced.

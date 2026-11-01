@@ -65,6 +65,11 @@ import (
 // NOT one of the built-in provider headers, so the plugin reads it explicitly.
 const stage0cScopeHeader = "x-session-scope"
 
+// stage0cProducer is the render backend the replayed arm must declare: the plugin
+// refuses to start without one (F3). It is never dialled — the replay substitutes
+// the recorded token corpus for the render.
+const stage0cProducer = `{"modelName":"stage0c","vllm":{"url":"http://127.0.0.1:1"}}`
+
 // stage0cMaxTokenDelta is how far the offline render may sit from the recorded
 // in_tokens. The corpus renders with a constant offset (the template's
 // generation-prompt suffix); anything larger means the template is not the engine's.
@@ -256,7 +261,7 @@ func TestStage0CReplay(t *testing.T) {
 	}
 	handle := testutils.NewTestHandle(ctx)
 	built, err := Factory("stage0c", json.NewDecoder(bytes.NewReader(
-		[]byte(`{"sessionHeaders":["`+stage0cScopeHeader+`"],"retryRule":`+retryRule+`}`))), handle)
+		[]byte(`{"sessionHeaders":["`+stage0cScopeHeader+`"],"retryRule":`+retryRule+`,"tokenProducer":`+stage0cProducer+`}`))), handle)
 	if err != nil {
 		t.Fatalf("build plugin: %v", err)
 	}

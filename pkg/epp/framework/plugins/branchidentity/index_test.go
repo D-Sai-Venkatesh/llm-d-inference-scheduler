@@ -123,6 +123,60 @@ func TestChain_MultiPromptConcatenates(t *testing.T) {
 	assert.Equal(t, testBlockSize+testBlockSize/2, both.tokens)
 }
 
+// TestChain_MultiPromptRechainsAcrossTheBoundary: F1 — a later prompt's blocks are
+// re-chained onto the chain before them, so two requests that share a later prompt
+// but differ before it do NOT share that prompt's block keys. Without the re-chain
+// (prefixhash seeds each prompt from the model and salt independently) a shared
+// prompt is a shared key set, and the resolve below reads it as a continuation.
+func TestChain_MultiPromptRechainsAcrossTheBoundary(t *testing.T) {
+	a, b, c := tokens(1, 2*testBlockSize), tokens(2, 2*testBlockSize), tokens(3, 2*testBlockSize)
+
+	ac, bc := chainOf(t, a, c), chainOf(t, b, c)
+	require.Len(t, ac.blocks, 4)
+	require.Len(t, bc.blocks, 4)
+
+	// The first prompt keeps the prefix scorer's own hashes, exactly as if it were
+	// the whole request (single-prompt requests carry no re-chain at all).
+	assert.Equal(t, chainOf(t, a).blocks, ac.blocks[:2])
+
+	for k := range ac.blocks {
+		assert.NotEqual(t, ac.blocks[k], bc.blocks[k], "block %d must not be shared", k)
+	}
+
+	// The re-chain is deterministic and content-addressed: the same two prompts
+	// yield the same chain, so a repeat still continues.
+	assert.Equal(t, ac.blocks, chainOf(t, a, c).blocks)
+
+	// An extension of the SECOND prompt re-chains consistently: the shared prefix of
+	// C keeps its ids, so a grown multi-prompt request still continues.
+	extended := chainOf(t, a, append(append([]uint32{}, c...), tokens(4, 10)...))
+	require.Len(t, extended.blocks, 5)
+	assert.Equal(t, ac.blocks, extended.blocks[:4])
+}
+
+// TestResolve_MultiPromptSharingALaterPromptIsNotAContinuation is F1's gate case:
+// tips [A,C] and [B,C] with |A|=|B| must NOT continue one another.
+func TestResolve_MultiPromptSharingALaterPromptIsNotAContinuation(t *testing.T) {
+	ix := newTestIndex()
+	a, b, c := tokens(1, 2*testBlockSize), tokens(2, 2*testBlockSize), tokens(3, 2*testBlockSize)
+
+	first := complete(t, ix, clockZero, arr(t, "", nil, "r1", a, c))
+	require.Equal(t, OutcomeNew, first.Outcome)
+
+	second := complete(t, ix, clockZero.Add(time.Second), arr(t, "", nil, "r2", b, c))
+	assert.Equal(t, OutcomeNew, second.Outcome,
+		"a different first prompt is a different conversation, however much of C it shares")
+	assert.NotEqual(t, first.ID, second.ID)
+	assert.Zero(t, second.MatchedBlocks, "nothing of the other conversation's chain may be verified")
+	requireInvariants(t, ix)
+
+	// The identical pair still continues, in both directions of arrival order.
+	third := complete(t, ix, clockZero.Add(2*time.Second), arr(t, "", nil, "r3", b, c))
+	assert.Equal(t, OutcomeMatched, third.Outcome)
+	assert.Equal(t, second.ID, third.ID)
+	requireInvariants(t, ix)
+}
+
 // TestResolve_Continuation: an appended turn continues the branch.
 func TestResolve_Continuation(t *testing.T) {
 	ix := newTestIndex()

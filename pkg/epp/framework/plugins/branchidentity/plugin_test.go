@@ -144,17 +144,38 @@ func roleToken(role string) uint32 {
 // newTestPluginWith builds the plugin through the Factory and then replaces the
 // render backend with the test renderer. The rules under test are about the
 // identity, not about a chat template's exact tokens.
+//
+// Every test config carries a tokenProducer block, because the plugin refuses to
+// start without one (F3); the URL is never dialled — the render is replaced below
+// — and the warmup it starts gives up against the closed port.
 func newTestPluginWith(t *testing.T, params string) *Plugin {
 	t.Helper()
-	var dec *json.Decoder
-	if params != "" {
-		dec = json.NewDecoder(strings.NewReader(params))
-	}
-	built, err := Factory("branch", dec, testutils.NewTestHandle(t.Context()))
+	built, err := Factory("branch", json.NewDecoder(strings.NewReader(withTestProducer(t, params))),
+		testutils.NewTestHandle(t.Context()))
 	require.NoError(t, err)
 	p := built.(*Plugin)
 	p.tokenize = testRenderer(0)
 	return p
+}
+
+// testProducerConfig is the render backend every test config carries: a vllm
+// block with no reachable server (the render is always substituted).
+const testProducerConfig = `{"modelName":"test-model","vllm":{"url":"http://127.0.0.1:1"}}`
+
+// withTestProducer merges that block into a test's parameter object, keeping the
+// test's own keys (a test that sets its own tokenProducer keeps it).
+func withTestProducer(t *testing.T, params string) string {
+	t.Helper()
+	merged := map[string]json.RawMessage{"tokenProducer": json.RawMessage(testProducerConfig)}
+	if params != "" {
+		require.NoError(t, json.Unmarshal([]byte(params), &merged))
+		if _, ok := merged["tokenProducer"]; !ok {
+			merged["tokenProducer"] = json.RawMessage(testProducerConfig)
+		}
+	}
+	raw, err := json.Marshal(merged)
+	require.NoError(t, err)
+	return string(raw)
 }
 
 func newTestPlugin(t *testing.T) *Plugin {
@@ -562,35 +583,86 @@ func TestFactory_Config(t *testing.T) {
 	assert.True(t, p.sticky)
 	assert.True(t, p.retry)
 	assert.Equal(t, defaultMaxBranches, p.idx.maxBranches)
-	assert.Equal(t, defaultRenderTimeoutSeconds*time.Second, p.renderTimeout)
 	assert.Equal(t, defaultMarkerTTLSeconds*time.Second, p.markerTTL,
 		"the marker TTL is the client request timeout, not the flow queue's 5-minute GC")
 
-	// The deprecated arm name still parses, and the render bound is configurable.
+	// The deprecated arm name still parses.
 	built, err := Factory("legacy", json.NewDecoder(strings.NewReader(
-		`{"queuedTtlSeconds":900,"renderTimeoutSeconds":3}`)), nil)
+		withTestProducer(t, `{"queuedTtlSeconds":900}`))), nil)
 	require.NoError(t, err)
 	assert.Equal(t, 900*time.Second, built.(*Plugin).markerTTL)
-	assert.Equal(t, 3*time.Second, built.(*Plugin).renderTimeout)
 
 	for name, params := range map[string]string{
-		"negative block size":   `{"blockSizeTokens":-1}`,
-		"negative sweep":        `{"sweepSeconds":-5}`,
-		"negative cap":          `{"maxBranches":-1}`,
-		"negative render bound": `{"renderTimeoutSeconds":-1}`,
-		"bad json":              `{`,
-		"bad token producer":    `{"tokenProducer":{"estimate":{},"modelName":"m"}}`,
+		"negative block size": `{"blockSizeTokens":-1}`,
+		"negative sweep":      `{"sweepSeconds":-5}`,
+		"negative cap":        `{"maxBranches":-1}`,
+		"bad json":            `{`,
+		"bad token producer":  `{"tokenProducer":{"estimate":{},"modelName":"m"}}`,
 	} {
 		_, err := Factory("bad", json.NewDecoder(strings.NewReader(params)), nil)
 		assert.Error(t, err, name)
 	}
 }
 
+// TestFactory_FailsClosedWithoutARender: F3 — a plugin whose identity would live in
+// byte space (a missing tokenProducer block, or one that selects the estimate
+// backend) REFUSES TO START rather than warning and deriving the retired v1 key.
+func TestFactory_FailsClosedWithoutARender(t *testing.T) {
+	cases := map[string]string{
+		"missing block": `{"blockSizeTokens":64}`,
+		"empty object":  `{}`,
+	}
+	for name, params := range cases {
+		_, err := Factory("norender", json.NewDecoder(strings.NewReader(params)), nil)
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), "tokenProducer", name)
+	}
+	// No parameters at all is the same refusal.
+	_, err := Factory("norender", nil, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "tokenProducer")
+
+	// A block that parses but selects no renderer: refused after construction.
+	for _, params := range []string{
+		`{"tokenProducer":{}}`,
+		`{"tokenProducer":{"estimate":{}}}`,
+	} {
+		_, err := Factory("norender", json.NewDecoder(strings.NewReader(params)), nil)
+		require.Error(t, err, params)
+		assert.Contains(t, err.Error(), "tokenProducer", params)
+	}
+
+	// An estimate backend beside a model name is already an invalid producer block.
+	_, err = Factory("norender", json.NewDecoder(strings.NewReader(
+		`{"tokenProducer":{"estimate":{},"modelName":"m"}}`)), nil)
+	require.Error(t, err)
+}
+
+// TestFactory_EchoesTheEffectiveConfig: the arm is verifiable from its artifacts —
+// the render backend included, since a wrong one silently changes the identity.
+func TestFactory_EchoesTheEffectiveConfig(t *testing.T) {
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	saved := os.Stdout
+	os.Stdout = w
+	t.Cleanup(func() { os.Stdout = saved })
+
+	built, err := Factory("echo", json.NewDecoder(strings.NewReader(withTestProducer(t, `{"logRequests":true}`))), nil)
+	require.NoError(t, err)
+	require.NotNil(t, built)
+	require.NoError(t, w.Close())
+	os.Stdout = saved
+	out, err := io.ReadAll(r)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), "effective config")
+	assert.Contains(t, string(out), "tokenProducer")
+}
+
 // TestFactory_MetricsRegistered: the derivation's counters and the table gauge are
 // exported.
 func TestFactory_MetricsRegistered(t *testing.T) {
 	handle := testutils.NewTestHandle(t.Context())
-	built, err := Factory("branch", nil, handle)
+	built, err := Factory("branch", json.NewDecoder(strings.NewReader(withTestProducer(t, ""))), handle)
 	require.NoError(t, err)
 	p := built.(*Plugin)
 	p.tokenize = testRenderer(0)

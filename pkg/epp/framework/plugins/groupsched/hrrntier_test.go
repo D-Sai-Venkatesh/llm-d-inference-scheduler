@@ -177,8 +177,8 @@ func TestShadowValidationMatrixIsScrapable(t *testing.T) {
 // and any decision difference between them is the engine's behaviour, not a shadow that
 // leaked into the policy.
 //
-// It is asserted against the two existing goldens (the default arm's and the archive F5′'s),
-// so no new trace is introduced for a claim that is really "nothing changed".
+// It is asserted against the default arm's existing golden, so no new trace is introduced
+// for a claim that is really "nothing changed".
 func TestTierConfiguredIsShadowNeutralForTheOtherArms(t *testing.T) {
 	tierFacts := func(entry string) Config {
 		c := defaultConfig()
@@ -191,7 +191,6 @@ func TestTierConfiguredIsShadowNeutralForTheOtherArms(t *testing.T) {
 		name, entry, golden string
 	}{
 		{"newcomer-first (the anchor arms)", "newcomer-first", "golden-f0p-bugfixes.txt"},
-		{"hrrn-bounded (F5′, the tier-blind comparator)", "hrrn-bounded", "golden-f5p-archive.txt"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

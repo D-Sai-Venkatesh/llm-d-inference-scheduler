@@ -521,6 +521,13 @@ report carries the EPP arrival-path p99 against B2a f0p's.
 
 ## 4d. The F5′ arm (bounded HRRN) — the ONE value that changes
 
+> **RETIRED as an arm, kept as a record (2026-11-02, the scheduler trim).** The bounded-HRRN
+> queue module is REMOVED: the trim keeps one implementation per module, so `entryOrder`
+> accepts `newcomer-first` only, its golden and its env files are gone from
+> `docs/gsch-core/` (the envs are in `retired/`), and its recipe lives at
+> `retired/golden-f5p-recipe.md`. The measurements below stand as measured on the builds
+> they name.
+
 The queue module has a second implementation, selected by `CORE_ENTRY_ORDER=hrrn-bounded`
 (rendered as `entryOrder: "hrrn-bounded"` in `CORE_MODULE_BLOCK`; the emitter's block for
 that arm is the one in `config_conformance_test.go`). Nothing else in an arm moves: the

@@ -57,7 +57,7 @@ package groupsched
 //	  kvBlockBytes: 0               # one KV block's bytes (needed iff cpuTierBytes>0)
 //	  sizing: "index"               # CORE_MODULE_BLOCK (one selector per module);
 //	                                # "tier-inclusive" sizes the budget from max(GPU, tier)
-//	  entryOrder: "newcomer-first"  # CORE_ENTRY_ORDER: | "hrrn-bounded" (F5′)
+//	  entryOrder: "newcomer-first"  # CORE_ENTRY_ORDER (one value: the trim keeps one impl)
 //	  engineChoice: "most-free-budget"
 //	  rotation: "quantum"
 //	  victim: "valve"
@@ -123,23 +123,6 @@ kvBlockBytes: 0`,
 		proto: Config{},
 		body: `sizing: "index"
 entryOrder: "newcomer-first"
-engineChoice: "most-free-budget"
-rotation: "quantum"
-victim: "valve"
-safety: "none"
-executionBudget: "none"`,
-	},
-	{
-		// The F5′ arm's module block: CORE_ENTRY_ORDER=hrrn-bounded. The KEYS are
-		// CORE_MODULE_BLOCK's, one VALUE differs — it is here because a value the emitter
-		// can render but the plugin rejects CrashLoops just as hard as an unknown key
-		// (the ENUM half, pinned by TestModuleValuesMatchTheEmitter) and because that
-		// value has to survive the same strict decode as any other (the TYPE half).
-		block: "CORE_MODULE_BLOCK (CORE_ENTRY_ORDER=hrrn-bounded)",
-		owner: PluginType,
-		proto: Config{},
-		body: `sizing: "index"
-entryOrder: "hrrn-bounded"
 engineChoice: "most-free-budget"
 rotation: "quantum"
 victim: "valve"
@@ -448,7 +431,7 @@ func TestModuleValuesMatchTheEmitter(t *testing.T) {
 		values []string
 	}{
 		{"Sizing", []string{"index", "tier-inclusive"}},
-		{"EntryOrder", []string{"newcomer-first", "hrrn-bounded"}},
+		{"EntryOrder", []string{"newcomer-first"}},
 		{"EngineChoice", []string{"most-free-budget"}},
 		{"Rotation", []string{"quantum"}},
 		{"Victim", []string{"valve"}},

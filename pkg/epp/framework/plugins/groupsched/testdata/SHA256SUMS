@@ -9,15 +9,10 @@
 #   golden-f0p-core.txt      the archive with NO fix (one of its legal traces): the archive
 #                            cannot reproduce itself past line 2,167 (evidence of the
 #                            map-order victim tie-break).
-#   golden-f5p-archive.txt   THE F5' EQUIVALENCE GOLDEN: the SAME archive build (dd5350b5
-#                            + the seven declared fixes, verified by regenerating
-#                            golden-f0p-bugfixes.txt byte for byte) with ONE value changed,
-#                            entryOrder: "hrrn-bounded". TestHrrnBoundedEqualsTheArchiveF5P.
 #
-# Both fix-bearing traces were regenerated when the three ACCOUNTING fixes landed
-# (README §2 rows 5-7); the recipe that rebuilds them, including the per-fix patches and
-# the divergence counts, is docs/gsch-core/golden-f5p-recipe.md.
+# The fix-bearing trace was regenerated when the three ACCOUNTING fixes landed
+# (README §2 rows 5-7); the recipe that rebuilds it, including the per-fix patches and the
+# divergence counts, is docs/gsch-core/golden-f5p-recipe.md.
 14e19914a25f00e02b2f0b4deaafb19e7626302bdce1b38b2be8d7b3e1cb9c98  golden-f0p-bugfixes.txt
 f3b667e87003a38e74026f0a6e3c6dc6809772c9dc3fda7c3fd0c121c347aa70  golden-f0p-core.txt
 643c75490f1fd34cd551be978e6b4fffbc735473a15e305b9d5431d5e17f3aa8  golden-f0p-total.txt
-da0ad67d456eac0fd0fd0cf54b3dd23f4b3696898fbf5393f64ef80490d5e24c  golden-f5p-archive.txt

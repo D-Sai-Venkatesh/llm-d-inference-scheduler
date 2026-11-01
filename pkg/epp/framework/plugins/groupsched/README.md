@@ -16,7 +16,6 @@ Six questions, one module each, one config value selecting the implementation:
 | identity | *(the branch-identity plugin)* | — | who is the member (= the queue key) |
 | sizing | `FootprintSizer` | `IndexSizer` ("index") | what does a head cost on THIS engine; how big is its seat budget |
 | queue | `EntryOrder` | `NewcomerFirst` ("newcomer-first") | which waiter is the head |
-| | | `HrrnBounded` ("hrrn-bounded") | *(alternative)* the same, ordered by equal slowdown with the denominator capped at the median waiter |
 | placement | `EngineChooser` | `MostFreeBudget` ("most-free-budget") | which engine takes the head |
 | tenure | `RotationPolicy` | `FixedQuantum` ("quantum") | when may a resident be released |
 | pressure | `VictimChooser` | `BudgetValve` ("valve") | who leaves when an engine is over budget |
@@ -57,13 +56,11 @@ on, victimOrder legacy, windowMode last4, gateMode detector, per-engine groups,
 member-stable binding, every F/PAT/residue knob off) **plus the seven fixes this branch
 makes to inherited rules**. `TestCoreEqualsF0P` requires byte equality with it.
 
-`testdata/golden-f5p-archive.txt` is the **second golden**, and it is the same build with
-ONE value changed (`entryOrder: "hrrn-bounded"`): 5,267 lines, 1,299 dispatches,
-reproduced byte for byte by the core's `HrrnBounded` module
-(`TestHrrnBoundedEqualsTheArchiveF5P`, no normalisation). Its generation recipe —
-including the seven fixes as an archive-side patch, validated by regenerating
-`golden-f0p-bugfixes.txt` byte for byte before it is used — is in
-`docs/gsch-core/golden-f5p-recipe.md`.
+The **second golden** — the same build with ONE value changed
+(`entryOrder: "hrrn-bounded"`, 5,267 lines, 1,299 dispatches) — was removed with that
+module (the trim keeps one implementation per interface). Its generation recipe,
+including the seven fixes as an archive-side patch, is kept in
+`docs/gsch-core/retired/golden-f5p-recipe.md`.
 
 Every fix is a bug fix to a rule the core inherited — none is a new idea. Fixes 0-4 were
 measured SEPARATELY on the same replay against the f0p baseline
@@ -149,7 +146,6 @@ tagged for removal.
 | `staleMultiple` | 3 | `safety.go` | freshness for the LIVE metric read, in framework refresh intervals — a wiring fact (3 × the poll cadence), not a policy constant. |
 | `eventRingSize` | 2048 | `scheduler.go` | the SEAT/EXIT ring bound (memory only). A ring wrap is now COUNTED (`Snapshot.EventRingDropped`, `llm_d_epp_group_event_ring_dropped_total`): the dump's `RecentEvents` covers the last 2,048 events and the counter says how much of the window lies before them, so "the ring does not span the run" is a measurement instead of an inference. |
 | `maxChains` | — | *removed* | with the derived window. |
-| median waiter size | — | `modules.go` (`lowerMedianColdTokens`) | **not a constant: DERIVED once per decision pass** from the live waiter set — the `hrrn-bounded` order's only input that is not already a fact about a head. Nothing is stored or cached, so the bound is always a statement about the CURRENT queue. |
 
 Rule: a new number in a decision path needs a table row saying why it cannot be derived.
 
@@ -160,12 +156,11 @@ Everything below was deleted from this branch and still exists on the archive br
 as a NEW IMPLEMENTATION of ONE module interface plus ONE config value, with evidence
 and the human's sign-off.
 
-* **entry orders**: HRRN (F5) — would be a second `EntryOrder`. Its bounded variant,
-  **hrrn-bounded (F5′), has RETURNED** as exactly that (human sign-off, 2026-11-01):
-  `HrrnBounded` in `modules.go`, one config value, the archive's dd5350b5 semantics
-  verified decision-for-decision against the archive build
-  (`TestHrrnBoundedEqualsTheArchiveF5P`; recipe in `docs/gsch-core/golden-f5p-recipe.md`).
-  Plain HRRN (uncapped) stays out: it is the measured-defect arm.
+* **entry orders**: HRRN (F5) and its bounded variant hrrn-bounded (F5′). F5′ was in the
+  tree as a second `EntryOrder` (and pinned decision-for-decision against the archive
+  build) and was REMOVED by the scheduler trim, 2026-11-02: one implementation per module,
+  so the queue rule is newcomer-first. Plain HRRN (uncapped) stays out: it is the
+  measured-defect arm.
 * **tenure variants**: dyn-size quantum (F3), quantum ceilings, MLFQ-2 pools (F9),
   rotate-when-free (F7), PAT (pause-aligned tenure), the ledger model (rho/nMax/paid).
 * **victim variants**: spec order, F6″ residue order.

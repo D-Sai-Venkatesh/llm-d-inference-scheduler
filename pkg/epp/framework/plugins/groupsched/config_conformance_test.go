@@ -56,7 +56,7 @@ package groupsched
 //	  cpuTierBytes: 0               # the CPU offload tier's BYTES (0 = no tier)
 //	  kvBlockBytes: 0               # one KV block's bytes (needed iff cpuTierBytes>0)
 //	  sizing: "index"               # CORE_MODULE_BLOCK (one selector per module);
-//	                                # "gpu-plus-tier" sizes the budget from GPU + tier
+//	                                # "tier-inclusive" sizes the budget from max(GPU, tier)
 //	  entryOrder: "newcomer-first"  # CORE_ENTRY_ORDER: | "hrrn-bounded" (F5′) | "hrrn-tier"
 //	  engineChoice: "most-free-budget"
 //	  rotation: "quantum"
@@ -168,14 +168,14 @@ cpuTierBytes: 549755813888
 kvBlockBytes: 6291456`,
 	},
 	{
-		// The SIZING arm's module block: CORE_SIZING=gpu-plus-tier (docs/gsch-core/
-		// core-q4-offload-tierbudget.env). One VALUE differs from CORE_MODULE_BLOCK: the
+		// The SIZING arm's module block: CORE_SIZING=tier-inclusive (docs/gsch-core/
+		// core-q4-offload-tierinclusive.env). One VALUE differs from CORE_MODULE_BLOCK: the
 		// emitter renders it verbatim, so the value has to survive the same strict decode
 		// as any other (the TYPE half) and buildModules has to accept it (the ENUM half).
-		block: "CORE_MODULE_BLOCK (CORE_SIZING=gpu-plus-tier)",
+		block: "CORE_MODULE_BLOCK (CORE_SIZING=tier-inclusive)",
 		owner: PluginType,
 		proto: Config{},
-		body: `sizing: "gpu-plus-tier"
+		body: `sizing: "tier-inclusive"
 entryOrder: "newcomer-first"
 engineChoice: "most-free-budget"
 rotation: "quantum"
@@ -185,14 +185,14 @@ executionBudget: "none"`,
 	},
 	{
 		// The EXECUTION-BUDGET arm's module block (docs/gsch-core/
-		// core-q4-offload-tierbudget-execbudget.env): CORE_EXECUTION_BUDGET=execution-budget.
-		// One VALUE differs from the tierbudget arm's block, and it has to survive the same
+		// core-q4-offload-tierinclusive-execbudget.env): CORE_EXECUTION_BUDGET=execution-budget.
+		// One VALUE differs from the tier-inclusive arm's block, and it has to survive the same
 		// strict decode (the TYPE half) and buildModules (the ENUM half) — a CrashLoop on
 		// the one arm that carries the two budgets otherwise.
 		block: "CORE_MODULE_BLOCK (CORE_EXECUTION_BUDGET=execution-budget)",
 		owner: PluginType,
 		proto: Config{},
-		body: `sizing: "gpu-plus-tier"
+		body: `sizing: "tier-inclusive"
 entryOrder: "newcomer-first"
 engineChoice: "most-free-budget"
 rotation: "quantum"
@@ -447,7 +447,7 @@ func TestModuleValuesMatchTheEmitter(t *testing.T) {
 		knob   string
 		values []string
 	}{
-		{"Sizing", []string{"index", "gpu-plus-tier"}},
+		{"Sizing", []string{"index", "tier-inclusive"}},
 		{"EntryOrder", []string{"newcomer-first", "hrrn-bounded", "hrrn-tier"}},
 		{"EngineChoice", []string{"most-free-budget"}},
 		{"Rotation", []string{"quantum"}},

@@ -145,7 +145,7 @@ The wave's BALANCE gate reads the per-engine series every 15 s. A core arm must 
 | `llm_d_epp_group_running_blocks{engine}` / `execution_budget_blocks{engine}` | THE EXECUTION BUDGET's two sides (§4g): the engine's RUNNING set (the dedup-exact union of its in-flight requests' chain blocks, from the EPP's own accounting) and the budget it is tested against (`fraction x num_gpu_blocks`). Read them as a ratio — that ratio IS the two-budget arm's mechanism, and `execution_budget_blocks == 0` means no dispatch gate is wired (every arm whose selector is `none`; `running_blocks` is then 0 by construction) |
 | `llm_d_epp_group_dispatch_holds_total{engine}` / `dispatch_held_turns_total{engine}` / `dispatch_held_seconds{engine}` | the gate's cost, two ways: decision PASSES that held at least one turn, TURNS held (counted once, at the first denial) and how long each held turn waited before it dispatched |
 | `llm_d_epp_group_cold_valve_held_gated_total{engine}` / `gate_charge_hold_seconds{engine}` | THE ONE INTERACTION between the two budgets, measured: cold-entry valve holds whose outstanding charge belonged to a turn the execution budget was HOLDING, and the age of the oldest such charge right now (0 = no admission is blocked by the interaction; a value that only grows IS an admission stall, and the refinement is to suspend a held turn's charge while it is held) |
-| `llm_d_epp_group_entry_wait_seconds_count{engine}` | the ADMISSION rate (seats taken per engine): the histogram's own count. Compare it against the tierbudget arm's — that is the number the interaction above would move |
+| `llm_d_epp_group_entry_wait_seconds_count{engine}` | the ADMISSION rate (seats taken per engine): the histogram's own count. Compare it against the tier-inclusive arm's — that is the number the interaction above would move |
 | `llm_d_epp_group_event_ring_dropped_total` | SEAT/EXIT events the bounded ring has wrapped past — how much of the window lies BEFORE the dump's `RecentEvents` tail. The stdout event stream is the durable copy; this measures what the dump lost |
 
 The gate line to read on a `none` arm: `detector_pool_score == 0` for the whole window
@@ -417,11 +417,11 @@ New series (per engine): `running_blocks`, `execution_budget_blocks` (0 = no gat
 `dispatch_holds_total`, `dispatch_held_turns_total`, `dispatch_held_seconds`,
 `cold_valve_held_gated_total`, `gate_charge_hold_seconds`.
 
-**PRE-RUN GATE for the two-budget arm** (c64, `core-q4-offload-tierbudget ‖
-core-q4-offload-tierbudget-execbudget`, same digest): `running_blocks /
+**PRE-RUN GATE for the two-budget arm** (c64, `core-q4-offload-tierinclusive ‖
+core-q4-offload-tierinclusive-execbudget`, same digest): `running_blocks /
 execution_budget_blocks <= 1` for the whole window on the exec arm (the gate working);
 `cold_valve_held_gated_total` and `gate_charge_hold_seconds` reported, and the admission
-rate (`entry_wait_seconds_count`) within ~2x of the tierbudget arm's — outside that, the
+rate (`entry_wait_seconds_count`) within ~2x of the tier-inclusive arm's — outside that, the
 interaction is what starved admissions and the refinement is §4g's (suspend a held turn's
 charge while it is held).
 
@@ -578,72 +578,98 @@ Arms (this directory): `core-q4-offload.env` (default queue, offload ON — the 
 fix's live confirmation AND the offload anchor) · `core-f5p-q4-offload.env` (tier-blind
 comparator; its settings diff to the arm below is the ONE line
 `CORE_ENTRY_ORDER=hrrn-bounded`) · `core-hrrn-tier-q4.env` (the arm) ·
-`core-q4-offload-tierbudget.env` (§4f: the same arm with `sizing: gpu-plus-tier`). Each
+`core-q4-offload-tierinclusive.env` (§4f: the same arm with `sizing: tier-inclusive`). Each
 keeps `OFFLOAD=0` cells on the same digest for the OFF/ON pair; `EPP_IMAGE_*` stays a
 PLACEHOLDER until the reviewer has read the diff and a digest is built.
 
-## 4f. The tier-sized seat budget — `sizing: "gpu-plus-tier"` (2026-11-02)
+## 4f. The tier-inclusive seat budget — `sizing: "tier-inclusive"` (2026-11-02)
 
 The SIZING module's SECOND value, and the one that prices the offload deployment's real
 capacity:
 
 ```
-budgetBlocks = floor(groupBudgetFraction x (num_gpu_blocks + tierBlocks))
+budgetBlocks = floor(groupBudgetFraction x max(num_gpu_blocks, tierBlocks))
 ```
 
 `tierBlocks` is the CPU tier SHADOW's own capacity (§4e), so the value adds no constant:
 the same two deployment facts (`cpuTierBytes`, `kvBlockBytes`) that size the shadow also
-size the budget it is added to. On the campaign deployment the budget goes from 38,173
-blocks to 121,186 (GPU 40,183 + tier 87,381, x 0.95).
+size the capacity the budget is a fraction of. On the campaign deployment (40,183 GPU
+blocks, a 512 GiB tier = 87,381 blocks = 2.17x the GPU pool) the budget goes from 38,173
+blocks to **83,011**.
+
+**THE CORRECTION THIS SECTION CARRIES (the tier-inclusive fix).** This value shipped first
+as `sizing: "gpu-plus-tier"`, which sized the budget from the **SUM** of the two capacities.
+That is wrong for this deployment: vLLM's native CPU offload is **write-through at compute
+time** — every chunk is stored to the tier as it is computed, and nothing is stored on GPU
+eviction — so the tier holds a copy of essentially everything HBM holds, and a block on the
+GPU is by construction also in the tier. The hierarchy is **inclusive**: the engine's unique
+capacity is `max(GPU, tier)`, not the sum. The summed rule gave 121,185 blocks (3.02x the
+GPU) where 83,011 exist — **~46 % of that budget was blocks it had counted twice** — and
+part of batch 2's overbooking is that number. At HEAD the additive value is **retired**, not
+kept beside the new one: a selector that prices capacity the deployment does not have is a
+footgun for the next arm that copies a config, and `buildModules` fails closed on it
+(`TestGpuPlusTierValueIsRetired`).
+
+**The archive, intact.** Batch 2's arm and its measurement stay here and in git history:
+`core-q4-offload-tierbudget.env` with `CORE_SIZING=gpu-plus-tier`, at commit `17a10e8c` /
+digest `groupsched-17a10e8c` (`git show 17a10e8c:docs/gsch-core/core-q4-offload-tierbudget.env`).
+The result is §4g's *Why, measured* paragraph, which now names both numbers: the arm ran a
+3.02x seat budget and the deployment's unique capacity is 2.17x.
 
 **Why the budget and not the order.** The budget sizes the working set an engine may hold,
 and what it reserves against is a MISS: with no tier a miss is a full prefill, with one it
 is ~1-4 % of a prefill. A seated member whose chain has left HBM is therefore still cheap
-to serve, and the engine's reachable capacity is GPU + tier (3.17x the GPU pool). Sizing
-from GPU alone reserves for the expensive miss the deployment no longer pays, and the c64
-cells show the cost: stock FCFS gained ~2x from offload (FCFS-ON 1.390 req/s) where the
-GPU-sized core gained 1.267.
+to serve, and the engine's reachable capacity is the larger of the two tiers — the CPU tier
+at 2.17x the GPU pool here. Sizing from GPU alone reserves for the expensive miss the
+deployment no longer pays, and the c64 cells show the cost: stock FCFS gained ~2x from
+offload (FCFS-ON 1.390 req/s) where the GPU-sized core gained 1.267.
 
 **What does not move**, both pinned by test:
 
-* the per-head COST stays GPU-only (`TestGpuPlusTierCostIsTheGPUOnlyCost`): a head is
+* the per-head COST stays GPU-only (`TestTierInclusiveCostIsTheGPUOnlyCost`): a head is
   admitted on what it will occupy in HBM, the same rule `hrrn-tier`'s tier-aware cost
   obeys — restorable blocks price priority, never seats;
 * the cold-entry valve's CAP stays the GPU headroom, `floor((1 - fraction) x num_gpu_blocks)
-  x blockSizeTokens` = 128,576 tokens here (`TestGpuPlusTierValveCapStaysGPUHeadroom`): the
+  x blockSizeTokens` = 128,576 tokens here (`TestTierInclusiveValveCapStaysGPUHeadroom`): the
   valve staggers GPU allocation bursts, and a tier cannot absorb one.
 
 **`tier = 0` is `sizing: "index"`** arithmetically and on the state machine
-(`TestGpuPlusTierZeroTierEqualsGPU`), so an arm can carry the value in both deployments and
-an OFF cell is not a second policy. The default value stays `"index"`, and the default's
-budget does not move when a tier is configured (`TestGpuPlusTierDefaultIsUnchanged`); the
+(`TestTierInclusiveZeroTierEqualsGPU`), so an arm can carry the value in both deployments and
+an OFF cell is not a second policy. **A tier SMALLER than the GPU is the GPU**
+(`TestTierInclusiveSmallerTierIsTheGPU`): the tier only ever COVERS HBM, so below the GPU's
+capacity it adds no reachable block. The default value stays `"index"`, and the default's
+budget does not move when a tier is configured (`TestTierInclusiveDefaultIsUnchanged`); the
 golden replay (`TestGolden`) runs on that default, byte for byte.
 
-The arm: `core-q4-offload-tierbudget.env` is `core-q4-offload.env` with ONE setting changed
-(`CORE_SIZING=gpu-plus-tier`). Its contrast is a same-digest pair, so the batch is
-`core-q4-offload ‖ core-q4-offload-tierbudget` at c64 and the same pair at c128. The
+The arm: `core-q4-offload-tierinclusive.env` is `core-q4-offload.env` with ONE setting
+changed (`CORE_SIZING=tier-inclusive`). Its contrast is a same-digest pair, so the batch is
+`core-q4-offload ‖ core-q4-offload-tierinclusive` at c64 and the same pair at c128. The
 emitter needs no new key: `CORE_SIZING` is already rendered into `CORE_MODULE_BLOCK`, and
 `buildModules` accepts the value (conformance test
 `TestModuleValuesMatchTheEmitter`, loader gate
-`TestGroupSchedulerCoreChainStartsWithGpuPlusTierSizing`).
-
+`TestGroupSchedulerCoreChainStartsWithTierInclusiveSizing`).
 
 ## 4g. THE EXECUTION BUDGET — `executionBudget: "execution-budget"` (2026-11-02)
 
 The DISPATCH module: the second of the TWO BUDGETS that §4f needed and did not have.
 
 ```
-SEATING  (residency) = floor(fraction x (num_gpu_blocks + tierBlocks))   §4f, unchanged
-DISPATCH (execution) = floor(fraction x  num_gpu_blocks)                 this value
+SEATING  (residency) = floor(fraction x max(num_gpu_blocks, tierBlocks))  §4f, unchanged
+DISPATCH (execution) = floor(fraction x  num_gpu_blocks)                  this value
 ```
 
-**Why, measured.** Batch 2 at c64 (tierbudget vs the same-digest q4-offload): the tier-sized
-seat budget widened the working set to GPU + tier (3.17x) and then let that many members be
-seated — and seated members RUN. A running request's KV needs HBM blocks, which the tier does
-not provide, so vLLM queued and preempted what the EPP had just dispatched: **43 preemptions
-vs 0, TTFT p50 0.9 s -> 17.8 s, newcomer TTFT p90 9.9 s -> 142 s**, with throughput up 10.8 %
-(the recompute waste behind it). The tier widens where IDLE chains live, not how many requests
-may run at once.
+**Why, measured.** Batch 2 at c64 (the then-named `tierbudget` arm vs the same-digest
+q4-offload): the tier-sized seat budget widened the working set and then let that many
+members be seated — and seated members RUN. (Batch 2 ran the ADDITIVE rule: 121,185 blocks,
+3.02x the GPU pool. The deployment's unique capacity is 2.17x, so ~46 % of those seats were
+blocks that live in HBM AND in the tier at once; §4f is the correction, and the seats this
+section reasons about are now 83,011.) A running request's KV needs HBM blocks, which the tier
+does not provide, so vLLM queued and preempted what the EPP had just dispatched: **43
+preemptions vs 0, TTFT p50 0.9 s -> 17.8 s, newcomer TTFT p90 9.9 s -> 142 s**, with
+throughput up 10.8 % (the recompute waste behind it). The tier widens where IDLE chains live,
+not how many requests may run at once — and the correction does not remove the reason for this
+module: at 83,011 seated blocks against a 38,173-block dispatch budget, seats still outnumber
+what HBM can run by 2.17x, so the gate still binds.
 
 **The rule.** A seated member's turn dispatches only if the engine's RUNNING SET — the
 dedup-exact union of its in-flight requests' chain blocks — plus what the turn would ADD to it
@@ -693,15 +719,16 @@ reportable from the digest, not inferred afterwards:
 | `dispatch_held_turns_total{engine}`, `dispatch_held_seconds{engine}` | how many turns the execution budget held, and for how long each waited before it ran (a clock started at the first denial and booked at dispatch) |
 | `cold_valve_held_gated_total{engine}` | how much of the cold-entry valve's blocking is attributable to a HELD turn's charge — the interaction's size |
 | `gate_charge_hold_seconds{engine}` | the age of the oldest such charge right now; a value that only grows = admissions are stalled by this and nothing else |
-| `entry_wait_seconds_count{engine}` | the ADMISSION rate (seats taken), the number to compare against the tierbudget arm |
+| `entry_wait_seconds_count{engine}` | the ADMISSION rate (seats taken), the number to compare against the tier-inclusive arm |
 
 If those say admissions starve, the refinement is: SUSPEND a held turn's cold charge while it
 is held and re-charge it at dispatch. None of this changes a decision, so every arm's trace is
 untouched by it.
 
-The arm: `core-q4-offload-tierbudget-execbudget.env` is `core-q4-offload-tierbudget.env` with
-ONE setting changed (`CORE_EXECUTION_BUDGET=execution-budget`), so the batch-2 pair is
-`core-q4-offload-tierbudget ‖ core-q4-offload-tierbudget-execbudget` on ONE digest at c64.
+The arm: `core-q4-offload-tierinclusive-execbudget.env` is `core-q4-offload-tierinclusive.env`
+with ONE setting changed (`CORE_EXECUTION_BUDGET=execution-budget`), so the pair is
+`core-q4-offload-tierinclusive ‖ core-q4-offload-tierinclusive-execbudget` on ONE digest at
+c64.
 The emitter needs ONE new key in `CORE_MODULE_BLOCK` (§2's printf) and ONE new enum case
 (`CORE_EXECUTION_BUDGET=none|execution-budget`); build-side contract
 `TestConfigEmitterConformance` + `TestModuleValuesMatchTheEmitter`, loader gate

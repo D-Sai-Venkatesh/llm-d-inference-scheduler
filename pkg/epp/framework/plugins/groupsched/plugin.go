@@ -186,8 +186,8 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// The policy has no MODES left, so the echo states the six things it does in
 	// words — a run's artifacts then say what ran without decoding knob names.
 	fmt.Printf("group-scheduler: CORE policy — identity: derived branch (member = queue key; nothing is written into the session slot)\n")
-	if r.sched.mod.sizer.Name() == "gpu-plus-tier" {
-		fmt.Printf("group-scheduler: CORE policy — sizing: per-engine seat budget = %v x that engine's WHOLE reachable working set (measured num_gpu_blocks + its CPU tier's blocks); footprint from the engine's own block index (dedup + cold-token estimate), GPU-only, and the cold-entry valve's cap stays the GPU headroom\n", cfg.GroupBudgetFraction)
+	if r.sched.mod.sizer.Name() == "tier-inclusive" {
+		fmt.Printf("group-scheduler: CORE policy — sizing: per-engine seat budget = %v x that engine's UNIQUE KV capacity, max(measured num_gpu_blocks, its CPU tier's blocks) — the tier is INCLUSIVE (native offload is write-through, it copies HBM), so the two do not add; footprint from the engine's own block index (dedup + cold-token estimate), GPU-only, and the cold-entry valve's cap stays the GPU headroom\n", cfg.GroupBudgetFraction)
 	} else {
 		fmt.Printf("group-scheduler: CORE policy — sizing: per-engine seat budget = %v x that engine's measured num_gpu_blocks; footprint from the engine's own block index (dedup + cold-token estimate)\n", cfg.GroupBudgetFraction)
 	}
@@ -209,8 +209,8 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// tier-aware or was F5′ under another name.
 	if n := cfg.tierBlocks(); n > 0 {
 		seats := "the tier adds no seats (the budget and the valve stay GPU-only)"
-		if r.sched.mod.sizer.Name() == "gpu-plus-tier" {
-			seats = "sizing=gpu-plus-tier adds the tier's blocks to the seat budget; the cold-entry valve stays GPU-only"
+		if r.sched.mod.sizer.Name() == "tier-inclusive" {
+			seats = "sizing=tier-inclusive sizes the seat budget from the tier's blocks where they exceed the GPU's (the tier is inclusive, not additive); the cold-entry valve stays GPU-only"
 		}
 		fmt.Printf("group-scheduler: CORE policy — offload: CPU tier shadow ON, %d blocks per engine (cpuTierBytes %d / kvBlockBytes %d) — restorable tokens count as cached for entryOrder=%s; %s\n", n, cfg.CpuTierBytes, cfg.KvBlockBytes, cfg.EntryOrder, seats)
 	} else {

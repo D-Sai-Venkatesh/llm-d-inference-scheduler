@@ -181,7 +181,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.neBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "ne_blocks",
 		Help: "distinct blocks charged to this engine's budget: every seated member's set, exiting members included until they drain"}, engineLabels)
 	g.budgetBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "budget_blocks",
-		Help: "seat budget in blocks (groupBudgetFraction x this engine's num_gpu_blocks; at sizing gpu-plus-tier, of num_gpu_blocks + the CPU tier's blocks)"}, engineLabels)
+		Help: "seat budget in blocks (groupBudgetFraction x this engine's num_gpu_blocks; at sizing tier-inclusive, of max(num_gpu_blocks, the CPU tier's blocks) — the tier is inclusive, so it never adds)"}, engineLabels)
 	g.waiters = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "waiters",
 		Help: "waiting heads ACCOUNTED to this engine (0 by construction: the queue is shared; see waiters_shared)"}, engineLabels)
 	g.coldInFlight = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "cold_inflight_tokens",

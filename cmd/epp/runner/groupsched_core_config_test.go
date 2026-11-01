@@ -95,7 +95,7 @@ flowControl:
 // a runner, and is run on its own:
 //
 //	go test ./cmd/epp/runner/ -run TestGroupSchedulerCoreChainStartsWithTheCPUTier
-//	go test ./cmd/epp/runner/ -run TestGroupSchedulerCoreChainStartsWithGpuPlusTierSizing
+//	go test ./cmd/epp/runner/ -run TestGroupSchedulerCoreChainStartsWithTierInclusiveSizing
 var runnerStartedInProcess atomic.Bool
 
 // TestGroupSchedulerDualReferenceStarts is the config-level DAG gate: one
@@ -228,27 +228,27 @@ func TestGroupSchedulerCoreChainStartsWithTheCPUTier(t *testing.T) {
 	}
 }
 
-// TestGroupSchedulerCoreChainStartsWithGpuPlusTierSizing is the TIER-SIZED budget arm's
-// loader gate (docs/gsch-core/core-q4-offload-tierbudget.env): the same chain with
-// `sizing: "gpu-plus-tier"` and the two tier facts it sizes the budget from. buildModules
+// TestGroupSchedulerCoreChainStartsWithTierInclusiveSizing is the TIER-SIZED budget arm's
+// loader gate (docs/gsch-core/core-q4-offload-tierinclusive.env): the same chain with
+// `sizing: "tier-inclusive"` and the two tier facts it sizes the budget from. buildModules
 // fails closed on an unknown module value, so a value the emitter can render and the plugin
 // rejects is a CrashLoop on that arm only — the contract test (config_conformance_test.go)
 // mirrors this path, and this runs it.
-func TestGroupSchedulerCoreChainStartsWithGpuPlusTierSizing(t *testing.T) {
+func TestGroupSchedulerCoreChainStartsWithTierInclusiveSizing(t *testing.T) {
 	if runnerStartedInProcess.Load() {
-		t.Skip("a runner has already been instantiated in this process (plugin metrics are process-global): run this gate on its own with -run TestGroupSchedulerCoreChainStartsWithGpuPlusTierSizing")
+		t.Skip("a runner has already been instantiated in this process (plugin metrics are process-global): run this gate on its own with -run TestGroupSchedulerCoreChainStartsWithTierInclusiveSizing")
 	}
-	tierCfg := strings.Replace(corePluginConfig, `sizing: "index"`, `sizing: "gpu-plus-tier"`, 1)
+	tierCfg := strings.Replace(corePluginConfig, `sizing: "index"`, `sizing: "tier-inclusive"`, 1)
 	tierCfg = strings.Replace(tierCfg, "    inflightReapSeconds: 3700\n",
 		"    inflightReapSeconds: 3700\n    cpuTierBytes: 549755813888\n    kvBlockBytes: 6291456\n", 1)
-	require.Contains(t, tierCfg, `sizing: "gpu-plus-tier"`, "the fixture must carry the sizing selector")
+	require.Contains(t, tierCfg, `sizing: "tier-inclusive"`, "the fixture must carry the sizing selector")
 	require.Contains(t, tierCfg, "kvBlockBytes: 6291456", "the fixture must carry the tier facts the budget is sized from")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	opts := runserver.NewOptions()
 	opts.ConfigText = tierCfg
-	opts.PoolName = "core-tierbudget"
+	opts.PoolName = "core-tierinclusive"
 	opts.AllowExperimentalPlugins = true
 	r := NewRunner()
 	rawConfig, err := r.parseConfigurationPhaseOne(ctx, opts)
@@ -260,8 +260,8 @@ func TestGroupSchedulerCoreChainStartsWithGpuPlusTierSizing(t *testing.T) {
 }
 
 // TestGroupSchedulerCoreChainStartsWithTheExecutionBudget is the TWO-BUDGET arm's loader
-// gate (docs/gsch-core/core-q4-offload-tierbudget-execbudget.env): the tier-sized seat
-// budget AND the execution budget, i.e. the config the batch-2 pair runs on one side.
+// gate (docs/gsch-core/core-q4-offload-tierinclusive-execbudget.env): the tier-inclusive
+// seat budget AND the execution budget, i.e. the config the next pair runs on one side.
 // `executionBudget` is a NEW key, so this is the path that must fail if the plugin's
 // parameters stop decoding it — the emitter renders the value verbatim and the EPP decodes
 // strictly, and buildModules fails closed on a value it does not know. Two checks in one:
@@ -270,7 +270,7 @@ func TestGroupSchedulerCoreChainStartsWithTheExecutionBudget(t *testing.T) {
 	if runnerStartedInProcess.Load() {
 		t.Skip("a runner has already been instantiated in this process (plugin metrics are process-global): run this gate on its own with -run TestGroupSchedulerCoreChainStartsWithTheExecutionBudget")
 	}
-	cfg := strings.Replace(corePluginConfig, `sizing: "index"`, `sizing: "gpu-plus-tier"`, 1)
+	cfg := strings.Replace(corePluginConfig, `sizing: "index"`, `sizing: "tier-inclusive"`, 1)
 	cfg = strings.Replace(cfg, "    inflightReapSeconds: 3700\n",
 		"    inflightReapSeconds: 3700\n    cpuTierBytes: 549755813888\n    kvBlockBytes: 6291456\n", 1)
 	cfg = strings.Replace(cfg, `executionBudget: "none"`, `executionBudget: "execution-budget"`, 1)

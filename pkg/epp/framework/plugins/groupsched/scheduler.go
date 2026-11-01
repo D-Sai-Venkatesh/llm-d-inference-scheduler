@@ -383,6 +383,11 @@ type member struct {
 	predResident float64
 	predBlocks   int64
 	predSet      bool
+	// gateHeldSince is when the DISPATCH gate first denied this member's queued turn
+	// (zero = not held). It is the measurement the two-budget interaction needs: how long
+	// a turn waited at the EPP because of the execution budget, booked at the moment the
+	// turn finally dispatches (and cleared when its head leaves the queue).
+	gateHeldSince time.Time
 }
 
 // inflightRec is one in-flight request's reconciliation record (C3).
@@ -533,6 +538,18 @@ type engineGroup struct {
 		// held at least one of this engine's turns back — the execution budget's measured
 		// cost, the way coldValveHeld is the stagger's.
 		dispatchHolds int64
+		// dispatchHeldTurns counts TURNS the gate held for at least one pass (a turn is
+		// counted once, at its first denial), and dispatchHeldWaits samples how long each
+		// held turn waited before it finally dispatched — the distribution the arm's
+		// report needs ("held-turn count and duration").
+		dispatchHeldTurns int64
+		dispatchHeldWaits []float64
+		// valveHeldGated counts the cold-entry VALVE's holds that happened while the
+		// charge owning that slot belonged to a turn the EXECUTION BUDGET was holding —
+		// the one place the two budgets touch (see README §4g). Non-zero is the measured
+		// size of that interaction; if it is large, the refinement is suspending a held
+		// turn's charge while it is held and re-charging it at dispatch.
+		valveHeldGated int64
 		// safetyFires / safetyFiredSeconds are the net's events and fired time.
 		safetyFires        int64
 		safetyFiredSeconds float64
@@ -628,6 +645,13 @@ type Scheduler struct {
 	// the next pass re-checks it; nothing is evicted and no seat moves. This is the
 	// execution budget's measured cost — the counterpart of onColdValveHeld.
 	onDispatchHold func(engine string)
+	// onDispatchHeldTurn fires when a turn the gate had held finally DISPATCHES, with how
+	// long it waited (the held-turn duration distribution).
+	onDispatchHeldTurn func(engine string, heldSeconds float64)
+	// onColdValveHeldGated fires when the cold-entry valve holds a head on an engine whose
+	// outstanding charge belongs to a turn the DISPATCH gate is holding — the two
+	// budgets' one intersection, counted so a run can size it.
+	onColdValveHeldGated func(engine string)
 	// onSafetyFire fires when an engine's safety net OPENS (a fire event).
 	onSafetyFire func(engine string)
 	// onShadowValidation receives one (predicted resident fraction, measured
@@ -1092,12 +1116,19 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 					break
 				}
 				held = true
+				// MEASUREMENT: the turn's hold CLOCK starts at the first denial and is
+				// read out when the turn finally dispatches (the winner path below), so
+				// the arm reports the wait the execution budget actually caused.
+				if m := g.members[cands[i].h.Member]; m != nil && m.gateHeldSince.IsZero() {
+					m.gateHeldSince = now
+					g.counters.dispatchHeldTurns++
+					if s.onDispatchHold != nil {
+						s.onDispatchHold(engineLabel(g.id))
+					}
+				}
 			}
 			if held {
 				g.counters.dispatchHolds++
-				if s.onDispatchHold != nil {
-					s.onDispatchHold(engineLabel(g.id))
-				}
 			}
 			if pick < 0 {
 				continue // every head on this engine is over the execution budget this pass
@@ -1135,6 +1166,18 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 			}
 		}
 		m.inflightIDs[rid] = inflightRec{since: now} // provisional (C3): confirmed at Dispatched
+		if !m.gateHeldSince.IsZero() {
+			// the held turn RUNS: book the wait it spent behind the execution budget
+			heldSeconds := now.Sub(m.gateHeldSince).Seconds()
+			m.gateHeldSince = time.Time{}
+			if heldSeconds < 0 {
+				heldSeconds = 0
+			}
+			g.counters.dispatchHeldWaits = append(g.counters.dispatchHeldWaits, heldSeconds)
+			if s.onDispatchHeldTurn != nil {
+				s.onDispatchHeldTurn(engineLabel(g.id), heldSeconds)
+			}
+		}
 		m.inflight = len(m.inflightIDs)
 		m.lastActivity = now
 		g.counters.served++
@@ -1153,6 +1196,38 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 		}
 	}
 	return "", -1
+}
+
+// gatedChargeOwnerLocked reports whether ANY of the named engine's members is a turn the
+// DISPATCH gate is holding while it still carries an unreleased cold-entry charge — the
+// state in which the execution budget is what keeps this engine's valve closed.
+func (s *Scheduler) gatedChargeOwnerLocked(engine string) bool {
+	g := s.groups[engine]
+	if g == nil {
+		return false
+	}
+	for _, m := range g.members {
+		if !m.gateHeldSince.IsZero() && m.coldEntry > 0 && !m.coldDone {
+			return true
+		}
+	}
+	return false
+}
+
+// gateChargeHoldSecondsLocked is how long the OLDEST such member has been holding that
+// charge (0 when none is): a value that only grows while admissions stay off is the
+// interaction becoming an admission stall.
+func (s *Scheduler) gateChargeHoldSecondsLocked(g *engineGroup, now time.Time) float64 {
+	var oldest float64
+	for _, m := range g.members {
+		if m.gateHeldSince.IsZero() || m.coldEntry <= 0 || m.coldDone {
+			continue
+		}
+		if age := now.Sub(m.gateHeldSince).Seconds(); age > oldest {
+			oldest = age
+		}
+	}
+	return oldest
 }
 
 // dispatchAllowedLocked is the DISPATCH GATE's answer for ONE seated head on ONE engine
@@ -1274,6 +1349,9 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 		for id, m := range g.members {
 			if _, ok := present[id]; !ok {
 				m.waitingSince = time.Time{}
+				// no queued head: a hold clock (the execution budget's measurement) is
+				// about a turn that no longer exists — the next one starts its own
+				m.gateHeldSince = time.Time{}
 			}
 		}
 	}
@@ -2528,6 +2606,16 @@ type EngineSnapshot struct {
 	RunningBlocks         int   `json:"runningBlocks"`
 	ExecutionBudgetBlocks int64 `json:"executionBudgetBlocks"`
 	DispatchHolds         int64 `json:"dispatchHolds"`
+	// The INTERACTION measurement (README §4g): DispatchHeldTurns counts turns the gate
+	// held at least once, DispatchHeldWaitP50/Peak is how long they waited before they
+	// dispatched, ValveHeldGated counts cold-entry valve holds whose charge belonged to a
+	// held turn, and ChargeHoldSeconds is the age of the oldest such charge RIGHT NOW (0 =
+	// no admission is blocked by this interaction; a value that only grows is one that is).
+	DispatchHeldTurns   int64   `json:"dispatchHeldTurns"`
+	DispatchHeldWaitP50 float64 `json:"dispatchHeldWaitP50"`
+	DispatchHeldWaitMax float64 `json:"dispatchHeldWaitPeak"`
+	ValveHeldGated      int64   `json:"valveHeldGated"`
+	ChargeHoldSeconds   float64 `json:"chargeHoldSeconds"`
 }
 
 // SnapshotLite is Snapshot without the event ring and config echo — the metrics
@@ -2604,7 +2692,12 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 			TierCapacityBlocks:    g.tier.Capacity(),
 			RunningBlocks:         g.index.RunningBlocksLocked(),
 			ExecutionBudgetBlocks: s.mod.gate.BudgetBlocks(g.numBlocks),
-			DispatchHolds:         g.counters.dispatchHolds}
+			DispatchHolds:         g.counters.dispatchHolds,
+			DispatchHeldTurns:     g.counters.dispatchHeldTurns,
+			DispatchHeldWaitP50:   p50(g.counters.dispatchHeldWaits),
+			DispatchHeldWaitMax:   maxOf(g.counters.dispatchHeldWaits),
+			ValveHeldGated:        g.counters.valveHeldGated,
+			ChargeHoldSeconds:     s.gateChargeHoldSecondsLocked(g, s.now)}
 		if g.blockSizeMismatch != nil {
 			es.BlockSizeErr = g.blockSizeMismatch.Error()
 		}
@@ -2640,6 +2733,17 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 	}
 	sort.Strings(snap.HeterogeneousEngines)
 	return snap
+}
+
+// maxOf is the peak of a sample (0 when empty) — the tail the p50 hides.
+func maxOf(w []float64) float64 {
+	var m float64
+	for _, v := range w {
+		if v > m {
+			m = v
+		}
+	}
+	return m
 }
 
 // p50 is the median of a wait sample (0 when empty).

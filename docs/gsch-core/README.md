@@ -142,7 +142,10 @@ The wave's BALANCE gate reads the per-engine series every 15 s. A core arm must 
 | `llm_d_epp_group_filter_decisions_total{decision}` | `pinned` vs `passthrough-*` (a run whose decisions are all passthrough is NOT pinned) |
 | `llm_d_epp_group_cold_cap_tokens{engine}` | the DERIVED cold-entry stagger cap (the budget's headroom, in tokens). Scorers divide `cold_inflight_tokens` by THIS; the cap moves with the engine and must never be copied out of an arm's config |
 | `llm_d_epp_group_cold_valve_held_total{engine}` | heads the valve held back (the budget would have admitted them; they WAIT). Non-zero is the stagger's measured cost; a value under `engine="single"` on a multi-engine stack was a labelling defect fixed in 8397e9aa |
-| `llm_d_epp_group_running_blocks{engine}` / `execution_budget_blocks{engine}` / `dispatch_holds_total{engine}` | THE EXECUTION BUDGET's three numbers (§4g): the engine's RUNNING set (the dedup-exact union of its in-flight requests' chain blocks, from the EPP's own accounting), the budget it is tested against (`fraction x num_gpu_blocks`), and how many decision passes held a turn back. `execution_budget_blocks == 0` means no dispatch gate is wired (every arm whose selector is `none`), and `running_blocks` is then 0 by construction: nothing is maintained |
+| `llm_d_epp_group_running_blocks{engine}` / `execution_budget_blocks{engine}` | THE EXECUTION BUDGET's two sides (§4g): the engine's RUNNING set (the dedup-exact union of its in-flight requests' chain blocks, from the EPP's own accounting) and the budget it is tested against (`fraction x num_gpu_blocks`). Read them as a ratio — that ratio IS the two-budget arm's mechanism, and `execution_budget_blocks == 0` means no dispatch gate is wired (every arm whose selector is `none`; `running_blocks` is then 0 by construction) |
+| `llm_d_epp_group_dispatch_holds_total{engine}` / `dispatch_held_turns_total{engine}` / `dispatch_held_seconds{engine}` | the gate's cost, two ways: decision PASSES that held at least one turn, TURNS held (counted once, at the first denial) and how long each held turn waited before it dispatched |
+| `llm_d_epp_group_cold_valve_held_gated_total{engine}` / `gate_charge_hold_seconds{engine}` | THE ONE INTERACTION between the two budgets, measured: cold-entry valve holds whose outstanding charge belonged to a turn the execution budget was HOLDING, and the age of the oldest such charge right now (0 = no admission is blocked by the interaction; a value that only grows IS an admission stall, and the refinement is to suspend a held turn's charge while it is held) |
+| `llm_d_epp_group_entry_wait_seconds_count{engine}` | the ADMISSION rate (seats taken per engine): the histogram's own count. Compare it against the tierbudget arm's — that is the number the interaction above would move |
 | `llm_d_epp_group_event_ring_dropped_total` | SEAT/EXIT events the bounded ring has wrapped past — how much of the window lies BEFORE the dump's `RecentEvents` tail. The stdout event stream is the durable copy; this measures what the dump lost |
 
 The gate line to read on a `none` arm: `detector_pool_score == 0` for the whole window
@@ -633,10 +636,22 @@ replay (`TestExecutionBudgetOnChangesNothingWhenItNeverBinds`). With the selecto
 NOTHING is maintained — no key scan per dispatch, no per-tick rebuild, no cache — so a
 comparator arm's CPU is identical to the build before this module existed.
 
-**ONE interaction, stated:** a HELD turn keeps its seat-time cold-entry charge (it will
-prefill when it runs), and the derived valve admits one outstanding prefill per engine — so a
-held turn occupies that slot while it waits. It is released the moment the turn dispatches
-(which the FIFO rule and the draining running set guarantee).
+**ONE interaction, stated AND MEASURED:** a HELD turn keeps its seat-time cold-entry charge
+(it will prefill when it runs), and the derived valve admits one outstanding prefill per
+engine — so a held turn occupies that slot while it waits. It is released the moment the turn
+dispatches (which the FIFO rule and the draining running set guarantee). The interaction is
+reportable from the digest, not inferred afterwards:
+
+| series | what it says |
+|---|---|
+| `dispatch_held_turns_total{engine}`, `dispatch_held_seconds{engine}` | how many turns the execution budget held, and for how long each waited before it ran (a clock started at the first denial and booked at dispatch) |
+| `cold_valve_held_gated_total{engine}` | how much of the cold-entry valve's blocking is attributable to a HELD turn's charge — the interaction's size |
+| `gate_charge_hold_seconds{engine}` | the age of the oldest such charge right now; a value that only grows = admissions are stalled by this and nothing else |
+| `entry_wait_seconds_count{engine}` | the ADMISSION rate (seats taken), the number to compare against the tierbudget arm |
+
+If those say admissions starve, the refinement is: SUSPEND a held turn's cold charge while it
+is held and re-charge it at dispatch. None of this changes a decision, so every arm's trace is
+untouched by it.
 
 The arm: `core-q4-offload-tierbudget-execbudget.env` is `core-q4-offload-tierbudget.env` with
 ONE setting changed (`CORE_EXECUTION_BUDGET=execution-budget`), so the batch-2 pair is

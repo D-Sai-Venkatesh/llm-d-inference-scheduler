@@ -294,9 +294,22 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 			// reason to evict — see EngineCandidate.Fits). The attribution is the engine
 			// id, not "": cold_valve_held_total read `engine="single"` on a two-engine
 			// stack while this passed the empty id (2026-11-01).
-			if s.onColdValveHeld != nil {
-				if engine, held := s.coldValveHeldOn(head); held {
+			if engine, held := s.coldValveHeldOn(head); held {
+				if s.onColdValveHeld != nil {
 					s.onColdValveHeld(engine)
+				}
+				// THE TWO BUDGETS' ONE INTERSECTION, MEASURED: if the charge filling this
+				// engine's valve slot belongs to a turn the DISPATCH gate is holding, the
+				// valve is closed BECAUSE of the execution budget. Counted so the arm can
+				// size it (README §4g, "one interaction, stated").
+				if s.gatedChargeOwnerLocked(engine) {
+					g := s.groups[engine]
+					if g != nil {
+						g.counters.valveHeldGated++
+					}
+					if s.onColdValveHeldGated != nil {
+						s.onColdValveHeldGated(engine)
+					}
 				}
 			}
 			return

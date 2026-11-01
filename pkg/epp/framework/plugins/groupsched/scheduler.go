@@ -44,8 +44,10 @@ import (
 // caps) and the per-engine saturation gate with its 0.80/5 constants.
 type Config struct {
 	// GroupBudgetFraction sizes each engine's SEAT BUDGET from that engine's own
-	// measured KV capacity: budgetBlocks = fraction × num_gpu_blocks. It is ONE
-	// number with TWO uses, and that is deliberate:
+	// measured KV capacity: budgetBlocks = fraction × num_gpu_blocks (with sizing
+	// "gpu-plus-tier": fraction × (num_gpu_blocks + that engine's CPU tier blocks),
+	// the same fraction of a wider working set). It is ONE number with TWO uses, and
+	// that is deliberate:
 	//
 	//	(1) SIZING — the budget a seat's footprint is admitted against;
 	//	(2) SAFETY  — the memory-only net's threshold (safety.go): the net fires
@@ -109,7 +111,15 @@ type Config struct {
 	// ---- ONE selector per module (a future idea = one new implementation + one
 	// value here; nothing else in the config moves). Validated by buildModules. ----
 	//
-	//	Sizing       "index"            footprint from the engine's own BlockIndex
+	//	Sizing       "index"            footprint from the engine's own BlockIndex,
+	//	                                budget = fraction x num_gpu_blocks |
+	//	             "gpu-plus-tier"    the same footprint and the same GPU-only cost,
+	//	                                with the budget sized from the engine's WHOLE
+	//	                                reachable working set: fraction x (num_gpu_blocks
+	//	                                + the CPU tier's blocks). The cold-entry valve's
+	//	                                cap stays the GPU headroom, so only the number of
+	//	                                seats moves (needs cpuTierBytes/kvBlockBytes;
+	//	                                0/0 makes it "index" arithmetically)
 	//	EntryOrder   "newcomer-first"   newcomers, then oldest, then id |
 	//	             "hrrn-bounded"     bounded HRRN: wait ÷ min(cold tokens, the median
 	//	                                waiter's cold tokens), newcomers as the outer
@@ -429,8 +439,11 @@ type engineGroup struct {
 	// id is the endpoint id the EPP discovered.
 	id string
 
-	index        *BlockIndex // attached at creation (block size from config)
-	budgetBlocks int         // 0 until THIS engine's num_gpu_blocks arrives
+	index *BlockIndex // attached at creation (block size from config)
+	// budgetBlocks is what this engine may seat, in blocks: the SIZING module's answer
+	// for THIS engine's measured capacity (and, at sizing gpu-plus-tier, its tier's
+	// blocks). 0 until THIS engine's num_gpu_blocks arrives.
+	budgetBlocks int
 	numBlocks    int
 	// blockSizeMismatch is the loud per-engine wiring failure (a measured
 	// CacheBlockSize that differs from the config's BlockSizeTokens).
@@ -498,6 +511,11 @@ type engineGroup struct {
 // which is why it needs no value of its own — with the budget at 0.95 of 40,183
 // blocks and 64-token blocks the cap is 2009 blocks = 128,576 tokens (the constant it
 // replaces was 131,072 in a unit the budget never used).
+//
+// IT READS num_gpu_blocks AND NOTHING ELSE, at every sizing value: the valve staggers
+// GPU allocation bursts, and a CPU tier cannot absorb one (a cold prefill allocates HBM
+// whatever the tier holds). So sizing gpu-plus-tier grows the budget and leaves this cap
+// where it is (TestGpuPlusTierValveCapStaysGPUHeadroom).
 //
 // 0 means "no measured capacity yet", and the places that call this are already
 // behind the capacity check (an engine without capacity takes no seats).
@@ -782,7 +800,10 @@ func (s *Scheduler) SetNumBlocksFor(engine string, blockSizeTokens, numBlocks in
 		return nil // first capacity wins, PER ENGINE
 	}
 	g.numBlocks = numBlocks
-	g.budgetBlocks = s.mod.sizer.BudgetBlocks(numBlocks)
+	// the tier's capacity comes from THIS engine's own shadow (0 when the deployment
+	// configures no tier), so both sizing values read one source for it and the
+	// GPU-only one ignores it.
+	g.budgetBlocks = s.mod.sizer.BudgetBlocks(numBlocks, g.tier.Capacity())
 	return nil
 }
 

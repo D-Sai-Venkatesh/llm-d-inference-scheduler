@@ -58,7 +58,7 @@ func TestColdCapIsTheBudgetsHeadroomPerEngine(t *testing.T) {
 	}
 	for _, c := range combs {
 		g := &engineGroup{numBlocks: c.numBlocks}
-		budget := IndexSizer{Fraction: c.fraction, BlockSize: c.blockSize}.BudgetBlocks(c.numBlocks)
+		budget := IndexSizer{Fraction: c.fraction, BlockSize: c.blockSize}.BudgetBlocks(c.numBlocks, 0)
 		g.budgetBlocks = budget
 		capTokens := g.coldCapTokens(c.fraction, c.blockSize)
 		headroomTokens := (1 - c.fraction) * float64(c.numBlocks) * float64(c.blockSize)
@@ -75,7 +75,7 @@ func TestColdCapIsTheBudgetsHeadroomPerEngine(t *testing.T) {
 	}
 	// the derived value at the campaign shape is the constant it replaces, to within
 	// one block: 2009 blocks x 64 = 128,576 tokens (the knob said 131,072).
-	g := &engineGroup{numBlocks: 40183, budgetBlocks: IndexSizer{Fraction: 0.95, BlockSize: 64}.BudgetBlocks(40183)}
+	g := &engineGroup{numBlocks: 40183, budgetBlocks: IndexSizer{Fraction: 0.95, BlockSize: 64}.BudgetBlocks(40183, 0)}
 	if got := g.coldCapTokens(0.95, 64); got != 128576 {
 		t.Fatalf("campaign-shape cap: %d want 128576 (2009 blocks x 64)", got)
 	}

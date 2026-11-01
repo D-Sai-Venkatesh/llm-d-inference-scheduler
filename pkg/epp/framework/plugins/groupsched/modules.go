@@ -27,7 +27,10 @@ package groupsched
 //	            member id IS the queue key. This package only READS it.
 //	SIZING      FootprintSizer: what a head costs on one engine, in blocks, from
 //	            the engine's own BlockIndex (dedup + cold-token estimate), and the
-//	            engine's seat budget from its measured KV capacity.
+//	            engine's seat budget from its measured KV capacity. Default
+//	            IndexSizer (budget = fraction x num_gpu_blocks); the alternative
+//	            GpuPlusTier sizes the budget from GPU blocks PLUS the CPU tier's
+//	            blocks (gpu-plus-tier).
 //	QUEUE       EntryOrder: which waiter is the head. Default newcomer-first, then
 //	            oldest arrival, then id. Alternatives: bounded HRRN (equal slowdown,
 //	            denominator capped at the median waiter size) and bounded HRRN with
@@ -587,8 +590,11 @@ func betterEngine(c, best EngineCandidate) bool {
 // blocks may this engine seat?".
 type FootprintSizer interface {
 	Name() string
-	// BudgetBlocks is one engine's seat budget, from its measured KV capacity.
-	BudgetBlocks(numBlocks int) int
+	// BudgetBlocks is one engine's seat budget, from its measured KV capacity and
+	// that engine's CPU tier capacity in blocks (0 = no tier configured). Both
+	// numbers are per-engine deployment facts; a GPU-only implementation ignores
+	// the tier's, so neither implementation reaches for the other's state.
+	BudgetBlocks(numBlocks, tierBlocks int) int
 	// Cost is the conservative admission cost of a QUEUED request against one
 	// engine's index, in blocks.
 	Cost(idx *BlockIndex, member string, sizeBytes int64) int64
@@ -619,7 +625,7 @@ type IndexSizer struct {
 
 func (IndexSizer) Name() string { return "index" }
 
-func (z IndexSizer) BudgetBlocks(numBlocks int) int {
+func (z IndexSizer) BudgetBlocks(numBlocks, _ int) int {
 	return int(z.Fraction * float64(numBlocks))
 }
 
@@ -656,6 +662,60 @@ func (z IndexSizer) TierCost(idx *BlockIndex, tier *tierShadow, member string, s
 }
 
 func (z IndexSizer) Tokens(blocks int64) int64 { return blocks * int64(z.BlockSize) }
+
+// GpuPlusTier is the SIZING alternative "gpu-plus-tier": the seat budget is a fraction
+// of the engine's whole reachable working set — its measured GPU blocks PLUS its CPU
+// tier's blocks — while a head's admission cost stays IndexSizer's GPU-only estimate.
+//
+//	BudgetBlocks = floor(fraction x (num_gpu_blocks + tierBlocks))
+//
+// WHY (PREREG-multipod-offload, "the seat budget counts GPU memory only"). The budget
+// sizes the working set an engine may hold, and what a miss costs is what it reserves
+// for: with no tier a miss is a full prefill, with a tier ~1-4 % of one (a restore). A
+// seated member whose chain has left HBM is therefore still cheap to serve, and the
+// engine's reachable capacity is GPU + tier — 40,183 GPU blocks + 87,381 tier blocks =
+// 3.17x the GPU pool on the campaign deployment. Sizing from GPU alone reserves for the
+// expensive miss the deployment no longer pays: on the c64 cells stock FCFS gained ~2x
+// from offload (1.390 req/s) where the GPU-sized core gained 1.267.
+//
+// WHAT DOES NOT GROW. The cold-entry valve's cap stays floor((1-fraction) x
+// num_gpu_blocks) x blockSize (engineGroup.coldCapTokens): it staggers GPU allocation
+// bursts, and the tier cannot absorb one. The per-head cost stays GPU-only, so a head is
+// admitted on what it will occupy in HBM — the same rule hrrn-tier's tier-aware cost
+// obeys (restorable blocks price priority, never seats).
+//
+// tierBlocks is the engine's TIER SHADOW capacity (tiershadow.go): the same two
+// deployment facts that size the shadow, read back from it, so this implementation adds
+// no constant of its own. 0 (no tier configured) makes BudgetBlocks IndexSizer's number
+// exactly; TestGpuPlusTierZeroTierEqualsGPU pins that degeneracy on the state machine.
+type GpuPlusTier struct {
+	Fraction  float64
+	BlockSize int
+}
+
+func (GpuPlusTier) Name() string { return "gpu-plus-tier" }
+
+func (z GpuPlusTier) BudgetBlocks(numBlocks, tierBlocks int) int {
+	return int(z.Fraction * float64(numBlocks+tierBlocks))
+}
+
+// The cost functions are IndexSizer's, delegated: this implementation changes WHICH
+// heads may be seated, never what a head costs.
+func (z GpuPlusTier) Cost(idx *BlockIndex, member string, sizeBytes int64) int64 {
+	return z.gpu().Cost(idx, member, sizeBytes)
+}
+
+func (z GpuPlusTier) TierCost(idx *BlockIndex, tier *tierShadow, member string, sizeBytes int64) (cold, resident, total int64) {
+	return z.gpu().TierCost(idx, tier, member, sizeBytes)
+}
+
+func (z GpuPlusTier) Tokens(blocks int64) int64 { return z.gpu().Tokens(blocks) }
+
+// gpu is this implementation's wiring facts as the GPU-only sizer, so the two selector
+// values share one cost implementation instead of keeping two copies of it.
+func (z GpuPlusTier) gpu() IndexSizer {
+	return IndexSizer{Fraction: z.Fraction, BlockSize: z.BlockSize}
+}
 
 // ---- SAFETY ------------------------------------------------------------------
 
@@ -758,8 +818,10 @@ func buildModules(cfg Config) (modules, error) {
 	switch cfg.Sizing {
 	case "", "index":
 		m.sizer = IndexSizer{Fraction: cfg.GroupBudgetFraction, BlockSize: cfg.BlockSizeTokens}
+	case "gpu-plus-tier":
+		m.sizer = GpuPlusTier{Fraction: cfg.GroupBudgetFraction, BlockSize: cfg.BlockSizeTokens}
 	default:
-		return m, errValue("sizing", cfg.Sizing, "index")
+		return m, errValue("sizing", cfg.Sizing, "index|gpu-plus-tier")
 	}
 	switch cfg.EntryOrder {
 	case "", "newcomer-first":

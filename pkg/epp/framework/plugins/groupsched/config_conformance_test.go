@@ -55,7 +55,8 @@ package groupsched
 //	  inflightReapSeconds: 3700
 //	  cpuTierBytes: 0               # the CPU offload tier's BYTES (0 = no tier)
 //	  kvBlockBytes: 0               # one KV block's bytes (needed iff cpuTierBytes>0)
-//	  sizing: "index"               # CORE_MODULE_BLOCK (one selector per module)
+//	  sizing: "index"               # CORE_MODULE_BLOCK (one selector per module);
+//	                                # "gpu-plus-tier" sizes the budget from GPU + tier
 //	  entryOrder: "newcomer-first"  # CORE_ENTRY_ORDER: | "hrrn-bounded" (F5′) | "hrrn-tier"
 //	  engineChoice: "most-free-budget"
 //	  rotation: "quantum"
@@ -160,6 +161,21 @@ capacityLivenessSeconds: 120
 inflightReapSeconds: 3700
 cpuTierBytes: 549755813888
 kvBlockBytes: 6291456`,
+	},
+	{
+		// The SIZING arm's module block: CORE_SIZING=gpu-plus-tier (docs/gsch-core/
+		// core-q4-offload-tierbudget.env). One VALUE differs from CORE_MODULE_BLOCK: the
+		// emitter renders it verbatim, so the value has to survive the same strict decode
+		// as any other (the TYPE half) and buildModules has to accept it (the ENUM half).
+		block: "CORE_MODULE_BLOCK (CORE_SIZING=gpu-plus-tier)",
+		owner: PluginType,
+		proto: Config{},
+		body: `sizing: "gpu-plus-tier"
+entryOrder: "newcomer-first"
+engineChoice: "most-free-budget"
+rotation: "quantum"
+victim: "valve"
+safety: "none"`,
 	},
 	{
 		// The branch plugin every core arm carries (BRANCH_PLUGIN=1). Its bool fields are
@@ -349,6 +365,57 @@ func TestShippedCoreEnvFilesUseYAMLBools(t *testing.T) {
 	}
 }
 
+// moduleEnvKnobs maps exp-ops' selector env knobs to the Config field each one fills. The
+// emitter writes the value VERBATIM into the rendered `parameters:` block, and
+// buildModules fails CLOSED on a value it does not know — so a typo in a shipped arm is a
+// CrashLoop, which is worth catching in the build rather than in a deploy.
+var moduleEnvKnobs = map[string]string{
+	"CORE_SIZING":        "Sizing",
+	"CORE_ENTRY_ORDER":   "EntryOrder",
+	"CORE_ENGINE_CHOICE": "EngineChoice",
+	"CORE_ROTATION":      "Rotation",
+	"CORE_VICTIM":        "Victim",
+	"CORE_SAFETY":        "Safety",
+}
+
+// TestShippedCoreEnvFilesUseKnownModuleValues pins the selector VALUES in the env files
+// this build ships: every one must be a value buildModules accepts, because the alternative
+// is an arm that refuses to start.
+func TestShippedCoreEnvFilesUseKnownModuleValues(t *testing.T) {
+	files, err := filepath.Glob(filepath.Join("..", "..", "..", "..", "..", "docs", "gsch-core", "*.env"))
+	if err != nil {
+		t.Fatalf("glob shipped core env files: %v", err)
+	}
+	if len(files) == 0 {
+		t.Skip("docs/gsch-core/*.env is not in this checkout")
+	}
+	checked := 0
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		for i, line := range strings.Split(string(raw), "\n") {
+			kv := strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
+			key, value, ok := strings.Cut(kv, "=")
+			key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+			knob, isModule := moduleEnvKnobs[key]
+			if !ok || !isModule {
+				continue
+			}
+			cfg := defaultConfig()
+			reflect.ValueOf(&cfg).Elem().FieldByName(knob).SetString(value)
+			checked++
+			if _, err := buildModules(cfg); err != nil {
+				t.Errorf("%s:%d: %s=%q — buildModules fails closed on it, so this arm CrashLoops at startup: %v", f, i+1, key, value, err)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no module selector was checked — the guard would pass vacuously")
+	}
+}
+
 // TestModuleValuesMatchTheEmitter pins the VALUES exp-ops can render for every module
 // selector: buildModules must accept each one and reject anything else.
 func TestModuleValuesMatchTheEmitter(t *testing.T) {
@@ -356,7 +423,7 @@ func TestModuleValuesMatchTheEmitter(t *testing.T) {
 		knob   string
 		values []string
 	}{
-		{"Sizing", []string{"index"}},
+		{"Sizing", []string{"index", "gpu-plus-tier"}},
 		{"EntryOrder", []string{"newcomer-first", "hrrn-bounded", "hrrn-tier"}},
 		{"EngineChoice", []string{"most-free-budget"}},
 		{"Rotation", []string{"quantum"}},

@@ -551,6 +551,12 @@ reproduces the archive build's F5′ trace byte for byte on the 2,600 s replay (
 
 ## 4e. The offload solution — `entryOrder: "hrrn-tier"` + the TIER SHADOW (2026-11-02)
 
+> **RETIRED as an arm, kept as a record (2026-11-02, the scheduler trim).** `hrrn-tier` is
+> REMOVED from the build: the trim keeps ONE implementation per module (entryOrder =
+> newcomer-first), so this value no longer exists and its env file is in
+> `docs/gsch-core/retired/`. The MEASUREMENTS below stand as measured on the builds they
+> name; the tier shadow and its validation are removed by the same series.
+
 The queue module's THIRD value, and the only one that reads anything to do with vLLM's CPU
 offload tier. The whole design is one page in
 `~/.sai-ka-knowledge-bank/explore/ring-window-v2/PREREG-multipod-offload.md`

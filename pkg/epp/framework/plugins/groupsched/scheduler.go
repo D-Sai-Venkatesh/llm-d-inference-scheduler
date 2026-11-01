@@ -125,12 +125,7 @@ type Config struct {
 	//	EntryOrder   "newcomer-first"   newcomers, then oldest, then id |
 	//	             "hrrn-bounded"     bounded HRRN: wait ÷ min(cold tokens, the median
 	//	                                waiter's cold tokens), newcomers as the outer
-	//	                                class, then the ratio, then oldest, then id |
-	//	             "hrrn-tier"        F5′ with the CPU-tier shadow in the denominator:
-	//	                                wait ÷ min(tier-aware cold tokens, the median of
-	//	                                them) — restorable tokens count as CACHED, so a
-	//	                                returner with a live CPU copy is re-seated before
-	//	                                it falls off the tier's cliff
+	//	                                class, then the ratio, then oldest, then id
 	//	EngineChoice "most-free-budget" most free budget where the head fits, tie → id
 	//	Rotation     "quantum"          fixed Q busy periods (plus S of silence)
 	//	Victim       "valve"            f0p's memory-pressure order
@@ -473,17 +468,6 @@ type waiter struct {
 	// index, so an engine that does not hold the member's blocks is costed as cold
 	// — which is the truth about that engine — instead of inheriting the best case.
 	coldTokensByEngine map[string]int64
-	// tierCostTokens is coldTokens' TIER-AWARE twin: the same best-case scalar with
-	// each engine's CPU-tier shadow counted as residence, so a block that is still
-	// restorable from some engine's tier is NOT part of it. It is the denominator
-	// `entryOrder: "hrrn-tier"` prices a waiter with, and it is deliberately a
-	// SEPARATE field: the admission cost above must stay GPU-only (offload adds no
-	// seats, so admitting against a tier-aware cost would overbook the engine).
-	// tierCostSet records that it was computed for this pass; when no engine has a
-	// tier the scheduler writes it EQUAL to coldTokens, which is what makes
-	// hrrn-tier degenerate to F5′ rather than to a special case.
-	tierCostTokens int64
-	tierCostSet    bool
 	// fairnessID rides with the head (see Head.FairnessID) so a SEAT event can name
 	// the wire-level identity even before the member has a record.
 	fairnessID string

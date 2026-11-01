@@ -205,8 +205,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		fmt.Printf("group-scheduler: CORE policy — dispatch: EXECUTION BUDGET per engine = %v x num_gpu_blocks, tested against the RUNNING set (the dedup-exact union of in-flight requests' chain blocks, this EPP's own accounting — no endpoint metrics); a turn that does not fit waits in the ordered queue, FIFO among the eligible, one turn always allowed on an idle engine. Seating is unchanged\n", cfg.GroupBudgetFraction)
 	}
 	// The CPU offload tier is a DEPLOYMENT FACT, so the echo states whether this arm has
-	// one at all: a run artifact then says whether `entryOrder: hrrn-tier` was actually
-	// tier-aware or was F5′ under another name.
+	// one at all: a run artifact then says what the deployment looked like.
 	if n := cfg.tierBlocks(); n > 0 {
 		seats := "the tier adds no seats (the budget and the valve stay GPU-only)"
 		if r.sched.mod.sizer.Name() == "tier-inclusive" {
@@ -214,7 +213,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		}
 		fmt.Printf("group-scheduler: CORE policy — offload: CPU tier shadow ON, %d blocks per engine (cpuTierBytes %d / kvBlockBytes %d) — restorable tokens count as cached for entryOrder=%s; %s\n", n, cfg.CpuTierBytes, cfg.KvBlockBytes, cfg.EntryOrder, seats)
 	} else {
-		fmt.Printf("group-scheduler: CORE policy — offload: NO CPU tier configured (cpuTierBytes 0) — no tier shadow; entryOrder hrrn-tier degenerates to F5′ exactly (see TestHrrnTierNoTierEqualsF5P)\n")
+		fmt.Printf("group-scheduler: CORE policy — offload: NO CPU tier configured (cpuTierBytes 0) — no tier shadow\n")
 	}
 	// The observation hooks are installed UNCONDITIONALLY: the metrics they
 	// feed are nil-safe, and a unit-mode run (no handle) must record the same

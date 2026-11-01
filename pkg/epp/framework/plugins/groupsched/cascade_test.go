@@ -33,7 +33,8 @@ package groupsched
 //	           MORE — they are already leaving.                    → tested below
 //
 // The numbers these tests pin, from the live batch-1 anchor (99a47617 vs 88e74f85, same
-// config, c128) and from the saturated replay arm (golden-hrrn-tier):
+// config, c128) and from the saturated replay arm (then the tier + hrrn-tier build, whose
+// own golden was removed with that module):
 //
 //	                       live: no-fix → cascade        replay arm: cascade → fixed
 //	mid-flight marks        87     → 2,520 (29x)          102   → 36
@@ -211,11 +212,9 @@ func TestExitCompositionIsNotACascade(t *testing.T) {
 		cfg  Config
 	}{
 		{"default arm (f0p config)", defaultConfig()},
-		{"saturated arm (tier + hrrn-tier)", func() Config {
+		{"saturated arm (CORE modules, 0.60 seat budget)", func() Config {
 			c := defaultConfig()
-			c.EntryOrder = "hrrn-tier"
-			c.KvBlockBytes = 4 * 64
-			c.CpuTierBytes = 2000 * c.KvBlockBytes
+			c.GroupBudgetFraction = 0.6 // the same memory pressure, with the modules that ship
 			return c
 		}()},
 	} {

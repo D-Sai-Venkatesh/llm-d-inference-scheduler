@@ -57,7 +57,7 @@ package groupsched
 //	  kvBlockBytes: 0               # one KV block's bytes (needed iff cpuTierBytes>0)
 //	  sizing: "index"               # CORE_MODULE_BLOCK (one selector per module);
 //	                                # "tier-inclusive" sizes the budget from max(GPU, tier)
-//	  entryOrder: "newcomer-first"  # CORE_ENTRY_ORDER: | "hrrn-bounded" (F5′) | "hrrn-tier"
+//	  entryOrder: "newcomer-first"  # CORE_ENTRY_ORDER: | "hrrn-bounded" (F5′)
 //	  engineChoice: "most-free-budget"
 //	  rotation: "quantum"
 //	  victim: "valve"
@@ -448,7 +448,7 @@ func TestModuleValuesMatchTheEmitter(t *testing.T) {
 		values []string
 	}{
 		{"Sizing", []string{"index", "tier-inclusive"}},
-		{"EntryOrder", []string{"newcomer-first", "hrrn-bounded", "hrrn-tier"}},
+		{"EntryOrder", []string{"newcomer-first", "hrrn-bounded"}},
 		{"EngineChoice", []string{"most-free-budget"}},
 		{"Rotation", []string{"quantum"}},
 		{"Victim", []string{"valve"}},

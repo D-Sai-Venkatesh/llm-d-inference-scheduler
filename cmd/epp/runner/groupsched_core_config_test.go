@@ -191,52 +191,6 @@ func TestGroupSchedulerCoreChainStarts(t *testing.T) {
 	require.Equal(t, 1, occurrences, "the group scheduler must appear once in the execution order, got %v", order)
 }
 
-// TestGroupSchedulerCoreChainStartsWithTheCPU Tier is the OFFLOAD arm's loader gate: the
-// same chain the wave renders, with the tier selector (`entryOrder: "hrrn-tier"`) and the
-// two deployment facts that size the tier shadow (cpuTierBytes, kvBlockBytes). It runs
-// through the REAL startup path — YAML to strict decode to plugin construction to the
-// DAG/layer-order validation — because the conformance test's strict decode is a mirror
-// of that path, not the path itself. A key the loader rejects, or a value whose YAML type
-// does not match the Go field, CrashLoops every arm carrying the block; this is where that
-// is caught before a deploy.
-//
-// The pair of subtests matters as much as the happy path: the tier arm must START, and the
-// key must be REJECTED when kvBlockBytes is missing for a configured tier (a tier with no
-// block size is a silent zero-capacity shadow — a run that looks tier-aware and is not).
-func TestGroupSchedulerCoreChainStartsWithTheCPUTier(t *testing.T) {
-	if runnerStartedInProcess.Load() {
-		t.Skip("a runner has already been instantiated in this process (plugin metrics are process-global): run this gate on its own with -run TestGroupSchedulerCoreChainStartsWithTheCPUTier")
-	}
-	tierCfg := strings.Replace(corePluginConfig, `entryOrder: "newcomer-first"`, `entryOrder: "hrrn-tier"`, 1)
-	tierCfg = strings.Replace(tierCfg, "    inflightReapSeconds: 3700\n",
-		"    inflightReapSeconds: 3700\n    cpuTierBytes: 549755813888\n    kvBlockBytes: 6291456\n", 1)
-	require.NotEqual(t, corePluginConfig, tierCfg, "the fixture must actually carry the tier keys")
-
-	start := func(t *testing.T, cfgText, pool string) error {
-		t.Helper()
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		opts := runserver.NewOptions()
-		opts.ConfigText = cfgText
-		opts.PoolName = pool
-		opts.AllowExperimentalPlugins = true
-		r := NewRunner()
-		rawConfig, err := r.parseConfigurationPhaseOne(ctx, opts)
-		if err != nil {
-			return err
-		}
-		ds := datastore.NewDatastore(ctx, r.setupMetricsCollection(opts))
-		_, err = r.parseConfigurationPhaseTwo(ctx, rawConfig, ds, opts.RefreshMetricsInterval)
-		return err
-	}
-
-	require.NoError(t, start(t, tierCfg, "core-tier"), "the offload arm's config must parse, decode and pass the plugin-DAG/layer-order validation")
-	runnerStartedInProcess.Store(true)
-	if !strings.Contains(tierCfg, "entryOrder: \"hrrn-tier\"") {
-		t.Fatal("the fixture must keep the tier selector")
-	}
-}
-
 // TestGroupSchedulerCoreChainStartsWithTierInclusiveSizing is the TIER-SIZED budget arm's
 // loader gate (docs/gsch-core/core-q4-offload-tierinclusive.env): the same chain with
 // `sizing: "tier-inclusive"` and the two tier facts it sizes the budget from. buildModules

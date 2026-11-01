@@ -418,7 +418,9 @@ tier: the shadow is nil, nothing is modelled, and `hrrn-tier` **degenerates to F
 **The tier adds no seats.** The tier-aware cost is a PRIORITY input only — the seat
 budget, the cold-entry valve and placement keep the GPU-only cost, because vLLM runs only
 from HBM and an admission discounted by a restorable block would overbook the engine the
-moment the restores land (`TestHrrnTierDoesNotDiscountTheSeatBudget`).
+moment the restores land (`TestHrrnTierDoesNotDiscountTheSeatBudget`). That is a property of
+the tier-aware COST; §4f is the one value that grows the BUDGET itself, and it keeps this
+rule for the per-head cost.
 
 **What the effect is, from the c128 order cut:** a returner with a live CPU copy has a
 DEADLINE — its restored share falls 90 % → 30 % → 14 % → 6.4 % across the <1, 1-3, 3-5,
@@ -463,9 +465,56 @@ when this landed, so it is handed over as text, exactly as §2 was):
 Arms (this directory): `core-q4-offload.env` (default queue, offload ON — the accounting
 fix's live confirmation AND the offload anchor) · `core-f5p-q4-offload.env` (tier-blind
 comparator; its settings diff to the arm below is the ONE line
-`CORE_ENTRY_ORDER=hrrn-bounded`) · `core-hrrn-tier-q4.env` (the arm). Each keeps
-`OFFLOAD=0` cells on the same digest for the OFF/ON pair; `EPP_IMAGE_*` stays a
+`CORE_ENTRY_ORDER=hrrn-bounded`) · `core-hrrn-tier-q4.env` (the arm) ·
+`core-q4-offload-tierbudget.env` (§4f: the same arm with `sizing: gpu-plus-tier`). Each
+keeps `OFFLOAD=0` cells on the same digest for the OFF/ON pair; `EPP_IMAGE_*` stays a
 PLACEHOLDER until the reviewer has read the diff and a digest is built.
+
+## 4f. The tier-sized seat budget — `sizing: "gpu-plus-tier"` (2026-11-02)
+
+The SIZING module's SECOND value, and the one that prices the offload deployment's real
+capacity:
+
+```
+budgetBlocks = floor(groupBudgetFraction x (num_gpu_blocks + tierBlocks))
+```
+
+`tierBlocks` is the CPU tier SHADOW's own capacity (§4e), so the value adds no constant:
+the same two deployment facts (`cpuTierBytes`, `kvBlockBytes`) that size the shadow also
+size the budget it is added to. On the campaign deployment the budget goes from 38,173
+blocks to 121,186 (GPU 40,183 + tier 87,381, x 0.95).
+
+**Why the budget and not the order.** The budget sizes the working set an engine may hold,
+and what it reserves against is a MISS: with no tier a miss is a full prefill, with one it
+is ~1-4 % of a prefill. A seated member whose chain has left HBM is therefore still cheap
+to serve, and the engine's reachable capacity is GPU + tier (3.17x the GPU pool). Sizing
+from GPU alone reserves for the expensive miss the deployment no longer pays, and the c64
+cells show the cost: stock FCFS gained ~2x from offload (FCFS-ON 1.390 req/s) where the
+GPU-sized core gained 1.267.
+
+**What does not move**, both pinned by test:
+
+* the per-head COST stays GPU-only (`TestGpuPlusTierCostIsTheGPUOnlyCost`): a head is
+  admitted on what it will occupy in HBM, the same rule `hrrn-tier`'s tier-aware cost
+  obeys — restorable blocks price priority, never seats;
+* the cold-entry valve's CAP stays the GPU headroom, `floor((1 - fraction) x num_gpu_blocks)
+  x blockSizeTokens` = 128,576 tokens here (`TestGpuPlusTierValveCapStaysGPUHeadroom`): the
+  valve staggers GPU allocation bursts, and a tier cannot absorb one.
+
+**`tier = 0` is `sizing: "index"`** arithmetically and on the state machine
+(`TestGpuPlusTierZeroTierEqualsGPU`), so an arm can carry the value in both deployments and
+an OFF cell is not a second policy. The default value stays `"index"`, and the default's
+budget does not move when a tier is configured (`TestGpuPlusTierDefaultIsUnchanged`); the
+golden replay (`TestGolden`) runs on that default, byte for byte.
+
+The arm: `core-q4-offload-tierbudget.env` is `core-q4-offload.env` with ONE setting changed
+(`CORE_SIZING=gpu-plus-tier`). Its contrast is a same-digest pair, so the batch is
+`core-q4-offload ‖ core-q4-offload-tierbudget` at c64 and the same pair at c128. The
+emitter needs no new key: `CORE_SIZING` is already rendered into `CORE_MODULE_BLOCK`, and
+`buildModules` accepts the value (conformance test
+`TestModuleValuesMatchTheEmitter`, loader gate
+`TestGroupSchedulerCoreChainStartsWithGpuPlusTierSizing`).
+
 
 ## 5. The wave (for the record)
 

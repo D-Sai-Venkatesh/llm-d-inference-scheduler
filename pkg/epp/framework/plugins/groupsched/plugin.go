@@ -234,9 +234,16 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	r.sched.onColdValveHeld = func(engine string) {
 		r.metrics.ObserveColdValveHeld(engineLabel(engine))
 	}
-	// The DISPATCH gate's holds (the execution budget): the counterpart of the cold valve's.
+	// The DISPATCH gate's holds (the execution budget): the counterpart of the cold valve's
+	// — the count, the DURATION of each held turn, and the one place the two budgets touch.
 	r.sched.onDispatchHold = func(engine string) {
 		r.metrics.ObserveDispatchHold(engineLabel(engine))
+	}
+	r.sched.onDispatchHeldTurn = func(engine string, heldSeconds float64) {
+		r.metrics.ObserveDispatchHeldTurn(engineLabel(engine), heldSeconds)
+	}
+	r.sched.onColdValveHeldGated = func(engine string) {
+		r.metrics.ObserveColdValveHeldGated(engineLabel(engine))
 	}
 	// The tier shadow's VALIDATION pairs: prediction at seat, measurement at the turn's
 	// settle (see the SHADOW-VALIDATION event for the joinable, per-id record).

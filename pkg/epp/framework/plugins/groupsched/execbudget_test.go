@@ -423,6 +423,84 @@ func TestExecutionBudgetBigTurnIsNotStarved(t *testing.T) {
 	})
 }
 
+// ---- (5b) the interaction, measured ----
+
+// THE HOLD IS MEASURED, not inferred: a held turn starts a clock at its first denial, the
+// clock is read out when the turn dispatches (count + duration), and while it is held the
+// cold-entry charge it owns is visible as the age that keeps the valve closed. The arm's
+// report reads exactly these three numbers to decide whether the one interaction between
+// the two budgets is costing admissions.
+func TestExecutionBudgetHoldIsMeasured(t *testing.T) {
+	const (
+		capacity = 1000 // dispatch budget 950
+		tier     = 3000
+	)
+	cfg := execBudgetConfig(capacity, tier)
+	forNs(t, cfg, capacity, func(t *testing.T, fx *engineSet) {
+		// Each Pick gets the WHOLE queue snapshot (as the plugin passes it): a member
+		// whose head is absent from a snapshot is headless for that pass, which clears the
+		// hold clock — the clock is about a QUEUED turn, not a member.
+		held := func(extra ...Head) []Head {
+			return append([]Head{head("b", 30*time.Second, bytesFor(500))}, extra...)
+		}
+		// A runs and its prefill lands (the valve's slot is free again)
+		fx.seatAndDispatch(t, "a", 600, keys(600, seedFor("a")))
+		engine := fx.s.bindings["a"]
+		fx.closeOtherEngines(t, seatBudgetOf(cfg, capacity, tier))
+		// B's turn is seated and HELD: 600 + 500 > 950
+		if i := fx.seatAndDispatch(t, "b", 500, keys(500, seedFor("b"))); i >= 0 {
+			t.Fatal("the fixture needs B held")
+		}
+		// one tick of the decision clock later the charge's AGE is readable (it is 0 at the
+		// instant of the denial: the hold started then and nothing has passed yet)
+		fx.tick(2 * time.Second)
+		es := fx.s.Snapshot().Engines[engineLabel(engine)]
+		if es.DispatchHeldTurns != 1 {
+			t.Fatalf("the held turn must be COUNTED once (it is one turn, however many passes deny it): %d", es.DispatchHeldTurns)
+		}
+		if es.DispatchHolds < 1 {
+			t.Fatalf("and the decision passes it was denied on must be counted too: %d", es.DispatchHolds)
+		}
+		if es.ChargeHoldSeconds <= 0 {
+			t.Fatalf("a held turn that still owns its cold-entry charge must show as holding the valve slot: %v s", es.ChargeHoldSeconds)
+		}
+		// ten more passes that deny it: still ONE turn, and the charge's age grows
+		for i := 0; i < 10; i++ {
+			fx.tick(10 * time.Second)
+			fx.pick(held()...)
+		}
+		es = fx.s.Snapshot().Engines[engineLabel(engine)]
+		if es.DispatchHeldTurns != 1 {
+			t.Fatalf("a re-denied turn is still the SAME held turn: %d", es.DispatchHeldTurns)
+		}
+		if es.ChargeHoldSeconds < 60 {
+			t.Fatalf("the charge's age must grow with the hold (>= 60 s after 10 x 10 s passes): %v s", es.ChargeHoldSeconds)
+		}
+		// a NEWCOMER's seat attempt in the same pass: the valve is the blocker, and the
+		// share of it attributable to the HELD turn's charge is counted
+		fx.pick(held(head("newcomer", time.Second, bytesFor(40)))...)
+		es = fx.s.Snapshot().Engines[engineLabel(engine)]
+		if es.ValveHeldGated < 1 {
+			t.Fatalf("a valve hold attributable to the HELD turn's charge must be counted: %d", es.ValveHeldGated)
+		}
+		if fx.s.seatedIDs()["newcomer"] {
+			t.Fatal("the newcomer must NOT be seated while the held turn owns the valve slot — this is the interaction")
+		}
+		// A settles; B dispatches; the clock is read out and cleared
+		fx.settleAt("a", 600)
+		if i := fx.seatAndDispatch(t, "b", 500, keys(500, seedFor("b"))); i < 0 {
+			t.Fatal("the held turn must dispatch once the running set frees")
+		}
+		es = fx.s.Snapshot().Engines[engineLabel(engine)]
+		if es.DispatchHeldWaitMax <= 0 || es.DispatchHeldWaitP50 <= 0 {
+			t.Fatalf("the held turn's WAIT must be booked when it dispatches: p50=%v peak=%v", es.DispatchHeldWaitP50, es.DispatchHeldWaitMax)
+		}
+		if es.ChargeHoldSeconds != 0 {
+			t.Fatalf("once the held turn ran, nothing is holding the valve slot any more: %v s", es.ChargeHoldSeconds)
+		}
+	})
+}
+
 // ---- (6) golden neutrality ----
 
 // THE DEFAULT CONFIG'S TRACE IS UNCHANGED. The default selector is "none", nothing is

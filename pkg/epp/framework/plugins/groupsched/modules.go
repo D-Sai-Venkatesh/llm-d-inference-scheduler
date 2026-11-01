@@ -768,13 +768,24 @@ type DispatchCtx struct {
 	// NEVER an endpoint metric — that is what keeps this gate out of the old per-engine
 	// gate's failure class (a metrics clone that latched and locked an engine out).
 	RunningBlocks int64
+	// ReservedBlocks is the engine's used side OUTSIDE that key set: the charges its
+	// in-flight requests hold that carry no keys — the PROVISIONAL estimate a Pick puts
+	// down for a turn that has not reached PreRequest yet, and the OUTPUT GROWTH
+	// (ceil(max_tokens / blockSize) blocks) every dispatched turn reserves for its own
+	// decode. Both are blocks the engine will occupy and neither is a chain block, so
+	// the budget must price them or it over-admits by construction (the c128 defect:
+	// 73.6 % of samples over budget, max 1.71).
+	ReservedBlocks int64
 	// ChainBlocks is what THIS head would ADD to the running set: its whole estimated
 	// footprint (its chain plus the wire-size growth, the same estimate the seat budget
-	// is charged with) MINUS the blocks the running set already holds (dedup).
+	// is charged with) MINUS the blocks the running set already holds (dedup), PLUS its
+	// own output growth (the blocks its decode will allocate, from its max_tokens).
 	ChainBlocks int64
 	// BudgetBlocks is this engine's dispatch budget in blocks (DispatchGate.BudgetBlocks).
 	BudgetBlocks int64
-	// Idle reports that NOTHING is in flight on the engine.
+	// Idle reports that NOTHING is in flight on the engine — no chain running and no
+	// reservation outstanding (a turn admitted in the Pick->PreRequest window IS in
+	// flight, even though its exact keys have not arrived yet).
 	Idle bool
 }
 
@@ -826,11 +837,17 @@ func (NoopDispatchGate) Allows(DispatchCtx) bool { return true }
 // ExecutionBudget is the dispatch gate "execution-budget": a running set may not grow
 // past the SAME fraction of the engine's GPU blocks that the seat budget assumes —
 //
-//	runningBlocks + thisHead'sAddedBlocks <= floor(fraction x num_gpu_blocks)
+//	runningBlocks + reservedBlocks + thisHead'sAddedBlocks <= floor(fraction x num_gpu_blocks)
 //
 // — with ONE liveness rule: a turn is always allowed when nothing is in flight on the
 // engine (otherwise a single chain larger than the budget could never start, and the
 // engine would idle while waiting for itself).
+//
+// THE THREE TERMS ARE ONE LEDGER, and each is priced where it becomes known: the exact
+// chain keys when the request reaches PreRequest, the PROVISIONAL estimate the moment a
+// Pick admits the turn (the Pick -> PreRequest window is where flow control calls back
+// at ~1 kHz, so an unpriced window over-admits by construction), and the turn's own
+// output growth from its max_tokens when it dispatches.
 //
 // WHY THE SAME FRACTION AND NO SECOND CONSTANT. The fraction is the deployment's own
 // statement about how much of an engine's KV is in use rather than headroom (the seat
@@ -875,7 +892,7 @@ func (e ExecutionBudget) Allows(c DispatchCtx) bool {
 	if c.Idle {
 		return true // LIVENESS: the first turn on an engine always runs, whatever its size
 	}
-	return c.RunningBlocks+c.ChainBlocks <= c.BudgetBlocks
+	return c.RunningBlocks+c.ReservedBlocks+c.ChainBlocks <= c.BudgetBlocks
 }
 
 // ---- SAFETY ------------------------------------------------------------------

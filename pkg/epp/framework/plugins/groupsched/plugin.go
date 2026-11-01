@@ -916,6 +916,7 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 		}
 		member, source := "", ""
 		reqID, size, fid := "", int64(0), ""
+		var maxTokens int64
 		if req := h.OriginalRequest(); req != nil {
 			if ir := req.InferenceRequest(); ir != nil {
 				member, source = r.memberOf(ir)
@@ -925,11 +926,13 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 				if size <= 0 {
 					size = int64(req.ByteSize())
 				}
+				maxTokens = maxOutputTokensOf(ir)
 			}
 		}
 		queues = append(queues, q)
 		heads = append(heads, Head{Member: member, Source: source,
-			FairnessID: fid, ReqID: reqID, Arrival: h.EnqueueTime(), SizeBytes: size})
+			FairnessID: fid, ReqID: reqID, Arrival: h.EnqueueTime(), SizeBytes: size,
+			MaxTokens: maxTokens})
 		return true
 	})
 	if len(heads) == 0 {
@@ -959,7 +962,8 @@ func (r *GroupScheduler) NewState(_ context.Context) any { return nil }
 
 // PreRequest runs after the request leaves the queue (dispatch): the
 // exact tier-A keys from the TokenizedRequest correct the estimate
-// (S0-1 d), the in-flight charge was already taken at Pick.
+// (S0-1 d) — and REPLACE the reservation the Pick took, keeping only the
+// turn's output growth (the execution budget's second term).
 func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) error {
 	// capacity first (belt-and-braces, third acquisition path): it must not
 	// depend on the request being trackable — anonymous traffic used to
@@ -985,8 +989,26 @@ func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.Inferen
 	// The engine here is AUTHORITATIVE (the pendingEngine idiom): Pick
 	// charged the seat to the member's homed engine, and the framework's
 	// actual choice moves that charge if it disagrees.
-	r.sched.DispatchedOn(id, request.RequestID, engine, keys, size, time.Now())
+	r.sched.DispatchedOnUsage(id, request.RequestID, engine, keys, size,
+		maxOutputTokensOf(request), time.Now())
 	return nil
+}
+
+// maxOutputTokensOf is the request's own output cap (max_tokens / max_completion_tokens /
+// max_output_tokens, as the parser normalises them into Body.MaxOutputTokens), 0 when the
+// client declared none. It is the DISPATCH gate's GROWTH term: a dispatched turn allocates
+// ceil(cap / blockSizeTokens) blocks of KV while it decodes, and that count is EXACT under
+// the campaign harness's ignore_eos — every output grows to its cap. One reader at Pick
+// (the reservation) and one at PreRequest (the confirmation), so the two prices of the same
+// turn cannot come from two different numbers.
+func maxOutputTokensOf(request *fwksched.InferenceRequest) int64 {
+	if request == nil || request.Body == nil || request.Body.MaxOutputTokens == nil {
+		return 0
+	}
+	if v := *request.Body.MaxOutputTokens; v > 0 {
+		return v
+	}
+	return 0
 }
 
 // blockKeysFor derives the chained token-block keys (tier A).

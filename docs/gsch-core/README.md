@@ -778,6 +778,76 @@ The emitter needs ONE new key in `CORE_MODULE_BLOCK` (§2's printf) and ONE new 
 `TestConfigEmitterConformance` + `TestModuleValuesMatchTheEmitter`, loader gate
 `TestGroupSchedulerCoreChainStartsWithTheExecutionBudget`.
 
+## 4h. EXEC v2 — THE PICK-RACE FIX (2026-11-02; DIFF STAGE ONLY, no digest, no runs)
+
+The execution budget of §4g overran its own budget on the steady state: at c128 **73.6 % of
+`running_blocks` samples were over `execution_budget_blocks`, max 1.71x**. The estimate's
+bias (10-13 %, §4a5's finding) cannot produce 1.71 — the reviewer's code read found the
+dominant term, and it is a RACE:
+
+**AT PICK the winner got a PROVISIONAL in-flight record that added NO blocks to the running
+set** ("the exact keys arrive at PreRequest"), and flow control calls `Pick` about every
+1 ms. Every turn inside the Pick -> PreRequest window therefore saw the SAME stale running
+count and passed the gate: burst over-admission by construction, invisible in the key set.
+Second, smaller term: nothing anywhere priced the KV a turn allocates while it DECODES, so
+even a perfectly sequenced running set understated the engine by the output's growth.
+
+**THE FIX — three pieces, all accounting, no policy change** (newcomer-first ordering in the
+dispatch queue is NOT here: that is an option the human is still deciding):
+
+| piece | what it does |
+|---|---|
+| (1) RESERVE AT PICK | the estimate the gate admitted the turn with goes onto the engine's used side IMMEDIATELY (`inflightRec.charge` -> `engineGroup.reserved`); PreRequest REPLACES it with the exact keys (keeping only the growth term); it is RELEASED on every path where the dispatch does not happen (settle/cancel, error before the first chunk, a re-pick of the same id, the provisional reap, an exit) |
+| (2) GROWTH RESERVATION | `ceil(max_tokens / blockSizeTokens)` blocks per dispatched turn, from the request's OWN cap (`Body.MaxOutputTokens`, normalised by the parser). Under the harness's `ignore_eos` every output grows to its cap, so the term is EXACT and needs no estimate. Released at settle |
+| (3) THE LEDGER | the gate now reads `runningBlocks + reservedBlocks + thisHead'sAddedBlocks <= budget`, and `Idle` means "no key running AND nothing reserved" — a turn admitted in the window is in flight even though its keys have not arrived |
+
+The reservation is the number the gate itself priced, so the ledger is closed under it. It is
+CONSERVATIVE where the exact union is not: a reservation carries no keys, so a second pick for
+the same member cannot dedup against it (it can only ever charge more than the turn will use,
+never less — the direction that cannot over-admit).
+
+**Where the numbers come from** — still no constant, no scrape:
+
+| term | source |
+|---|---|
+| `runningBlocks` | `BlockIndex.blocksRun` (§4g, unchanged) |
+| `reservedBlocks` | the sum of the in-flight records' charges: provisional estimates (Pick -> PreRequest) + output growth (dispatching -> settle). Maintained at Pick / PreRequest / settle / reap / exit and re-derived from those records once per tick, like the key set |
+| what the turn adds | the deduped footprint estimate (§4g) + its own growth term |
+| budget | `fraction x num_gpu_blocks` (unchanged) |
+
+**What does not move** (each pinned by test): the seat budget, the per-head cost estimate, the
+cold-entry valve, the queue order, placement, rotation, the gate's fraction and its liveness
+rule. With the selector at `none` nothing is maintained — no reservation, no growth term, no
+cache — so the default config's replay stays byte-identical
+(`TestExecutionBudgetDefaultIsGoldenNeutral`), and the module ON a deployment where the running
+set always fits still moves nothing in the whole 2,600 s replay
+(`TestExecutionBudgetOnChangesNothingWhenItNeverBinds`).
+
+**The tests (N=1 and N=2 throughout)** — `execpick_test.go`:
+
+| test | what it pins |
+|---|---|
+| `TestExecutionBudgetPickReservationClosesTheRace` | ten Picks inside ONE held-open Pick -> PreRequest window admit exactly `floor(budget/turn)` per engine, the used side never exceeds the budget at any pick, the running KEY set stays 0 (it is the reservation, not the keys, that holds the rest), PreRequest replaces the charge (used side does not move), and a settle frees exactly one turn |
+| `TestExecutionBudgetReservationReleasedOnEveryNonDispatchPath` | five subtests, one per path: client cancel, error before the first chunk (empty req-id branch), re-pick, unobserved termination (the 30 s provisional reap), member exit — the used side returns to 0 every time |
+| `TestExecutionBudgetGrowthReservation` | `ceil(cap/blockSize)` counted at Pick, kept (alone) at PreRequest, exported (`reservedBlocks`, `execution_reserved_blocks`), released at settle; a trailing partial block rounds UP; no cap reserves nothing |
+| `TestExecutionBudgetGrowthAloneHoldsATurn` | the control and the case: the same turn runs without a cap and WAITS with one, because 60 blocks of decode growth overrun what its chain alone fits |
+| `TestExecutionBudgetPickReservationGoldenNeutral` | the two golden claims above, restated where the fix lives (f0p goldens unchanged, `testdata/SHA256SUMS` unchanged) |
+| `TestExecutionBudgetHoldsAreExported` | `dispatch_holds_total` MOVES — see below |
+| `checkRunning` (extended) | the invariant now covers both halves of the used side: keys == the derived union AND `reserved` == the sum the records carry (no drift, never negative) |
+
+**The export bug (§4g's `dispatch_holds_total`).** The series was instantiated with
+`Add(0)` in `Refresh` and incremented NOWHERE: on every arm it existed and could never leave
+zero, so the budget's measured cost was invisible (the held TURN count and the held-seconds
+histogram were exported by hooks; the PASS count was not). It is now exported by DELTA from
+the scheduler's own cumulative per-engine count — one source of truth, the same idiom as
+`queue_view_untrusted_passes_total`, no hook a unit-mode run can forget — with a re-base (never
+a negative delta) if the count restarts, and `execution_reserved_blocks` is the new gauge that
+makes the reservation visible next to `running_blocks`.
+
+**STATUS: build to the DIFF STAGE.** No digest is cut, nothing is deployed and no window is
+run: the human is deciding whether the associated policy ("option B", newcomer-first dispatch
+ordering) is pursued at all. This build sits ready if the answer is yes.
+
 ## 5. The wave (for the record)
 
 `2 pods × {FCFS, core-Q4, core-Q8} × {c64, c128, c32}`, 45 min each, batched

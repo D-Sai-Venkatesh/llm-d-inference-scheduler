@@ -425,6 +425,50 @@ rate (`entry_wait_seconds_count`) within ~2x of the tier-inclusive arm's — out
 interaction is what starved admissions and the refinement is §4g's (suspend a held turn's
 charge while it is held).
 
+## 4a6. THE SEVENTH DIGEST — the TIER-INCLUSIVE correction (2026-11-02)
+
+    EPP_IMAGE_TAG=groupsched-e78152da
+    EPP_IMAGE_DIGEST=sha256:4c44cf26d51017a49fae1376f3bc24fad4db268c9d51d5cc7e419cb81c27f639   (OCI index, keeps the attestation)
+    EPP_IMAGE_DIGEST_AMD64=sha256:8362525787f987f3ebd5b3927953c4751b319f2c4571daa7a4a697eecafbdc5a
+    attestation manifest  sha256:d57c5fa4e825f3035c6027abd1d33b7315c8cb26c0a2b4342aa39ec50de10850 (unknown/unknown,
+                          vnd.docker.reference.digest = the amd64 manifest)
+
+Built from dsai/gsch-core HEAD `e78152da2796b2ef5cfc9a03e12034e567958495` with a CLEAN tree,
+by the same recipe as §4a0-§4a5 (`docker buildx build --platform linux/amd64`,
+`--build-arg TARGETOS=linux TARGETARCH=amd64 COMMIT_SHA=<head> BUILD_REF=dsai/gsch-core
+LDFLAGS="-s -w"`, `-f Dockerfile.epp`, `--push`). Pull-back verification: the linux/amd64
+manifest unpacks to a 75,649,186-byte x86-64 statically-linked stripped `/app/epp`
+(sha256 `5232f014abafe715af2ae40f6e851f7ab170534f30da870aacf2e767d713cd89`) whose build
+settings carry `CommitSHA=e78152da2796b2ef5cfc9a03e12034e567958495`,
+`BuildRef=dsai/gsch-core`, `CGO_ENABLED=0`, `GOARCH=amd64`, `GOOS=linux`; strings carry
+everything §4a5 carries (`execution-budget`, `hrrn-tier`, `cold_cap_tokens`, `exiting_*`,
+`dispatch_held_*`, …) PLUS this build's own marker — **`tier-inclusive`** — and **NONE of the
+retired `gpu-plus-tier`** (nor the additive phrase "whole reachable working set"): the summed
+value is gone from the code, not just from the configs. Same absent set as §4a5
+(`pat_eligible_*`, `residue_predicted_ratio`, `engine_gate_closed`, `pooled_endpoints`,
+`mlfq2`, `rotateWhenFree`, `coldEntryCapTokens`, `residueRelease`).
+
+**What it carries:** ONE commit on top of §4a5 (`17a10e8c`) — the tier-inclusive correction
+(§4f): `budgetBlocks = floor(fraction x max(num_gpu_blocks, tierBlocks))`, and the additive
+`sizing: "gpu-plus-tier"` retired (`buildModules` fails closed on it).
+**DEFAULT-NEUTRAL, decision-identical for every arm that does not select the value:** the
+default replay is byte-identical (`TestCoreEqualsF0P`, `TestGoldenHashesPinned`, testdata
+untouched), and the arms whose `CORE_SIZING` is `index` (`core-q4-offload`, `core-hrrn-tier-q4`,
+`core-f5p-q4-offload`, and every non-offload arm) only gain the renamed strings.
+
+**ONE DIGEST FOR THE WHOLE OFFLOAD PROGRAM (the pin operation, verified):** every arm still
+on the superseded batch-2 build `groupsched-99a47617` was re-pinned to this one in ONE
+operation — `core-q4-offload.env` (the INDEX arm of the c64 triple: its old pin
+**overwritten**), `core-q4-offload-tierinclusive.env`, `core-q4-offload-tierinclusive-execbudget.env`,
+and the anchor pair `core-hrrn-tier-q4.env` + `core-f5p-q4-offload.env`. All ten shipped
+`docs/gsch-core/*.env` files were then checked AGAINST THE REGISTRY in one pass: each
+declared `(tag, index, amd64)` triple equals what `docker buildx imagetools inspect` reports
+for its tag — five on `groupsched-e78152da`, and the ARCHIVAL arms untouched on their own
+digests by their own headers (`core-q4.env` / `core-q8.env` / `core-q4-anchor-n1.env` on
+`groupsched-88e74f85`, `core-q4-8397e9aa.env` / `core-f5p-q4.env` on `groupsched-8397e9aa`).
+A new way to get a Q4 no-offload cell on THIS build is a digest-named copy (the
+`core-q4-8397e9aa.env` convention), never a re-pin of a wave record.
+
 ## 4b. Pre-flight gates (every core arm, before its window counts)
 
 * `llm_d_epp_group_detector_pool_score == 0` for the WHOLE window (the pool gate never
@@ -579,8 +623,8 @@ fix's live confirmation AND the offload anchor) · `core-f5p-q4-offload.env` (ti
 comparator; its settings diff to the arm below is the ONE line
 `CORE_ENTRY_ORDER=hrrn-bounded`) · `core-hrrn-tier-q4.env` (the arm) ·
 `core-q4-offload-tierinclusive.env` (§4f: the same arm with `sizing: tier-inclusive`). Each
-keeps `OFFLOAD=0` cells on the same digest for the OFF/ON pair; `EPP_IMAGE_*` stays a
-PLACEHOLDER until the reviewer has read the diff and a digest is built.
+keeps `OFFLOAD=0` cells on the same digest for the OFF/ON pair. All five arms here are
+pinned to `groupsched-e78152da`, the tier-inclusive build (§4a6, the one re-pin operation).
 
 ## 4f. The tier-inclusive seat budget — `sizing: "tier-inclusive"` (2026-11-02)
 

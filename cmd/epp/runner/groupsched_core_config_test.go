@@ -171,7 +171,12 @@ func TestGroupSchedulerCoreChainStarts(t *testing.T) {
 	// execution order EXACTLY ONCE (one instance behind two references), and the
 	// order must be valid (no layer-order violation) — this is the check that
 	// rejected wave 1's config live.
-	order, err := datalayer.ValidateAndOrderDataDependencies(r.PluginHandle.GetAllPlugins())
+	// Resolve the producer phases exactly as the runner does (this is a variadic
+	// option, so a phase-less call would silently validate a DIFFERENT order than
+	// the one startup uses).
+	producerPhases := datalayer.ResolveDataProducerPhases(r.PluginHandle.GetAllPlugins(), cfg.DataProducerPhases)
+	order, err := datalayer.ValidateAndOrderDataDependencies(r.PluginHandle.GetAllPlugins(),
+		datalayer.WithDataProducerPhases(producerPhases))
 	require.NoError(t, err, "the plugin DAG / layer order must be valid")
 	var occurrences int
 	for _, name := range order {

@@ -19,6 +19,7 @@ package datalayer
 import (
 	"testing"
 
+	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/groupsched"
 )
 
@@ -37,7 +38,13 @@ func TestGroupSchedulerLayerStaysFlowControl(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Factory: %v", err)
 	}
-	if got := pluginToLayerExecutionOrder(p); got != FlowControlLayer {
+	// Declared as a RequestHandling-phase producer: the phase map is what now moves a
+	// DataProducer ahead of the screeners, so it is the strictest case for this pin —
+	// the FairnessPolicy check must win over both producer phases.
+	phases := map[string]fwkrc.DataProducerPhase{
+		p.TypedName().Name: fwkrc.DataProducerPhaseRequestHandling,
+	}
+	if got := pluginToLayerExecutionOrder(p, phases); got != FlowControlLayer {
 		t.Fatalf("group scheduler layer = %d, want %d (FlowControlLayer): implementing the scheduling Filter must NOT move it out of the flow-control layer", got, FlowControlLayer)
 	}
 }

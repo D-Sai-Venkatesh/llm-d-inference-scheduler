@@ -38,6 +38,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/bandselection"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/ordering/fcfs"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/usagelimits"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
@@ -115,6 +116,9 @@ func newIntegrationHarness(t *testing.T, plugin fwkplugin.Plugin) (*controller.F
 			SaturationDetector: &unsaturatedDetector{},
 			EndpointCandidates: &contractmocks.MockEndpointCandidates{},
 			UsageLimitPolicy:   usagelimits.DefaultPolicy(),
+			// The dispatch cycle ranks the bands through the BandSelectionPolicy; the
+			// stock strict policy is what an arm that names no band policy loads.
+			BandSelectionPolicy: bandselection.DefaultPolicy(),
 		})
 	t.Cleanup(func() { cancel(); time.Sleep(50 * time.Millisecond) })
 	time.Sleep(10 * time.Millisecond)

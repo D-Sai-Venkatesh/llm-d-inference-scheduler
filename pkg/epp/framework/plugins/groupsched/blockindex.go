@@ -126,6 +126,25 @@ type BlockIndex struct {
 	// blocksNE, maintained at exactly the same sites, and checkInvariantLocked proves
 	// it against the seated sets like the other two.
 	blocksExit map[Hash]int
+	// blocksRun is the refcount over the IN-FLIGHT REQUESTS' chain blocks (as recorded
+	// at dispatch) — the RUNNING SET: what the engine must hold in HBM right now because
+	// a request that is RUNNING refers to it. It is a fourth view of the same truth and
+	// it answers a question the other three cannot: the seat budget asks "may this
+	// member live here?", which is residency; the DISPATCH budget asks "may this turn
+	// RUN here?", which is execution (PREREG-multipod-offload, "THE EXECUTION BUDGET").
+	//
+	// It is maintained by the scheduler at EVERY place an in-flight record changes
+	// (dispatch and a re-dispatch add, settle and the reap drop, a rebind moves the
+	// member's ids, an exit drops them with it) with the same panic-on-underflow
+	// discipline as the other counters, and RE-DERIVED from those records once per tick
+	// (Scheduler.deriveLocked) so a missed site cannot outlive a second. With the
+	// dispatch gate OFF nothing is ever written: the map stays empty and the comparator
+	// arms pay no allocation and no scan.
+	blocksRun map[Hash]int
+	// runVersion bumps on every blocksRun mutation — the dispatch gate's cache key (a
+	// cached "what does this head add to the running set" is stale the moment the set
+	// moves, even when the index's own state is unchanged).
+	runVersion uint64
 
 	sessions map[string]*sessionBlocks
 	seated   map[string]struct{}
@@ -164,6 +183,7 @@ func NewBlockIndex(blockSizeTokens int) (*BlockIndex, error) {
 		blocks:          make(map[Hash]int),
 		blocksNE:        make(map[Hash]int),
 		blocksExit:      make(map[Hash]int),
+		blocksRun:       make(map[Hash]int),
 		sessions:        make(map[string]*sessionBlocks),
 		seated:          make(map[string]struct{}),
 	}, nil
@@ -408,6 +428,75 @@ func (b *BlockIndex) markExitingLocked(id string) {
 	for h := range s.set() {
 		b.blocksExit[h]++
 	}
+}
+
+// ---- the RUNNING set (the dispatch budget's used side) ----
+
+// AddRunningLocked counts one dispatched request's chain blocks into the running set.
+// The keys are the request's exact tier-A chain (inflightRec.keys), so a block two
+// in-flight requests share is counted ONCE — the refcount is the dedup.
+func (b *BlockIndex) AddRunningLocked(keys []Hash) {
+	if len(keys) == 0 {
+		return
+	}
+	b.runVersion++
+	for _, h := range keys {
+		b.blocksRun[h]++
+	}
+}
+
+// DropRunningLocked removes one terminated request's chain blocks from the running set.
+// Underflow panics like every other counter here: a drop without a matching add is a
+// programming error, not a state to be papered over.
+func (b *BlockIndex) DropRunningLocked(keys []Hash) {
+	if len(keys) == 0 {
+		return
+	}
+	b.runVersion++
+	for _, h := range keys {
+		b.dec(b.blocksRun, h)
+	}
+}
+
+// SetRunningLocked REPLACES the running set with a derived one (the tick's
+// derive-don't-accumulate heal: the scheduler recomputes the union from the in-flight
+// records, so a path that forgot to drop its keys cannot outlive one second).
+func (b *BlockIndex) SetRunningLocked(want map[Hash]int) {
+	b.runVersion++
+	b.blocksRun = want
+}
+
+// RunningBlocksLocked is the running set's SIZE in blocks — the number the dispatch
+// budget is tested against.
+func (b *BlockIndex) RunningBlocksLocked() int { return len(b.blocksRun) }
+
+// RunVersionLocked is the running set's mutation version (the dispatch gate's cache key).
+func (b *BlockIndex) RunVersionLocked() uint64 { return b.runVersion }
+
+// setSharedWithRunningLocked counts how many of the member's set blocks the RUNNING set
+// already holds. It is the dedup term of the union: a head whose chain is partly
+// running does not pay for those blocks twice, and the answer is computed in place (no
+// set is built, so the per-turn check allocates nothing).
+func (b *BlockIndex) setSharedWithRunningLocked(id string) int64 {
+	s, ok := b.sessions[id]
+	if !ok || len(b.blocksRun) == 0 {
+		return 0
+	}
+	var n int64
+	for h := range s.dispSet {
+		if _, running := b.blocksRun[h]; running {
+			n++
+		}
+	}
+	for h := range s.waitSet {
+		if _, dispatched := s.dispSet[h]; dispatched {
+			continue // already counted above
+		}
+		if _, running := b.blocksRun[h]; running {
+			n++
+		}
+	}
+	return n
 }
 
 // ---- waiting / dispatch bookkeeping ----

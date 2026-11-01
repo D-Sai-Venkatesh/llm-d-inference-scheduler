@@ -119,6 +119,19 @@ type groupMetrics struct {
 	// costs in waiting).
 	coldValveHeld *prometheus.CounterVec
 
+	// ---- the DISPATCH gate (the execution budget) ----
+	//
+	// runningBlocks is the running set's SIZE (the dedup-exact union of the engine's
+	// in-flight requests' chain blocks) and executionBudgetBlocks what it is tested
+	// against (fraction x num_gpu_blocks; 0 = no gate wired). dispatchHolds counts the
+	// decision passes on which the gate held at least one turn back. On every arm whose
+	// selector is the default ("none") the gauge is the running set the gate WOULD see
+	// (nothing is maintained, so 0) and the budget is 0: the series exist so a scrape is
+	// never missing, and they are only interesting on the execution-budget arm.
+	runningBlocks *prometheus.GaugeVec
+	execBudget    *prometheus.GaugeVec
+	dispatchHolds *prometheus.CounterVec
+
 	// ---- the CPU-tier shadow (piece 1) and its VALIDATION (piece 3) ----
 	//
 	// shadowBlocks / shadowCapacity are the model's own state per engine: a shadow
@@ -223,6 +236,12 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "engines torn down by an endpoint delete"})
 	g.coldValveHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "cold_valve_held_total",
 		Help: "heads the cold-entry valve held back (the budget would have admitted them; they WAIT, nothing is evicted)"}, engineLabels)
+	g.runningBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "running_blocks",
+		Help: "the engine's RUNNING set in blocks: the dedup-exact union of its in-flight requests' chain blocks (0 when no dispatch gate is wired)"}, engineLabels)
+	g.execBudget = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "execution_budget_blocks",
+		Help: "the DISPATCH budget in blocks: groupBudgetFraction x num_gpu_blocks (0 = no dispatch gate wired)"}, engineLabels)
+	g.dispatchHolds = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "dispatch_holds_total",
+		Help: "decision passes on which the execution budget held at least one of this engine's turns back (the turn waits in the EPP's ordered queue)"}, engineLabels)
 	g.shadowBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "tier_shadow_blocks",
 		Help: "blocks this engine's CPU-tier SHADOW believes are stored in the offload tier (0 = no tier configured)"}, engineLabels)
 	g.shadowCapacity = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "tier_shadow_capacity_blocks",
@@ -238,6 +257,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.safetyFired, g.safetyFires, g.safetyFiredSeconds, g.safetySkips, g.engineKV, g.engineWaiting,
 		g.poolScore, g.staleSamples, g.capacityHeterogeneous, g.filterDecisions, g.affinityViolations, g.rebinds, g.engineGone,
 		g.coldValveHeld, g.queueViewAge, g.queueViewUntrusted, g.eventRingDropped,
+		g.runningBlocks, g.execBudget, g.dispatchHolds,
 		g.shadowBlocks, g.shadowCapacity, g.shadowPairs} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second
@@ -290,6 +310,9 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 		g.served.WithLabelValues(label).Add(0)
 		g.fcfs.WithLabelValues("nocapacity").Add(0)
 		g.safetySkips.WithLabelValues(label).Add(0)
+		g.runningBlocks.WithLabelValues(label).Set(float64(es.RunningBlocks))
+		g.execBudget.WithLabelValues(label).Set(float64(es.ExecutionBudgetBlocks))
+		g.dispatchHolds.WithLabelValues(label).Add(0)
 		for _, reason := range []string{"quantum-complete", "idle", "exiting", "engine-idle", "ttl",
 			"exiting-drain", "budget-idle", "budget-noqueue", "budget-exiting", "engine-gone"} {
 			g.exits.WithLabelValues(label, reason).Add(0)
@@ -459,6 +482,15 @@ func (g *groupMetrics) ObserveColdValveHeld(engine string) {
 		return
 	}
 	g.coldValveHeld.WithLabelValues(engineLabel(engine)).Inc()
+}
+
+// ObserveDispatchHold counts one decision pass on which the DISPATCH gate (the execution
+// budget) held at least one of an engine's turns back.
+func (g *groupMetrics) ObserveDispatchHold(engine string) {
+	if g == nil || g.dispatchHolds == nil {
+		return
+	}
+	g.dispatchHolds.WithLabelValues(engineLabel(engine)).Inc()
 }
 
 // ObserveShadowValidation books ONE shadow-validation pair: the predicted resident

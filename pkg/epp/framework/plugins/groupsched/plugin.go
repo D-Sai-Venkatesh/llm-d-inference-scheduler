@@ -198,6 +198,12 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	} else {
 		fmt.Printf("group-scheduler: CORE policy — safety: MEMORY-ONLY net per engine, fires at measured kv >= %v (the budget's own fraction; no queue term), holds that engine's own dispatches and new seats, never influences placement\n", cfg.GroupBudgetFraction)
 	}
+	// The DISPATCH gate is echoed ONLY when it is on: the values that are off by default
+	// must leave the comparator arms' logs byte-identical to the build before they existed
+	// (the arm-diff artifacts are compared verbatim).
+	if r.sched.mod.gateOn {
+		fmt.Printf("group-scheduler: CORE policy — dispatch: EXECUTION BUDGET per engine = %v x num_gpu_blocks, tested against the RUNNING set (the dedup-exact union of in-flight requests' chain blocks, this EPP's own accounting — no endpoint metrics); a turn that does not fit waits in the ordered queue, FIFO among the eligible, one turn always allowed on an idle engine. Seating is unchanged\n", cfg.GroupBudgetFraction)
+	}
 	// The CPU offload tier is a DEPLOYMENT FACT, so the echo states whether this arm has
 	// one at all: a run artifact then says whether `entryOrder: hrrn-tier` was actually
 	// tier-aware or was F5′ under another name.
@@ -227,6 +233,10 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	r.sched.onUnbind = func(member string) { r.pins.del(member) }
 	r.sched.onColdValveHeld = func(engine string) {
 		r.metrics.ObserveColdValveHeld(engineLabel(engine))
+	}
+	// The DISPATCH gate's holds (the execution budget): the counterpart of the cold valve's.
+	r.sched.onDispatchHold = func(engine string) {
+		r.metrics.ObserveDispatchHold(engineLabel(engine))
 	}
 	// The tier shadow's VALIDATION pairs: prediction at seat, measurement at the turn's
 	// settle (see the SHADOW-VALIDATION event for the joinable, per-id record).

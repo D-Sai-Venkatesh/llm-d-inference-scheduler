@@ -165,7 +165,10 @@ func (fx *engineSet) closeOtherEngines(t *testing.T, seatBudget int64) {
 }
 
 // checkRunning is the ACCOUNTING INVARIANT: every engine's maintained running set equals
-// the union re-derived from the scheduler's own in-flight records (the tick's heal).
+// the union re-derived from the scheduler's own in-flight records (the tick's heal), and
+// every engine's maintained CHARGE (the reservations: provisional estimates + output
+// growth) equals the sum the same records carry. One invariant, both halves of the used
+// side — a reservation that is released twice or missed shows up here and nowhere else.
 func (fx *engineSet) checkRunning(t *testing.T, when string) {
 	t.Helper()
 	fx.s.mu.Lock()
@@ -174,6 +177,13 @@ func (fx *engineSet) checkRunning(t *testing.T, when string) {
 		want := fx.s.deriveRunningLocked(g)
 		if !sameCounts(want, g.index.blocksRun) {
 			t.Fatalf("running set drift %s on engine %s: maintained %v != derived %v", when, g.id, g.index.blocksRun, want)
+		}
+		if wc := fx.s.deriveChargeLocked(g); g.reserved != wc {
+			t.Fatalf("charge drift %s on engine %s: maintained %d != derived %d (the reservations must be exactly what the in-flight records carry)",
+				when, g.id, g.reserved, wc)
+		}
+		if g.reserved < 0 {
+			t.Fatalf("negative reservation %s on engine %s: %d", when, g.id, g.reserved)
 		}
 	}
 }

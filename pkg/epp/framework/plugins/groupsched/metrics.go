@@ -129,8 +129,19 @@ type groupMetrics struct {
 	// (nothing is maintained, so 0) and the budget is 0: the series exist so a scrape is
 	// never missing, and they are only interesting on the execution-budget arm.
 	runningBlocks *prometheus.GaugeVec
-	execBudget    *prometheus.GaugeVec
-	dispatchHolds *prometheus.CounterVec
+	// reservedBlocks is the part of the used side that carries no keys: the provisional
+	// estimates of turns admitted in the Pick->PreRequest window plus the output growth
+	// each dispatched turn reserves from its own max_tokens. The gate tests
+	// running_blocks + reserved_blocks against execution_budget_blocks — a run that
+	// scrapes only running_blocks reads the engine as emptier than the gate does.
+	reservedBlocks *prometheus.GaugeVec
+	execBudget     *prometheus.GaugeVec
+	dispatchHolds  *prometheus.CounterVec
+	// dispatchHoldsLast is the per-engine cumulative count the DELTA is taken against.
+	// The counter is exported from the scheduler's OWN cumulative count (one source of
+	// truth) rather than from a hook, so a unit-mode run and a live one cannot disagree
+	// and no path can forget to fire it — exactly like queueViewUntrusted.
+	dispatchHoldsLast map[string]int64
 	// The INTERACTION (README §4g): how many turns the gate held and for how long
 	// (heldTurns / heldSeconds), how much of the cold-entry valve's blocking is
 	// attributable to a HELD turn's outstanding charge (valveHeldGated), and how long the
@@ -164,7 +175,8 @@ const subsystem = "llm_d_epp_group"
 var engineLabels = []string{"engine"}
 
 func newGroupMetrics(sched *Scheduler) *groupMetrics {
-	return &groupMetrics{sched: sched, known: map[string]struct{}{}}
+	return &groupMetrics{sched: sched, known: map[string]struct{}{},
+		dispatchHoldsLast: map[string]int64{}}
 }
 
 func (g *groupMetrics) register(reg prometheus.Registerer) error {
@@ -246,6 +258,8 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "heads the cold-entry valve held back (the budget would have admitted them; they WAIT, nothing is evicted)"}, engineLabels)
 	g.runningBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "running_blocks",
 		Help: "the engine's RUNNING set in blocks: the dedup-exact union of its in-flight requests' chain blocks (0 when no dispatch gate is wired)"}, engineLabels)
+	g.reservedBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "execution_reserved_blocks",
+		Help: "the part of the execution budget's used side that carries no chain keys: provisional estimates of turns admitted in the Pick->PreRequest window + the output growth each dispatched turn reserves from its max_tokens (0 = no dispatch gate wired)"}, engineLabels)
 	g.execBudget = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "execution_budget_blocks",
 		Help: "the DISPATCH budget in blocks: groupBudgetFraction x num_gpu_blocks (0 = no dispatch gate wired)"}, engineLabels)
 	g.dispatchHolds = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "dispatch_holds_total",
@@ -273,7 +287,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.safetyFired, g.safetyFires, g.safetyFiredSeconds, g.safetySkips, g.engineKV, g.engineWaiting,
 		g.poolScore, g.staleSamples, g.capacityHeterogeneous, g.filterDecisions, g.affinityViolations, g.rebinds, g.engineGone,
 		g.coldValveHeld, g.queueViewAge, g.queueViewUntrusted, g.eventRingDropped,
-		g.runningBlocks, g.execBudget, g.dispatchHolds,
+		g.runningBlocks, g.reservedBlocks, g.execBudget, g.dispatchHolds,
 		g.heldTurns, g.heldSeconds, g.valveHeldGated, g.chargeHold,
 		g.shadowBlocks, g.shadowCapacity, g.shadowPairs} {
 		if err := reg.Register(c); err != nil {
@@ -328,9 +342,22 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 		g.fcfs.WithLabelValues("nocapacity").Add(0)
 		g.safetySkips.WithLabelValues(label).Add(0)
 		g.runningBlocks.WithLabelValues(label).Set(float64(es.RunningBlocks))
+		g.reservedBlocks.WithLabelValues(label).Set(float64(es.ReservedBlocks))
 		g.execBudget.WithLabelValues(label).Set(float64(es.ExecutionBudgetBlocks))
 		g.chargeHold.WithLabelValues(label).Set(es.ChargeHoldSeconds)
-		g.dispatchHolds.WithLabelValues(label).Add(0)
+		// THE PASS COUNT, exported by DELTA from the scheduler's own cumulative count. It
+		// used to be instantiated with Add(0) and nothing else — the series existed and
+		// could never move, so the execution budget's measured cost was invisible on every
+		// arm (the reviewer's finding: metrics.go's Add(0) had no increment path anywhere).
+		// A counter that restarted (a scheduler replaced in-process) re-bases instead of
+		// going backwards: a Counter must never observe a negative delta.
+		if last := g.dispatchHoldsLast[label]; es.DispatchHolds < last {
+			g.dispatchHoldsLast[label] = 0
+		}
+		if d := es.DispatchHolds - g.dispatchHoldsLast[label]; d > 0 {
+			g.dispatchHolds.WithLabelValues(label).Add(float64(d))
+		}
+		g.dispatchHoldsLast[label] = es.DispatchHolds
 		g.heldTurns.WithLabelValues(label).Add(0)
 		g.heldSeconds.WithLabelValues(label).Observe(0)
 		for _, reason := range []string{"quantum-complete", "idle", "exiting", "engine-idle", "ttl",
@@ -357,9 +384,12 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 			continue
 		}
 		delete(g.known, label)
+		delete(g.dispatchHoldsLast, label)
 		for _, vec := range []*prometheus.GaugeVec{g.seats, g.uniqueBlocks, g.neBlocks,
+			g.runningBlocks, g.reservedBlocks,
 			g.exitingMembers, g.exitingBlocks, g.exitingOldest,
 			g.budgetBlocks, g.capacity, g.waiters, g.coldInFlight, g.coldCap, g.safetyFired,
+			g.execBudget, g.chargeHold,
 			g.engineKV, g.engineWaiting, g.shadowBlocks, g.shadowCapacity} {
 			vec.DeleteLabelValues(label)
 		}

@@ -161,7 +161,11 @@ func (c *tokenCorpus) tokenize(_ context.Context, request *fwksched.InferenceReq
 	if err := json.Unmarshal(buf, &rec); err != nil {
 		return fmt.Errorf("decode tokens for %q: %w", request.RequestID, err)
 	}
-	if delta := len(rec.Tokens) - rec.InTokens; delta > stage0cMaxTokenDelta || delta < -stage0cMaxTokenDelta {
+	// The cross-check needs a recorded count. Some prepared windows carry no
+	// in_tokens (the 0B prep did not record one), so the check is skipped there
+	// rather than passing trivially — the render is still the engine's template
+	// applied to the real body.
+	if delta := len(rec.Tokens) - rec.InTokens; rec.InTokens > 0 && (delta > stage0cMaxTokenDelta || delta < -stage0cMaxTokenDelta) {
 		return fmt.Errorf("render drifted from the engine for %q: %d rendered, %d recorded",
 			request.RequestID, len(rec.Tokens), rec.InTokens)
 	}

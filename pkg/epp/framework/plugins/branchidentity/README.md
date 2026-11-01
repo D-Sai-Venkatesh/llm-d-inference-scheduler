@@ -53,15 +53,16 @@ A branch is a **KV-cache lineage**, so the identity is the tokens the engine wou
      full-block count descending to 1. The tip index is **not prefix-closed** (a tip may exist at
      k=7 with none at k=5), so the probe must not stop at the first miss.
    - **Tail tolerance.** The unverified tail of a tip is therefore its partial block plus one full
-     block: **always between B and 2B−1 tokens of slack**. A request that differs from the tip only
-     there continues it — which absorbs end-of-tip rendering variance that the history does not
-     reproduce (the generation prompt, a template's empty-think stub, a BPE merge at the boundary).
-     One block of slack, rather than the partial block alone, is what makes the guarantee hold
-     wherever the prompt ends: with the partial block alone the slack can be *zero*, and an end
-     variance that crosses the block edge re-keys the branch.
+     block: for a tip of two or more full blocks, **always between B and 2B−1 tokens of slack**. A
+     request that differs from the tip only there continues it — which absorbs end-of-tip rendering
+     variance that the history does not reproduce (the generation prompt, a template's empty-think
+     stub, a BPE merge at the boundary). One block of slack, rather than the partial block alone, is
+     what makes the guarantee hold wherever the prompt ends: with the partial block alone the slack
+     can be *zero*, and an end variance that crosses the block edge re-keys the branch.
    - **Guards.** A tip with exactly **one** full block gets no tolerance — its prefix would be
-     empty and match every request — so that block must match. A tip **shorter than one block** has
-     no block hash to index and is not continuable at all: it re-keys once on its next turn.
+     empty and match every request — so that block must match and only its partial block is
+     unverified. A tip **shorter than one block** has no block hash to index and is not continuable
+     at all: it re-keys once on its next turn.
    - **S2's exact key** is separate: `(token count, last hash including the partial block)`, i.e.
      the whole rendered prompt. Two requests with the same pair rendered the same prompt.
    - The **longest verified prefix wins**; among equally long candidates a free tip beats a busy
@@ -258,6 +259,22 @@ engine's chat template (`transformers.apply_chat_template`); the harness injects
 So on WEKA no conversation was ever re-fragmented (0 splits — the unsafe direction) and 37 tail
 re-renders (the harness rewriting the last message's tail, 10 of them exactly one block shorter)
 became continuations — the safe direction, and each one counted.
+
+**Result, Exgentic stage-0B (13,429 requests, tool-call corpus):**
+
+| | count |
+|---|---|
+| branches, v1 | 806 |
+| branches, v2 | 928 |
+| **old branches split** | **122** — every one class (iii): the conversation's first turn renders to 37 tokens (well under B), so v2 does not index that tip and the next turn re-keys ONCE; all later turns continue the new branch |
+| merges | 0 |
+| class (i) tool/thinking splits | 0 — in these bodies the tool block is constant per conversation, so there is no deep divergence at all |
+| determinism mismatches | 0 |
+| content continuity | 12,496 / 12,496 = **100.00%** |
+
+That window records no `in_tokens`, so the render could not be cross-checked against the engine
+there (the template is still applied to the real bodies); the a0 window, which does record them,
+renders at a constant −2.
 
 **Declared classes, for reference** — (i) tools/thinking now count, so a mid-thread tool-set change
 or a re-rendered history splits the branch (exactly where the KV cache splits); (ii) the tip's

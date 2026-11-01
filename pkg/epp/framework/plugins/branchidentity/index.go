@@ -339,7 +339,7 @@ func (ix *branchIndex) Resolve(now time.Time, a Arrival, forkOnBusy, stickyGuard
 // NOT prefix-closed: a tip may exist at k=7 with none at k=5, so an early stop at
 // the first miss would lose it.
 func (ix *branchIndex) matchLocked(now time.Time, c chain, scope string) (*branchRecord, int) {
-	for k := c.fullBlocks; k >= 1; k-- {
+	for k := min(c.fullBlocks, len(c.blocks)); k >= 1; k-- {
 		var best *branchRecord
 		bestOutstanding := true
 		for _, cand := range ix.byPrefix[c.blocks[k-1]] {
@@ -396,21 +396,21 @@ func (ix *branchIndex) advanceLocked(now time.Time, rec *branchRecord, a Arrival
 // sync.
 //
 // THE TOLERANCE: the verified prefix is the tip's chain EXCEPT its last full
-// block, so the unverified tail is always between B and 2B-1 tokens. A request
-// that differs from the tip only there still continues it, which absorbs
-// end-of-tip rendering variance that the history does not reproduce — the
+// block. A tip with two or more full blocks therefore leaves its partial block
+// plus one whole block unverified — between B and 2B-1 tokens — and a request
+// that differs from the tip only there still continues it. That absorbs
+// end-of-tip rendering variance which the history does not reproduce: the
 // generation prompt, a template's empty-think stub, a BPE merge at the boundary.
-// One block of slack (rather than the partial block alone) is what makes the
+// One block of slack, rather than the partial block alone, is what makes the
 // guarantee hold wherever the prompt ends: with the partial block alone the slack
-// can be ZERO, and an end variance that crosses the block edge re-keys the
-// branch.
+// can be ZERO, and an end variance that crosses the block edge re-keys the branch.
 //
 // GUARDS: a tip with exactly ONE full block gets no tolerance — its prefix would
-// be empty and match every request — so that one block must match; and a tip
-// shorter than one block is not continuable at all (it has no block hash to index
-// and would otherwise match on an empty prefix). Both err toward NEW, which is
-// the unsafe direction, and both are counted by the equivalence gate as declared
-// classes (iii) and (v).
+// be empty and match every request — so that one block must match and only its
+// partial block is unverified; and a tip shorter than one block is not continuable
+// at all (it has no block hash to index, and would otherwise match on an empty
+// prefix). Both err toward NEW, which is the unsafe direction, and both are
+// counted by the equivalence gate as declared classes (iii) and (v).
 func (ix *branchIndex) setTipLocked(rec *branchRecord, c chain) {
 	ix.unindexLocked(rec)
 	rec.fullBlocks, rec.tokens, rec.lastHash = c.fullBlocks, c.tokens, c.lastHash()

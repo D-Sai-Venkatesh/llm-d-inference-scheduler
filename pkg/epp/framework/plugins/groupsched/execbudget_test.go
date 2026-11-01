@@ -31,7 +31,7 @@ package groupsched
 // requests may RUN at once.
 //
 // Every property below runs at N=1 AND at N=2: the gate is per engine by construction, so
-// N is a case of the code and not a branch of it. The fixtures set sizing "gpu-plus-tier"
+// N is a case of the code and not a branch of it. The fixtures set sizing "tier-inclusive"
 // with a tier — the arm this module ships for — because that is the only configuration in
 // which the SEAT budget can exceed the GPU, and therefore the only one where the gate can
 // bind for long.
@@ -49,11 +49,11 @@ import (
 
 // execBudgetConfig is the default config with the EXECUTION BUDGET on. The tier is what
 // lets the seat budget outgrow the GPU:
-// seat = 0.95 x (capacity + tier), dispatch = 0.95 x capacity.
+// seat = 0.95 x max(capacity, tier), dispatch = 0.95 x capacity.
 func execBudgetConfig(capacity, tier int) Config {
 	c := defaultConfig()
 	c.ExecutionBudget = "execution-budget"
-	c.Sizing = "gpu-plus-tier"
+	c.Sizing = "tier-inclusive"
 	c.KvBlockBytes = 4 * 64 // the index's 4-bytes/token convention (see sizetier_test.go)
 	c.CpuTierBytes = int64(tier) * c.KvBlockBytes
 	return c
@@ -71,9 +71,14 @@ func execBudgetOf(fraction float64, numBlocks int) int64 {
 	return int64(fraction * float64(numBlocks))
 }
 
-// seatBudgetOf is the OTHER budget (unchanged, the sizing module's): fraction x (GPU + tier).
+// seatBudgetOf is the OTHER budget (unchanged, the sizing module's): fraction x
+// max(GPU, tier) — the tier COPIES HBM, so it adds no capacity to it.
 func seatBudgetOf(cfg Config, capacity, tier int) int64 {
-	return int64(cfg.GroupBudgetFraction * float64(capacity+tier))
+	unique := capacity
+	if tier > unique {
+		unique = tier
+	}
+	return int64(cfg.GroupBudgetFraction * float64(unique))
 }
 
 // newFixture builds a scheduler with n engines of the given measured capacity — the twin
@@ -181,7 +186,8 @@ func (fx *engineSet) checkRunning(t *testing.T, when string) {
 func TestExecutionBudgetTurnWaitsThenDispatches(t *testing.T) {
 	const (
 		capacity = 1000 // GPU blocks: the DISPATCH budget is 950
-		tier     = 3000 // the SEAT budget is 0.95 x 4000 = 3800, so both turns can be seated
+		tier     = 3000 // the SEAT budget is 0.95 x max(1000, 3000) = 2850 (the tier is inclusive:
+		// it IS the unique capacity here), so both turns can be seated
 	)
 	cfg := execBudgetConfig(capacity, tier)
 	forNs(t, cfg, capacity, func(t *testing.T, fx *engineSet) {
@@ -258,7 +264,9 @@ func TestExecutionBudgetIsTheOnlyDifference(t *testing.T) {
 func TestExecutionBudgetLivenessOnAnIdleEngine(t *testing.T) {
 	const (
 		capacity = 1000 // dispatch budget 950
-		tier     = 3000
+		// the SEAT budget must still admit a 2900-block chain, and sizing tier-inclusive takes
+		// max(1000, 3200): the TIER alone has to carry it (0.95 x 3200 = 3040)
+		tier = 3200
 	)
 	cfg := execBudgetConfig(capacity, tier)
 	forNs(t, cfg, capacity, func(t *testing.T, fx *engineSet) {
@@ -676,7 +684,7 @@ func TestExecutionBudgetSelectorIsConformant(t *testing.T) {
 // seat budget from pricing the same head two different ways. Pinned for every wired sizer
 // (a future implementation that breaks it fails here, not in a run).
 func TestExecutionBudgetSizerContractHolds(t *testing.T) {
-	for _, sizing := range []string{"index", "gpu-plus-tier"} {
+	for _, sizing := range []string{"index", "tier-inclusive"} {
 		sizing := sizing
 		t.Run(sizing, func(t *testing.T) {
 			cfg := execBudgetConfig(1000, 2000)

@@ -29,8 +29,11 @@ package groupsched
 //	            the engine's own BlockIndex (dedup + cold-token estimate), and the
 //	            engine's seat budget from its measured KV capacity. Default
 //	            IndexSizer (budget = fraction x num_gpu_blocks); the alternative
-//	            GpuPlusTier sizes the budget from GPU blocks PLUS the CPU tier's
-//	            blocks (gpu-plus-tier).
+//	            TierInclusive sizes the budget from the engine's UNIQUE capacity
+//	            when a CPU offload tier is configured: fraction x max(num_gpu_blocks,
+//	            the tier's blocks) — the tier is INCLUSIVE (vLLM's native offload is
+//	            write-through), so it holds a copy of what HBM holds and adds no
+//	            capacity of its own (tier-inclusive).
 //	QUEUE       EntryOrder: which waiter is the head. Default newcomer-first, then
 //	            oldest arrival, then id. Alternatives: bounded HRRN (equal slowdown,
 //	            denominator capped at the median waiter size) and bounded HRRN with
@@ -599,7 +602,9 @@ type FootprintSizer interface {
 	// BudgetBlocks is one engine's seat budget, from its measured KV capacity and
 	// that engine's CPU tier capacity in blocks (0 = no tier configured). Both
 	// numbers are per-engine deployment facts; a GPU-only implementation ignores
-	// the tier's, so neither implementation reaches for the other's state.
+	// the tier's, so neither implementation reaches for the other's state. A
+	// tier-aware one must combine them the way the deployment's offload actually
+	// combines them: the hierarchy is INCLUSIVE, so max, never the sum.
 	BudgetBlocks(numBlocks, tierBlocks int) int
 	// Cost is the conservative admission cost of a QUEUED request against one
 	// engine's index, in blocks.
@@ -669,20 +674,32 @@ func (z IndexSizer) TierCost(idx *BlockIndex, tier *tierShadow, member string, s
 
 func (z IndexSizer) Tokens(blocks int64) int64 { return blocks * int64(z.BlockSize) }
 
-// GpuPlusTier is the SIZING alternative "gpu-plus-tier": the seat budget is a fraction
-// of the engine's whole reachable working set — its measured GPU blocks PLUS its CPU
-// tier's blocks — while a head's admission cost stays IndexSizer's GPU-only estimate.
+// TierInclusive is the SIZING alternative "tier-inclusive": the seat budget is a fraction
+// of the engine's UNIQUE KV capacity — max(num_gpu_blocks, tierBlocks) — while a head's
+// admission cost stays IndexSizer's GPU-only estimate.
 //
-//	BudgetBlocks = floor(fraction x (num_gpu_blocks + tierBlocks))
+//	BudgetBlocks = floor(fraction x max(num_gpu_blocks, tierBlocks))
+//
+// WHY THE MAX AND NOT THE SUM (the tier-inclusive correction, 2026-11-02). vLLM's native
+// CPU offload is WRITE-THROUGH at compute time: every chunk is stored to the tier as it is
+// computed, and nothing is stored on GPU eviction. The tier therefore holds a copy of
+// essentially everything HBM holds — a block on the GPU is, by construction, also in the
+// tier — so the hierarchy is INCLUSIVE: what an engine can reach is the MAX of the two
+// capacities, because a block needs a place in ONE of them and the tier already covers
+// everything HBM covers. A sum prices twice-billed blocks that do not exist.
 //
 // WHY (PREREG-multipod-offload, "the seat budget counts GPU memory only"). The budget
 // sizes the working set an engine may hold, and what a miss costs is what it reserves
 // for: with no tier a miss is a full prefill, with a tier ~1-4 % of one (a restore). A
 // seated member whose chain has left HBM is therefore still cheap to serve, and the
-// engine's reachable capacity is GPU + tier — 40,183 GPU blocks + 87,381 tier blocks =
-// 3.17x the GPU pool on the campaign deployment. Sizing from GPU alone reserves for the
-// expensive miss the deployment no longer pays: on the c64 cells stock FCFS gained ~2x
+// engine's reachable capacity is the max of the two. Sizing from GPU alone reserves for
+// the expensive miss the deployment no longer pays: on the c64 cells stock FCFS gained ~2x
 // from offload (1.390 req/s) where the GPU-sized core gained 1.267.
+//
+// THE CAMPAIGN DEPLOYMENT: 40,183 GPU blocks, and a tier of 512 GiB ÷ 6,291,456-byte
+// blocks = 87,381 blocks (2.17x the GPU pool). The tier IS the unique capacity there, so
+// the budget is floor(0.95 x 87,381) = 83,011 blocks — 2.17x the GPU-only 38,173, where the
+// summed value this replaces said 121,185 (3.02x: 46 % of it did not exist).
 //
 // WHAT DOES NOT GROW. The cold-entry valve's cap stays floor((1-fraction) x
 // num_gpu_blocks) x blockSize (engineGroup.coldCapTokens): it staggers GPU allocation
@@ -693,33 +710,44 @@ func (z IndexSizer) Tokens(blocks int64) int64 { return blocks * int64(z.BlockSi
 // tierBlocks is the engine's TIER SHADOW capacity (tiershadow.go): the same two
 // deployment facts that size the shadow, read back from it, so this implementation adds
 // no constant of its own. 0 (no tier configured) makes BudgetBlocks IndexSizer's number
-// exactly; TestGpuPlusTierZeroTierEqualsGPU pins that degeneracy on the state machine.
-type GpuPlusTier struct {
+// exactly; TestTierInclusiveZeroTierEqualsGPU pins that degeneracy on the state machine.
+//
+// THE VALUE IT REPLACES. This module was "gpu-plus-tier" (fraction x the SUM of the two
+// capacities) through the batch-2 arm, which ran 121,185 blocks of seats on a 40,183-block
+// GPU. The summed value is RETIRED rather than kept beside this one: HEAD must not offer a
+// selector that prices capacity the deployment does not have, or a copied arm pins the
+// over-seating again. Its measurement and its config stay in the archive —
+// docs/gsch-core/README.md §4f, at commit 17a10e8c / digest groupsched-17a10e8c.
+type TierInclusive struct {
 	Fraction  float64
 	BlockSize int
 }
 
-func (GpuPlusTier) Name() string { return "gpu-plus-tier" }
+func (TierInclusive) Name() string { return "tier-inclusive" }
 
-func (z GpuPlusTier) BudgetBlocks(numBlocks, tierBlocks int) int {
-	return int(z.Fraction * float64(numBlocks+tierBlocks))
+func (z TierInclusive) BudgetBlocks(numBlocks, tierBlocks int) int {
+	unique := numBlocks
+	if tierBlocks > unique {
+		unique = tierBlocks
+	}
+	return int(z.Fraction * float64(unique))
 }
 
 // The cost functions are IndexSizer's, delegated: this implementation changes WHICH
 // heads may be seated, never what a head costs.
-func (z GpuPlusTier) Cost(idx *BlockIndex, member string, sizeBytes int64) int64 {
+func (z TierInclusive) Cost(idx *BlockIndex, member string, sizeBytes int64) int64 {
 	return z.gpu().Cost(idx, member, sizeBytes)
 }
 
-func (z GpuPlusTier) TierCost(idx *BlockIndex, tier *tierShadow, member string, sizeBytes int64) (cold, resident, total int64) {
+func (z TierInclusive) TierCost(idx *BlockIndex, tier *tierShadow, member string, sizeBytes int64) (cold, resident, total int64) {
 	return z.gpu().TierCost(idx, tier, member, sizeBytes)
 }
 
-func (z GpuPlusTier) Tokens(blocks int64) int64 { return z.gpu().Tokens(blocks) }
+func (z TierInclusive) Tokens(blocks int64) int64 { return z.gpu().Tokens(blocks) }
 
 // gpu is this implementation's wiring facts as the GPU-only sizer, so the two selector
 // values share one cost implementation instead of keeping two copies of it.
-func (z GpuPlusTier) gpu() IndexSizer {
+func (z TierInclusive) gpu() IndexSizer {
 	return IndexSizer{Fraction: z.Fraction, BlockSize: z.BlockSize}
 }
 
@@ -808,7 +836,8 @@ func (NoopDispatchGate) Allows(DispatchCtx) bool { return true }
 // statement about how much of an engine's KV is in use rather than headroom (the seat
 // budget already assumes an engine may run to it, and the memory-only net fires at it).
 // The dispatch budget is that statement applied to the OTHER quantity: residency is
-// priced against GPU + tier, execution against GPU, and both are the same fraction of a
+// priced against the engine's UNIQUE capacity (max of GPU and tier — the tier is
+// inclusive), execution against the GPU alone, and both are the same fraction of a
 // measured capacity. There is nothing to tune and no unit of its own.
 //
 // WHY IT IS SAFE WHERE THE OLD GATE WAS NOT. Three differences, each of which the old
@@ -958,10 +987,10 @@ func buildModules(cfg Config) (modules, error) {
 	switch cfg.Sizing {
 	case "", "index":
 		m.sizer = IndexSizer{Fraction: cfg.GroupBudgetFraction, BlockSize: cfg.BlockSizeTokens}
-	case "gpu-plus-tier":
-		m.sizer = GpuPlusTier{Fraction: cfg.GroupBudgetFraction, BlockSize: cfg.BlockSizeTokens}
+	case "tier-inclusive":
+		m.sizer = TierInclusive{Fraction: cfg.GroupBudgetFraction, BlockSize: cfg.BlockSizeTokens}
 	default:
-		return m, errValue("sizing", cfg.Sizing, "index|gpu-plus-tier")
+		return m, errValue("sizing", cfg.Sizing, "index|tier-inclusive")
 	}
 	switch cfg.EntryOrder {
 	case "", "newcomer-first":

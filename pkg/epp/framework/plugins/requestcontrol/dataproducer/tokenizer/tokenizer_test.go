@@ -62,9 +62,8 @@ func (m *mockTokenizer) RenderResponses(ctx context.Context, payload fwkrh.Reque
 
 func newTestPlugin(tok tokenizer) *Plugin {
 	return &Plugin{
-		typedName:   plugin.TypedName{Type: PluginType, Name: "test"},
-		backend:     renderBackend{tk: tok},
-		backendName: BackendVLLM,
+		typedName: plugin.TypedName{Type: PluginType, Name: "test"},
+		Producer:  &Producer{backend: renderBackend{tk: tok}, backendName: BackendVLLM},
 	}
 }
 

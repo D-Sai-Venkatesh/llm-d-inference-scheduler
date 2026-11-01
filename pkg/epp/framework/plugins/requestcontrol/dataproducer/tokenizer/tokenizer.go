@@ -22,7 +22,6 @@ package tokenizer
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -30,22 +29,13 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/tokenization"
 	tokenizerTypes "github.com/llm-d/llm-d-router/pkg/kvcache/tokenization/types"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 
-	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
-	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
-	mmobs "github.com/llm-d/llm-d-router/pkg/epp/framework/common/observability/multimodal"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
-	sourcenotifications "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/notifications"
-	rcplugins "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol"
-	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 )
 
 type tokenizer interface {
@@ -235,6 +225,40 @@ type framesStridedMode struct {
 	FrameStride int `json:"frameStride,omitempty"`
 }
 
+// validate rejects configurations no backend can serve. It is shared by the
+// plugin factory and by a library caller that builds a producer directly.
+func (c *tokenizerPluginConfig) validate() error {
+	estimate := c.Estimate != nil
+	vllm := c.VLLM != nil || c.ModelName != ""
+	if estimate && vllm {
+		return fmt.Errorf("invalid configuration for '%s' plugin: only one of 'estimate' or 'vllm' may be set", PluginType)
+	}
+	// modelName is required only by the real-tokenizer backend; the zero-config
+	// path selects the estimate backend, which needs none.
+	if vllm && c.ModelName == "" {
+		return fmt.Errorf("invalid configuration for '%s' plugin: 'modelName' must be specified", PluginType)
+	}
+	if c.Estimate != nil && c.Estimate.Image != nil {
+		if m := c.Estimate.Image.Mode; m != "" && m != imageModeDynamic && m != imageModeStatic {
+			return fmt.Errorf("invalid configuration for '%s' plugin: estimate.image.mode must be %q or %q", PluginType, imageModeDynamic, imageModeStatic)
+		}
+	}
+	if c.Estimate != nil && c.Estimate.Video != nil {
+		vid := c.Estimate.Video
+		if vid.TokensPerFrame != nil {
+			if m := vid.TokensPerFrame.Mode; m != "" && m != videoTPFModeDynamic && m != videoTPFModeStatic {
+				return fmt.Errorf("invalid configuration for '%s' plugin: estimate.video.tokensPerFrame.mode must be %q or %q", PluginType, videoTPFModeDynamic, videoTPFModeStatic)
+			}
+		}
+		if vid.Frames != nil {
+			if m := vid.Frames.Mode; m != "" && m != videoFramesModeSampled && m != videoFramesModeStrided {
+				return fmt.Errorf("invalid configuration for '%s' plugin: estimate.video.frames.mode must be %q or %q", PluginType, videoFramesModeSampled, videoFramesModeStrided)
+			}
+		}
+	}
+	return nil
+}
+
 // PluginFactory is the factory function for the tokenizer plugin.
 func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
 	config := tokenizerPluginConfig{}
@@ -245,33 +269,8 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 		}
 	}
 
-	estimate := config.Estimate != nil
-	vllm := config.VLLM != nil || config.ModelName != ""
-	if estimate && vllm {
-		return nil, fmt.Errorf("invalid configuration for '%s' plugin: only one of 'estimate' or 'vllm' may be set", PluginType)
-	}
-	// modelName is required only by the real-tokenizer backend; the zero-config
-	// path selects the estimate backend, which needs none.
-	if vllm && config.ModelName == "" {
-		return nil, fmt.Errorf("invalid configuration for '%s' plugin: 'modelName' must be specified", PluginType)
-	}
-	if config.Estimate != nil && config.Estimate.Image != nil {
-		if m := config.Estimate.Image.Mode; m != "" && m != imageModeDynamic && m != imageModeStatic {
-			return nil, fmt.Errorf("invalid configuration for '%s' plugin: estimate.image.mode must be %q or %q", PluginType, imageModeDynamic, imageModeStatic)
-		}
-	}
-	if config.Estimate != nil && config.Estimate.Video != nil {
-		vid := config.Estimate.Video
-		if vid.TokensPerFrame != nil {
-			if m := vid.TokensPerFrame.Mode; m != "" && m != videoTPFModeDynamic && m != videoTPFModeStatic {
-				return nil, fmt.Errorf("invalid configuration for '%s' plugin: estimate.video.tokensPerFrame.mode must be %q or %q", PluginType, videoTPFModeDynamic, videoTPFModeStatic)
-			}
-		}
-		if vid.Frames != nil {
-			if m := vid.Frames.Mode; m != "" && m != videoFramesModeSampled && m != videoFramesModeStrided {
-				return nil, fmt.Errorf("invalid configuration for '%s' plugin: estimate.video.frames.mode must be %q or %q", PluginType, videoFramesModeSampled, videoFramesModeStrided)
-			}
-		}
+	if err := config.validate(); err != nil {
+		return nil, err
 	}
 
 	p, err := NewPlugin(handle.Context(), name, &config)
@@ -282,73 +281,30 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 	return p, nil
 }
 
-// NewPlugin constructs the configured backend: vllm /render (selected by
-// 'vllm' or 'modelName'), or estimate byte-packing (the default when no
-// backend is set).
+// NewPlugin constructs the plugin around the configured backend: vllm /render
+// (selected by 'vllm' or 'modelName'), or estimate byte-packing (the default
+// when no backend is set).
 func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) (*Plugin, error) {
-	var backend tokenInputProducer
-	var backendName string
-	var endpointPicker *discoveredEndpointPicker
-	switch {
-	case config.VLLM != nil || config.ModelName != "":
-		cfg := config.VLLM
-		if cfg == nil {
-			cfg = &vllmConfig{}
-		}
-		renderer, err := newVLLMHTTPRenderer(cfg)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize vLLM HTTP renderer for '%s' plugin - %w", PluginType, err)
-		}
-		renderer.pluginName = name
-		registerRenderMetrics()
-		legacyMessages, err := configureLegacyMessages(ctx, name, cfg.MessagesRenderMode)
-		if err != nil {
-			return nil, err
-		}
-		legacyResponses, err := configureLegacyResponses(ctx, name, cfg.ResponsesRenderMode)
-		if err != nil {
-			return nil, err
-		}
-		backend = renderBackend{
-			tk: renderer, modelName: config.ModelName,
-			legacyMessages: legacyMessages, legacyResponses: legacyResponses,
-			warmupAuth: vllmWarmupAuthHeader(),
-		}
-		backendName = BackendVLLM
-		endpointPicker, _ = renderer.endpointPicker.(*discoveredEndpointPicker)
-		if endpointPicker != nil && endpointPicker.config.DiscoverModelLimits {
-			go endpointPicker.watchModelLimits(ctx, renderer.client, config.ModelName)
-		}
-	default:
-		backend = estimateBackend{img: newImageEstimator(config.Estimate), vid: newVideoEstimator(config.Estimate), aud: newAudioEstimator(config.Estimate)}
-		backendName = BackendEstimate
+	owner := plugin.TypedName{Type: PluginType, Name: name}
+	producer, err := newProducer(ctx, owner, config)
+	if err != nil {
+		return nil, err
 	}
-
-	typedName := plugin.TypedName{Type: PluginType, Name: name}
-	p := &Plugin{
-		typedName:   typedName,
-		backend:     backend,
-		backendName: backendName,
-		dk:          TokenizedPromptDataKey.WithNonEmptyProducerName(name),
-	}
-	if endpointPicker != nil {
-		p.endpointDiscovery = newEndpointDiscoveryHandler(typedName, endpointPicker)
-	}
-	if w, ok := backend.(warmer); ok {
-		go w.warmup(ctx)
-	}
-	return p, nil
+	return &Plugin{
+		typedName: owner,
+		Producer:  producer,
+		dk:        TokenizedPromptDataKey.WithNonEmptyProducerName(name),
+	}, nil
 }
 
 // Plugin tokenizes the prompt in the incoming request and writes the result to
 // InferenceRequestBody.TokenizedRequest for downstream DataProducer / scoring plugins.
 type Plugin struct {
 	typedName plugin.TypedName
-	backend   tokenInputProducer
-	// backendName identifies the configured backend on the tokenize span.
-	backendName       string
-	dk                plugin.DataKey
-	endpointDiscovery *endpointDiscoveryHandler
+	// Producer does the rendering: one render per request, shared with any plugin
+	// that needs the tokens before this one's dispatch phase.
+	*Producer
+	dk plugin.DataKey
 }
 
 // compile-time assertions.
@@ -382,94 +338,20 @@ func (p *Plugin) Produces() map[plugin.DataKey]any {
 
 // RegisterDependencies wires discovery-backed renderers to endpoint lifecycle events.
 func (p *Plugin) RegisterDependencies(r datalayer.Registrar) error {
-	if p.endpointDiscovery == nil {
-		return nil
-	}
-	return r.Register(datalayer.PendingRegistration{
-		Owner:         p.TypedName(),
-		SourceType:    sourcenotifications.EndpointNotificationSourceType,
-		Extractor:     p.endpointDiscovery,
-		DefaultSource: sourcenotifications.NewEndpointDataSource(sourcenotifications.EndpointNotificationSourceType, sourcenotifications.EndpointNotificationSourceType),
-	})
+	return p.Producer.RegisterDependencies(r)
 }
 
 // ProduceTimeout surfaces the backend's render timeout when it manages one, so
 // the director extends the data-producer budget past its default. Returns 0 to
 // keep the default (e.g. the estimate backend, which is in-memory).
-func (p *Plugin) ProduceTimeout() time.Duration {
-	if ta, ok := p.backend.(timeoutAware); ok {
-		return ta.produceTimeout()
-	}
-	return 0
-}
+func (p *Plugin) ProduceTimeout() time.Duration { return p.Producer.Timeout() }
 
-// Produce derives the request's TokenizedRequest via the configured backend and
-// stores it on the body. Skips when one is already present; errors propagate to
-// the Director, which logs and continues.
-//
-// The tokenize span opens below the already-tokenized skip path, so it is
-// emitted only when the backend is actually invoked.
+// Produce derives the request's TokenizedRequest at dispatch through the embedded
+// Producer, and is a no-op when an earlier hook already rendered the request
+// (branch identity renders at arrival — the Producer's skip path makes that one
+// render per request). Errors propagate to the Director, which logs and continues.
 func (p *Plugin) Produce(ctx context.Context, request *scheduling.InferenceRequest, _ []scheduling.Endpoint) error {
-	if request.Body == nil {
-		return errors.New("request body is nil")
-	}
-	if request.Body.RenderRequest {
-		return nil
-	}
-	if request.Body.TokenizedRequest != nil {
-		// A parser (e.g. vLLM gRPC) may pre-populate tokens without a salt;
-		// ensure cache-salt isolation still applies on the skip path.
-		if request.Body.TokenizedRequest.CacheSalt == "" {
-			request.Body.TokenizedRequest.CacheSalt = CacheSaltFromBody(request.Body)
-		}
-		return nil
-	}
-
-	ctx = withMMMetadata(ctx, parseMMMetadataHeaders(request.Headers))
-	if auth, ok := metadata.GetLowerCaseHeaderValue(request.Headers, "authorization"); ok {
-		ctx = withAuthHeader(ctx, auth)
-	}
-
-	ctx, span := tracing.Tracer(rcplugins.TracerScope).Start(ctx, "tokenize",
-		trace.WithSpanKind(trace.SpanKindInternal),
-	)
-	defer span.End()
-	// On the default (tracing-disabled) path Start returns a non-recording span;
-	// skip attribute construction, which walks the request's multimodal features.
-	tracingActive := span.IsRecording()
-	if tracingActive {
-		attrs := []attribute.KeyValue{
-			semconv.LLMDEPPTokenProducerBackend(p.backendName),
-		}
-		if request.TargetModel != "" {
-			attrs = append(attrs, semconv.GenAIRequestModel(request.TargetModel))
-		}
-		if clientRequestID := request.Headers[reqcommon.RequestIDHeaderKey]; clientRequestID != "" {
-			attrs = append(attrs, semconv.GenAIRequestID(clientRequestID))
-		}
-		span.SetAttributes(attrs...)
-	}
-
-	tp, err := p.backend.produce(ctx, request.Body)
-	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
-		return err
-	}
-	if tp == nil || tp.TokenCount() == 0 {
-		if tracingActive {
-			span.SetAttributes(semconv.LLMDEPPTokenProducerResult(resultSkippedNoTokens))
-		}
-		return nil
-	}
-	tp.CacheSalt = CacheSaltFromBody(request.Body)
-	request.Body.TokenizedRequest = tp
-
-	if tracingActive {
-		span.SetAttributes(append(mmobs.SpanAttributes(request),
-			semconv.LLMDEPPTokenProducerTokenCount(tp.TokenCount()),
-		)...)
-	}
-	return nil
+	return p.Producer.Tokenize(ctx, request)
 }
 
 // convertMMFeaturesToUpstream flattens the kv-cache map-shaped multimodal

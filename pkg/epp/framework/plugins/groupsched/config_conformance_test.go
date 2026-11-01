@@ -61,7 +61,10 @@ package groupsched
 //	  engineChoice: "most-free-budget"
 //	  rotation: "quantum"
 //	  victim: "valve"
-//	  safety: "none"
+//	  safety: "none"             # CORE_SAFETY: | "budget-fraction" (the memory-only net)
+//	  executionBudget: "none"    # CORE_EXECUTION_BUDGET: | "execution-budget" (the
+//	                              # dispatch budget: the CPU tier widens residency,
+//	                              # never how many requests may RUN at once)
 //	flowControl:
 //	  saturationDetector:
 //	    pluginRef: group           # the SAME plugin instance answers the pool gate
@@ -123,7 +126,8 @@ entryOrder: "newcomer-first"
 engineChoice: "most-free-budget"
 rotation: "quantum"
 victim: "valve"
-safety: "none"`,
+safety: "none"
+executionBudget: "none"`,
 	},
 	{
 		// The F5′ arm's module block: CORE_ENTRY_ORDER=hrrn-bounded. The KEYS are
@@ -139,7 +143,8 @@ entryOrder: "hrrn-bounded"
 engineChoice: "most-free-budget"
 rotation: "quantum"
 victim: "valve"
-safety: "none"`,
+safety: "none"
+executionBudget: "none"`,
 	},
 	{
 		// The OFFLOAD arm's base block: CORE_BASE_BLOCK with the two tier facts set — the
@@ -175,7 +180,25 @@ entryOrder: "newcomer-first"
 engineChoice: "most-free-budget"
 rotation: "quantum"
 victim: "valve"
-safety: "none"`,
+safety: "none"
+executionBudget: "none"`,
+	},
+	{
+		// The EXECUTION-BUDGET arm's module block (docs/gsch-core/
+		// core-q4-offload-tierbudget-execbudget.env): CORE_EXECUTION_BUDGET=execution-budget.
+		// One VALUE differs from the tierbudget arm's block, and it has to survive the same
+		// strict decode (the TYPE half) and buildModules (the ENUM half) — a CrashLoop on
+		// the one arm that carries the two budgets otherwise.
+		block: "CORE_MODULE_BLOCK (CORE_EXECUTION_BUDGET=execution-budget)",
+		owner: PluginType,
+		proto: Config{},
+		body: `sizing: "gpu-plus-tier"
+entryOrder: "newcomer-first"
+engineChoice: "most-free-budget"
+rotation: "quantum"
+victim: "valve"
+safety: "none"
+executionBudget: "execution-budget"`,
 	},
 	{
 		// The branch plugin every core arm carries (BRANCH_PLUGIN=1). Its bool fields are
@@ -370,12 +393,13 @@ func TestShippedCoreEnvFilesUseYAMLBools(t *testing.T) {
 // buildModules fails CLOSED on a value it does not know — so a typo in a shipped arm is a
 // CrashLoop, which is worth catching in the build rather than in a deploy.
 var moduleEnvKnobs = map[string]string{
-	"CORE_SIZING":        "Sizing",
-	"CORE_ENTRY_ORDER":   "EntryOrder",
-	"CORE_ENGINE_CHOICE": "EngineChoice",
-	"CORE_ROTATION":      "Rotation",
-	"CORE_VICTIM":        "Victim",
-	"CORE_SAFETY":        "Safety",
+	"CORE_SIZING":           "Sizing",
+	"CORE_ENTRY_ORDER":      "EntryOrder",
+	"CORE_ENGINE_CHOICE":    "EngineChoice",
+	"CORE_ROTATION":         "Rotation",
+	"CORE_VICTIM":           "Victim",
+	"CORE_SAFETY":           "Safety",
+	"CORE_EXECUTION_BUDGET": "ExecutionBudget",
 }
 
 // TestShippedCoreEnvFilesUseKnownModuleValues pins the selector VALUES in the env files
@@ -429,6 +453,7 @@ func TestModuleValuesMatchTheEmitter(t *testing.T) {
 		{"Rotation", []string{"quantum"}},
 		{"Victim", []string{"valve"}},
 		{"Safety", []string{"none", "budget-fraction"}},
+		{"ExecutionBudget", []string{"none", "execution-budget"}},
 	}
 	for _, e := range emitted {
 		for _, v := range e.values {

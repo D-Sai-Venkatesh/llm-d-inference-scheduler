@@ -102,10 +102,10 @@ if [ "${CHAIN:-}" = "groupsched-core" ]; then
   # CORE_ENTRY_ORDER is "newcomer-first" (default) or "hrrn-bounded" (F5', see §4d):
   # ONE value, and buildModules fails closed on anything else (a typo must never
   # silently measure the anchor twice).
-  printf -v CORE_MODULE_BLOCK '    sizing: "%s"\n    entryOrder: "%s"\n    engineChoice: "%s"\n    rotation: "%s"\n    victim: "%s"\n    safety: "%s"' \
+  printf -v CORE_MODULE_BLOCK '    sizing: "%s"\n    entryOrder: "%s"\n    engineChoice: "%s"\n    rotation: "%s"\n    victim: "%s"\n    safety: "%s"\n    executionBudget: "%s"' \
     "${CORE_SIZING:-index}" "${CORE_ENTRY_ORDER:-newcomer-first}" \
     "${CORE_ENGINE_CHOICE:-most-free-budget}" "${CORE_ROTATION:-quantum}" \
-    "${CORE_VICTIM:-valve}" "${CORE_SAFETY:-none}"
+    "${CORE_VICTIM:-valve}" "${CORE_SAFETY:-none}" "${CORE_EXECUTION_BUDGET:-none}"
 else
   CORE_MODULE_BLOCK=""   # legacy/B2a arms render exactly what they render today
 fi
@@ -142,6 +142,7 @@ The wave's BALANCE gate reads the per-engine series every 15 s. A core arm must 
 | `llm_d_epp_group_filter_decisions_total{decision}` | `pinned` vs `passthrough-*` (a run whose decisions are all passthrough is NOT pinned) |
 | `llm_d_epp_group_cold_cap_tokens{engine}` | the DERIVED cold-entry stagger cap (the budget's headroom, in tokens). Scorers divide `cold_inflight_tokens` by THIS; the cap moves with the engine and must never be copied out of an arm's config |
 | `llm_d_epp_group_cold_valve_held_total{engine}` | heads the valve held back (the budget would have admitted them; they WAIT). Non-zero is the stagger's measured cost; a value under `engine="single"` on a multi-engine stack was a labelling defect fixed in 8397e9aa |
+| `llm_d_epp_group_running_blocks{engine}` / `execution_budget_blocks{engine}` / `dispatch_holds_total{engine}` | THE EXECUTION BUDGET's three numbers (§4g): the engine's RUNNING set (the dedup-exact union of its in-flight requests' chain blocks, from the EPP's own accounting), the budget it is tested against (`fraction x num_gpu_blocks`), and how many decision passes held a turn back. `execution_budget_blocks == 0` means no dispatch gate is wired (every arm whose selector is `none`), and `running_blocks` is then 0 by construction: nothing is maintained |
 | `llm_d_epp_group_event_ring_dropped_total` | SEAT/EXIT events the bounded ring has wrapped past — how much of the window lies BEFORE the dump's `RecentEvents` tail. The stdout event stream is the durable copy; this measures what the dump lost |
 
 The gate line to read on a `none` arm: `detector_pool_score == 0` for the whole window
@@ -577,6 +578,73 @@ emitter needs no new key: `CORE_SIZING` is already rendered into `CORE_MODULE_BL
 `TestModuleValuesMatchTheEmitter`, loader gate
 `TestGroupSchedulerCoreChainStartsWithGpuPlusTierSizing`).
 
+
+## 4g. THE EXECUTION BUDGET — `executionBudget: "execution-budget"` (2026-11-02)
+
+The DISPATCH module: the second of the TWO BUDGETS that §4f needed and did not have.
+
+```
+SEATING  (residency) = floor(fraction x (num_gpu_blocks + tierBlocks))   §4f, unchanged
+DISPATCH (execution) = floor(fraction x  num_gpu_blocks)                 this value
+```
+
+**Why, measured.** Batch 2 at c64 (tierbudget vs the same-digest q4-offload): the tier-sized
+seat budget widened the working set to GPU + tier (3.17x) and then let that many members be
+seated — and seated members RUN. A running request's KV needs HBM blocks, which the tier does
+not provide, so vLLM queued and preempted what the EPP had just dispatched: **43 preemptions
+vs 0, TTFT p50 0.9 s -> 17.8 s, newcomer TTFT p90 9.9 s -> 142 s**, with throughput up 10.8 %
+(the recompute waste behind it). The tier widens where IDLE chains live, not how many requests
+may run at once.
+
+**The rule.** A seated member's turn dispatches only if the engine's RUNNING SET — the
+dedup-exact union of its in-flight requests' chain blocks — plus what the turn would ADD to it
+fits the dispatch budget. Otherwise the turn waits at the EPP, FIFO by turn arrival among the
+dispatch-eligible. LIVENESS: one turn is always allowed when nothing is in flight on the
+engine. The waiting moved from vLLM's preempting queue into the EPP's ordered one, where it is
+measurable (`dispatch_holds_total`).
+
+**Where the numbers come from** — no constant, no metric:
+
+| term | source |
+|---|---|
+| running set | `BlockIndex.blocksRun`: a refcount over the chain blocks of the requests the scheduler itself dispatched, maintained where an in-flight record changes (dispatch, settle, reap, rebind, exit) and re-derived from those records once per tick |
+| what the turn adds | the sizing module's own footprint estimate (its chain + the wire-size growth — the same number the seat budget is charged with), minus the blocks the running set already holds |
+| budget | `fraction x num_gpu_blocks`, the deployment's own statement applied to the execution quantity |
+
+**Why a NEW seam and not the SAFETY module.** `SafetyDetector` answers a different question
+from a different input class: it is defined over ENDPOINT METRICS (`kv`, `have`), it has two
+readers (the per-engine holds and the framework's pool Saturation signal), and it is OFF by
+default precisely because a metric gate that misreads its input is worse than no gate. Folding
+an accounting gate in would have given one interface two unrelated inputs and two unrelated
+readers. The gate is its own module — one question (`may this turn RUN now?`), one default
+(`none`), one config value — and the safety module's default is untouched.
+
+**Why it cannot resurrect the deleted per-engine gate.** That gate read a construction-time
+metrics CLONE (it froze when dispatch stopped, and latched) and a raw request COUNT
+(`waiting >= 5`). This one reads the EPP's own block accounting, per engine, by construction:
+no scrape, no staleness rule, no clone, and nothing pooled across engines. It also never
+touches placement or the seats — it excludes one turn for one pass.
+
+**What does not move** (each pinned by test): the seat budget, the per-head cost, the
+cold-entry valve, the queue order, placement, rotation. The default value is `none`, the
+default config's replay is byte-identical (`TestExecutionBudgetDefaultIsGoldenNeutral`), and
+enabling the module where the running set always fits changes nothing in the whole 2,600 s
+replay (`TestExecutionBudgetOnChangesNothingWhenItNeverBinds`). With the selector at `none`
+NOTHING is maintained — no key scan per dispatch, no per-tick rebuild, no cache — so a
+comparator arm's CPU is identical to the build before this module existed.
+
+**ONE interaction, stated:** a HELD turn keeps its seat-time cold-entry charge (it will
+prefill when it runs), and the derived valve admits one outstanding prefill per engine — so a
+held turn occupies that slot while it waits. It is released the moment the turn dispatches
+(which the FIFO rule and the draining running set guarantee).
+
+The arm: `core-q4-offload-tierbudget-execbudget.env` is `core-q4-offload-tierbudget.env` with
+ONE setting changed (`CORE_EXECUTION_BUDGET=execution-budget`), so the batch-2 pair is
+`core-q4-offload-tierbudget ‖ core-q4-offload-tierbudget-execbudget` on ONE digest at c64.
+The emitter needs ONE new key in `CORE_MODULE_BLOCK` (§2's printf) and ONE new enum case
+(`CORE_EXECUTION_BUDGET=none|execution-budget`); build-side contract
+`TestConfigEmitterConformance` + `TestModuleValuesMatchTheEmitter`, loader gate
+`TestGroupSchedulerCoreChainStartsWithTheExecutionBudget`.
 
 ## 5. The wave (for the record)
 

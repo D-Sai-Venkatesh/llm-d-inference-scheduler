@@ -16,48 +16,43 @@ limitations under the License.
 
 package branchidentity
 
-// STAGE 0C — replay a campaign window through the SHIPPED plugin.
+// STAGE 0C (v2) — replay a recorded campaign window through the arrival hook with
+// the ENGINE's own tokens.
 //
-// The stage 0 / 0B validations scored a Python re-implementation. This drives the
-// real thing: each request of a recorded window is parsed by the PRODUCTION parser
-// (parsers/openai — the same InferenceRequestBody the EPP builds) and pushed
-// through the plugin's own hooks at the recorded arrival / dispatch / settle
-// timestamps, with the clock injected (p.now) and the session attribute fed from
-// the harness's root id. The per-request derived ids are written out for scoring
-// against ground truth (stage0c_score.py).
+// The v2 identity is a token-space key, so an offline replay needs the render that
+// the engine would perform. STAGE0C_TOKENS is a JSONL corpus of {i, n, in_tokens,
+// tokens} produced offline with the model's chat template (transformers
+// apply_chat_template, the same Jinja template vLLM applies); the replay injects
+// those tokens in place of the render and VALIDATES them against the recorded
+// in_tokens, so a template that drifted cannot silently pass.
 //
-// It is skipped unless STAGE0C_WINDOW points at a prepared window:
+// Each request is parsed by the PRODUCTION parser (parsers/openai) and pushed
+// through the plugin's real hooks at the recorded arrival / dispatch / settle
+// times, with the clock injected.
 //
-//	STAGE0C_WINDOW=/tmp/stage0c/a0.jsonl STAGE0C_OUT=/tmp/stage0c/a0.go.jsonl \
+//	STAGE0C_WINDOW=/tmp/stage0c/a0.jsonl \
+//	STAGE0C_TOKENS=/tmp/biv2/a0.qwen3.tokens.jsonl \
+//	STAGE0C_OUT=/tmp/biv2/v2-a0.jsonl \
 //	  go test ./pkg/epp/framework/plugins/branchidentity/ -run TestStage0CReplay -v -timeout 3h
 //
-// Env:
+// Env: STAGE0C_UNSCOPED=1 (send no session header), STAGE0C_RETRY_RULE=0 (the
+// campaign setting), STAGE0C_SCOPE=thread (scope by thread id instead of root).
 //
-//	STAGE0C_UNSCOPED=1   send no session header (the no-session-header floor, and
-//	                     the S4 "unscoped" variant: what a corpus of look-alike
-//	                     sessions costs when nothing scopes the index)
-//	STAGE0C_RETRY_RULE=0 configure the arm with retryRule=false (the campaign
-//	                     setting: both a0 firings of S2 turned out to be
-//	                     CROSS-thread, i.e. no client retries in the corpus at all)
-//	STAGE0C_SCOPE=thread scope the index by the request's own thread id
-//	                     (x_correlation_id) instead of its session root — the shape
-//	                     the shadow arm has, where the only session header the client
-//	                     sends IS the thread id. Root is the stage-0c default.
-//
-// Nothing here touches the cluster, a GPU, or the network: it is a local replay of
-// recorded bodies.
+// Nothing here touches the cluster, a GPU, or the network.
 
 import (
 	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"sort"
 	"testing"
 	"time"
 
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
+	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/openai"
 
@@ -67,9 +62,13 @@ import (
 )
 
 // stage0cScopeHeader is the header the replay uses as the client session id. It is
-// NOT one of the built-in provider headers, so the plugin is configured to read it
-// explicitly and no real-session semantics are assumed.
+// NOT one of the built-in provider headers, so the plugin reads it explicitly.
 const stage0cScopeHeader = "x-session-scope"
+
+// stage0cMaxTokenDelta is how far the offline render may sit from the recorded
+// in_tokens. The corpus renders with a constant offset (the template's
+// generation-prompt suffix); anything larger means the template is not the engine's.
+const stage0cMaxTokenDelta = 2
 
 // stage0cLine is one prepared request (stage0c_prep.py).
 type stage0cLine struct {
@@ -80,7 +79,6 @@ type stage0cLine struct {
 	GT      string          `json:"gt"`
 	GTRoot  string          `json:"gt_root"`
 	Kind    string          `json:"kind"`
-	Reset   bool            `json:"reset"`
 	StartNs int64           `json:"start_ns"`
 	AckNs   int64           `json:"ack_ns"`
 	EndNs   int64           `json:"end_ns"`
@@ -91,18 +89,86 @@ type stage0cLine struct {
 }
 
 // stage0cResult is one request's outcome, keyed by the window index.
-//
-// Outcome/Retry/Sticky come from the plugin's own counters, diffed around the one
-// RequestHeader call, so a scoring pass can name WHICH requests a rule fired on
-// (the S2 retry total alone says how many, never which).
 type stage0cResult struct {
 	I       int    `json:"i"`
 	Req     string `json:"req"`
 	ID      string `json:"id"`
 	Parse   bool   `json:"parseError"`
 	Outcome string `json:"outcome,omitempty"`
-	Retry   bool   `json:"retry,omitempty"`
-	Sticky  bool   `json:"sticky,omitempty"`
+	Turn    int    `json:"turn"`
+	Tokens  int    `json:"tokens"`
+	Blocks  int    `json:"blocks"`
+}
+
+// tokenCorpus injects the offline render's tokens, reading each request's line on
+// demand so a 900 MB corpus never has to fit in memory.
+type tokenCorpus struct {
+	f       *os.File
+	offsets map[string]tokenOffset
+}
+
+type tokenOffset struct {
+	off int64
+	len int
+}
+
+func openTokenCorpus(t *testing.T, path string) *tokenCorpus {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open token corpus: %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	c := &tokenCorpus{f: f, offsets: make(map[string]tokenOffset)}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 512<<20)
+	var offset int64
+	for sc.Scan() {
+		raw := sc.Bytes()
+		var head struct {
+			I int `json:"i"`
+		}
+		if err := json.Unmarshal(raw, &head); err != nil {
+			t.Fatalf("bad token corpus line at offset %d: %v", offset, err)
+		}
+		c.offsets[fmt.Sprintf("r%d", head.I)] = tokenOffset{off: offset, len: len(raw)}
+		offset += int64(len(raw)) + 1
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan token corpus: %v", err)
+	}
+	return c
+}
+
+// tokenize is the arrival hook's render, served from the corpus.
+func (c *tokenCorpus) tokenize(_ context.Context, request *fwksched.InferenceRequest) error {
+	if request.Body.TokenizedRequest != nil {
+		return nil
+	}
+	at, ok := c.offsets[request.RequestID]
+	if !ok {
+		return fmt.Errorf("no recorded tokens for request %q", request.RequestID)
+	}
+	buf := make([]byte, at.len)
+	if _, err := c.f.ReadAt(buf, at.off); err != nil {
+		return fmt.Errorf("read tokens for %q: %w", request.RequestID, err)
+	}
+	var rec struct {
+		Tokens   []uint32 `json:"tokens"`
+		InTokens int      `json:"in_tokens"`
+	}
+	if err := json.Unmarshal(buf, &rec); err != nil {
+		return fmt.Errorf("decode tokens for %q: %w", request.RequestID, err)
+	}
+	if delta := len(rec.Tokens) - rec.InTokens; delta > stage0cMaxTokenDelta || delta < -stage0cMaxTokenDelta {
+		return fmt.Errorf("render drifted from the engine for %q: %d rendered, %d recorded",
+			request.RequestID, len(rec.Tokens), rec.InTokens)
+	}
+	request.Body.TokenizedRequest = &fwkrh.TokenizedRequest{
+		Prompts: []fwkrh.PromptTokens{{TokenIDs: rec.Tokens}},
+	}
+	return nil
 }
 
 func TestStage0CReplay(t *testing.T) {
@@ -110,9 +176,13 @@ func TestStage0CReplay(t *testing.T) {
 	if window == "" {
 		t.Skip("STAGE0C_WINDOW not set: stage-0c replay is an offline validation harness")
 	}
+	corpusPath := os.Getenv("STAGE0C_TOKENS")
+	if corpusPath == "" {
+		t.Skip("STAGE0C_TOKENS not set: the v2 identity needs the engine's tokens")
+	}
 	out := os.Getenv("STAGE0C_OUT")
 	if out == "" {
-		out = window + ".go.jsonl"
+		out = window + ".v2.jsonl"
 	}
 	unscoped := os.Getenv("STAGE0C_UNSCOPED") == "1"
 
@@ -123,8 +193,7 @@ func TestStage0CReplay(t *testing.T) {
 	}
 	defer f.Close()
 
-	// Pass 1 — metadata + byte offsets only, so the window never has to fit in
-	// memory (a WEKA window is ~850 MB of bodies).
+	// Pass 1 — metadata + byte offsets only (a WEKA window is ~850 MB of bodies).
 	start := time.Now()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 256<<20)
@@ -147,8 +216,7 @@ func TestStage0CReplay(t *testing.T) {
 	t.Logf("[stage0c] window %s: %d requests indexed in %s (unscoped=%v)",
 		window, len(lines), time.Since(start).Round(time.Millisecond), unscoped)
 
-	// Events in wall-clock order: a settle precedes an arrival at the same instant
-	// (the request that ended there must free its tip before the next one looks).
+	// Events in wall-clock order: a settle precedes an arrival at the same instant.
 	const (
 		evSettle = iota
 		evArrive
@@ -176,14 +244,13 @@ func TestStage0CReplay(t *testing.T) {
 		return events[i].idx < events[j].idx
 	})
 
-	// The plugin, configured as the stage-1 arm will be, except that the session
-	// header is the replay's own scope header. STAGE0C_RETRY_RULE=0 reproduces the
-	// CAMPAIGN setting (retryRule off — see the C3 labelling of the two a0 firings).
-	handle := testutils.NewTestHandle(ctx)
+	// The plugin, configured as the stage-1 arm is, except that the session header
+	// is the replay's own scope header and the render is the recorded corpus.
 	retryRule := "true"
 	if os.Getenv("STAGE0C_RETRY_RULE") == "0" {
 		retryRule = "false"
 	}
+	handle := testutils.NewTestHandle(ctx)
 	built, err := Factory("stage0c", json.NewDecoder(bytes.NewReader(
 		[]byte(`{"sessionHeaders":["`+stage0cScopeHeader+`"],"retryRule":`+retryRule+`}`))), handle)
 	if err != nil {
@@ -192,6 +259,7 @@ func TestStage0CReplay(t *testing.T) {
 	p := built.(*Plugin)
 	var clock time.Time
 	p.now = func() time.Time { return clock }
+	p.tokenize = openTokenCorpus(t, corpusPath).tokenize
 
 	parser := openai.NewOpenAIParser()
 	reqs := make([]*fwksched.InferenceRequest, len(lines))
@@ -207,7 +275,6 @@ func TestStage0CReplay(t *testing.T) {
 
 		switch ev.kind {
 		case evArrive:
-			// Read this request's body and parse it the way the EPP does.
 			buf := make([]byte, l.Len)
 			if _, err := f.ReadAt(buf, l.Off); err != nil {
 				t.Fatalf("read body %d: %v", l.I, err)
@@ -235,8 +302,8 @@ func TestStage0CReplay(t *testing.T) {
 				req.Body = parsed.Body
 			}
 			reqs[ev.idx] = req
+
 			matched0, forked0, new0 := counterValue(p.metrics.matched), counterValue(p.metrics.forked), counterValue(p.metrics.fresh)
-			sticky0, retry0 := counterValue(p.metrics.sticky), counterValue(p.metrics.retried)
 			if err := p.RequestHeader(ctx, req); err != nil {
 				t.Fatalf("RequestHeader %d: %v", l.I, err)
 			}
@@ -248,15 +315,18 @@ func TestStage0CReplay(t *testing.T) {
 			case counterValue(p.metrics.fresh) > new0:
 				results[ev.idx].Outcome = "new"
 			default:
-				results[ev.idx].Outcome = "unflattened"
+				results[ev.idx].Outcome = "none"
 			}
-			results[ev.idx].Retry = counterValue(p.metrics.retried) > retry0
-			results[ev.idx].Sticky = counterValue(p.metrics.sticky) > sticky0
 			id, _ := fwksched.ReadRequestAttribute[string](req, BranchIdentityKey)
 			if id == "" {
 				noID++
 			}
 			results[ev.idx].ID = id
+			if arrival, ok := fwksched.ReadRequestAttribute[BranchArrival](req, BranchArrivalKey); ok {
+				results[ev.idx].Turn = arrival.Turn
+			}
+			results[ev.idx].Tokens = tokenizedTokens(req)
+			results[ev.idx].Blocks = tokenizedBlocks(p, req)
 
 		case evDispatch:
 			if req := reqs[ev.idx]; req != nil {
@@ -270,8 +340,7 @@ func TestStage0CReplay(t *testing.T) {
 					EndOfStream:      true,
 					TerminationCause: fwkrc.TerminationCauseNatural,
 				}, nil)
-				// Keep memory flat on a 13k-request window.
-				req.Body = nil
+				req.Body = nil // keep memory flat on a 13k-request window
 				reqs[ev.idx] = nil
 			}
 		}
@@ -279,10 +348,11 @@ func TestStage0CReplay(t *testing.T) {
 
 	t.Logf("[stage0c] %d requests, %d branches, %d parse errors, %d no-id",
 		len(lines), p.idx.Len(), parseErrors, noID)
-	t.Logf("[stage0c] counters: matched=%v forked=%v new=%v sticky=%v retry=%v overridden=%v",
+	t.Logf("[stage0c] counters: matched=%v forked=%v new=%v sticky=%v retry=%v renderFailure=%v multiPrompt=%v overridden=%v",
 		counterValue(p.metrics.matched), counterValue(p.metrics.forked),
 		counterValue(p.metrics.fresh), counterValue(p.metrics.sticky),
-		counterValue(p.metrics.retried), counterValue(p.metrics.overridden))
+		counterValue(p.metrics.retried), counterValue(p.metrics.renderFailure),
+		counterValue(p.metrics.multiPrompt), counterValue(p.metrics.overridden))
 
 	w, err := os.Create(out)
 	if err != nil {
@@ -300,6 +370,26 @@ func TestStage0CReplay(t *testing.T) {
 		t.Fatalf("flush: %v", err)
 	}
 	t.Logf("[stage0c] wrote %s", out)
+}
+
+// tokenizedTokens is the request's total token count as the identity sees it.
+func tokenizedTokens(request *fwksched.InferenceRequest) int {
+	total := 0
+	if request.Body == nil || request.Body.TokenizedRequest == nil {
+		return 0
+	}
+	for _, p := range request.Body.TokenizedRequest.Prompts {
+		total += len(p.TokenIDs)
+	}
+	return total
+}
+
+// tokenizedBlocks is the request's full-block count.
+func tokenizedBlocks(p *Plugin, request *fwksched.InferenceRequest) int {
+	if request.Body == nil {
+		return 0
+	}
+	return identityChain(context.Background(), request, p.blockSize).fullBlocks
 }
 
 // counterValue reads one counter (nil-safe: a plugin built without a handle has

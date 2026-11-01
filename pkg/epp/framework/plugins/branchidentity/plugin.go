@@ -29,6 +29,7 @@ import (
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/prefixhash"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 )
@@ -38,57 +39,62 @@ const PluginType = "branch-identity"
 
 // BranchIdentityKey is the request-attribute key carrying the DERIVED branch id.
 // The director uses it as the fairness id (the flow-control queue key) when the
-// request carried no explicit fairness header. Like agent-identity, the key
-// carries no producer name: any plugin able to derive a branch is an acceptable
-// source.
+// request carried no explicit fairness header.
 var BranchIdentityKey = fwkplugin.NewDataKey("branch-identity", "")
 
-// BranchSessionKey is the request-attribute key carrying the client's session
-// id, when it sent one. It is deliberately SEPARATE from the branch id: the
-// session is an attribute for the session fairness layer, the branch is the
-// queue key (design: "the client session header is kept as a SEPARATE attribute
-// for stage 2 — neither overwrites the other").
+// BranchSessionKey is the request-attribute key carrying the client's session id,
+// when it sent one. It is deliberately SEPARATE from the branch id: the session is
+// an attribute for the session fairness layer, the branch is the queue key.
 var BranchSessionKey = fwkplugin.NewDataKey("branch-session", "")
 
-// branchMarkerKey is the request-attribute key carrying the request's internal
-// marker id — the handle all three hooks use to move this request between its
-// branch's pending and in-flight sets. It equals the request id when the client
-// supplied one and a per-request synthetic id otherwise, so a body-less request
-// id cannot collapse two arrivals into one marker.
+// BranchArrivalKey is the request-attribute key carrying the ARRIVAL RECORD: which
+// of the three outcomes this request was (continued / forked / new) and its turn
+// number on its branch. It is a pure OUTPUT — the scheduler reads it to tell a
+// branch's first turn from a continuation (a newcomer from an incumbent); nothing
+// here reads it back, so publishing it cannot change the derivation.
+var BranchArrivalKey = fwkplugin.NewDataKey("branch-arrival", "")
+
+// BranchArrival is the published arrival record.
+type BranchArrival struct {
+	// Outcome is the arrival outcome: OutcomeMatched (continued its branch),
+	// OutcomeForked (started a sibling of a busy tip) or OutcomeNew.
+	Outcome Outcome `json:"outcome"`
+	// Turn is the arrival's 1-based turn number on its branch: 1 for a branch's
+	// first request, n for the n-th continuation.
+	Turn int `json:"turn"`
+}
+
+// branchMarkerKey is the request-attribute key carrying the request's marker —
+// the handle all three hooks use to move this request between its branch's
+// pending and in-flight sets. It equals the request id when the client supplied
+// one and a per-request synthetic id otherwise.
 var branchMarkerKey = fwkplugin.NewDataKey("branch-marker", "")
 
 const (
-	// defaultBlockSizeTokens is the identity chunk length in pseudo-tokens
-	// (4 canonical bytes each, so 256-byte chunks — the survey's convention).
-	// Independent of the engine's KV block size: identity only needs a stable
-	// chunking of the identity stream.
+	// defaultBlockSizeTokens is the identity block length — the prefix scorer's
+	// B, one shared knob, not an identity-specific size.
 	defaultBlockSizeTokens = 64
-	// defaultMarkerTTLSeconds bounds how long an arrival/in-flight marker keeps
-	// its branch outstanding when the request never reports an end of stream.
-	// That happens only to requests REJECTED before dispatch (admission
-	// TTL/capacity): the response hook is forced on the abort path for every
-	// request that picked a pod, but a rejected request never gets one.
-	//
-	// The horizon is the CLIENT's request timeout (the harness runs 3600s), NOT
-	// the flow-control queue's 5-minute idle GC: those are different clocks, and
-	// on A0 16% of requests waited more than 600s for admission, so a 600s marker
-	// TTL would expire markers of requests that are still legitimately queued and
-	// hand their branch to a concurrent sibling as if it were free. Pruning an
-	// arrival errs toward CONTINUATION, the safe direction, which is why the TTL
-	// is generous rather than tight.
+	// defaultMarkerTTLSeconds bounds how long an outstanding marker keeps its
+	// branch busy when the request never reports an end of stream (a request
+	// rejected in admission control never gets one). It is the CLIENT's request
+	// timeout, not the flow queue's 5-minute idle GC: 16% of a0's requests waited
+	// over 600s for admission, so a 600s horizon would expire markers of requests
+	// that are still legitimately queued. Pruning errs toward continuation.
 	defaultMarkerTTLSeconds = 3600
 	// defaultSweepSeconds is the cap-enforcement tick.
 	defaultSweepSeconds = 60
-	// defaultMaxBranches is the table cap (the ONLY eviction path; there is no
-	// time-based GC — see EnforceCap). Generous: a record is ~200 bytes, and
-	// stage 0 measured ~9.6k threads per 90-minute window.
+	// defaultMaxBranches is the table cap (the only eviction path).
 	defaultMaxBranches = 100000
+	// defaultRenderTimeoutSeconds bounds the ARRIVAL-time render. Identity carries
+	// its own bound rather than inheriting the producer's: the producer's timeout
+	// protects a dispatch phase that may fall back to a default, while a request
+	// must not enter the fairness path without an identity for longer than this.
+	defaultRenderTimeoutSeconds = 10
 )
 
 // defaultSessionHeaders are the client session headers read for scoping, in
-// priority order: the same provider headers the agent-identity plugin resolves,
-// so the session ATTRIBUTE stage 2 needs is the session the rest of the system
-// already sees.
+// priority order: the provider headers the agent-identity plugin resolves, so the
+// session attribute is the session the rest of the system already sees.
 var defaultSessionHeaders = []string{
 	agentidentity.ClaudeCodeSessionHeader,
 	agentidentity.OpenCodeSessionHeader,
@@ -98,15 +104,22 @@ var defaultSessionHeaders = []string{
 
 // Parameters is the plugin's configuration block.
 type Parameters struct {
-	// BlockSizeTokens is the identity chunk length in pseudo-tokens (4 bytes
-	// each). Zero selects the default (64 → 256-byte chunks).
+	// BlockSizeTokens is the identity block length in tokens — the prefix
+	// scorer's block size. Zero selects the default (64).
 	BlockSizeTokens int `json:"blockSizeTokens,omitempty"`
+	// TokenProducer configures the render backend that supplies the request's
+	// real tokens, in the token-producer plugin's own parameter language. The
+	// identity is a token-space key, so an arm wants the render backend here; the
+	// estimate backend is accepted (tests, and the byte-space fallback) and is
+	// announced on startup.
+	TokenProducer json.RawMessage `json:"tokenProducer,omitempty"`
+	// RenderTimeoutSeconds bounds the arrival-time render. Zero selects the
+	// default (10s).
+	RenderTimeoutSeconds float64 `json:"renderTimeoutSeconds,omitempty"`
 	// MarkerTTLSeconds bounds how long an outstanding marker (arrival or in
 	// flight) that never settles keeps its branch busy. It must be at least the
-	// client's request timeout — a marker that expires while its request is still
-	// queued makes a live branch look free. There is no idle/branch TTL: branches
-	// are retained (stage 0 measured a p99.9 inter-turn gap of 3,036s, so any
-	// silence timeout would mint false new branches when dormant threads return).
+	// client's request timeout. There is no branch TTL: branches are retained (no
+	// idle GC — a dormant client that returns must find its branch).
 	MarkerTTLSeconds float64 `json:"markerTtlSeconds,omitempty"`
 	// QueuedTTLSeconds is the deprecated name of MarkerTTLSeconds, accepted so an
 	// older arm's config still parses.
@@ -114,64 +127,43 @@ type Parameters struct {
 	// SweepSeconds is the cap-enforcement tick.
 	SweepSeconds float64 `json:"sweepSeconds,omitempty"`
 	// MaxBranches caps the branch table: the only eviction path, idlest
-	// non-outstanding branches first. Zero selects the default.
+	// non-outstanding branches first.
 	MaxBranches int `json:"maxBranches,omitempty"`
 	// SessionHeaders are client session headers prepended to the built-in list.
 	SessionHeaders []string `json:"sessionHeaders,omitempty"`
-	// Salt is folded into the block-hash chain. Empty (the default) keeps ids
-	// reproducible across instances.
-	Salt string `json:"salt,omitempty"`
-	// ForkOnBusy is the continuation rule's busy half: extend a busy tip → fork
-	// a new branch. Default true (the design's rule). False makes every match a
-	// continuation — the v2c failure mode, kept only as a measurement arm.
+	// ForkOnBusy is the continuation rule's busy half: extend a busy tip → fork a
+	// new branch. Default true (the design's rule). False makes every match a
+	// continuation — a measurement arm only.
 	ForkOnBusy *bool `json:"forkOnBusy,omitempty"`
-	// StickyBusyGuard is the H1 guard: a request that extends a tip AND begins
-	// with the tip's assistant reply is a proven continuation even when the
-	// branch looks busy. Default true.
+	// StickyBusyGuard is H1: a request that extends a tip AND begins with the
+	// tip's assistant reply is a proven continuation even when the branch looks
+	// busy. Default true.
 	StickyBusyGuard *bool `json:"stickyBusyGuard,omitempty"`
-	// RetryRule is S2: a request byte-identical to a tip whose branch has nothing
-	// IN FLIGHT (only arrival markers) is a client retry, not a sibling, and
-	// continues the branch. Default true.
+	// RetryRule is S2: a request identical to a tip whose branch has nothing in
+	// flight (only arrival markers) is a client retry, not a sibling. Default true.
 	RetryRule *bool `json:"retryRule,omitempty"`
 	// LogRequests emits one JSON line per request on stdout:
 	//
 	//	branch-identity: request {"seq":…,"scope":…,"derived":…,"outcome":…}
 	//
-	// Default FALSE — it is an INSTRUMENT, not a feature, and it exists because in
-	// shadow mode the derived id reaches no span: the span's fairness id is the
-	// client's explicit header (that is what keeps the arm an anchor), and the
-	// EPP's request id does not join to a harness's records. A run that needs the
-	// per-request derived-vs-thread confusion matrix turns this on and joins these
-	// lines to its records by (scope, arrival order). It changes no state and no
-	// decision; with it off the plugin is byte-for-byte the same code path.
+	// Default FALSE — it is an INSTRUMENT for scoring a shadow arm whose derived
+	// id reaches no span. It changes no state and no decision.
 	LogRequests bool `json:"logRequests,omitempty"`
-	// LogHeaders adds the client's own identity headers to that line:
-	//
-	//	"headers":{"x-correlation-id":"…","x-request-id":"…"}
-	//
-	// It exists for the UNSCOPED stage-1 arm, where no session header is sent and
-	// `scope` is therefore empty: the census (StateDumper) cannot attribute a
-	// branch to a client thread there, but the harness's thread id still travels
-	// on a NON-fairness header, so copying it makes the per-request
-	// derived-vs-thread confusion matrix exact. A FIXED whitelist of two headers,
-	// read-only: it is gated on LogRequests and touches neither the identity nor
-	// any decision (`TestLogHeadersKeepResolveOutcomeIdentical` pins that).
+	// LogHeaders adds the client's own identity headers to that line, for an
+	// UNSCOPED arm where no session header is sent and the census cannot
+	// attribute a branch to a client thread.
 	LogHeaders bool `json:"logHeaders,omitempty"`
-	// LogHeaderNames extends the logHeaders whitelist with further client headers
-	// to copy onto the same line (e.g. a harness's own thread/turn markers). It is
-	// APPENDED to the built-in list, gated on LogRequests AND LogHeaders, and is a
-	// pure observer: no header here is ever read by the identity, the scope or any
-	// matching decision (the whitelist is consulted only by loggedHeaders).
+	// LogHeaderNames extends the logHeaders whitelist. A pure observer: no header
+	// here is read by the identity, the scope or any decision.
 	LogHeaderNames []string `json:"logHeaderNames,omitempty"`
 }
 
-// loggedHeaderNames is the built-in logHeaders whitelist: the client's correlation
-// id (the thread ground truth a harness reports in its records) and its request id.
+// loggedHeaderNames is the built-in logHeaders whitelist: the client's
+// correlation id (a harness's thread ground truth) and its request id.
 var loggedHeaderNames = []string{"x-correlation-id", "x-request-id"}
 
-// loggedHeaderList is the effective whitelist: the built-in pair plus any
-// configured extras, lowercased and de-duplicated (the handler stores header
-// keys lowercased; the scan below stays case-insensitive anyway).
+// loggedHeaderList returns the effective whitelist: built-ins plus extras,
+// lowercased and de-duplicated (request headers are stored lowercased).
 func loggedHeaderList(extra []string) []string {
 	out := append([]string(nil), loggedHeaderNames...)
 	seen := make(map[string]struct{}, len(out)+len(extra))
@@ -204,6 +196,12 @@ func (p *Parameters) validate() error {
 	if p.BlockSizeTokens < 0 {
 		return fmt.Errorf("blockSizeTokens must be > 0, got %d", p.BlockSizeTokens)
 	}
+	if p.RenderTimeoutSeconds == 0 {
+		p.RenderTimeoutSeconds = defaultRenderTimeoutSeconds
+	}
+	if p.RenderTimeoutSeconds < 0 {
+		return fmt.Errorf("renderTimeoutSeconds must be > 0, got %v", p.RenderTimeoutSeconds)
+	}
 	if p.MarkerTTLSeconds == 0 {
 		p.MarkerTTLSeconds = p.QueuedTTLSeconds
 	}
@@ -234,18 +232,24 @@ var (
 	_ fwkrc.ResponseBodyProcessor  = &Plugin{}
 	_ fwkplugin.ProducerPlugin     = &Plugin{}
 	_ fwkplugin.StateDumper        = &Plugin{}
+	_ fwkdl.Registrant             = &Plugin{}
 )
 
-// Plugin derives branch identity from the request body and owns the branch
-// table. One instance serves every hook (the groupsched pattern): the
-// busy/chain state is a single mutex-guarded struct rather than a cross-plugin
-// channel, and the framework registers a multi-interface plugin at every
-// interface it satisfies.
+// Plugin derives branch identity from the request body and owns the branch table.
+// One instance serves every hook: the busy/tip state is a single mutex-guarded
+// struct rather than a cross-plugin channel.
 type Plugin struct {
 	typedName fwkplugin.TypedName
 
 	idx     *branchIndex
 	metrics *branchMetrics
+	// producer renders the request's real tokens (the token producer, as a
+	// library); tokenize is the call site, so a test can substitute a
+	// deterministic renderer.
+	producer      *tokenizer.Producer
+	tokenize      func(ctx context.Context, request *fwksched.InferenceRequest) error
+	blockSize     int
+	renderTimeout time.Duration
 
 	markerTTL      time.Duration
 	sweep          time.Duration
@@ -256,15 +260,12 @@ type Plugin struct {
 	logHeaders     bool
 	logHeadersList []string
 	sessions       []string
-	// now is the clock seam: the replay validation (stage 0c) drives recorded
-	// arrival/dispatch/settle times through the real hooks, so every time
-	// observation the table makes must come from here rather than time.Now.
+	// now is the clock seam: the stage-0c replay drives recorded arrival /
+	// dispatch / settle times through the real hooks.
 	now func() time.Time
 
 	anonSeq atomic.Uint64
-	// logSeq orders the LogRequests instrument's lines (arrival order, so a scoring
-	// pass can align a scope's lines with its records' turns without a request-id
-	// join).
+	// logSeq orders the LogRequests instrument's lines in arrival order.
 	logSeq atomic.Uint64
 }
 
@@ -280,8 +281,22 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		return nil, fmt.Errorf("invalid parameters of the '%s' plugin: %w", PluginType, err)
 	}
 
+	ctx := context.Background()
+	if handle != nil {
+		ctx = handle.Context()
+	}
+	typedName := fwkplugin.TypedName{Type: PluginType, Name: name}
+	producer, err := tokenizer.NewProducer(ctx, typedName, params.TokenProducer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build the token producer of the '%s' plugin: %w", PluginType, err)
+	}
+
 	p := &Plugin{
-		typedName:      fwkplugin.TypedName{Type: PluginType, Name: name},
+		typedName:      typedName,
+		producer:       producer,
+		tokenize:       producer.Tokenize,
+		blockSize:      params.BlockSizeTokens,
+		renderTimeout:  time.Duration(params.RenderTimeoutSeconds * float64(time.Second)),
 		markerTTL:      time.Duration(params.MarkerTTLSeconds * float64(time.Second)),
 		sweep:          time.Duration(params.SweepSeconds * float64(time.Second)),
 		forkOnBusy:     params.ForkOnBusy == nil || *params.ForkOnBusy,
@@ -293,13 +308,17 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		sessions:       sessionHeaders(params.SessionHeaders),
 		now:            time.Now,
 	}
-	p.idx = newBranchIndex(params.BlockSizeTokens, params.Salt, p.markerTTL, params.MaxBranches)
+	p.idx = newBranchIndex(params.BlockSizeTokens, p.markerTTL, params.MaxBranches)
 	p.metrics = newBranchMetrics()
 
-	// The effective config is echoed at startup so a run's arm is verifiable
-	// from its artifacts (the groupsched convention).
+	// The effective config is echoed at startup so a run's arm is verifiable from
+	// its artifacts.
 	if echo, err := json.Marshal(params); err == nil {
 		fmt.Printf("%s: effective config %s\n", PluginType, echo)
+	}
+	if producer.BackendName() != tokenizer.BackendVLLM {
+		fmt.Printf("%s: WARNING token producer backend is %q — identity is a token-space key, so an arm must render (modelName/vllm)\n",
+			PluginType, producer.BackendName())
 	}
 
 	if handle != nil {
@@ -323,54 +342,54 @@ func (p *Plugin) Produces() map[fwkplugin.DataKey]any {
 	return map[fwkplugin.DataKey]any{
 		BranchIdentityKey: "",
 		BranchSessionKey:  "",
+		BranchArrivalKey:  BranchArrival{},
 		branchMarkerKey:   "",
 	}
+}
+
+// RegisterDependencies forwards the render backend's endpoint discovery, so a
+// discovery-backed renderer sees the endpoint lifecycle like the token-producer
+// plugin's does.
+func (p *Plugin) RegisterDependencies(r fwkdl.Registrar) error {
+	return p.producer.RegisterDependencies(r)
 }
 
 // RequestHeader derives the branch id before admission control and makes it the
 // request's fairness id — the flow-control queue key must exist before the
 // request enqueues, and this hook runs after body parsing but before Admit.
 //
-// It also publishes the branch (and the session, when the client sent one) as
-// request attributes: the director's fairness-id fallback and the stage-2 session
-// policy read them, and keeping the session under its own key is what lets the
-// policy tell a sibling from a newcomer without making the session a queue key.
+// It renders the request's tokens HERE, on arrival, so the dispatch-time token
+// producer finds them already present and skips: one render per request, shared
+// by identity and every prefix scorer.
 //
-// It never fails the request: a body shape the flattener does not cover simply
-// leaves the attribute unset, and the fairness id falls back to the explicit
-// header, the agent identity, or the default id.
-func (p *Plugin) RequestHeader(_ context.Context, request *fwksched.InferenceRequest) error {
+// It also publishes the branch, the session (when the client sent one) and the
+// arrival record. It never fails the request: a request the render cannot
+// describe gets its own branch (counted) and the request proceeds.
+func (p *Plugin) RequestHeader(ctx context.Context, request *fwksched.InferenceRequest) error {
 	if request == nil || request.Body == nil {
 		return nil
 	}
 	// An explicit x-llm-d-inference-fairness-id header wins (operators keep a
 	// manual override). It is counted, because a harness that sets it turns the
-	// whole derivation into a no-op without any other visible signal — the
-	// stage-1 harness fix (no --session-header=x-llm-d-inference-fairness-id) is
-	// deployment config, and this counter is how a run proves it was applied.
+	// whole derivation into a no-op with no other visible signal.
 	explicit := request.FairnessID != ""
 
-	start := p.now()
-	identity, err := tokenizer.FlattenIdentityBytes(request.Body)
-	if err != nil {
-		p.metrics.observeUnflattened()
-		return nil
-	}
-	chain := p.idx.Chain(identity)
+	c, ok := p.chainFor(ctx, request)
 	roles := messageRoles(request.Body)
 	scope := p.sessionID(request)
 	marker := p.markerID(request)
-	flattened := p.now()
 
-	res := p.idx.Resolve(p.now(), Arrival{
-		Stream: identity, Chain: chain, Scope: scope, Roles: roles, Marker: marker,
-	}, p.forkOnBusy, p.sticky, p.retry)
-
-	p.metrics.observeFlatten(flattened.Sub(start))
-	p.metrics.observeResolveLatency(res.Elapsed)
+	res := p.idx.Resolve(p.now(), Arrival{Chain: c, Scope: scope, Roles: roles, Marker: marker},
+		p.forkOnBusy, p.sticky, p.retry)
 	p.metrics.observeResolve(res)
+	if !ok {
+		// A render failure leaves the request without an identity: it gets its own
+		// branch (never a continuation) and the counter names the failure.
+		p.metrics.observeRenderFailure()
+	}
 
 	request.PutAttribute(BranchIdentityKey, res.ID)
+	request.PutAttribute(BranchArrivalKey, BranchArrival{Outcome: res.Outcome, Turn: res.Turn})
 	request.PutAttribute(branchMarkerKey, marker)
 	if explicit {
 		p.metrics.observeExplicitOverride()
@@ -381,16 +400,71 @@ func (p *Plugin) RequestHeader(_ context.Context, request *fwksched.InferenceReq
 	if scope != "" {
 		request.PutAttribute(BranchSessionKey, scope)
 	}
-	p.logRequest(request, res, scope, explicit, len(chain), len(identity))
+	p.logRequest(request, res, scope, explicit, c)
 	return nil
 }
 
+// chainFor renders the request's tokens and hashes them into its identity chain.
+// ok is false when the request has no identity: a render error or timeout, or a
+// body that renders to no tokens.
+func (p *Plugin) chainFor(ctx context.Context, request *fwksched.InferenceRequest) (chain, bool) {
+	renderCtx, cancel := context.WithTimeout(ctx, p.renderTimeout)
+	defer cancel()
+
+	start := p.now()
+	err := p.tokenize(renderCtx, request)
+	p.metrics.observeRender(p.now().Sub(start))
+	if err != nil {
+		return chain{}, false
+	}
+
+	start = p.now()
+	c := identityChain(renderCtx, request, p.blockSize)
+	p.metrics.observeChain(p.now().Sub(start))
+	if len(c.blocks) == 0 {
+		return chain{}, false
+	}
+	if prompts := tokenizedPrompts(request); prompts > 1 {
+		p.metrics.addMultiPrompt(prompts)
+	}
+	return c, true
+}
+
+// identityChain hashes a tokenized request into its identity chain, in the prefix
+// scorer's own block-hash space (model + cache salt seeded, chained). ALL prompts
+// count: their chains are concatenated in order.
+func identityChain(ctx context.Context, request *fwksched.InferenceRequest, blockSize int) chain {
+	hashes, promptTokens := prefixhash.GetBlockHashesWithPromptTokens(ctx, request, blockSize, maxChainBlocks)
+	if len(hashes) == 0 {
+		return chain{}
+	}
+	c := chain{blocks: make([]prefixhash.BlockHash, 0, len(hashes))}
+	for _, prompt := range hashes {
+		c.blocks = append(c.blocks, prompt...)
+	}
+	for _, n := range promptTokens {
+		c.tokens += n
+	}
+	c.fullBlocks = len(c.blocks)
+	if last := promptTokens[len(promptTokens)-1]; last%blockSize != 0 {
+		// The last prompt ends mid-block: that block is the tip's partial block.
+		c.fullBlocks--
+	}
+	return c
+}
+
+// tokenizedPrompts is the number of prompts the render produced.
+func tokenizedPrompts(request *fwksched.InferenceRequest) int {
+	if request == nil || request.Body == nil || request.Body.TokenizedRequest == nil {
+		return 0
+	}
+	return len(request.Body.TokenizedRequest.Prompts)
+}
+
 // logRequest emits the per-request instrument line when Parameters.LogRequests is
-// on (off by default). One write per line, in arrival order, carrying exactly what
-// a scoring pass needs and nothing that requires a join into a harness's private
-// id space: the client SCOPE (the session header, which for a shadow arm is the
-// thread id), the DERIVED branch, the outcome, and the identity size.
-func (p *Plugin) logRequest(request *fwksched.InferenceRequest, res ResolveResult, scope string, explicit bool, blocks, bytes int) {
+// on (off by default): one write per line, in arrival order, carrying the client
+// scope, the derived branch, the outcome and the identity size.
+func (p *Plugin) logRequest(request *fwksched.InferenceRequest, res ResolveResult, scope string, explicit bool, c chain) {
 	if !p.logRequests {
 		return
 	}
@@ -400,17 +474,18 @@ func (p *Plugin) logRequest(request *fwksched.InferenceRequest, res ResolveResul
 		Scope    string            `json:"scope"`
 		Derived  string            `json:"derived"`
 		Outcome  string            `json:"outcome"`
+		Turn     int               `json:"turn"`
 		Retry    bool              `json:"retry,omitempty"`
 		Sticky   bool              `json:"sticky,omitempty"`
 		Explicit bool              `json:"explicit"`
 		Blocks   int               `json:"blocks"`
-		Bytes    int               `json:"bytes"`
+		Tokens   int               `json:"tokens"`
 		Marker   string            `json:"marker"`
 		Headers  map[string]string `json:"headers,omitempty"`
 	}{
 		Seq: p.logSeq.Add(1), TS: p.now().UTC().Format(time.RFC3339Nano), Scope: scope,
-		Derived: res.ID, Outcome: string(res.Outcome), Retry: res.Retry, Sticky: res.StickyBusy,
-		Explicit: explicit, Blocks: blocks, Bytes: bytes, Marker: markerOf(request),
+		Derived: res.ID, Outcome: string(res.Outcome), Turn: res.Turn, Retry: res.Retry, Sticky: res.StickyBusy,
+		Explicit: explicit, Blocks: c.fullBlocks, Tokens: c.tokens, Marker: markerOf(request),
 		Headers: p.loggedHeaders(request),
 	})
 	if err != nil {
@@ -451,13 +526,10 @@ func (p *Plugin) loggedHeaders(request *fwksched.InferenceRequest) map[string]st
 	return out
 }
 
-// PreRequest records the DISPATCH transition (admitted → on its way to an
-// engine), moving this request's marker from its branch's pending set to its
-// in-flight set. The branch is already busy from ARRIVAL — RequestHeader marks
-// it — so nothing about identity depends on this hook; it exists so the
-// outstanding set names WHICH requests are running. Marking busy only here would
-// leave the queueing interval unprotected, and under load that is most of the
-// busy period.
+// PreRequest records the DISPATCH transition, moving this request's marker from
+// its branch's pending set to its in-flight set. The branch is already busy from
+// ARRIVAL, so nothing about identity depends on this hook; it names WHICH requests
+// are running.
 func (p *Plugin) PreRequest(_ context.Context, request *fwksched.InferenceRequest, _ *fwksched.SchedulingResult) error {
 	if request == nil {
 		return nil
@@ -468,10 +540,9 @@ func (p *Plugin) PreRequest(_ context.Context, request *fwksched.InferenceReques
 	return nil
 }
 
-// ResponseBody settles the branch on the end of the response lifecycle, removing
-// this request's marker from its branch's in-flight set. The director forces this
-// call on abort/disconnect for every dispatched request, so the busy flag cannot
-// wedge.
+// ResponseBody settles the branch at the end of the response lifecycle. The
+// director forces this call on abort/disconnect for every dispatched request, so
+// the busy flag cannot wedge.
 func (p *Plugin) ResponseBody(_ context.Context, request *fwksched.InferenceRequest, response *fwkrc.Response, _ *fwkdl.EndpointMetadata) {
 	if request == nil || response == nil || !response.EndOfStream {
 		return
@@ -483,8 +554,7 @@ func (p *Plugin) ResponseBody(_ context.Context, request *fwksched.InferenceRequ
 
 // DumpState reports the branch table.
 func (p *Plugin) DumpState() (json.RawMessage, error) {
-	now := time.Now()
-	snap := p.idx.Snapshot(now)
+	snap := p.idx.Snapshot(time.Now())
 	p.metrics.setRecords(snap.Branches)
 	return json.Marshal(snap)
 }
@@ -515,9 +585,9 @@ func (p *Plugin) runSweeper(ctx context.Context) {
 	}
 }
 
-// sweepOnce enforces the table cap and refreshes the branch_records gauge. There
-// is no idle GC (see branchIndex.EnforceCap): a dormant thread that returns must
-// find its branch, or it is minted a fresh id and re-enters as a newcomer.
+// sweepOnce enforces the table cap and refreshes the records gauge. There is no
+// idle GC (see branchIndex.EnforceCap): a dormant client that returns must find
+// its branch, or it is minted a fresh id and re-enters as a newcomer.
 func (p *Plugin) sweepOnce(now time.Time) {
 	if removed := p.idx.EnforceCap(now); removed > 0 {
 		p.metrics.addEvicted(removed)
@@ -526,9 +596,8 @@ func (p *Plugin) sweepOnce(now time.Time) {
 }
 
 // markerID returns the request's marker handle for the branch's outstanding set:
-// its request id when the client/framework supplied one, a per-request synthetic
-// id otherwise. The value is published as a request attribute so every hook of
-// the same request agrees on it.
+// its request id when the client or framework supplied one, a per-request
+// synthetic id otherwise.
 func (p *Plugin) markerID(request *fwksched.InferenceRequest) string {
 	if id := strings.TrimSpace(request.RequestID); id != "" {
 		return id
@@ -537,8 +606,8 @@ func (p *Plugin) markerID(request *fwksched.InferenceRequest) string {
 }
 
 // markerOf reads the marker an earlier hook published, falling back to the
-// request id (and, if even that is absent, to a constant so the operations stay
-// no-ops rather than corrupting another request's marker).
+// request id so the operations stay no-ops rather than corrupting another
+// request's marker.
 func markerOf(request *fwksched.InferenceRequest) string {
 	if marker, ok := fwksched.ReadRequestAttribute[string](request, branchMarkerKey); ok && marker != "" {
 		return marker
@@ -546,8 +615,8 @@ func markerOf(request *fwksched.InferenceRequest) string {
 	return request.RequestID
 }
 
-// sessionHeaders returns the operator's extras followed by the defaults, lower-
-// cased (request headers are stored lowercased).
+// sessionHeaders returns the operator's extras followed by the defaults,
+// lower-cased (request headers are stored lowercased).
 func sessionHeaders(extras []string) []string {
 	out := make([]string, 0, len(extras)+len(defaultSessionHeaders))
 	for _, h := range extras {
@@ -557,8 +626,8 @@ func sessionHeaders(extras []string) []string {
 }
 
 // messageRoles returns the request's message roles in wire order. Body shapes
-// without a message array return nil: the sticky-busy guard needs message
-// structure and simply cannot fire for them.
+// without a message array return nil: H1 needs message structure and cannot fire
+// for them.
 func messageRoles(body *fwkrh.InferenceRequestBody) []string {
 	if body == nil {
 		return nil

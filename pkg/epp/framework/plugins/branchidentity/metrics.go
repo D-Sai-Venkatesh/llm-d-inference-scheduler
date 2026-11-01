@@ -24,54 +24,60 @@ import (
 
 const metricsSubsystem = "llm_d_epp_branch"
 
-// branchMetrics is the legibility set for the derivation: how often a request
-// continued a branch, forked one, or found nothing, how big the table is, how
-// much the flattening and the resolve cost on the (untimed, pre-admission)
-// request path, and how often the derivation was bypassed.
+// branchMetrics is the legibility set for the derivation: the arrival-outcome
+// mix, the table size, the three costs on the arrival path (render, chain,
+// resolve), and the bypass/failure counters.
 type branchMetrics struct {
-	matched    prometheus.Counter
-	forked     prometheus.Counter
-	fresh      prometheus.Counter
-	sticky     prometheus.Counter
-	retried    prometheus.Counter
-	evicted    prometheus.Counter
-	unflatten  prometheus.Counter
-	overridden prometheus.Counter
-	records    prometheus.Gauge
-	flattenNs  prometheus.Histogram
-	resolveNs  prometheus.Histogram
+	matched       prometheus.Counter
+	forked        prometheus.Counter
+	fresh         prometheus.Counter
+	sticky        prometheus.Counter
+	retried       prometheus.Counter
+	evicted       prometheus.Counter
+	renderFailure prometheus.Counter
+	multiPrompt   prometheus.Counter
+	overridden    prometheus.Counter
+	records       prometheus.Gauge
+	renderNs      prometheus.Histogram
+	chainNs       prometheus.Histogram
+	resolveNs     prometheus.Histogram
 }
 
 func newBranchMetrics() *branchMetrics { return &branchMetrics{} }
 
 func (m *branchMetrics) register(reg prometheus.Registerer) error {
 	m.matched = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "matched_total",
-		Help: "requests that continued an existing branch (same fairness id as the branch's previous turn)"})
+		Help: "requests that continued their branch (the arrival outcome 'continue'; same queue key as the branch's previous turn)"})
 	m.forked = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "forks_total",
-		Help: "requests that extended a BUSY branch tip and therefore forked a new branch"})
+		Help: "requests that extended a BUSY tip and therefore forked a new branch (a parallel sibling)"})
 	m.fresh = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "new_total",
-		Help: "requests that matched no branch tip and started an unrelated branch"})
+		Help: "requests that matched no tip and started a new branch"})
 	m.sticky = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "sticky_busy_total",
-		Help: "requests whose continuation was proven by content (H1 reply guard) despite a busy branch"})
+		Help: "requests whose continuation was proven by content (the H1 reply guard) despite a busy branch"})
 	m.retried = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "retry_total",
-		Help: "requests byte-identical to a tip with nothing in flight, treated as a client retry of a still-queued turn (S2)"})
+		Help: "requests identical to a tip with nothing in flight, treated as a client retry of a still-queued turn (S2)"})
 	m.evicted = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "evicted_total",
 		Help: "branches removed by the table cap (the only eviction path; there is no idle GC)"})
-	m.unflatten = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "unflattened_total",
-		Help: "requests whose body has no canonical stream; the fairness id falls back to the header/agent identity"})
+	m.renderFailure = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "render_failure_total",
+		Help: "requests with no identity because the arrival-time render failed or timed out; each starts its own branch"})
+	m.multiPrompt = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "multi_prompt_requests_total",
+		Help: "requests whose render produced more than one prompt; their per-prompt chains are concatenated"})
 	m.overridden = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: metricsSubsystem, Name: "explicit_override_total",
 		Help: "requests that carried an explicit fairness id, so the derived branch did not become the queue key (a run whose whole point is the derivation must keep this at 0)"})
 	m.records = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: metricsSubsystem, Name: "records",
 		Help: "live branches in the table"})
-	m.flattenNs = prometheus.NewHistogram(prometheus.HistogramOpts{Subsystem: metricsSubsystem, Name: "flatten_ns",
-		Help:    "identity flattening + block chaining time per request (the pre-admission cost of derivation)",
-		Buckets: prometheus.ExponentialBuckets(2000, 4, 8)})
+	m.renderNs = prometheus.NewHistogram(prometheus.HistogramOpts{Subsystem: metricsSubsystem, Name: "render_ns",
+		Help:    "arrival-time render latency per request (the token producer, relocated from dispatch)",
+		Buckets: prometheus.ExponentialBuckets(50_000, 4, 10)})
+	m.chainNs = prometheus.NewHistogram(prometheus.HistogramOpts{Subsystem: metricsSubsystem, Name: "chain_ns",
+		Help:    "block-chain hashing time per request (the prefix scorer's chained hashes)",
+		Buckets: prometheus.ExponentialBuckets(1_000, 4, 8)})
 	m.resolveNs = prometheus.NewHistogram(prometheus.HistogramOpts{Subsystem: metricsSubsystem, Name: "resolve_ns",
 		Help:    "branch table resolve time per request (under the table lock: match + mint)",
 		Buckets: prometheus.ExponentialBuckets(500, 4, 8)})
 	for _, c := range []prometheus.Collector{
-		m.matched, m.forked, m.fresh, m.sticky, m.retried, m.evicted, m.unflatten,
-		m.overridden, m.records, m.flattenNs, m.resolveNs,
+		m.matched, m.forked, m.fresh, m.sticky, m.retried, m.evicted, m.renderFailure,
+		m.multiPrompt, m.overridden, m.records, m.renderNs, m.chainNs, m.resolveNs,
 	} {
 		if err := reg.Register(c); err != nil {
 			return err
@@ -80,15 +86,15 @@ func (m *branchMetrics) register(reg prometheus.Registerer) error {
 	return nil
 }
 
-func (m *branchMetrics) observeFlatten(d time.Duration) {
-	if m.flattenNs != nil {
-		m.flattenNs.Observe(float64(d.Nanoseconds()))
+func (m *branchMetrics) observeRender(d time.Duration) {
+	if m.renderNs != nil && d >= 0 {
+		m.renderNs.Observe(float64(d.Nanoseconds()))
 	}
 }
 
-func (m *branchMetrics) observeResolveLatency(d time.Duration) {
-	if m.resolveNs != nil && d >= 0 {
-		m.resolveNs.Observe(float64(d.Nanoseconds()))
+func (m *branchMetrics) observeChain(d time.Duration) {
+	if m.chainNs != nil && d >= 0 {
+		m.chainNs.Observe(float64(d.Nanoseconds()))
 	}
 }
 
@@ -113,11 +119,20 @@ func (m *branchMetrics) observeResolve(res ResolveResult) {
 	if res.Retry && m.retried != nil {
 		m.retried.Inc()
 	}
+	if m.resolveNs != nil && res.Elapsed >= 0 {
+		m.resolveNs.Observe(float64(res.Elapsed.Nanoseconds()))
+	}
 }
 
-func (m *branchMetrics) observeUnflattened() {
-	if m.unflatten != nil {
-		m.unflatten.Inc()
+func (m *branchMetrics) observeRenderFailure() {
+	if m.renderFailure != nil {
+		m.renderFailure.Inc()
+	}
+}
+
+func (m *branchMetrics) addMultiPrompt(n int) {
+	if m.multiPrompt != nil && n > 0 {
+		m.multiPrompt.Inc()
 	}
 }
 

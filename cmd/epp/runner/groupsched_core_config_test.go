@@ -51,6 +51,10 @@ plugins:
   parameters:
     blockSizeTokens: 64
     logRequests: true
+    tokenProducer:
+      modelName: test-model
+      vllm:
+        url: http://localhost:8000
 - type: token-producer
   parameters:
     modelName: test-model

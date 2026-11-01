@@ -2,96 +2,119 @@
 
 **Type:** `branch-identity`
 **Interfaces:** `requestcontrol.RequestHeaderProcessor`, `requestcontrol.PreRequest`,
-`requestcontrol.ResponseBodyProcessor`, `plugin.ProducerPlugin`, `plugin.StateDumper`
+`requestcontrol.ResponseBodyProcessor`, `plugin.ProducerPlugin`, `plugin.StateDumper`,
+`datalayer.Registrant`
 
-Derives the **flow-control queue key from the request body**: the plugin flattens the
-conversation into an identity byte stream, chains it into block hashes, matches it against the
-live branch table before admission control, and makes the matched (or newly minted) **branch id**
-the request's `FairnessID`.
+Derives the **flow-control queue key from the request body**: at arrival the plugin renders the
+request with the token producer, hashes it into the prefix scorer's own block chain, and matches
+it against the live branch table before admission control, so the request's `FairnessID` is a
+derived **branch id**.
+
+**Glossary** (used throughout this package): a *request* is one call (one turn); a *branch* is a
+chain of requests, each continuing the previous, and its id is the queue key; the *tip* is a
+branch's latest request; the three arrival outcomes are *continue*, *fork* and *new*; a *session*
+is the client's session header — an attribute, never a key; an *engine* is one vLLM pod; a *seat*
+is the right to run on an engine, held by one branch; a *queue* is branches waiting for a seat.
 
 ## Why the queue key is a BRANCH, not a session
 
 The fairness id *is* the flow-control queue key: one id = one FIFO queue, and the scheduler only
 ever sees queue heads. Keying by session therefore serialises a session's siblings behind each
 other by construction — measured as TTFT p50 ×6.1 and a −13.5pt main-chain cache-hit collapse
-(`v2c-analysis.md`). A branch is the unit that can actually dispatch in parallel: the parent turn
-and each sub-agent that inherits its context get their own queue.
+(`v2c-analysis.md`). A branch is the unit that can dispatch in parallel: the parent turn and each
+sub-agent that inherits its context get their own queue.
 
 The **session** is still available — as an attribute (`branch-session`), never as a queue key.
-That is what the stage-2 session fairness layer reads to tell a newcomer from a sibling.
+The stage-2 session fairness layer reads it to tell a newcomer from an incumbent.
 
 Nothing in the scheduler changes: the policy seats whatever id it is given.
 
-## How identity is derived
+## The identity is the engine's token stream
 
-1. **Identity flattening** (`tokenizer.FlattenIdentityBytes`, a *separate* view from the sizing
-   path's `FlattenCanonicalBytes`): each message as `role` + content + assistant tool-call
-   arguments, in wire order, with no per-request fields, **no tool-DEFINITION block** and **no
-   thinking blocks**. Append-only conversations therefore produce streams where turn N is a byte
-   prefix of turn N+1 — independent of JSON key order, `max_tokens`, `stream`, request ids, of the
-   chat template's token-space rewriting, of the client dropping earlier turns' thinking (the
-   Anthropic API keeps only the last assistant turn's signed thinking), and of a mid-thread tool-set
-   change (claude_code hands a sub-task to a `Task` tool and the set changes under it).
-   Tool-*set* equality is deliberately **not** a gate: a gate would turn exactly those legitimate
-   churns into non-matches, i.e. the false-new-branch class it was meant to remove.
-2. **Chained block hashes**: the stream is packed 4 bytes per pseudo-token and hashed in
-   `blockSizeTokens`-token blocks, each key chained from the previous (`ChainedBlockHashes`,
-   lifted from groupsched with the same tail rule). The block count is
-   `floor(len(stream) / blockBytes)` — a block counts only when the stream completes it — and the
-   trailing partial block is not chained: its content changes as soon as the conversation grows.
-3. **Tail-exact tips**: the index stores each branch's tip as `(blocks, h_blocks, tailLen,
-   tailHash)` — the number of full blocks, the chained hash of the last of them, and the byte
-   length + hash of everything past it. A chained hash commits to every block before it, so the
-   full blocks are proven by one lookup while the **tail is verified explicitly, byte for byte**:
-   a request continues the branch only if the tip's *entire* stream is a byte prefix of its own.
-   The **longest** matching tip wins, and a tip whose tail does not match falls through to the next
-   shorter candidate. Tips **shorter than one block** have no block hash to look up, so they are
-   indexed by `(tailLen, tailHash)` and matched the same way — without that, every sub-chunk
-   conversation (a turn under one block) read as a false NEW branch on every turn.
+A branch is a **KV-cache lineage**, so the identity is the tokens the engine would render, in the
+**prefix scorer's own hash space** — not a normalized view of the body:
+
+1. **One render per request, at arrival.** `RequestHeader` calls the token producer as a library
+   (`tokenizer.Producer.Tokenize`), which writes `Body.TokenizedRequest` + `CacheSalt`. The
+   dispatch-time `token-producer` plugin then finds the tokens present and returns on its own skip
+   path, as does every later consumer: **exactly one render per request**, shared by identity and
+   every prefix scorer. The render is *relocated*, not added — ~120ms leaves the dispatch path for
+   the arrival path (measured: 1.42µs/token linear, 91% of EPP processing, 6–15% of TTFT; the
+   totals are unchanged).
+2. **Block chain** (`prefixhash.GetBlockHashesWithPromptTokens`): B-token blocks, chained, seeded
+   with the target model + cache salt — the same hashes the prefix scorer and the ledger use, so
+   "same prefix" means the same thing to identity and to the cache. `blockSizeTokens` is *the same
+   knob* as the scorer's `B`. All prompts count: a multi-prompt request's per-prompt chains are
+   **concatenated** (the faithful mapping of the byte-era `strings.Join`), counted as
+   `multi_prompt_requests_total`.
+3. **The continuation rule.** R continues T iff **T's full-block chain, except its last full
+   block, is a prefix of R's chain.**
+   - The tip is indexed by its *second-to-last* full-block hash; the lookup probes k = R's own
+     full-block count descending to 1. The tip index is **not prefix-closed** (a tip may exist at
+     k=7 with none at k=5), so the probe must not stop at the first miss.
+   - **Tail tolerance.** The unverified tail of a tip is therefore its partial block plus one full
+     block: **always between B and 2B−1 tokens of slack**. A request that differs from the tip only
+     there continues it — which absorbs end-of-tip rendering variance that the history does not
+     reproduce (the generation prompt, a template's empty-think stub, a BPE merge at the boundary).
+     One block of slack, rather than the partial block alone, is what makes the guarantee hold
+     wherever the prompt ends: with the partial block alone the slack can be *zero*, and an end
+     variance that crosses the block edge re-keys the branch.
+   - **Guards.** A tip with exactly **one** full block gets no tolerance — its prefix would be
+     empty and match every request — so that block must match. A tip **shorter than one block** has
+     no block hash to index and is not continuable at all: it re-keys once on its next turn.
+   - **S2's exact key** is separate: `(token count, last hash including the partial block)`, i.e.
+     the whole rendered prompt. Two requests with the same pair rendered the same prompt.
+   - The **longest verified prefix wins**; among equally long candidates a free tip beats a busy
+     one, then the longer tip, then the most recently seen (the id breaks an exact tie, so a replay
+     is deterministic).
 4. **Continue or fork**:
    - tip free (nothing in flight or pending) → **continue** (same id, same queue);
-   - **H1 reply guard**: a request that extends an outstanding tip AND begins with the tip's
-     assistant reply contains that reply, which an in-flight request cannot have — proven
-     completion, continue. Stage 0 measured 42 of 48 fork candidates to be exactly this case, so
-     the guard — not a busy grace window — is what keeps the fork rate honest (`stickyBusyGuard`,
-     on by default). The guard needs tail-exact tips to be sound: only then is message index
-     `msgCount` in the request the first message past the tip.
-   - **S2 retry rule**: a request **byte-identical** to the tip while the branch has nothing IN
-     FLIGHT (only arrival markers) is a client retry of a still-queued turn, not a sibling →
-     continue (`retryRule`, on by default; counted as `retry_total`). Two identical prompts are
-     indistinguishable by body, and the flow-control queue key is fixed at arrival: when both
-     arrive while the tip is still queued they MERGE into one queue entry, and nothing re-keys
-     them at `PreRequest`. That is the cheaper error (identical bodies share their whole prefix,
-     so the merge costs no cache) against forking a queue on what may be a pure retry. An
+   - **H1 reply guard**: a request that extends a tip AND begins with the tip's assistant reply
+     contains that reply, which an in-flight request cannot have — proven completion, continue.
+     Stage 0 measured 42 of 48 fork candidates to be exactly this case, so the guard — not a busy
+     grace window — is what keeps the fork rate honest (`stickyBusyGuard`, on by default). The
+     guard is sound only because a match proves the tip's token prefix: message index `msgCount` in
+     the request IS the first message past the tip.
+   - **S2 retry rule**: a request **identical** to the tip while the branch has nothing IN FLIGHT
+     (only arrival markers) is a client retry of a still-queued turn, not a sibling → continue
+     (`retryRule`, on by default; counted as `retry_total`). The queue key is fixed at arrival, so
+     two identical prompts arriving while the tip is still queued MERGE into one queue entry and
+     nothing re-keys them later. That is the cheaper error (identical bodies share their whole
+     prefix, so the merge costs no cache) against forking a queue on what may be a pure retry. An
      identical prompt arriving after the first one was DISPATCHED is decided by the busy flag and
      forks normally;
-   - tip outstanding → **fork** a new branch. The usual case is a sub-agent inheriting the
-     parent's context.
-5. **Opaque stable ids**: 10 hex chars derived from the creating stream's tip commitment, the fork
+   - tip outstanding → **fork** a new branch. The usual case is a sub-agent inheriting the parent's
+     context.
+5. **Opaque stable ids**: 10 hex chars derived from the creating request's tip commitment, the fork
    ordinal and the session scope. The same conversation derives the same id on any instance with
-   the same salt, and a continuation keeps it for the branch's whole life. An id held by a **live**
-   branch is never reused: a re-minted seed (a client re-sending an earlier turn after the branch
-   advanced, a look-alike fork) bumps the ordinal and gets a distinct branch. Overwriting would
-   leave the old record *ghosted* — still matched by the tip index, no longer in the table — so it
-   would keep advancing requests and would never be evictable.
+   the same model, salt and block size, and a continuation keeps it for the branch's whole life. An
+   id held by a **live** branch is never reused: a re-minted seed (a client re-sending an earlier
+   turn after the branch advanced, a look-alike fork) bumps the ordinal and gets a distinct branch.
+   Overwriting would leave the old record *ghosted* — still matched by the tip index, no longer in
+   the table — so it would keep advancing requests and would never be evictable.
 
 `x-llm-d-inference-fairness-id` still wins when present (an explicit override) and is counted
-(`explicit_override_total`), and a silently derived id never fails a request: a body shape the
-flattener does not cover leaves the attribute unset and the existing fallbacks apply.
+(`explicit_override_total`). **A render failure never fails the request**: the request gets its own
+branch (a NEW keyed by the request, never a continuation) and `render_failure_total` names it. The
+arrival render carries identity's **own timeout** (`renderTimeoutSeconds`, default 10s) rather than
+inheriting the token producer's.
 
-**Stage-1 deployment note (the harness, not the code).** The derivation is a no-op for any run
-whose harness sends `x-llm-d-inference-fairness-id`: aiperf's
-`--session-header=x-llm-d-inference-fairness-id` (and `--session-header-source=root`) turn every
-request into an "explicit override" and the arm then measures A0 with extra steps. Stage 1 must run
-with **no fairness-id session header** (`--session-header-source=root` alone is fine: the session id
-lands in the branch's separate `branch-session` attribute). Check
-`llm_d_epp_branch_explicit_override_total == 0` in the run's scrapes before reading any result.
+## The arrival record (a published output)
+
+Every derived request carries `branch-arrival`: the **outcome** (`matched` = continued, `forked`,
+`new`) and the arrival's **1-based turn number on its branch** (1 for a branch's first request, and
+for a fork's first). It is a pure output — written after the resolve, read by the scheduler to tell
+a newcomer from an incumbent — and nothing in this plugin reads it back.
+
+```go
+record, ok := fwksched.ReadRequestAttribute[branchidentity.BranchArrival](request, branchidentity.BranchArrivalKey)
+```
 
 ## Hook timing
 
 | hook | what it does | why here |
 |---|---|---|
-| `RequestHeader` (pre-admission) | flatten → chain → resolve → sets `FairnessID`; publishes `branch-identity` + `branch-session` | the queue key must exist **before** the request enqueues; the parsed body is available and nothing network-bound may run here |
+| `RequestHeader` (pre-admission) | render → chain → resolve → sets `FairnessID`; publishes `branch-identity`, `branch-session`, `branch-arrival` | the queue key must exist **before** the request enqueues, and the render has to happen once — here, where the parse is already done |
 | `PreRequest` (post-scheduling) | moves the request's marker from the branch's `pending` set to its `inflight` set | **not** where busy is set: busy is set at arrival, because under load the queueing interval is most of a busy period (v2c median wait 22s) |
 | `ResponseBody(EndOfStream)` | removes the request's marker from the branch's `inflight` set | forced by the server on abort/disconnect/panic for every request that picked a pod |
 
@@ -106,96 +129,175 @@ frees a branch that still has work queued or holds one that has none.
 
 Branches are **never GC'd by silence**. Stage 0 measured a p99.9 inter-turn idle gap of 3,036
 seconds: any plausible `T_gc` drops dormant threads that then return, and a dropped branch is a
-**false new branch** — a fresh fairness id, i.e. a newcomer, which is the unsafe direction of the
-pre-registration. Branch records are content-addressed and tiny, the flow-control registry already
-GCs idle *queues*, and the only eviction path is the count cap (`maxBranches`, idlest
-non-outstanding branches first).
+**false new branch** — a fresh fairness id, i.e. a newcomer, which is the unsafe direction. Branch
+records are content-addressed and tiny, the flow-control registry already GCs idle *queues*, and
+the only eviction path is the count cap (`maxBranches`, idlest non-outstanding branches first).
 
 **Markers expire after `markerTtlSeconds` (default 3600s — the client's request timeout), not after
 the flow queue's 5-minute GC.** Those are different clocks: on A0 16% of requests waited more than
-600s for admission, so a 600s horizon would expire the markers of requests that are still
-legitimately queued and hand their branch to a concurrent sibling as if it were free. Expiry is the
-only way a rejected-before-dispatch request (or a client that vanished mid-stream) is ever observed
-— the response hook is forced only once a pod is picked — and pruning errs toward continuation.
+600s for admission, so a 600s horizon would expire the markers of requests still legitimately
+queued and hand their branch to a concurrent sibling as if it were free. Expiry is the only way a
+rejected-before-dispatch request is ever observed, and pruning errs toward continuation.
 
 ## Configuration
 
 ```yaml
 plugins:
-  - name: branch-identity
-    type: branch-identity
+  - type: branch-identity
     parameters:
-      blockSizeTokens: 64        # 256-byte chunks (4 bytes per pseudo-token)
-      markerTtlSeconds: 3600     # marker horizon = the client request timeout (NOT the queue GC)
-      sweepSeconds: 60           # cap enforcement tick
-      maxBranches: 100000        # the only eviction path; ~200 B per record
+      blockSizeTokens: 64           # = the prefix scorer's B; the output is in ITS hash space
+      tokenProducer:                # the SAME render backend the token-producer plugin uses
+        modelName: meta-llama/Llama-3.1-8B-Instruct
+        vllm:
+          url: http://127.0.0.1:8000
+      renderTimeoutSeconds: 10      # identity's own bound on the arrival render
+      markerTtlSeconds: 3600        # marker horizon = the client request timeout (NOT the queue GC)
+      sweepSeconds: 60              # cap enforcement tick
+      maxBranches: 100000           # the only eviction path
       # sessionHeaders: [x-my-session]   # prepended to the built-in provider list
-      # salt: ""                          # folded into the chain; empty = reproducible ids
       # forkOnBusy: true                  # false = every match continues (measurement arm only)
       # stickyBusyGuard: true             # H1 reply guard
       # retryRule: true                   # S2: an exact duplicate of a still-queued tip is a retry
       # logRequests: false                # INSTRUMENT: one JSON line per request (see below)
 ```
 
+**`tokenProducer` is the real-token requirement.** Without it the plugin builds the tokenizer's
+`estimate` backend (byte packing), which turns the identity back into a byte-space key — the
+retired v1 behaviour. The plugin announces that at startup:
+
+```
+branch-identity: WARNING token producer backend is "estimate" — identity is a token-space key, so an arm must render (modelName/vllm)
+```
+
+It must be the *same* backend (model, endpoint, salt) the `token-producer` plugin uses, or the
+identity's hashes and the prefix scorer's diverge for the same request.
+
 Built-in session headers (priority order): `x-claude-code-session-id`, `x-session-affinity`,
-`session-id`, `session_id` — the same list `agent-identity` resolves, so the session the policy
-sees is the session the rest of the system sees.
+`session-id`, `session_id` — the same list `agent-identity` resolves.
 
 ## Metrics
 
 | metric | meaning |
 |---|---|
-| `llm_d_epp_branch_matched_total` | continuations (same id as the branch's previous turn) |
+| `llm_d_epp_branch_matched_total` | continuations (`continue`: same id as the branch's previous turn) |
 | `llm_d_epp_branch_forks_total` | forks (extension of an outstanding tip) |
-| `llm_d_epp_branch_new_total` | no tip matched: an unrelated branch |
+| `llm_d_epp_branch_new_total` | no tip matched: a new branch |
 | `llm_d_epp_branch_sticky_busy_total` | continuations proven by the H1 reply guard despite a busy tip |
-| `llm_d_epp_branch_retry_total` | S2 continuations: byte-identical duplicates of a still-queued tip |
+| `llm_d_epp_branch_retry_total` | S2 continuations: identical duplicates of a still-queued tip |
 | `llm_d_epp_branch_explicit_override_total` | requests that carried an explicit fairness id (a run of this plugin must keep it at 0) |
+| `llm_d_epp_branch_render_failure_total` | arrivals with no identity (render error/timeout): each starts its own branch |
+| `llm_d_epp_branch_multi_prompt_requests_total` | requests whose render produced more than one prompt |
 | `llm_d_epp_branch_records` | live branches |
-| `llm_d_epp_branch_flatten_ns` | identity flattening + chaining cost per request (pre-admission, untimed path) |
+| `llm_d_epp_branch_render_ns` | arrival-time render latency per request (the producer, relocated from dispatch) |
+| `llm_d_epp_branch_chain_ns` | block-chain hashing per request |
 | `llm_d_epp_branch_resolve_ns` | resolve cost per request (inside the table lock: match + mint) |
-| `llm_d_epp_branch_unflattened_total` | bodies with no canonical stream (fairness id falls back) |
 | `llm_d_epp_branch_evicted_total` | cap evictions |
 
-`DumpState` returns the branch table (block count, message count, in-flight/queued, forks, turns,
-idle/age; newest 200 rows).
+`DumpState` returns the branch table (full blocks, token count, message count, in-flight/queued,
+forks, turns, idle/age; newest 200 rows).
 
 ## The `logRequests` instrument (off by default)
 
 A **shadow arm** — the plugin armed on a stack whose client still sends the fairness header — keeps
-the client's explicit id as the queue key, so the derived id reaches no span: the span's fairness id
-is the explicit header, and the EPP's request id (`x-request-id`) lives in an id space no harness
-records share. `logRequests: true` closes that gap with one stdout line per request:
+the client's explicit id as the queue key, so the derived id reaches no span. `logRequests: true`
+closes that gap with one stdout line per request:
 
 ```
 branch-identity: request {"seq":1,"ts":"…","scope":"<session header>","derived":"8f21c0aa93",
-                          "outcome":"matched","explicit":true,"blocks":12,"bytes":347895,"marker":"…"}
+                          "outcome":"matched","turn":7,"explicit":true,"blocks":12,
+                          "tokens":347895,"marker":"…"}
 ```
 
-`scope` is the client session header the arm configured (with `sessionHeaders:
-[x-llm-d-inference-fairness-id]` that IS the client's thread id), `seq` is arrival order, and
-`outcome` is matched/forked/new. A scoring pass joins those three to the harness's records by
-(scope, arrival order) and scores the derived-vs-thread confusion matrix per request. It is
-behaviour-neutral — no state, no decision — and with it off the code path is unchanged.
+`scope` is the client session header the arm configured, `seq` is arrival order, `outcome` and
+`turn` are the arrival record. It is behaviour-neutral — no state, no decision.
 
-Keep ids short: they can become metric label values, and fairness-id label cardinality is capped
-(`--fairness-id-metric-label-limit` / `BoundFairnessID`).
+Keep ids short: they can become metric label values (`--fairness-id-metric-label-limit`).
+
+## The equivalence gate (v1 → v2)
+
+The v2 identity is a **token-space** key, so its ids differ from v1's by construction (they are
+minted from the tip commitment, which moved from the byte chain to the prefix-scorer chain). What
+must NOT change is the **grouping**, so the gate is **partition equivalence**: build the
+old-id ↔ new-id mapping over a recorded window and require it to be one-to-one, except for the
+declared classes, each counted.
+
+Both sides are replayed through the real hooks by `stage0c_replay_test.go`, on the rebased tree:
+
+```sh
+# old side: the shipped byte implementation
+STAGE0C_WINDOW=/tmp/stage0c/a0.jsonl \
+  STAGE0C_OUT=/tmp/stage0c/a0.old.jsonl \
+  go test ./pkg/epp/framework/plugins/branchidentity/ -run TestStage0CReplay -v -timeout 3h
+
+# new side, twice (the second run proves the ids are deterministic)
+STAGE0C_WINDOW=/tmp/stage0c/a0.jsonl STAGE0C_TOKENS=<engine-render.jsonl> \
+  STAGE0C_OUT=/tmp/stage0c/a0.new.jsonl \
+  go test ./pkg/epp/framework/plugins/branchidentity/ -run TestStage0CReplay -v -timeout 3h
+```
+
+`STAGE0C_TOKENS` is a JSONL corpus of `{i, n, in_tokens, tokens}` rendered offline with the
+engine's chat template (`transformers.apply_chat_template`); the harness injects those tokens and
+**validates them against the recorded `in_tokens`**, so a drifted template cannot pass silently.
+
+**Result, WEKA stage-0C (`a0`, 3,626 requests, Qwen3 template — the arm's model):**
+
+| | count |
+|---|---|
+| requests | 3,626 |
+| branches, v1 (bytes) | 981 |
+| branches, v2 (tokens) | 943 |
+| **old branches split into 2+ new** | **0** |
+| **new branches merging 2+ old** | **37** (36 pairs, 1 triple) → 38 fewer branches |
+| merge class | 37 × tail tolerance; every merge point's divergence is **68–71 tokens from the tip's end**, i.e. inside the tip's **last full block** — the block the one-full-block tolerance absorbs and a partial-block-only tolerance would NOT |
+| class (i) tool/thinking splits | 0 (the corpus has no tool blocks) |
+| class (iii) sub-block tips | 0 (smallest request is 136 tokens) |
+| class (iv) render failures | 0 |
+| determinism: id mismatches across 2 replays | 0 |
+| content continuity: exact extensions that continued | 2,577 / 2,577 = **100.00%** (v1: 100.00%) |
+
+So on WEKA no conversation was ever re-fragmented (0 splits — the unsafe direction) and 37 tail
+re-renders (the harness rewriting the last message's tail, 10 of them exactly one block shorter)
+became continuations — the safe direction, and each one counted.
+
+**Declared classes, for reference** — (i) tools/thinking now count, so a mid-thread tool-set change
+or a re-rendered history splits the branch (exactly where the KV cache splits); (ii) the tip's
+trailing partial block is not verified; (iii) a tip shorter than one full block is not continuable
+and re-keys once; (iv) a render failure at arrival is a NEW branch plus a counter; (v) an
+end-of-tip variance that crosses a block edge — closed *by construction* by the one-full-block
+tolerance.
 
 ## Known limits
 
 - **State is per EPP instance.** Behind N replicas, the same conversation landing on another EPP
-  re-derives its branch from content (same id, different table), which is fine for identity but
-  not for the *outstanding* marks. The stage-1 campaign runs a single EPP.
-- **Bodies shorter than one block** (a tiny first turn, < 256 canonical bytes) have no chain: they
-  are matched by `(tailLen, tailHash)` instead, so their continuations do continue them. The
-  sub-chunk scan costs one hash per live sub-chunk length (bounded by the block size in bytes) and
-  only runs while such a tip exists.
+  re-derives its branch from content (same id, different table), which is fine for identity but not
+  for the *outstanding* marks. The stage-1 campaign runs a single EPP.
+- **Multi-prompt slack.** For a multi-prompt request the tolerance applies to the *concatenated*
+  chain, so the unverified region can exceed 2B−1 tokens (an earlier prompt's blocks are interior
+  and stay verified, the last prompt's tail is what is unverified). Single-prompt chat is unaffected;
+  cross-protocol continuation is not a requirement.
+- **A stale re-send is not a continuation... unless it is one block short of the tip.** A request
+  that is a proper prefix of its branch's tip (a client re-sending an earlier turn after the branch
+  advanced) matches only if the tip is at most one full block longer; then it continues the branch
+  and the tip moves back to it. The next real turn finds the branch either way, so the branch id is
+  unaffected — only the tip pointer regresses for one turn.
 - **A fork's first new message that is an assistant message** (a framework that spawns a child
   *after* the parent's assistant tool-call turn puts that message in the child's history) is
   indistinguishable from an H1 continuation by construction. The design labels this H2 and says
   measure, don't fix.
-- **Tool-call flattening is UNVALIDATED by the WEKA corpus** (zero tool blocks there) but measured
-  on Exgentic: 67.5% of its requests carry `tool_calls`, and the amended matcher scores 0.00%
-  content-continuous false-new on them (stage 0B §5). Stage 0C re-scores the SHIPPED Go code.
-- Without a client session header, look-alike traces of different sessions may share a branch
-  (the accepted floor: A0-equivalent with derived branches).
+- Without a client session header, look-alike traces of different sessions may share a branch (the
+  accepted floor).
+
+## Deployment preconditions (not enforced by this plugin)
+
+- **The flow-control loop must actually reach `Pick`.** Identity's queue key only decides anything
+  if the fairness policy is consulted. Confirmed for our config: one priority band, the noop
+  saturation detector returns 0.0 — below the fail-open ceiling of 1.0 — so no band is gated and
+  `Pick` runs every cycle while any queue holds a head.
+- **The per-band caps are BOUNDED BY DEFAULT.** A band's `maxBytes` defaults to **1 GB** and its
+  `maxRequests` to **5000**; `0` means *take the default*, **not** "unbounded" (per-*flow* maxima
+  are the opposite: `0` disables them). Our core configs never set either, so the campaign ran on
+  the defaults — they never bound in the measured ranges, but that is luck, not design. An arm that
+  needs an effectively removed band bound must set an explicit large value.
+- An arm must not send `x-llm-d-inference-fairness-id` from its harness
+  (`--session-header=x-llm-d-inference-fairness-id`), or every request is an "explicit override" and
+  the arm measures A0 with extra steps. Keep `llm_d_epp_branch_explicit_override_total == 0`.

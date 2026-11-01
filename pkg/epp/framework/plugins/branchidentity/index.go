@@ -15,70 +15,34 @@ limitations under the License.
 */
 
 // Package branchidentity derives the flow-control queue key from the request
-// body: a request-control plugin that flattens the conversation into an
-// identity byte stream, chains it into block hashes, and matches it against the
-// live branch table before admission control, so the fairness id
-// (FairnessID → the flow queue key) is a DERIVED, stable branch id rather than
-// a client-supplied thread id.
+// body: the arrival hook renders the request with the token producer, hashes it
+// into the prefix scorer's own block chain, and matches it against the live
+// branch table, so the fairness id is a derived BRANCH id instead of a
+// client-supplied session id.
 //
-// The identity model (BRANCH-IDENTITY-DESIGN.md):
+// A branch is a chain of requests, each continuing the previous; its tip is the
+// latest request. An arrival CONTINUES a tip, FORKS it (it extends a busy tip) or
+// starts a NEW branch. The session header is a separate attribute, never a queue
+// key.
 //
-//   - Queue key = BRANCH. Sibling requests of one agent session (sub-agents
-//     inheriting the parent's context) are separate branches, so they dispatch
-//     in parallel instead of serialising behind each other in one queue.
-//   - SESSION is an attribute, never a queue key. The plugin reads the client's
-//     session header (when present) and publishes it under its own key for the
-//     stage-2 session fairness layer; it does not overwrite the branch id.
-//   - Identity is FLATTENING, not tokens: chat templates can rewrite history in
-//     token space while the conversation continues (thinking models drop past
-//     reasoning, some stamp dates), and clients drop earlier turns' thinking and
-//     swap tool sets mid-thread. The tokenizer's IDENTITY stream is the stable
-//     view (tokenizer.FlattenIdentityBytes).
-//   - A tip is TAIL-EXACT: (blocks, tip hash, tail length, tail hash) describes
-//     the tip request's ENTIRE stream, not just its last full block. A request
-//     continues the branch only if the tip's whole stream is a byte prefix of
-//     its own — the full blocks are implied by the chained hash, the tail is
-//     verified explicitly. Tips shorter than one block (a tiny first turn) are
-//     indexed by (tail length, tail hash), so they are matchable too: without
-//     that, every sub-chunk conversation read as a false NEW branch.
-//   - Continuation: R continues B iff B's tip is a prefix of R's stream AND B
-//     has nothing outstanding; otherwise R FORKS a new branch. Two overrides:
-//     the sticky-busy guard (H1: R extends B's tip and the first message past
-//     the tip is an assistant message, so R contains B's reply — an in-flight
-//     request cannot have it; proven completion), and the retry rule (S2: R is
-//     byte-IDENTICAL to B's tip and B has nothing in flight but its arrival
-//     marker — a duplicate of a still-queued request is a client retry; the
-//     error asymmetry favours continuation).
-//   - BUSY IS MARKED AT ARRIVAL (RequestHeader), not at dispatch: the queued
-//     interval is most of a busy period under load (v2c's median wait was 22s),
-//     and a branch that looks free while its turn sits in the admission queue
-//     would hand a sibling the parent's queue — the head-of-line blocking this
-//     design exists to remove. The flag is cleared at end of stream, or expires
-//     with its marker when a request is rejected before dispatch.
-//   - Markers are per REQUEST ID (a set of pending and a set of in-flight
-//     request ids per branch), never FIFO counters: a branch's outstanding count
-//     must be exactly "which requests of mine have not finished", so a
-//     cancellation, a rejection and a retry each remove or add exactly one
-//     entry. The marker TTL is the harness request timeout (3600s), not the
-//     flow queue's 5-minute idle GC — those are different clocks, and 16% of A0's
-//     requests waited longer than 600s for admission.
-//   - The TIP moves at arrival too, so a fork cannot hide: a sibling of the old
-//     prefix extends an interior node of the moved tip and gets its own branch
-//     structurally, and the busy flag only has to guard the one case content
-//     cannot separate — two IDENTICAL prompts in flight at once, which are two
-//     parallel siblings and therefore two branches.
-//   - Retention is content-addressed, not time-based: branches are never GC'd by
-//     silence (stage 0 measured a p99.9 inter-turn idle gap of 3,036s; any T_gc
-//     would false-new-branch a dormant thread when it returns). Only a count cap
-//     evicts, idlest first, and never a branch with anything outstanding.
+// The identity is the ENGINE's token stream, not a normalized view of the body:
+// a branch is a KV-cache lineage, so a request continues a tip exactly when the
+// cache would serve it the same prefix. That is why the block chain is the prefix
+// scorer's own (prefixhash, model+salt seeded, chained) and why a mid-thread
+// tool-set change or a re-rendered history SPLITS a branch — the tokens really do
+// diverge there.
 //
-// Error asymmetry (PREREG-branch-identity.md): a missed continuation (a false
-// NEW branch) is the unsafe direction — it re-fragments a conversation into
-// fresh fairness ids and re-introduces newcomer churn — while a false merge
-// only shares a queue between two continuations of the same conversation. Every
-// rule below resolves in favour of continuation. Stage 0 confirmed the asymmetry
-// is real and that the H1 guard, not a busy grace window, is what rescues it: 42
-// of 48 fork candidates were continuations the reply guard recovered.
+// Busy is marked at ARRIVAL, not at dispatch: under load the queueing interval is
+// most of a busy period, so a branch that looked free while its turn sat in the
+// admission queue would hand a sibling the parent's queue. A branch is retained
+// by content: there is no idle GC (stage 0 measured a p99.9 inter-turn gap of
+// 3,036s, so any silence timeout mints false NEW branches for dormant clients);
+// only the table cap evicts.
+//
+// Error asymmetry: a missed continuation (a false NEW branch) re-fragments a
+// client into newcomer churn, while a false continuation only shares a queue
+// between two requests of the same branch. Every rule resolves toward
+// continuation — including the tail tolerance in setTipLocked.
 package branchidentity
 
 import (
@@ -89,180 +53,99 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/prefixhash"
 )
 
-// Hash is one chained block key.
-type Hash uint64
-
 const (
-	// bytesPerPseudoToken mirrors the tokenizer's estimate backend: canonical
-	// bytes are read 4 at a time as pseudo-token IDs, so a block of N tokens
-	// covers 4N canonical bytes.
-	bytesPerPseudoToken = 4
-	// idHexLen keeps branch ids short (survey §3.4): a branch id can become a
-	// metric label value, and fairness-id label cardinality is capped
-	// (--fairness-id-metric-label-limit).
+	// idHexLen keeps branch ids short: an id can become a metric label value.
 	idHexLen = 10
-	// maxPendingPerBranch bounds one branch's set of arrival markers that have
-	// not dispatched yet. A leak (a request admitted then rejected before
-	// PreRequest, a client that vanishes) can then never grow without bound or
-	// wedge the branch.
+	// maxPendingPerBranch bounds one branch's arrival markers that have not
+	// dispatched, so a leaked marker cannot wedge or grow the branch.
 	maxPendingPerBranch = 64
 	// maxSnapshotRows bounds the StateDumper table.
 	maxSnapshotRows = 200
-	// maxMintAttempts bounds the ordinal bumps used to avoid reusing a live
-	// branch id; past it a process-unique nonce mint is used instead (see
-	// mintLocked).
+	// maxMintAttempts bounds the ordinal bumps used to avoid reusing a live id.
 	maxMintAttempts = 1 << 12
-	// tailSeed starts the chained tail hash.
-	tailSeed = 0xcbf29ce484222325
-	// tailPrime is the tail chain's multiplier (FNV-1a's 64-bit prime).
-	tailPrime = 1099511628211
+	// maxChainBlocks bounds a chain's length. It is effectively unbounded — a
+	// truncated chain would make long requests look alike — and only guards a
+	// corrupt token count.
+	maxChainBlocks = 1 << 20
 )
 
 // mintFallbackSeq makes a minted id unique within this process when the ordinal
 // space is exhausted (see mintLocked).
 var mintFallbackSeq atomic.Uint64
 
-// Outcome labels how Resolve identified a request.
+// Outcome labels how Resolve identified a request — the three arrival outcomes.
 type Outcome string
 
 const (
-	// OutcomeMatched: the request continued an existing branch (same id as the
-	// branch's previous turn).
+	// OutcomeMatched: the request continued a branch (the "continue" outcome).
 	OutcomeMatched Outcome = "matched"
-	// OutcomeForked: the request extended a BUSY branch's tip, so it started a
-	// new branch (a parallel sibling — a sub-agent inheriting the parent's
-	// context).
+	// OutcomeForked: the request extended a BUSY tip, so it started a new branch
+	// (a parallel sibling inheriting the tip's context).
 	OutcomeForked Outcome = "forked"
-	// OutcomeNew: nothing in the table matched (or the body has no chain), so
-	// the request started an unrelated branch.
+	// OutcomeNew: nothing matched, so the request started a new branch.
 	OutcomeNew Outcome = "new"
 )
 
-// ChainedBlockHashes computes the chained block keys of a pseudo-token stream:
-// blockSize-token blocks, each key chained from the previous one, the salt
-// folded into the chain's seed. Lifted from groupsched's Scheduler.HashTokens
-// (same hashing, same tail rule) so there is one chaining implementation for
-// both the sizing path and the identity path.
-//
-// The trailing PARTIAL block is not in the chain (n = len(tokens)/blockSize): its
-// content changes the moment the conversation grows, so counting it would make
-// every continuation look divergent. It is not ignored either — the branch table
-// keeps its hash as the tip's TAIL, and a continuation must contain it byte for
-// byte (see branchRecord.tipPrefixOf).
-func ChainedBlockHashes(tokens []uint32, salt string, blockSize int) []Hash {
-	if blockSize <= 0 || len(tokens) == 0 {
-		return nil
-	}
-	n := len(tokens) / blockSize
-	out := make([]Hash, 0, n)
-	var parent uint64
-	s := sha256.Sum256([]byte(salt))
-	saltSeed := binary.LittleEndian.Uint64(s[:8])
-	for i := 0; i < n; i++ {
-		h := sha256.New()
-		var b [8]byte
-		binary.LittleEndian.PutUint64(b[:], saltSeed^parent)
-		h.Write(b[:])
-		for j := i * blockSize; j < (i+1)*blockSize; j++ {
-			binary.LittleEndian.PutUint32(b[:4], tokens[j])
-			h.Write(b[:4])
-		}
-		parent = binary.LittleEndian.Uint64(h.Sum(nil)[:8])
-		out = append(out, Hash(parent))
-	}
-	return out
+// chain is a request's identity in the prefix scorer's hash space.
+type chain struct {
+	// blocks holds every block hash in order: the per-prompt chains
+	// concatenated, each prompt's trailing partial block included. All prompts
+	// count (the faithful mapping of v1's strings.Join).
+	//
+	// A multi-prompt request's earlier prompts keep their interior partial block
+	// in the chain. That is stricter than the tip tolerance below, not looser in
+	// the direction that matters: a continuation has to reproduce them exactly.
+	blocks []prefixhash.BlockHash
+	// fullBlocks counts the blocks that cover a whole block of tokens — every
+	// block but the LAST prompt's trailing partial one. Only the end of a chain
+	// is a tip, so only the end needs the distinction.
+	fullBlocks int
+	// tokens is the request's prompt token count.
+	tokens int
 }
 
-// tailChain hashes a run of canonical BYTES as a chain: h_0 = tailSeed,
-// h_i = mix(h_{i-1}, byte_i).
-//
-// Bytes, not pseudo-tokens: a stream's length is generally not a multiple of 4,
-// so its last token is zero-padded, and two streams that share that region in
-// bytes would hash differently if the padding were part of the digest. The tail is
-// the one hash that has to be exact at BYTE granularity — a block boundary is
-// always 4-byte aligned, so the chained block hashes are unaffected.
-func tailChain(b []byte) Hash {
-	h := uint64(tailSeed)
-	for _, c := range b {
-		h = (h ^ uint64(c)) * tailPrime
+// lastHash is the tip commitment: the last block hash, partial block included.
+// Together with tokens it is the S2 exact key — two requests with the same pair
+// rendered the same prompt.
+func (c chain) lastHash() prefixhash.BlockHash {
+	if len(c.blocks) == 0 {
+		return 0
 	}
-	return Hash(h)
-}
-
-// packPseudoTokens packs canonical bytes into little-endian uint32 pseudo-token
-// IDs (zero-padded tail). Mirrors the tokenizer's packBytes so the identity path
-// and the sizing path chunk the same body at the same boundaries.
-//
-// The padding is internal: the caller's stream is never modified, because the
-// tip's TAIL is hashed over the raw bytes (a padded last token would make two
-// streams that share those bytes hash differently).
-func packPseudoTokens(raw []byte) []uint32 {
-	if len(raw) == 0 {
-		return nil
-	}
-	out := make([]uint32, (len(raw)+bytesPerPseudoToken-1)/bytesPerPseudoToken)
-	for i := range out {
-		var w [bytesPerPseudoToken]byte
-		end := (i + 1) * bytesPerPseudoToken
-		if end > len(raw) {
-			end = len(raw)
-		}
-		copy(w[:], raw[i*bytesPerPseudoToken:end])
-		out[i] = binary.LittleEndian.Uint32(w[:])
-	}
-	return out
-}
-
-// shortKey indexes a tip that is shorter than one block: its whole stream is the
-// tail, so (length, chained hash) identifies it. Such tips have no block hash to
-// look up, which is exactly why the block-keyed index cannot find them.
-type shortKey struct {
-	tailLen  int
-	tailHash Hash
+	return c.blocks[len(c.blocks)-1]
 }
 
 // branchRecord is one live branch: its tip and its liveness.
-//
-// The tip describes the ENTIRE stream of the branch's latest request:
-//
-//	blocks   — number of full blocks in its chain (0 for a sub-chunk request)
-//	tip      — the chained hash of the last full block (a chained hash commits to
-//	           every block before it, so this plus blocks identifies that prefix)
-//	tailLen  — pseudo-tokens past the last full block
-//	tailHash — tailChain over exactly those tokens (the whole stream when
-//	           blocks == 0)
-//
-// A request continues this branch only if its own stream CONTAINS all of that as
-// a byte prefix: the chained block hash proves the full blocks, tailHash proves
-// the tail. Without the tail check a request that shares only the full blocks
-// (same first 256 bytes, different continuation) would be merged into the
-// branch; without the blocks==0 index a sub-chunk conversation could never be
-// continued at all.
 type branchRecord struct {
 	id string
-	// idSeed is the hash preimage the id was minted from (tip commitment, fork
-	// ordinal, scope): it identifies the branch's creation, so a genuine id
-	// collision is distinguishable from the same branch being minted again.
-	idSeed Hash
+	// idSeed is the tip commitment the id was minted from, plus the fork ordinal
+	// and the scope.
+	idSeed prefixhash.BlockHash
 	scope  string // client session id at creation, "" when the client sent none
 
-	blocks   int
-	tip      Hash
-	tailLen  int // bytes past the last full block
-	tailHash Hash
+	// The tip. (fullBlocks, lastHash, tokens) is the S2 exact key: two requests
+	// with the same triple are identical up to the whole rendered prompt.
+	fullBlocks int
+	lastHash   prefixhash.BlockHash
+	tokens     int
+	// prefixLen is how many leading blocks CONTINUATION verifies — the tip's
+	// chain except its last full block — and prefixKey is that prefix's last
+	// hash, the tip index key. prefixLen == 0 means the tip is not continuable
+	// (it is shorter than one full block).
+	prefixLen int
+	prefixKey prefixhash.BlockHash
 
-	// msgCount is the message count of the tip request. The sticky-busy guard
-	// needs it: the message at that index of a later request is the first one
-	// past the tip.
+	// msgCount is the tip request's message count: H1 reads the role at that
+	// index of a later request.
 	msgCount int
 
-	// pending holds the arrival markers of this branch's requests that have not
-	// dispatched yet (they are in admission control); inflight those that have.
-	// Both are keyed by request id: a branch's outstanding set must name exactly
-	// which of its requests are unfinished, so a cancellation, a rejection or a
-	// retry adds or removes exactly one entry (a FIFO counter cannot say that).
+	// pending holds the arrival markers of requests that have not dispatched
+	// (they are in admission control), inflight those that have. Keyed by
+	// request id, so a cancellation, a rejection or a retry adds or removes
+	// exactly one entry — a FIFO counter cannot say which request ended.
 	pending  map[string]time.Time
 	inflight map[string]time.Time
 
@@ -275,18 +158,13 @@ type branchRecord struct {
 // idle reports the branch's silence (no arrival, dispatch or settle).
 func (r *branchRecord) idle(now time.Time) time.Duration { return now.Sub(r.lastSeen) }
 
-// streamLen is the tip request's identity stream length in bytes.
-func (r *branchRecord) streamLen(blockBytes int) int { return r.blocks*blockBytes + r.tailLen }
-
 // markPending records one arrival marker, keeping the branch alive.
 func (r *branchRecord) markPending(marker string, now time.Time) {
 	if r.pending == nil {
 		r.pending = make(map[string]time.Time, 2)
 	}
 	if _, dup := r.pending[marker]; !dup && len(r.pending) >= maxPendingPerBranch {
-		// Bound the set: a runaway client cannot grow one branch's marker set
-		// without limit. The branch stays outstanding through the existing
-		// markers, so a lost marker errs toward continuation.
+		// A lost marker errs toward continuation, which is the safe direction.
 		return
 	}
 	r.pending[marker] = now
@@ -302,14 +180,11 @@ func (r *branchRecord) markDispatched(marker string, now time.Time) {
 }
 
 // markSettled removes a marker from in flight (response complete or aborted).
-func (r *branchRecord) markSettled(marker string) {
-	delete(r.inflight, marker)
-}
+func (r *branchRecord) markSettled(marker string) { delete(r.inflight, marker) }
 
-// pruneMarkers drops markers older than ttl: a request that never reached
-// PreRequest (denied in admission control, cancelled) or never reported an end
-// of stream must not keep its branch outstanding forever. Pruning errs toward
-// continuation, the safe direction.
+// pruneMarkers drops markers older than ttl: a request rejected before dispatch
+// or one that never reported an end of stream must not keep its branch busy
+// forever. Pruning errs toward continuation.
 func (r *branchRecord) pruneMarkers(now time.Time, ttl time.Duration) {
 	if ttl <= 0 {
 		return
@@ -323,44 +198,21 @@ func (r *branchRecord) pruneMarkers(now time.Time, ttl time.Duration) {
 	}
 }
 
-// outstanding reports whether the branch has anything in flight or pending — the
-// continuation rule's "busy" predicate.
+// outstanding reports whether the branch has a request in flight or pending —
+// the continuation rule's busy predicate.
 func (r *branchRecord) outstanding() bool {
 	return len(r.inflight) > 0 || len(r.pending) > 0
 }
 
-// tipPrefixOf reports whether this branch's whole tip stream is a byte prefix of
-// stream, i.e. whether the request that produced stream can be a continuation of
-// this branch. The full blocks are implied by the chained hash the caller matched
-// on; the tail is verified here, byte for byte.
-func (r *branchRecord) tipPrefixOf(stream []byte, blockBytes int) bool {
-	start := r.blocks * blockBytes
-	if len(stream) < start+r.tailLen {
-		return false
-	}
-	if r.tailLen == 0 {
-		return true
-	}
-	return tailChain(stream[start:start+r.tailLen]) == r.tailHash
-}
-
-// isExact reports whether stream is byte-identical to the branch's tip stream.
-func (r *branchRecord) isExact(stream []byte, blockBytes int) bool {
-	return len(stream) == r.streamLen(blockBytes) && r.tipPrefixOf(stream, blockBytes)
-}
-
 // Arrival is one request's identity inputs.
 type Arrival struct {
-	// Stream is the request's identity stream (the bytes
-	// tokenizer.FlattenIdentityBytes produced).
-	Stream []byte
-	// Chain is ChainedBlockHashes(packPseudoTokens(Stream), salt, blockSize),
-	// computed by the caller so the hashing stays off the index lock.
-	Chain []Hash
+	// Chain is the request's identity chain; the zero value means the request
+	// has no identity (a failed render), which never continues anything.
+	Chain chain
 	// Scope is the client session id, "" when the client sent none.
 	Scope string
 	// Roles is the request's message roles in wire order (nil for body shapes
-	// without messages — the sticky-busy guard then cannot fire).
+	// without messages — H1 then cannot fire).
 	Roles []string
 	// Marker is the request's id: the handle that later removes this arrival
 	// from the branch's outstanding set.
@@ -373,132 +225,78 @@ type ResolveResult struct {
 	ID string
 	// Outcome is matched / forked / new.
 	Outcome Outcome
-	// Blocks is the request's own chain length (full blocks).
+	// Turn is the arrival's 1-based turn number on its branch: 1 for a branch's
+	// first request, and for a fork's first. Published as an attribute (the
+	// arrival record the scheduler reads).
+	Turn int
+	// Blocks is the arrival's own full-block count.
 	Blocks int
-	// MatchedBlocks is the matched tip's length (0 for a new branch); for a
-	// fork it is the parent tip's length.
+	// MatchedBlocks is the verified prefix length of the matched tip (0 for a
+	// new branch); for a fork it is the parent tip's.
 	MatchedBlocks int
 	// StickyBusy is set when the H1 guard overrode the busy flag.
 	StickyBusy bool
-	// Retry is set when the S2 rule treated a byte-identical duplicate of a
-	// still-queued tip as a continuation (a client retry, not a sibling).
+	// Retry is set when S2 treated a duplicate of a still-queued tip as a
+	// client retry (a continuation, not a sibling).
 	Retry bool
 	// Elapsed is the time the resolve spent inside the table lock.
 	Elapsed time.Duration
 }
 
-// branchIndex is the branch table: branch id → record, plus the tip lookup
-// (last block hash → candidate branches, and (length, hash) → sub-chunk tips).
-// Safe for concurrent use.
+// branchIndex is the branch table: branch id → record, plus the tip index
+// (prefix key → candidate branches). Safe for concurrent use.
 type branchIndex struct {
 	mu sync.Mutex
 
 	blockSize   int
-	salt        string
 	markerTTL   time.Duration
 	maxBranches int
 
 	branches map[string]*branchRecord
-	// byTip indexes tips with at least one full block by their last block hash.
-	byTip map[Hash][]*branchRecord
-	// byShort indexes tips shorter than one block by (length, chained hash).
-	byShort map[shortKey][]*branchRecord
-	// shortLens is the set of tail lengths live in byShort (the scan bound).
-	shortLens map[int]struct{}
+	// byPrefix indexes continuable tips by their verified-prefix hash. The
+	// prefix LENGTH is carried on the record, not in the key: a chained hash
+	// commits to its whole prefix, so two lengths sharing one key can only be a
+	// collision, which the length check rejects.
+	byPrefix map[prefixhash.BlockHash][]*branchRecord
 }
 
-func newBranchIndex(blockSize int, salt string, markerTTL time.Duration, maxBranches int) *branchIndex {
-	if blockSize <= 0 {
-		blockSize = defaultBlockSizeTokens
-	}
+func newBranchIndex(blockSize int, markerTTL time.Duration, maxBranches int) *branchIndex {
 	return &branchIndex{
 		blockSize:   blockSize,
-		salt:        salt,
 		markerTTL:   markerTTL,
 		maxBranches: maxBranches,
 		branches:    make(map[string]*branchRecord),
-		byTip:       make(map[Hash][]*branchRecord),
-		byShort:     make(map[shortKey][]*branchRecord),
-		shortLens:   make(map[int]struct{}),
+		byPrefix:    make(map[prefixhash.BlockHash][]*branchRecord),
 	}
 }
 
-// blockBytes is the byte length of one identity block.
-func (ix *branchIndex) blockBytes() int { return ix.blockSize * bytesPerPseudoToken }
-
-// Chain hashes an identity byte stream into the request's block chain.
-//
-// The block count is floor(len(stream) / blockBytes): a block counts only when the
-// stream COMPLETES it. Reading the count off the packed tokens instead would count
-// a partially-filled block (the last token is zero-padded), so two streams whose
-// tails share their bytes would hash a different number of blocks — the exact
-// false-new failure the tail check exists to prevent.
-func (ix *branchIndex) Chain(stream []byte) []Hash {
-	return ChainStream(stream, ix.salt, ix.blockSize)
-}
-
-// ChainStream is Chain without an index: the pure function the tests and the
-// replay harness both need.
-func ChainStream(stream []byte, salt string, blockSize int) []Hash {
-	if blockSize <= 0 {
-		blockSize = defaultBlockSizeTokens
-	}
-	blockBytes := blockSize * bytesPerPseudoToken
-	blocks := len(stream) / blockBytes
-	if blocks == 0 {
-		return nil
-	}
-	return ChainedBlockHashes(packPseudoTokens(stream[:blocks*blockBytes]), salt, blockSize)
-}
-
-// Resolve identifies the branch for an arriving request and records the
-// arrival.
+// Resolve identifies the branch for an arriving request and records the arrival.
 //
 // The decision, in order:
-//  1. longest branch tip that is a TAIL-EXACT prefix of the request's stream, in
-//     the same session scope (a tip from another session never matches; an
-//     unscoped tip matches any session).
+//  1. the tip with the longest verified prefix, in the same scope.
 //  2. tip not outstanding → continue (a repeat of a finished turn).
-//  3. sticky-busy guard (when enabled): the first message past the tip is an
-//     assistant message → the request contains the tip's reply → continue.
-//  4. retry rule (when enabled): the request is byte-identical to the tip and the
-//     tip has nothing IN FLIGHT (only arrival markers) → continue. Two identical
-//     prompts are indistinguishable by body, so a retry of a still-queued turn
-//     and a genuinely parallel duplicate of it take the same path; nothing later
-//     can tell them apart either, because the fairness id (the flow-control queue
-//     key) is fixed HERE, at arrival — the two MERGE into one queue entry and no
-//     hook re-keys them. The alternative — fork every duplicate — pays a queue on
-//     a request that may be a pure retry; the errors are named, not hidden:
-//     identical queued bodies merge (a false merge that costs nothing for a cache,
-//     since identical bodies share the whole prefix).
-//  5. tip outstanding and unproven (unless forkOnBusy is off) → fork: a request
-//     already IN FLIGHT is dispatched under its own id, so a duplicate arriving
-//     now is a parallel sibling and an extension is context inheritance. Both
-//     need their own queue.
+//  3. H1 (when enabled): the first message past the tip is an assistant message,
+//     so the request contains the tip's reply → continue.
+//  4. S2 (when enabled): the request is identical to the tip and the tip has
+//     nothing IN FLIGHT (only arrival markers) → continue (a client retry).
+//  5. tip outstanding and unproven → fork (unless forkOnBusy is off).
 //  6. no matching tip → new branch.
 func (ix *branchIndex) Resolve(now time.Time, a Arrival, forkOnBusy, stickyGuard, retryRule bool) ResolveResult {
-	// Chaining is the expensive part, so a caller may pass the chain precomputed;
-	// deriving it here only costs the caller who forgot (and stays correct).
-	chain := a.Chain
-	if chain == nil && len(a.Stream) > 0 {
-		chain = ix.Chain(a.Stream)
-	}
-
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	start := time.Now()
 
-	rec, matched, exact := ix.matchLocked(now, a.Stream, chain, a.Scope)
+	rec, matched := ix.matchLocked(now, a.Chain, a.Scope)
 	if rec == nil {
-		fresh := ix.mintLocked(now, nil, a, chain)
-		return ResolveResult{ID: fresh.id, Outcome: OutcomeNew, Blocks: len(chain), Elapsed: time.Since(start)}
+		fresh := ix.mintLocked(now, nil, a)
+		return ResolveResult{ID: fresh.id, Outcome: OutcomeNew, Turn: 1, Blocks: a.Chain.fullBlocks, Elapsed: time.Since(start)}
 	}
 
-	// Continuation needs a FREE tip: a tip with a request in flight or pending
-	// belongs to that request (an identical prompt arriving meanwhile is a
-	// parallel sibling, not a continuation), unless content proves completion
-	// (H1) or a still-queued duplicate is a retry (S2), or the fork rule is
-	// configured off.
+	// S2's exact key: the whole rendered prompt, tail included.
+	exact := rec.tokens == a.Chain.tokens && rec.lastHash == a.Chain.lastHash()
+	// A continuation needs a FREE tip: a tip with a request in flight or pending
+	// belongs to that request, unless content proves completion (H1) or a
+	// still-queued duplicate is a retry (S2), or the fork rule is configured off.
 	cont := !rec.outstanding()
 	sticky, retry := false, false
 	if !cont {
@@ -506,11 +304,10 @@ func (ix *branchIndex) Resolve(now time.Time, a Arrival, forkOnBusy, stickyGuard
 		case stickyGuard && startsWithReply(rec.msgCount, a.Roles):
 			sticky, cont = true, true
 		case retryRule && exact && len(rec.inflight) == 0:
-			// Byte-identical to the tip, and nothing of the branch has actually
-			// started: treat it as a client retry of a request still sitting in
-			// the admission queue. The queue key was already fixed at ARRIVAL, so
-			// the two merge in the flow-control queue — nothing re-keys at
-			// PreRequest, and a second identical prompt cannot be forked later.
+			// Identical to the tip with nothing actually started: a client retry
+			// of a request still sitting in the admission queue. The queue key was
+			// fixed at ARRIVAL, so the two merge in the flow queue and nothing
+			// re-keys them later.
 			retry, cont = true, true
 		default:
 			cont = !forkOnBusy
@@ -518,43 +315,35 @@ func (ix *branchIndex) Resolve(now time.Time, a Arrival, forkOnBusy, stickyGuard
 	}
 
 	if cont {
-		ix.advanceLocked(now, rec, a, chain)
+		ix.advanceLocked(now, rec, a)
 		return ResolveResult{
-			ID: rec.id, Outcome: OutcomeMatched, Blocks: len(chain),
+			ID: rec.id, Outcome: OutcomeMatched, Turn: rec.turns, Blocks: a.Chain.fullBlocks,
 			MatchedBlocks: matched, StickyBusy: sticky, Retry: retry, Elapsed: time.Since(start),
 		}
 	}
 
-	fork := ix.mintLocked(now, rec, a, chain)
+	fork := ix.mintLocked(now, rec, a)
 	rec.forks++
 	return ResolveResult{
-		ID: fork.id, Outcome: OutcomeForked, Blocks: len(chain), MatchedBlocks: matched,
+		ID: fork.id, Outcome: OutcomeForked, Turn: 1, Blocks: a.Chain.fullBlocks, MatchedBlocks: matched,
 		Elapsed: time.Since(start),
 	}
 }
 
-// matchLocked returns the branch whose tip stream is the LONGEST tail-exact
-// prefix of the request's stream, plus that prefix's length in full blocks and
-// whether the match is byte-identical to the whole request. Scoped tips only
+// matchLocked returns the branch whose verified prefix is the longest prefix of
+// the arrival's chain, and that prefix's length in blocks. Scoped tips only
 // match their own session; unscoped tips match any (the floor the design accepts
 // when the client sends no session header).
 //
-// Candidates are tried longest first: block-indexed tips descending from the
-// request's own chain length, then sub-chunk tips descending by length — and a
-// candidate whose tail does not match falls through to the next shorter tip,
-// which is how a request that shares only a prefix of a tip's tail still finds
-// its (shorter) true predecessor.
-func (ix *branchIndex) matchLocked(now time.Time, stream []byte, chain []Hash, scope string) (*branchRecord, int, bool) {
-	for i := len(chain) - 1; i >= 0; i-- {
+// The probe DESCENDS over the arrival's own block hashes because the tip index is
+// NOT prefix-closed: a tip may exist at k=7 with none at k=5, so an early stop at
+// the first miss would lose it.
+func (ix *branchIndex) matchLocked(now time.Time, c chain, scope string) (*branchRecord, int) {
+	for k := c.fullBlocks; k >= 1; k-- {
 		var best *branchRecord
 		bestOutstanding := true
-		for _, cand := range ix.byTip[chain[i]] {
-			if cand.blocks != i+1 {
-				// Same last hash at a different length can only be a hash
-				// collision; it is not a prefix relation, so skip it.
-				continue
-			}
-			if !sameScope(cand.scope, scope) || !cand.tipPrefixOf(stream, ix.blockBytes()) {
+		for _, cand := range ix.byPrefix[c.blocks[k-1]] {
+			if cand.prefixLen != k || !sameScope(cand.scope, scope) {
 				continue
 			}
 			cand.pruneMarkers(now, ix.markerTTL)
@@ -563,148 +352,90 @@ func (ix *branchIndex) matchLocked(now time.Time, stream []byte, chain []Hash, s
 			case best == nil:
 				best, bestOutstanding = cand, out
 			case bestOutstanding && !out:
-				// A free tip is the better continuation target than a busy one
-				// with identical content (an exact duplicate of the tip).
+				// A free tip is the better continuation target than a busy one of
+				// identical content (the busy one has a sibling in flight).
 				best, bestOutstanding = cand, out
-			case bestOutstanding == out && cand.lastSeen.After(best.lastSeen):
+			case bestOutstanding == out && betterTip(cand, best):
 				best = cand
 			}
 		}
 		if best != nil {
-			return best, i + 1, best.isExact(stream, ix.blockBytes())
+			return best, k
 		}
 	}
-
-	if rec := ix.matchShortLocked(now, stream, scope); rec != nil {
-		return rec, 0, rec.isExact(stream, ix.blockBytes())
-	}
-	return nil, 0, false
+	return nil, 0
 }
 
-// matchShortLocked matches tips shorter than one block (a stream with no full
-// block has no hash to look up in byTip, so it is indexed by length + hash
-// instead). Every live sub-chunk length is tried, longest first: each needs one
-// hash of the request's own prefix of that many bytes.
-func (ix *branchIndex) matchShortLocked(now time.Time, stream []byte, scope string) *branchRecord {
-	if len(ix.byShort) == 0 || len(stream) == 0 {
-		return nil
+// betterTip orders two equally verifiable candidates: the LONGER tip first (it
+// carries more evidence, and v1 matched the longest tip), then the most recently
+// seen, then the id — the last term keeps the choice deterministic when a
+// replay's clock ties, which the stage-0c gate requires.
+func betterTip(cand, best *branchRecord) bool {
+	if cand.fullBlocks != best.fullBlocks {
+		return cand.fullBlocks > best.fullBlocks
 	}
-	maxLen := ix.blockBytes() - 1
-	if maxLen > len(stream) {
-		maxLen = len(stream)
+	if !cand.lastSeen.Equal(best.lastSeen) {
+		return cand.lastSeen.After(best.lastSeen)
 	}
-	if maxLen <= 0 {
-		return nil
-	}
-	for _, length := range ix.shortLensDescending(maxLen) {
-		hash := tailChain(stream[:length])
-		var best *branchRecord
-		bestOutstanding := true
-		for _, cand := range ix.byShort[shortKey{tailLen: length, tailHash: hash}] {
-			if cand.tailLen != length || !sameScope(cand.scope, scope) || !cand.tipPrefixOf(stream, ix.blockBytes()) {
-				continue
-			}
-			cand.pruneMarkers(now, ix.markerTTL)
-			out := cand.outstanding()
-			switch {
-			case best == nil:
-				best, bestOutstanding = cand, out
-			case bestOutstanding && !out:
-				best, bestOutstanding = cand, out
-			case bestOutstanding == out && cand.lastSeen.After(best.lastSeen):
-				best = cand
-			}
-		}
-		if best != nil {
-			return best
-		}
-	}
-	return nil
+	return cand.id < best.id
 }
 
-// shortLensDescending returns the live sub-chunk tail lengths up to maxLen,
-// longest first (the longest matching tip wins).
-func (ix *branchIndex) shortLensDescending(maxLen int) []int {
-	if len(ix.shortLens) == 0 {
-		return nil
-	}
-	lens := make([]int, 0, len(ix.shortLens))
-	for length := range ix.shortLens {
-		if length <= maxLen {
-			lens = append(lens, length)
-		}
-	}
-	sort.Sort(sort.Reverse(sort.IntSlice(lens)))
-	return lens
-}
-
-// advanceLocked moves the branch's tip to the arriving request's stream and
-// records the arrival. The tip moves at ARRIVAL (design §5): the request is the
-// branch's newest context whether or not it has dispatched yet, and a later
-// request extending it must see it.
-func (ix *branchIndex) advanceLocked(now time.Time, rec *branchRecord, a Arrival, chain []Hash) {
-	ix.setTipLocked(rec, a.Stream, chain)
+// advanceLocked moves the branch's tip to the arriving request and records the
+// arrival. The tip moves at ARRIVAL: the request is the branch's newest context
+// whether or not it has dispatched yet, and a later request extending it must see
+// it.
+func (ix *branchIndex) advanceLocked(now time.Time, rec *branchRecord, a Arrival) {
+	ix.setTipLocked(rec, a.Chain)
 	rec.msgCount = len(a.Roles)
 	rec.lastSeen = now
 	rec.turns++
 	rec.markPending(a.Marker, now)
 }
 
-// setTipLocked re-points the record at a new tip stream, keeping both tip
-// indexes in sync.
-func (ix *branchIndex) setTipLocked(rec *branchRecord, stream []byte, chain []Hash) {
-	blocks := len(chain)
-	tip := Hash(0)
-	if blocks > 0 {
-		tip = chain[blocks-1]
-	}
-	start := blocks * ix.blockBytes()
-	if start > len(stream) {
-		start = len(stream)
-	}
-	tailLen := len(stream) - start
-	tailHash := tailChain(stream[start:])
-	if rec.blocks == blocks && rec.tip == tip && rec.tailLen == tailLen && rec.tailHash == tailHash {
-		return
-	}
+// setTipLocked re-points the record at a new tip chain, keeping the tip index in
+// sync.
+//
+// THE TOLERANCE: the verified prefix is the tip's chain EXCEPT its last full
+// block, so the unverified tail is always between B and 2B-1 tokens. A request
+// that differs from the tip only there still continues it, which absorbs
+// end-of-tip rendering variance that the history does not reproduce — the
+// generation prompt, a template's empty-think stub, a BPE merge at the boundary.
+// One block of slack (rather than the partial block alone) is what makes the
+// guarantee hold wherever the prompt ends: with the partial block alone the slack
+// can be ZERO, and an end variance that crosses the block edge re-keys the
+// branch.
+//
+// GUARDS: a tip with exactly ONE full block gets no tolerance — its prefix would
+// be empty and match every request — so that one block must match; and a tip
+// shorter than one block is not continuable at all (it has no block hash to index
+// and would otherwise match on an empty prefix). Both err toward NEW, which is
+// the unsafe direction, and both are counted by the equivalence gate as declared
+// classes (iii) and (v).
+func (ix *branchIndex) setTipLocked(rec *branchRecord, c chain) {
 	ix.unindexLocked(rec)
-	rec.blocks, rec.tip, rec.tailLen, rec.tailHash = blocks, tip, tailLen, tailHash
+	rec.fullBlocks, rec.tokens, rec.lastHash = c.fullBlocks, c.tokens, c.lastHash()
+	rec.prefixLen, rec.prefixKey = 0, 0
+	if rec.fullBlocks > 0 {
+		rec.prefixLen = max(rec.fullBlocks-1, 1)
+		rec.prefixKey = c.blocks[rec.prefixLen-1]
+	}
 	ix.indexLocked(rec)
 }
 
-// indexLocked inserts the record into the tip index that its shape belongs to.
+// indexLocked inserts the record under its prefix key.
 func (ix *branchIndex) indexLocked(rec *branchRecord) {
-	if rec.blocks > 0 {
-		ix.byTip[rec.tip] = append(ix.byTip[rec.tip], rec)
+	if rec.prefixLen == 0 {
 		return
 	}
-	key := shortKey{tailLen: rec.tailLen, tailHash: rec.tailHash}
-	ix.byShort[key] = append(ix.byShort[key], rec)
-	ix.shortLens[rec.tailLen] = struct{}{}
+	ix.byPrefix[rec.prefixKey] = append(ix.byPrefix[rec.prefixKey], rec)
 }
 
-// unindexLocked removes the record from the tip index (GC, re-tip).
+// unindexLocked removes the record from the tip index (cap eviction, re-tip).
 func (ix *branchIndex) unindexLocked(rec *branchRecord) {
-	if rec.blocks > 0 {
-		cands := ix.byTip[rec.tip]
-		for i, c := range cands {
-			if c == rec {
-				cands = append(cands[:i], cands[i+1:]...)
-				break
-			}
-		}
-		if len(cands) == 0 {
-			delete(ix.byTip, rec.tip)
-			return
-		}
-		ix.byTip[rec.tip] = cands
+	if rec.prefixLen == 0 {
 		return
 	}
-	if rec.tailLen == 0 && rec.tailHash == 0 {
-		return // never indexed (a record that has not been given a stream yet)
-	}
-	key := shortKey{tailLen: rec.tailLen, tailHash: rec.tailHash}
-	cands := ix.byShort[key]
+	cands := ix.byPrefix[rec.prefixKey]
 	for i, c := range cands {
 		if c == rec {
 			cands = append(cands[:i], cands[i+1:]...)
@@ -712,49 +443,26 @@ func (ix *branchIndex) unindexLocked(rec *branchRecord) {
 		}
 	}
 	if len(cands) == 0 {
-		delete(ix.byShort, key)
-		ix.refreshShortLens(key.tailLen)
+		delete(ix.byPrefix, rec.prefixKey)
 		return
 	}
-	ix.byShort[key] = cands
+	ix.byPrefix[rec.prefixKey] = cands
 }
 
-// refreshShortLens drops a tail length from the scan bound once no sub-chunk tip
-// uses it.
-func (ix *branchIndex) refreshShortLens(length int) {
-	for key := range ix.byShort {
-		if key.tailLen == length {
-			return
-		}
-	}
-	delete(ix.shortLens, length)
-}
-
-// mintLocked creates a branch. Its id is derived from the creating stream's tip
-// commitment (plus a fork ordinal, so a fork of the same content gets its own
-// id): the same conversation yields the same id on any instance, without a
-// registry to consult. The id does not change as the branch continues —
-// continuations keep the record's id, only the tip moves.
+// mintLocked creates a branch. Its id is derived from the creating request's tip
+// commitment, the fork ordinal and the scope: the same branch yields the same id
+// on any instance without a registry, and a branch keeps its id as it continues.
 //
-// An id the table already holds belongs to a LIVE branch, which is never
-// overwritten: overwriting it used to leave the old record GHOSTED — still in the
-// tip index, no longer in the table — so it kept matching and advancing requests
-// (corrupting the branch counters) and was invisible to the cap (never evicted,
-// tip index growing without bound). What looks like the same branch being minted
-// twice (a client re-sending a first turn after its branch advanced, a
-// look-alike fork with the same ordinal) therefore bumps the ordinal until the id
-// is free, and gets a distinct branch. Stage-0c/1 telemetry did not depend on
-// cross-arrival id reuse: the id is the queue key, and two different moments in a
-// conversation are two different queue states.
-func (ix *branchIndex) mintLocked(now time.Time, parent *branchRecord, a Arrival, chain []Hash) *branchRecord {
-	tip := Hash(0)
-	if len(chain) > 0 {
-		tip = chain[len(chain)-1]
-	} else {
-		// A stream shorter than one block has no chain: its whole-stream tail
-		// hash is its commitment.
-		tip = tailChain(a.Stream)
-	}
+// An id the table already holds belongs to a LIVE branch and is never
+// overwritten — overwriting leaves the old record GHOSTED (still indexed, no
+// longer in the table: it keeps matching, is invisible to the cap, and the index
+// grows without bound). What looks like the same branch being minted twice (a
+// client re-sending an earlier turn after its branch advanced, a look-alike fork
+// with the same ordinal) bumps the ordinal and gets a distinct branch: the id is
+// the queue key, and two different moments in a conversation are two different
+// queue states.
+func (ix *branchIndex) mintLocked(now time.Time, parent *branchRecord, a Arrival) *branchRecord {
+	tip := a.Chain.lastHash()
 	ordinal := 0
 	if parent != nil {
 		ordinal = parent.forks + 1
@@ -771,7 +479,7 @@ func (ix *branchIndex) mintLocked(now time.Time, parent *branchRecord, a Arrival
 		} else {
 			// Every ordinal in the window is taken by a live id (astronomically
 			// unlikely): salt with a process-unique nonce rather than reuse.
-			seed = mintSeed(tip, ordinal, a.Scope) ^ Hash(mintFallbackSeq.Add(1))
+			seed = mintSeed(tip, ordinal, a.Scope) ^ prefixhash.BlockHash(mintFallbackSeq.Add(1))
 		}
 		id = branchID(seed)
 	}
@@ -791,7 +499,7 @@ func (ix *branchIndex) mintLocked(now time.Time, parent *branchRecord, a Arrival
 		rec.scope = parent.scope
 	}
 	ix.branches[id] = rec
-	ix.setTipLocked(rec, a.Stream, chain)
+	ix.setTipLocked(rec, a.Chain)
 	rec.markPending(a.Marker, now)
 	return rec
 }
@@ -827,21 +535,13 @@ func (ix *branchIndex) Settle(id, marker string, now time.Time) bool {
 }
 
 // EnforceCap bounds the table when it grows past maxBranches, evicting the
-// IDLEST non-outstanding branches first.
-//
-// There is deliberately NO time-based (silence) GC. Stage 0 measured a p99.9
-// inter-turn idle gap of 3,036 seconds on the campaign corpus: any plausible T_gc
-// would drop dormant threads that then return, and a premature drop is a false
-// NEW branch — the unsafe direction (PREREG's hard <1% bar) — because a returning
-// thread would be minted a fresh fairness id and re-enter as a newcomer. Branch
-// records are content-addressed and tiny, so they are retained; the flow-control
-// registry already GCs the idle QUEUES. The count cap is the only eviction path,
-// and it never removes a branch with anything in flight or pending.
+// IDLEST non-outstanding branches first. There is deliberately NO silence GC
+// (see the package doc): the count cap is the only eviction path, and it never
+// removes a branch with anything outstanding.
 func (ix *branchIndex) EnforceCap(now time.Time) int {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 
-	removed := 0
 	for _, rec := range ix.branches {
 		rec.pruneMarkers(now, ix.markerTTL)
 	}
@@ -855,6 +555,7 @@ func (ix *branchIndex) EnforceCap(now time.Time) int {
 		}
 	}
 	sort.Slice(victims, func(i, j int) bool { return victims[i].lastSeen.Before(victims[j].lastSeen) })
+	removed := 0
 	for i := 0; i < len(victims) && len(ix.branches) > ix.maxBranches; i++ {
 		ix.unindexLocked(victims[i])
 		delete(ix.branches, victims[i].id)
@@ -863,14 +564,14 @@ func (ix *branchIndex) EnforceCap(now time.Time) int {
 	return removed
 }
 
-// Len is the live branch count (the branch_records gauge).
+// Len is the live branch count (the records gauge).
 func (ix *branchIndex) Len() int {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	return len(ix.branches)
 }
 
-// checkIndexInvariants reports every record reachable from a tip index that is
+// checkIndexInvariants reports every record reachable from the tip index that is
 // not the live record for its id. A violation means a record was overwritten
 // (ghosted) or unindexed inconsistently; the concurrency test asserts it is
 // empty.
@@ -879,30 +580,23 @@ func (ix *branchIndex) checkIndexInvariants() []string {
 	defer ix.mu.Unlock()
 	var problems []string
 	seen := make(map[*branchRecord]int, len(ix.branches))
-	for hash, cands := range ix.byTip {
+	for key, cands := range ix.byPrefix {
 		for _, cand := range cands {
 			seen[cand]++
-			if cand.blocks == 0 || ix.branches[cand.id] != cand {
-				problems = append(problems, "byTip record not live: "+cand.id)
+			if ix.branches[cand.id] != cand {
+				problems = append(problems, "indexed record not live: "+cand.id)
 			}
-			if cand.blocks > 0 && cand.tip != hash {
-				problems = append(problems, "byTip record under the wrong hash: "+cand.id)
-			}
-		}
-	}
-	for key, cands := range ix.byShort {
-		for _, cand := range cands {
-			seen[cand]++
-			if cand.blocks != 0 || ix.branches[cand.id] != cand {
-				problems = append(problems, "byShort record not live: "+cand.id)
-			}
-			if cand.tailLen != key.tailLen || cand.tailHash != key.tailHash {
-				problems = append(problems, "byShort record under the wrong key: "+cand.id)
+			if cand.prefixKey != key || cand.prefixLen == 0 {
+				problems = append(problems, "record under the wrong prefix key: "+cand.id)
 			}
 		}
 	}
 	for _, rec := range ix.branches {
-		if seen[rec] != 1 {
+		want := 0
+		if rec.prefixLen > 0 {
+			want = 1
+		}
+		if seen[rec] != want {
 			problems = append(problems, "live record indexed "+itoa(seen[rec])+" times: "+rec.id)
 		}
 	}
@@ -938,7 +632,7 @@ type branchRow struct {
 	ID          string  `json:"id"`
 	Scope       string  `json:"scope,omitempty"`
 	Blocks      int     `json:"blocks"`
-	TailLen     int     `json:"tailLen"`
+	Tokens      int     `json:"tokens"`
 	MsgCount    int     `json:"msgCount"`
 	InFlight    int     `json:"inflight"`
 	Pending     int     `json:"pending"`
@@ -964,8 +658,8 @@ func (ix *branchIndex) Snapshot(now time.Time) branchTable {
 		rows = append(rows, branchRow{
 			ID:          rec.id,
 			Scope:       rec.scope,
-			Blocks:      rec.blocks,
-			TailLen:     rec.tailLen,
+			Blocks:      rec.fullBlocks,
+			Tokens:      rec.tokens,
 			MsgCount:    rec.msgCount,
 			InFlight:    len(rec.inflight),
 			Pending:     len(rec.pending),
@@ -988,21 +682,17 @@ func (ix *branchIndex) Snapshot(now time.Time) branchTable {
 	return snap
 }
 
-// startsWithReply implements the H1 sticky-busy guard's content test: the
-// message at the tip's message count is an assistant message, i.e. the request
-// begins with the reply to the tip's request. A concurrent fork cannot contain
-// the reply of a request that is still in flight, so the content proves the tip
-// completed even when the busy flag is stale.
+// startsWithReply is H1's content test: the message at the tip's message count is
+// an assistant message, i.e. the request carries the reply to the tip's request.
+// A request still in flight cannot have its reply in anyone's history, so the
+// content proves the tip completed even when the busy flag is stale.
 //
-// The test is sound only because tips are TAIL-EXACT: the tip's entire stream is
-// a prefix of the request's, so message index msgCount in the request IS the
-// first message past the tip. With the old block-only tips a request could share
-// the full blocks but diverge inside the tail, and the role at that index
-// belonged to a different message.
+// The test is sound only because a match proves the tip's token prefix: message
+// index msgCount in the request IS the first message past the tip.
 //
-// (Structural caveat, measured not fixed — design H2: a framework that spawns a
-// child AFTER the parent's assistant tool-call turn puts that assistant message
-// into the child's history too, where it looks like a continuation.)
+// (Measured caveat, design H2: a framework that spawns a child after the parent's
+// assistant tool-call turn puts that message into the child's history too, where
+// it looks like a continuation.)
 func startsWithReply(tipMsgCount int, roles []string) bool {
 	if tipMsgCount <= 0 || tipMsgCount >= len(roles) {
 		return false
@@ -1010,32 +700,30 @@ func startsWithReply(tipMsgCount int, roles []string) bool {
 	return roles[tipMsgCount] == "assistant"
 }
 
-// sameScope reports whether a branch tip is visible to a request in scope. An
-// absent scope on either side matches (no session header → no scoping, the
-// design's accepted floor); two different sessions never match.
+// sameScope reports whether a tip is visible to a request in scope. An absent
+// scope on either side matches (no session header → no scoping); two different
+// sessions never match.
 func sameScope(branchScope, requestScope string) bool {
 	return branchScope == "" || requestScope == "" || branchScope == requestScope
 }
 
 // branchID mints the opaque branch id: the first 10 hex chars of a hash over the
 // mint seed.
-func branchID(seed Hash) string {
+func branchID(seed prefixhash.BlockHash) string {
 	var b [8]byte
 	binary.LittleEndian.PutUint64(b[:], uint64(seed))
 	sum := sha256.Sum256(b[:])
 	return hex.EncodeToString(sum[:])[:idHexLen]
 }
 
-// mintSeed hashes the branch id's inputs: the creating stream's tip commitment,
-// the fork ordinal (siblings of the same content get distinct ids) and the
-// session scope (two clients sending look-alike bodies stay distinct even when
-// their streams coincide).
-func mintSeed(tip Hash, ordinal int, scope string) Hash {
+// mintSeed hashes the branch id's inputs: the tip commitment, the fork ordinal
+// (siblings of the same content get distinct ids) and the session scope.
+func mintSeed(tip prefixhash.BlockHash, ordinal int, scope string) prefixhash.BlockHash {
 	h := sha256.New()
 	var b [16]byte
 	binary.LittleEndian.PutUint64(b[:8], uint64(tip))
 	binary.LittleEndian.PutUint64(b[8:], uint64(ordinal)) //#nosec G115 -- ordinal is a bounded counter
 	h.Write(b[:])
 	h.Write([]byte(scope))
-	return Hash(binary.LittleEndian.Uint64(h.Sum(nil)[:8]))
+	return prefixhash.BlockHash(binary.LittleEndian.Uint64(h.Sum(nil)[:8]))
 }

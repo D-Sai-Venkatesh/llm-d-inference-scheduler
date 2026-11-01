@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -35,11 +37,12 @@ import (
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	testutils "github.com/llm-d/llm-d-router/test/utils"
 )
 
-// filler produces n deterministic bytes' worth of content (the default chunk is
-// 256 canonical bytes, so this controls how many blocks a body spans).
+// filler produces n deterministic content bytes; one content byte is one token,
+// so this controls how many blocks a body spans at the default block size (64).
 func filler(seed byte, n int) string { return strings.Repeat(string(seed), n) }
 
 func user(seed byte, n int) fwkrh.Message {
@@ -50,9 +53,8 @@ func assistant(seed byte, n int) fwkrh.Message {
 	return fwkrh.Message{Role: "assistant", Content: fwkrh.Content{Raw: filler(seed, n)}}
 }
 
-// reqSeq makes every test request a distinct request id, because the branch's
-// outstanding set is keyed by request id (two hooks of one request share a marker;
-// two requests never do).
+// reqSeq makes every test request a distinct request id: a branch's outstanding
+// set is keyed by request id.
 var reqSeq atomic.Uint64
 
 func chatReq(msgs ...fwkrh.Message) *fwksched.InferenceRequest {
@@ -67,15 +69,100 @@ func chatReqID(id string, msgs ...fwkrh.Message) *fwksched.InferenceRequest {
 	}
 }
 
-func newTestPlugin(t *testing.T) *Plugin {
-	t.Helper()
-	p, err := Factory("branch", nil, testutils.NewTestHandle(t.Context()))
-	require.NoError(t, err)
-	return p.(*Plugin)
+// testRenderer stands in for a chat template: the tools block first, then each
+// message's role, tool calls and content, then the generation-prompt suffix
+// (stub tokens). The properties the identity depends on hold: an appended message
+// extends the token stream, and a mid-thread change to the tools block or to an
+// earlier message moves it.
+func testRenderer(stub int) func(context.Context, *fwksched.InferenceRequest) error {
+	return func(_ context.Context, request *fwksched.InferenceRequest) error {
+		if request.Body.TokenizedRequest != nil {
+			return nil // the producer's own skip path
+		}
+		ids := testTokenIDs(request.Body, stub)
+		if len(ids) == 0 {
+			return nil
+		}
+		request.Body.TokenizedRequest = &fwkrh.TokenizedRequest{
+			Prompts:   []fwkrh.PromptTokens{{TokenIDs: ids}},
+			CacheSalt: tokenizer.CacheSaltFromBody(request.Body),
+		}
+		return nil
+	}
 }
 
-// branchOf runs the header hook and returns the derived id and the request's
-// fairness id.
+func testTokenIDs(body *fwkrh.InferenceRequestBody, stub int) []uint32 {
+	var ids []uint32
+	switch {
+	case body.ChatCompletions != nil:
+		for _, tool := range body.ChatCompletions.Tools {
+			ids = append(ids, textTokens(fmt.Sprint(tool))...)
+		}
+		for _, m := range body.ChatCompletions.Messages {
+			ids = append(ids, roleToken(m.Role))
+			if len(m.ToolCalls) > 0 {
+				ids = append(ids, textTokens(fmt.Sprint(m.ToolCalls))...)
+			}
+			ids = append(ids, textTokens(m.Content.Raw)...)
+		}
+	case body.Messages != nil:
+		for _, m := range body.Messages.Messages {
+			ids = append(ids, roleToken(m.Role))
+			ids = append(ids, textTokens(m.Content.Raw)...)
+		}
+	}
+	for i := 0; i < stub && len(ids) > 0; i++ {
+		ids = append(ids, 900_000+uint32(i))
+	}
+	return ids
+}
+
+// textTokens renders text as one token per byte, above the role-token range.
+func textTokens(s string) []uint32 {
+	out := make([]uint32, len(s))
+	for i := 0; i < len(s); i++ {
+		out[i] = 2000 + uint32(s[i])
+	}
+	return out
+}
+
+// roleToken gives each role its own token, above the byte range.
+func roleToken(role string) uint32 {
+	switch role {
+	case "user":
+		return 1001
+	case "assistant":
+		return 1002
+	case "system":
+		return 1003
+	case "tool":
+		return 1004
+	}
+	return 1005 + uint32(len(role))
+}
+
+// newTestPluginWith builds the plugin through the Factory and then replaces the
+// render backend with the test renderer. The rules under test are about the
+// identity, not about a chat template's exact tokens.
+func newTestPluginWith(t *testing.T, params string) *Plugin {
+	t.Helper()
+	var dec *json.Decoder
+	if params != "" {
+		dec = json.NewDecoder(strings.NewReader(params))
+	}
+	built, err := Factory("branch", dec, testutils.NewTestHandle(t.Context()))
+	require.NoError(t, err)
+	p := built.(*Plugin)
+	p.tokenize = testRenderer(0)
+	return p
+}
+
+func newTestPlugin(t *testing.T) *Plugin {
+	t.Helper()
+	return newTestPluginWith(t, "")
+}
+
+// branchOf runs the header hook and returns the derived id and the fairness id.
 func branchOf(t *testing.T, p *Plugin, req *fwksched.InferenceRequest) (branchID, fairnessID string) {
 	t.Helper()
 	require.NoError(t, p.RequestHeader(context.Background(), req))
@@ -86,9 +173,9 @@ func branchOf(t *testing.T, p *Plugin, req *fwksched.InferenceRequest) (branchID
 	return id, req.FairnessID
 }
 
-// dispatchAndComplete models a full turn: the request leaves the queue and its
-// response completes (the director forces the EndOfStream call even on abort).
-func dispatchAndComplete(t *testing.T, p *Plugin, req *fwksched.InferenceRequest) {
+// finishTurn models a full turn: the request leaves the queue and its response
+// completes (the director forces the EndOfStream call even on abort).
+func finishTurn(t *testing.T, p *Plugin, req *fwksched.InferenceRequest) {
 	t.Helper()
 	require.NoError(t, p.PreRequest(context.Background(), req, nil))
 	p.ResponseBody(context.Background(), req, &fwkrc.Response{
@@ -98,7 +185,7 @@ func dispatchAndComplete(t *testing.T, p *Plugin, req *fwksched.InferenceRequest
 }
 
 // TestRequestHeader_SetsTheQueueKey: the derived branch id is the request's
-// fairness id, so it is set before the request enqueues (it IS the queue key).
+// fairness id, so it exists before the request enqueues.
 func TestRequestHeader_SetsTheQueueKey(t *testing.T) {
 	p := newTestPlugin(t)
 
@@ -109,180 +196,362 @@ func TestRequestHeader_SetsTheQueueKey(t *testing.T) {
 	assert.Regexp(t, "^[0-9a-f]+$", id, "branch ids are opaque, short hex")
 }
 
-// TestRequestHeader_ExplicitFairnessHeaderWins: an operator/client override still
-// wins over the derivation (the derivation is the default, not a mandate).
+// TestRequestHeader_ExplicitFairnessHeaderWins: an operator override still wins.
 func TestRequestHeader_ExplicitFairnessHeaderWins(t *testing.T) {
 	p := newTestPlugin(t)
 	req := chatReq(user('a', 600))
 	req.FairnessID = "client-thread-1"
 
 	id, fairness := branchOf(t, p, req)
-	assert.NotEmpty(t, id, "the branch is still tracked and published")
-	assert.Equal(t, "client-thread-1", fairness)
+	require.NotEmpty(t, id)
+	assert.Equal(t, "client-thread-1", fairness, "the explicit id is not overwritten")
 }
 
-// TestLifecycle_ContinuationIsTheSameID: the queue key changes only when the
-// branch does.
+// TestLifecycle_ContinuationIsTheSameID: a finished turn's successor continues it.
 func TestLifecycle_ContinuationIsTheSameID(t *testing.T) {
 	p := newTestPlugin(t)
 
-	turn1 := chatReq(user('a', 600))
-	id1, _ := branchOf(t, p, turn1)
-	dispatchAndComplete(t, p, turn1)
+	first := chatReq(user('a', 600))
+	id1, _ := branchOf(t, p, first)
+	finishTurn(t, p, first)
 
-	turn2 := chatReq(user('a', 600), assistant('b', 400), user('c', 300))
-	id2, fairness2 := branchOf(t, p, turn2)
-	assert.Equal(t, id1, id2)
+	second := chatReq(user('a', 600), assistant('b', 40), user('c', 60))
+	id2, fairness2 := branchOf(t, p, second)
+	assert.Equal(t, id1, id2, "an appended turn continues the branch")
 	assert.Equal(t, id1, fairness2)
-
-	// A re-send of the CURRENT tip (a retry) stays on the branch.
-	idAgain, _ := branchOf(t, p, chatReq(user('a', 600), assistant('b', 400), user('c', 300)))
-	assert.Equal(t, id1, idAgain, "a retry of the tip continues the branch")
-
-	// A re-send of an EARLIER turn does not: the tip has moved past it, and an id
-	// held by a live branch is never reused (it used to overwrite and ghost it).
-	idOld, _ := branchOf(t, p, chatReq(user('a', 600)))
-	assert.NotEqual(t, id1, idOld)
-	assert.Contains(t, idsOf(p), id1, "the original branch is still live")
 }
 
-// TestLifecycle_ForkWhileBusy: a sibling that extends a BUSY branch's tip (a
-// sub-agent inheriting the parent's context) gets its own queue key, so it
-// dispatches in parallel instead of queueing behind its parent.
+// TestArrivalRecord_IsPublishedForTheScheduler pins the arrival record the
+// scheduler consumes: the outcome (continued / forked / new) and the arrival's
+// turn number on its branch, as one data key. It is an OUTPUT of the derivation.
+func TestArrivalRecord_IsPublishedForTheScheduler(t *testing.T) {
+	p := newTestPlugin(t)
+
+	// Turn 1: a new branch.
+	first := chatReq(user('a', 600))
+	_, _ = branchOf(t, p, first)
+	assert.Equal(t, BranchArrival{Outcome: OutcomeNew, Turn: 1}, arrivalOf(t, first))
+	finishTurn(t, p, first)
+
+	// Turn 2 and 3: continuations of the same branch.
+	for wantTurn := 2; wantTurn <= 3; wantTurn++ {
+		next := chatReq(user('a', 600), assistant('b', 40), user('c', 60))
+		_, _ = branchOf(t, p, next)
+		assert.Equal(t, BranchArrival{Outcome: OutcomeMatched, Turn: wantTurn}, arrivalOf(t, next))
+		finishTurn(t, p, next)
+	}
+
+	// A sibling of a busy tip is a fork, and a fork's turn restarts at 1.
+	busy := chatReq(user('z', 600))
+	forkedID, _ := branchOf(t, p, busy)
+	require.NoError(t, p.PreRequest(context.Background(), busy, nil))
+	sibling := chatReq(user('z', 600), user('y', 60))
+	siblingID, _ := branchOf(t, p, sibling)
+	require.NotEqual(t, forkedID, siblingID)
+	assert.Equal(t, BranchArrival{Outcome: OutcomeForked, Turn: 1}, arrivalOf(t, sibling))
+
+	// The record is declared in Produces(), so a consumer may depend on the key.
+	_, declared := p.Produces()[BranchArrivalKey]
+	assert.True(t, declared, "the arrival record must be a declared output")
+}
+
+// TestArrivalRecord_DoesNotChangeTheDerivation: the record is published AFTER the
+// resolve, so reading it from the request cannot alter any id.
+func TestArrivalRecord_DoesNotChangeTheDerivation(t *testing.T) {
+	replay := func(drop bool) []string {
+		p := newTestPlugin(t)
+		var ids []string
+		for _, msgs := range [][]fwkrh.Message{
+			{user('a', 300)},
+			{user('a', 300), assistant('b', 40), user('c', 50)},
+			{user('a', 300), assistant('b', 40), user('c', 50), assistant('d', 30), user('e', 20)},
+		} {
+			req := chatReq(msgs...)
+			id, _ := branchOf(t, p, req)
+			ids = append(ids, id)
+			if drop {
+				req.PutAttribute(BranchArrivalKey, nil)
+			}
+			finishTurn(t, p, req)
+		}
+		return ids
+	}
+	assert.Equal(t, replay(false), replay(true))
+}
+
+// arrivalOf reads the published arrival record.
+func arrivalOf(t *testing.T, request *fwksched.InferenceRequest) BranchArrival {
+	t.Helper()
+	record, ok := fwksched.ReadRequestAttribute[BranchArrival](request, BranchArrivalKey)
+	require.True(t, ok, "every derived request publishes its arrival record")
+	return record
+}
+
+// TestLifecycle_ForkWhileBusy: extending a tip that is still in flight forks.
 func TestLifecycle_ForkWhileBusy(t *testing.T) {
 	p := newTestPlugin(t)
 
-	parent := chatReq(user('a', 600))
-	idParent, _ := branchOf(t, p, parent)
-	require.NoError(t, p.PreRequest(context.Background(), parent, nil)) // in flight, no response yet
+	first := chatReq(user('a', 600))
+	id1, _ := branchOf(t, p, first)
+	require.NoError(t, p.PreRequest(context.Background(), first, nil))
 
-	child := chatReq(user('a', 600), user('z', 300))
-	idChild, _ := branchOf(t, p, child)
-	assert.NotEqual(t, idParent, idChild, "a sibling must not share the parent's queue")
-	assert.NotEmpty(t, idChild)
+	// No assistant message after the tip, so H1 cannot prove completion.
+	second := chatReq(user('a', 600), user('c', 60))
+	id2, _ := branchOf(t, p, second)
+	assert.NotEqual(t, id1, id2, "a busy tip's extension is a sibling")
 }
 
-// TestH1_ReplyGuardIsLoadBalancingTheRealCase (H1, load-bearing): a request that
-// extends a busy tip and begins with the tip's assistant reply is a proven
-// continuation, so a stale busy flag cannot fragment the conversation. Stage 0
-// measured 42 of 48 fork candidates to be exactly this case.
+// TestH1_ReplyGuard: the request carries the tip's reply, so a busy tip is proven
+// complete and the request continues (H1).
 func TestH1_ReplyGuard(t *testing.T) {
 	p := newTestPlugin(t)
 
-	parent := chatReq(user('a', 600))
-	idParent, _ := branchOf(t, p, parent)
-	require.NoError(t, p.PreRequest(context.Background(), parent, nil)) // never settles
+	first := chatReq(user('a', 600))
+	id1, _ := branchOf(t, p, first)
+	require.NoError(t, p.PreRequest(context.Background(), first, nil))
 
-	// The next turn begins with the parent's assistant reply.
-	continued := chatReq(user('a', 600), assistant('b', 400), user('c', 300))
-	idNext, _ := branchOf(t, p, continued)
-	assert.Equal(t, idParent, idNext, "content proves completion; the guard must override the busy flag")
+	second := chatReq(user('a', 600), assistant('b', 40), user('c', 60))
+	id2, _ := branchOf(t, p, second)
+	assert.Equal(t, id1, id2)
+	require.NotNil(t, p.metrics.sticky)
+	assert.EqualValues(t, 1, testutil.ToFloat64(p.metrics.sticky))
 }
 
-// TestSessionIsAnAttributeNotAQueueKey: the client session is published under its
-// own key (stage 2 reads it) and never becomes the branch id.
+// TestSessionIsAnAttributeNotAQueueKey: the session header is published on its own
+// key and never overwrites the branch id.
 func TestSessionIsAnAttributeNotAQueueKey(t *testing.T) {
-	p := newTestPlugin(t)
+	p := newTestPluginWith(t, `{"sessionHeaders":["x-session-scope"]}`)
 
 	req := chatReq(user('a', 600))
-	req.Headers["x-claude-code-session-id"] = "sess-1"
-	id, _ := branchOf(t, p, req)
+	req.Headers["x-session-scope"] = "session-7"
+	id, fairness := branchOf(t, p, req)
+
 	session, ok := fwksched.ReadRequestAttribute[string](req, BranchSessionKey)
 	require.True(t, ok)
-	assert.Equal(t, "sess-1", session)
-	assert.NotEqual(t, "sess-1", id, "the session must never be the queue key")
+	assert.Equal(t, "session-7", session)
+	assert.Equal(t, id, fairness, "the branch, not the session, is the queue key")
+	assert.NotEqual(t, "session-7", id)
 
-	// The same body in another session is another branch (no look-alike merge).
-	other := chatReq(user('a', 600))
-	other.Headers["x-claude-code-session-id"] = "sess-2"
-	idOther, _ := branchOf(t, p, other)
-	assert.NotEqual(t, id, idOther)
+	// A request under another session is a different branch.
+	other := chatReq(user('a', 600), assistant('b', 40), user('c', 60))
+	other.Headers["x-session-scope"] = "session-8"
+	id2, _ := branchOf(t, p, other)
+	assert.NotEqual(t, id, id2)
 }
 
-// TestToolCalls_DoNotMergeConversations: two agentic loops that differ only in
-// their assistant tool-call arguments must not collapse onto one branch — the
-// survey's false-merge gap (assistant turns with empty content).
-//
-// NOTE: unvalidated by the campaign corpus — the WEKA trace contains no tool
-// blocks, so this path is exercised only by unit tests. Treat it as a
-// live-deployment risk, not a measured behaviour.
-func TestToolCalls_DoNotMergeConversations(t *testing.T) {
+// TestToolSetChangeSplitsTheBranch is declared class (i): the identity follows the
+// engine's tokens, so a mid-thread tool-set change (rendered at the head by every
+// common template) splits the branch — exactly where the KV cache splits.
+func TestToolSetChangeSplitsTheBranch(t *testing.T) {
 	p := newTestPlugin(t)
-	call := func(args string) fwkrh.Message {
-		var v any
-		require.NoError(t, json.Unmarshal([]byte(`{"id":"call_1","type":"function","function":{"name":"read","arguments":`+args+`}}`), &v))
-		return fwkrh.Message{Role: "assistant", ToolCalls: []any{v}}
+
+	first := chatReq(user('a', 600))
+	first.Body.ChatCompletions.Tools = []any{map[string]any{"name": "search"}}
+	id1, _ := branchOf(t, p, first)
+	finishTurn(t, p, first)
+
+	second := chatReq(user('a', 600), assistant('b', 40), user('c', 60))
+	second.Body.ChatCompletions.Tools = []any{map[string]any{"name": "search"}, map[string]any{"name": "task"}}
+	id2, _ := branchOf(t, p, second)
+	assert.NotEqual(t, id1, id2, "a new tool set is a new token prefix")
+
+	// The same body with the SAME tools continues.
+	third := chatReq(user('a', 600), assistant('b', 40), user('c', 60), assistant('d', 30), user('e', 20))
+	third.Body.ChatCompletions.Tools = second.Body.ChatCompletions.Tools
+	id3, _ := branchOf(t, p, third)
+	assert.Equal(t, id2, id3, "with the tool set unchanged the branch continues")
+}
+
+// TestRerenderedHistorySplitsTheBranch is the other half of class (i): a client
+// that drops an earlier turn's reasoning re-renders history, so the tokens before
+// the new message move and the branch splits.
+func TestRerenderedHistorySplitsTheBranch(t *testing.T) {
+	p := newTestPlugin(t)
+
+	first := chatReq(user('a', 600), assistant('r', 200))
+	id1, _ := branchOf(t, p, first)
+	finishTurn(t, p, first)
+
+	// The same conversation with that assistant turn's reasoning stripped.
+	stripped := chatReq(user('a', 600), fwkrh.Message{Role: "assistant", Content: fwkrh.Content{Raw: ""}}, user('c', 60))
+	id2, _ := branchOf(t, p, stripped)
+	assert.NotEqual(t, id1, id2, "re-rendered history is a different token prefix")
+}
+
+// TestGenerationPromptStub_InsideThePartialBlockContinues: the tip's END renders
+// differently in history (a generation-prompt stub the history drops). With the
+// stub inside the tip's partial block the request continues.
+func TestGenerationPromptStub_InsideThePartialBlockContinues(t *testing.T) {
+	// 1 role token + 140 content tokens + 20 stub tokens = 161: two full blocks,
+	// the stub inside the partial block (128..160).
+	plantGenerationStub(t, 140, 20, true)
+}
+
+// TestGenerationPromptStub_StraddlingABlockEdgeContinues: the same stub planted so
+// that it completes the tip's last FULL block (the divergence crosses a block
+// edge). A partial-block-only tolerance calls this a false new branch; the
+// one-full-block tolerance absorbs it.
+func TestGenerationPromptStub_StraddlingABlockEdgeContinues(t *testing.T) {
+	// 1 role token + 188 content tokens + 20 stub tokens = 209: three full blocks,
+	// the stub's first 4 tokens inside the last full block (128..191).
+	plantGenerationStub(t, 188, 20, false)
+}
+
+// plantGenerationStub drives the stub fixture end to end: a tip whose render ends
+// with a generation-prompt stub, then the next turn of the same conversation,
+// whose history does not contain that stub.
+func plantGenerationStub(t *testing.T, contentLen, stub int, expectInPartialBlock bool) {
+	t.Helper()
+	p := newTestPlugin(t)
+	p.tokenize = testRenderer(stub)
+
+	tip := chatReq(user('a', contentLen))
+	tipIDs := testTokenIDs(tip.Body, stub)
+	require.GreaterOrEqual(t, len(tipIDs)/testBlockSize, 2, "the fixture needs a multi-block tip")
+	lastFullEnd := (len(tipIDs) / testBlockSize) * testBlockSize
+
+	nextIDs := testTokenIDs(chatReq(user('a', contentLen), assistant('b', 40), user('c', 60)).Body, stub)
+	divergence := firstDiff(tipIDs, nextIDs)
+	require.Equal(t, 1+contentLen, divergence, "the tip diverges exactly where its stub begins")
+	if expectInPartialBlock {
+		require.GreaterOrEqual(t, divergence, lastFullEnd, "the stub must lie inside the tip's partial block")
+	} else {
+		require.GreaterOrEqual(t, divergence, lastFullEnd-testBlockSize, "the stub must lie inside the tip's last full block")
+		require.Less(t, divergence, lastFullEnd)
 	}
-	a := chatReq(user('a', 600), call(`"{\"path\":\"/tmp\"}"`))
-	b := chatReq(user('a', 600), call(`"{\"path\":\"/etc\"}"`))
 
-	idA, _ := branchOf(t, p, a)
-	idB, _ := branchOf(t, p, b)
-	assert.NotEqual(t, idA, idB)
+	tipID, _ := branchOf(t, p, tip)
+	finishTurn(t, p, tip)
 
-	// And the tool call is part of the branch's identity for its own continuations.
-	dispatchAndComplete(t, p, a)
-	idA2, _ := branchOf(t, p, chatReq(user('a', 600), call(`"{\"path\":\"/tmp\"}"`), user('c', 300)))
-	assert.Equal(t, idA, idA2)
+	nextID, _ := branchOf(t, p, chatReq(user('a', contentLen), assistant('b', 40), user('c', 60)))
+	assert.Equal(t, tipID, nextID, "an end-of-tip-only difference continues the branch")
 }
 
-// TestUnflattenableBody_FallsBackSilently: a body with no canonical stream leaves
-// the fairness id alone (the director falls back) and never fails the request.
-func TestUnflattenableBody_FallsBackSilently(t *testing.T) {
+// TestRenderFailure_StartsItsOwnBranch is declared class (iv): a request the
+// render cannot describe gets its own branch, and the failure is counted.
+func TestRenderFailure_StartsItsOwnBranch(t *testing.T) {
 	p := newTestPlugin(t)
-	req := &fwksched.InferenceRequest{RequestID: "r", Headers: map[string]string{}, Body: &fwkrh.InferenceRequestBody{}}
+	p.tokenize = func(context.Context, *fwksched.InferenceRequest) error {
+		return fmt.Errorf("render endpoint unavailable")
+	}
 
-	id, fairness := branchOf(t, p, req)
-	assert.Empty(t, id)
-	assert.Empty(t, fairness, "no derivation → the existing fairness-id fallbacks apply")
-	_, ok := fwksched.ReadRequestAttribute[string](req, BranchSessionKey)
-	assert.False(t, ok)
+	first := chatReq(user('a', 600))
+	id1, fairness1 := branchOf(t, p, first)
+	require.NotEmpty(t, id1)
+	assert.Equal(t, id1, fairness1, "a failed render still yields a queue key")
+	require.NotNil(t, p.metrics.renderFailure)
+	assert.EqualValues(t, 1, testutil.ToFloat64(p.metrics.renderFailure))
+
+	// Two failing requests never share a branch, and neither is continuable.
+	second := chatReq(user('a', 600))
+	id2, _ := branchOf(t, p, second)
+	assert.NotEqual(t, id1, id2)
 }
 
-// TestDormantReturn_KeepsTheID is the stage-0 retention rule at the plugin level:
-// hours of silence do not change a returning thread's branch (the sweep only
-// enforces the table cap).
-func TestDormantReturn_KeepsTheID(t *testing.T) {
+// TestEmptyRender_StartsItsOwnBranch: a body that renders to no tokens is a
+// render failure too (nothing to key on).
+func TestEmptyRender_StartsItsOwnBranch(t *testing.T) {
 	p := newTestPlugin(t)
+	req := &fwksched.InferenceRequest{RequestID: "r-empty", Headers: map[string]string{},
+		Body: &fwkrh.InferenceRequestBody{ChatCompletions: &fwkrh.ChatCompletionsRequest{}}}
 
-	turn1 := chatReq(user('a', 600))
-	id1, _ := branchOf(t, p, turn1)
-	dispatchAndComplete(t, p, turn1)
-
-	p.sweepOnce(time.Now().Add(2 * time.Hour))
-
-	turn2 := chatReq(user('a', 600), assistant('b', 400), user('c', 300))
-	id2, _ := branchOf(t, p, turn2)
-	assert.Equal(t, id1, id2, "a dormant thread is not a new thread")
+	id, _ := branchOf(t, p, req)
+	require.NotEmpty(t, id)
+	assert.EqualValues(t, 1, testutil.ToFloat64(p.metrics.renderFailure))
 }
 
-// TestDumpState reports the branch table.
+// TestArrivalRendersOnceAndDispatchSkips: the render is RELOCATED from dispatch to
+// arrival, not added — exactly one render per request, and the token producer's
+// existing skip path makes the dispatch-time call a no-op.
+func TestArrivalRendersOnceAndDispatchSkips(t *testing.T) {
+	// Count only THIS request's renders: the backend's warmup probes the same
+	// server with a "warmup" body.
+	var renders atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "aaaa") {
+			renders.Add(1)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"token_ids": tokens(1, 3*testBlockSize)})
+	}))
+	defer srv.Close()
+
+	params := fmt.Sprintf(`{"tokenProducer":{"modelName":"m","vllm":{"url":%q}}}`, srv.URL)
+	built, err := Factory("branch", json.NewDecoder(strings.NewReader(params)), testutils.NewTestHandle(t.Context()))
+	require.NoError(t, err)
+	p := built.(*Plugin)
+
+	req := chatReq(user('a', 600))
+	// The renderer receives the wire payload, which a hand-built body carries only
+	// once Payload is set.
+	req.Body.Payload = fwkrh.PayloadMap{"model": "m", "messages": []any{
+		map[string]any{"role": "user", "content": strings.Repeat("a", 600)},
+	}}
+	_, _ = branchOf(t, p, req)
+	require.Equal(t, int64(1), renders.Load(), "the arrival hook renders once")
+	require.NotNil(t, req.Body.TokenizedRequest)
+
+	// The dispatch-time token producer finds the tokens and returns early.
+	require.NoError(t, p.producer.Tokenize(context.Background(), req))
+	assert.Equal(t, int64(1), renders.Load(), "no second render")
+}
+
+// TestMultiPromptConcatenatesChains: every prompt counts, so a multi-prompt
+// request's identity is the concatenation of the per-prompt chains, and the
+// request is counted.
+func TestMultiPromptConcatenatesChains(t *testing.T) {
+	p := newTestPlugin(t)
+	p.tokenize = func(_ context.Context, request *fwksched.InferenceRequest) error {
+		request.Body.TokenizedRequest = &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{
+			{TokenIDs: tokens(1, testBlockSize)},
+			{TokenIDs: tokens(2, testBlockSize)},
+		}}
+		return nil
+	}
+
+	req := chatReq(user('a', 10))
+	id1, _ := branchOf(t, p, req)
+	require.NotNil(t, p.metrics.multiPrompt)
+	assert.EqualValues(t, 1, testutil.ToFloat64(p.metrics.multiPrompt))
+	assert.Equal(t, 2, p.idx.branches[id1].fullBlocks, "both prompts contribute blocks")
+
+	// A repeat continues it.
+	req2 := chatReq(user('a', 10))
+	id2, _ := branchOf(t, p, req2)
+	assert.Equal(t, id1, id2)
+}
+
+// TestDeterminism_TwoReplaysAgree: the same requests in the same order produce the
+// same branch ids (the ids are minted from content, not from a clock).
+func TestDeterminism_TwoReplaysAgree(t *testing.T) {
+	replay := func() []string {
+		p := newTestPlugin(t)
+		var ids []string
+		for i := 0; i < 20; i++ {
+			req := chatReq(user('a', 300), assistant('b', 50), user(byte('c'+i%3), 40+i))
+			id, _ := branchOf(t, p, req)
+			ids = append(ids, id)
+			finishTurn(t, p, req)
+		}
+		return ids
+	}
+	assert.Equal(t, replay(), replay())
+}
+
+// TestDumpState: the snapshot reports the table.
 func TestDumpState(t *testing.T) {
 	p := newTestPlugin(t)
-	req := chatReq(user('a', 600))
-	branchOf(t, p, req)
-	require.NoError(t, p.PreRequest(context.Background(), req, nil))
+	_, _ = branchOf(t, p, chatReq(user('a', 600)))
 
 	raw, err := p.DumpState()
 	require.NoError(t, err)
-	var snap map[string]any
+	var snap branchTable
 	require.NoError(t, json.Unmarshal(raw, &snap))
-	assert.EqualValues(t, 1, snap["branches"])
-	assert.EqualValues(t, 1, snap["inFlight"])
-	rows, ok := snap["rows"].([]any)
-	require.True(t, ok)
-	require.Len(t, rows, 1)
-}
-
-// idsOf lists the live branch ids (test helper).
-func idsOf(p *Plugin) []string {
-	p.idx.mu.Lock()
-	defer p.idx.mu.Unlock()
-	ids := make([]string, 0, len(p.idx.branches))
-	for id := range p.idx.branches {
-		ids = append(ids, id)
-	}
-	return ids
+	assert.Equal(t, 1, snap.Branches)
+	assert.Equal(t, 1, snap.Busy, "the arrival marked the branch busy")
+	require.Len(t, snap.Rows, 1)
+	assert.Equal(t, testBlockSize, snap.BlockSize)
+	assert.Greater(t, snap.Rows[0].Tokens, 0)
 }
 
 // TestFactory_Config: defaults resolve, invalid values fail closed.
@@ -291,43 +560,43 @@ func TestFactory_Config(t *testing.T) {
 	assert.Equal(t, defaultBlockSizeTokens, p.idx.blockSize)
 	assert.True(t, p.forkOnBusy)
 	assert.True(t, p.sticky)
+	assert.True(t, p.retry)
 	assert.Equal(t, defaultMaxBranches, p.idx.maxBranches)
-	assert.Equal(t, time.Duration(defaultMarkerTTLSeconds)*time.Second, p.markerTTL,
+	assert.Equal(t, defaultRenderTimeoutSeconds*time.Second, p.renderTimeout)
+	assert.Equal(t, defaultMarkerTTLSeconds*time.Second, p.markerTTL,
 		"the marker TTL is the client request timeout, not the flow queue's 5-minute GC")
-	assert.True(t, p.retry, "the S2 retry rule is on by default")
 
-	// The deprecated arm name still parses (an older deployment key).
-	dec := json.NewDecoder(strings.NewReader(`{"queuedTtlSeconds":900}`))
-	built, err := Factory("legacy", dec, nil)
+	// The deprecated arm name still parses, and the render bound is configurable.
+	built, err := Factory("legacy", json.NewDecoder(strings.NewReader(
+		`{"queuedTtlSeconds":900,"renderTimeoutSeconds":3}`)), nil)
 	require.NoError(t, err)
 	assert.Equal(t, 900*time.Second, built.(*Plugin).markerTTL)
-	assert.Equal(t, []string{
-		"x-claude-code-session-id", "x-session-affinity", "session-id", "session_id",
-	}, p.sessions)
+	assert.Equal(t, 3*time.Second, built.(*Plugin).renderTimeout)
 
 	for name, params := range map[string]string{
-		"negative block size": `{"blockSizeTokens":-1}`,
-		"zero sweep":          `{"sweepSeconds":-5}`,
-		"negative cap":        `{"maxBranches":-1}`,
-		"bad json":            `{`,
+		"negative block size":   `{"blockSizeTokens":-1}`,
+		"negative sweep":        `{"sweepSeconds":-5}`,
+		"negative cap":          `{"maxBranches":-1}`,
+		"negative render bound": `{"renderTimeoutSeconds":-1}`,
+		"bad json":              `{`,
+		"bad token producer":    `{"tokenProducer":{"estimate":{},"modelName":"m"}}`,
 	} {
-		dec := json.NewDecoder(strings.NewReader(params))
-		_, err := Factory("bad", dec, nil)
+		_, err := Factory("bad", json.NewDecoder(strings.NewReader(params)), nil)
 		assert.Error(t, err, name)
 	}
 }
 
-// TestFactory_MetricsRegistered: the derivation's counters and the table gauge
-// are exported.
+// TestFactory_MetricsRegistered: the derivation's counters and the table gauge are
+// exported.
 func TestFactory_MetricsRegistered(t *testing.T) {
 	handle := testutils.NewTestHandle(t.Context())
 	built, err := Factory("branch", nil, handle)
 	require.NoError(t, err)
 	p := built.(*Plugin)
+	p.tokenize = testRenderer(0)
 
-	req := chatReq(user('a', 600))
-	require.NoError(t, p.RequestHeader(context.Background(), req))
-	require.NoError(t, p.PreRequest(context.Background(), req, nil))
+	_, _ = branchOf(t, p, chatReq(user('a', 600)))
+	_, _ = p.DumpState()
 
 	reg, ok := handle.Metrics().(*prometheus.Registry)
 	require.True(t, ok)
@@ -341,7 +610,10 @@ func TestFactory_MetricsRegistered(t *testing.T) {
 		"llm_d_epp_branch_new_total",
 		"llm_d_epp_branch_forks_total",
 		"llm_d_epp_branch_records",
-		"llm_d_epp_branch_flatten_ns",
+		"llm_d_epp_branch_render_failure_total",
+		"llm_d_epp_branch_multi_prompt_requests_total",
+		"llm_d_epp_branch_render_ns",
+		"llm_d_epp_branch_chain_ns",
 		"llm_d_epp_branch_resolve_ns",
 		"llm_d_epp_branch_sticky_busy_total",
 		"llm_d_epp_branch_retry_total",
@@ -351,277 +623,105 @@ func TestFactory_MetricsRegistered(t *testing.T) {
 	}
 }
 
-// TestIdentity_ToolSetChurnMidThreadContinues (B4): the identity stream excludes
-// the tool DEFINITIONS, so an agent that swaps its tool set between turns (claude_code
-// does exactly this when it hands a sub-task to a `Task` tool) still continues its
-// branch. Stage 0B measured 32 of 33 Exgentic mid-thread "splits" to be this class,
-// and a per-step tool shortlist would make it unbounded — the unsafe direction.
-func TestIdentity_ToolSetChurnMidThreadContinues(t *testing.T) {
-	p := newTestPlugin(t)
-
-	turn1 := chatReq(user('a', 600))
-	turn1.Body.ChatCompletions.Tools = []any{map[string]any{"type": "function", "function": map[string]any{"name": "read"}}}
-	id1, _ := branchOf(t, p, turn1)
-	dispatchAndComplete(t, p, turn1)
-
-	// Same conversation, a completely different tool set.
-	turn2 := chatReq(user('a', 600), assistant('b', 400), user('c', 300))
-	turn2.Body.ChatCompletions.Tools = []any{map[string]any{"type": "function", "function": map[string]any{"name": "Task"}}}
-	id2, _ := branchOf(t, p, turn2)
-	assert.Equal(t, id1, id2, "a tool-set change must cost a cache miss, never an identity change")
-
-	// And with the tool set REMOVED entirely.
-	turn3 := chatReq(user('a', 600), assistant('b', 400), user('c', 300), assistant('d', 100), user('e', 100))
-	id3, _ := branchOf(t, p, turn3)
-	assert.Equal(t, id1, id3)
-}
-
-// TestIdentity_DroppedThinkingContinues (B4): Anthropic clients only keep the LAST
-// assistant turn's signed thinking — earlier turns drop theirs — so thinking blocks
-// must not be part of the identity stream, or every turn would look like a new
-// conversation.
-func TestIdentity_DroppedThinkingContinues(t *testing.T) {
-	p := newTestPlugin(t)
-	filler600 := filler('a', 600)
-
-	withThinking := &fwkrh.InferenceRequestBody{Messages: &fwkrh.MessagesRequest{
-		System: fwkrh.AnthropicContent{Raw: "be terse"},
-		Messages: []fwkrh.AnthropicMessage{
-			{Role: "user", Content: fwkrh.AnthropicContent{Raw: filler600}},
-			{Role: "assistant", Content: fwkrh.AnthropicContent{Structured: []fwkrh.AnthropicContentBlock{
-				{Type: "thinking", Thinking: "let me think about this at length"},
-				{Type: "text", Text: filler('b', 400)},
-			}}},
-		},
-	}}
-	turn1 := &fwksched.InferenceRequest{RequestID: "m1", Headers: map[string]string{}, Body: withThinking}
-	id1, _ := branchOf(t, p, turn1)
-	dispatchAndComplete(t, p, turn1)
-
-	// The next turn drops the earlier assistant's thinking block, as the API does.
-	next := &fwkrh.InferenceRequestBody{Messages: &fwkrh.MessagesRequest{
-		System: fwkrh.AnthropicContent{Raw: "be terse"},
-		Messages: []fwkrh.AnthropicMessage{
-			{Role: "user", Content: fwkrh.AnthropicContent{Raw: filler600}},
-			{Role: "assistant", Content: fwkrh.AnthropicContent{Structured: []fwkrh.AnthropicContentBlock{
-				{Type: "text", Text: filler('b', 400)},
-			}}},
-			{Role: "user", Content: fwkrh.AnthropicContent{Raw: filler('c', 300)}},
-		},
-	}}
-	id2, _ := branchOf(t, p, &fwksched.InferenceRequest{RequestID: "m2", Headers: map[string]string{}, Body: next})
-	assert.Equal(t, id1, id2, "dropped thinking must not fragment the conversation")
-}
-
-// TestExplicitFairnessOverrideIsCounted (B1): the derivation is silently bypassed
-// when a client (or a harness flag) sets the fairness id, so the bypass is counted —
-// it is how a run proves the stage-1 harness did not send one.
+// TestExplicitFairnessOverrideIsCounted: a harness that sets the fairness id turns
+// the derivation into a no-op, so the bypass is counted.
 func TestExplicitFairnessOverrideIsCounted(t *testing.T) {
 	p := newTestPlugin(t)
 	req := chatReq(user('a', 600))
 	req.FairnessID = "client-thread-1"
-	branchOf(t, p, req)
+	_, _ = branchOf(t, p, req)
 	require.NotNil(t, p.metrics.overridden)
 	assert.EqualValues(t, 1, testutil.ToFloat64(p.metrics.overridden))
 
-	plain := chatReq(user('b', 600))
-	branchOf(t, p, plain)
+	_, _ = branchOf(t, p, chatReq(user('b', 600)))
 	assert.EqualValues(t, 1, testutil.ToFloat64(p.metrics.overridden), "no override, no count")
 }
 
-// TestRetryIsCounted (S2): a retry of a still-queued turn continues the branch and
-// is visible as its own counter (stage 1 reads it to see how much of the fork rate
-// was retries).
+// TestRetryIsContainedAndCounted: S2 — an identical duplicate of a still-queued
+// turn continues its branch, and the counter names how much of the fork rate was
+// retries.
 func TestRetryIsContainedAndCounted(t *testing.T) {
 	p := newTestPlugin(t)
 
-	turn1 := chatReqID("dup", user('a', 600))
-	id1, _ := branchOf(t, p, turn1) // arrival only: still queued
-
-	retry := chatReqID("dup-2", user('a', 600))
-	id2, _ := branchOf(t, p, retry)
-	assert.Equal(t, id1, id2, "a byte-identical duplicate of a queued turn is a retry")
+	id1, _ := branchOf(t, p, chatReqID("dup", user('a', 600))) // arrival only: queued
+	id2, _ := branchOf(t, p, chatReqID("dup-2", user('a', 600)))
+	assert.Equal(t, id1, id2, "an identical duplicate of a queued turn is a retry")
 	require.NotNil(t, p.metrics.retried)
 	assert.EqualValues(t, 1, testutil.ToFloat64(p.metrics.retried))
 }
 
-// TestLogRequests (the shadow/stage-1 instrument): with logRequests on, ONE JSON
-// line per request is printed, carrying the scope (the client session header), the
-// DERIVED id and the outcome — the per-request pair a shadow arm cannot get from a
-// span, because there the span's fairness id is the client's explicit header. With
-// the parameter off (the default) nothing is printed, so a production build is
-// untouched.
+// TestLogRequests: with the instrument on, one JSON line per request carries the
+// scope, the derived id and the outcome; with it off nothing is printed.
 func TestLogRequests(t *testing.T) {
-	build := func(t *testing.T, logOn bool) *Plugin {
-		t.Helper()
-		p, err := Factory("branch", json.NewDecoder(strings.NewReader(
-			`{"sessionHeaders":["x-session-scope"],"logRequests":`+fmt.Sprint(logOn)+`}`)),
-			testutils.NewTestHandle(t.Context()))
-		require.NoError(t, err)
-		return p.(*Plugin)
-	}
-
-	capture := func(t *testing.T, fn func()) string {
-		t.Helper()
-		r, w, err := os.Pipe()
-		require.NoError(t, err)
-		orig := os.Stdout
-		os.Stdout = w
-		defer func() { os.Stdout = orig }()
-		done := make(chan string, 1)
-		go func() {
-			b, _ := io.ReadAll(r)
-			done <- string(b)
-		}()
-		fn()
-		require.NoError(t, w.Close())
-		return <-done
-	}
-
-	req := func() *fwksched.InferenceRequest {
-		r := chatReq(user('a', 600))
-		r.Headers["x-session-scope"] = "thread-7"
-		return r
-	}
-
-	on := build(t, true)
+	on := newTestPluginWith(t, `{"sessionHeaders":["x-session-scope"],"logRequests":true}`)
+	req := chatReq(user('a', 600))
+	req.Headers["x-session-scope"] = "session-3"
 	var id string
-	out := capture(t, func() {
-		id, _ = branchOf(t, on, req())
-	})
-	require.Contains(t, out, "branch-identity: request ")
-	line := strings.TrimPrefix(strings.TrimSpace(out), "branch-identity: request ")
-	var rec struct {
-		Seq      uint64 `json:"seq"`
-		Scope    string `json:"scope"`
-		Derived  string `json:"derived"`
-		Outcome  string `json:"outcome"`
-		Explicit bool   `json:"explicit"`
-		Blocks   int    `json:"blocks"`
-	}
-	require.NoError(t, json.Unmarshal([]byte(line), &rec), "the instrument line must be one JSON object: %q", line)
-	assert.Equal(t, "thread-7", rec.Scope)
-	assert.Equal(t, id, rec.Derived, "the logged derived id is the one the plugin resolved")
-	assert.Equal(t, "new", rec.Outcome)
-	assert.False(t, rec.Explicit)
-	assert.EqualValues(t, 1, rec.Seq)
+	out := captureStdout(t, func() { id, _ = branchOf(t, on, req) })
+	assert.Contains(t, out, `"scope":"session-3"`)
+	assert.Contains(t, out, `"derived":"`+id+`"`)
+	assert.Contains(t, out, `"outcome":"new"`)
 
-	off := build(t, false)
-	out = capture(t, func() { branchOf(t, off, req()) })
-	assert.Empty(t, out, "logRequests=false must print nothing")
+	off := newTestPlugin(t)
+	out = captureStdout(t, func() { _, _ = branchOf(t, off, chatReq(user('a', 600))) })
+	assert.Empty(t, out, "the instrument is off by default")
 }
 
-// TestLogHeadersKeepResolveOutcomeIdentical (stage-1 P1): the logHeaders instrument
-// copies the client's x-correlation-id / x-request-id into the per-request line so an
-// UNSCOPED arm (no session header → empty scope) can still score the derived-vs-thread
-// confusion matrix per request. It must be a pure OBSERVER: the same request sequence
-// fed to a plugin with the instrument on and one with it off must resolve to the same
-// derived ids, the same outcomes and the same fairness ids.
+// TestLogHeadersKeepResolveOutcomeIdentical: the header copies are a pure observer.
 func TestLogHeadersKeepResolveOutcomeIdentical(t *testing.T) {
-	build := func(t *testing.T, logHeaders bool) *Plugin {
-		t.Helper()
-		p, err := Factory("branch", json.NewDecoder(strings.NewReader(
-			`{"logRequests":true,"logHeaders":`+fmt.Sprint(logHeaders)+`}`)),
-			testutils.NewTestHandle(t.Context()))
-		require.NoError(t, err)
-		return p.(*Plugin)
-	}
-
-	// Three turns of one thread plus a sibling extending the same prefix: the
-	// sequence exercises a "new", a "matched" and a fork decision.
-	seq := func() []*fwksched.InferenceRequest {
-		mk := func(turn int) *fwksched.InferenceRequest {
-			msgs := []fwkrh.Message{user('a', 600)}
-			for i := 1; i < turn; i++ {
-				msgs = append(msgs, assistant('b', 300), user('c', 300))
-			}
-			r := chatReq(msgs...)
-			r.Headers["x-correlation-id"] = "thread-42"
-			r.Headers["x-request-id"] = fmt.Sprintf("req-%d", turn)
-			return r
-		}
-		return []*fwksched.InferenceRequest{mk(1), mk(2), mk(3), mk(2)}
-	}
-
-	run := func(t *testing.T, logHeaders bool) (ids, fids []string, logged string) {
-		t.Helper()
-		r, w, err := os.Pipe()
-		require.NoError(t, err)
-		orig := os.Stdout
-		os.Stdout = w
-		defer func() { os.Stdout = orig }()
-		done := make(chan string, 1)
-		go func() {
-			b, _ := io.ReadAll(r)
-			done <- string(b)
-		}()
-		p := build(t, logHeaders)
-		for _, req := range seq() {
-			id, fid := branchOf(t, p, req)
+	run := func(params string) []string {
+		p := newTestPluginWith(t, params)
+		var ids []string
+		for _, msgs := range [][]fwkrh.Message{
+			{user('a', 300)},
+			{user('a', 300), assistant('b', 40), user('c', 50)},
+			{user('z', 300)},
+		} {
+			req := chatReq(msgs...)
+			req.Headers["x-correlation-id"] = "thread-9"
+			id, _ := branchOf(t, p, req)
 			ids = append(ids, id)
-			fids = append(fids, fid)
-			// clear the arrival marker so the next turn sees a free tip
-			p.idx.Settle(id, markerOf(req), p.now())
+			finishTurn(t, p, req)
 		}
-		require.NoError(t, w.Close())
-		return ids, fids, <-done
+		return ids
 	}
-
-	offIDs, offFIDs, offOut := run(t, false)
-	onIDs, onFIDs, onOut := run(t, true)
-
-	assert.Equal(t, offIDs, onIDs, "derived ids must not depend on the instrument")
-	assert.Equal(t, offFIDs, onFIDs, "fairness ids must not depend on the instrument")
-	// the derived id IS the fairness id in an arm with no explicit header
-	for i := range onIDs {
-		assert.Equal(t, onIDs[i], onFIDs[i], "unscoped run: derived id is the queue key")
-	}
-	assert.NotContains(t, offOut, "\"headers\"", "logHeaders=false must not copy headers")
-	assert.Contains(t, onOut, `"x-correlation-id":"thread-42"`)
-	assert.Contains(t, onOut, `"x-request-id":"req-1"`)
+	plain := run(`{}`)
+	logged := run(`{"logRequests":true,"logHeaders":true}`)
+	assert.Equal(t, plain, logged)
 }
 
-// TestLogHeaderNamesConfigured (WAVE-1 item 4): logHeaderNames EXTENDS the
-// whitelist with a harness's own markers without touching anything else — the
-// extras are only ever read by the log line, never by the identity, the scope or
-// a matching decision.
+// TestLogHeaderNamesConfigured: the whitelist takes configured extras.
 func TestLogHeaderNamesConfigured(t *testing.T) {
-	build := func(t *testing.T) *Plugin {
-		t.Helper()
-		p, err := Factory("branch", json.NewDecoder(strings.NewReader(
-			`{"logRequests":true,"logHeaders":true,"logHeaderNames":["X-Turn-Id","x-correlation-id",""]}`)),
-			testutils.NewTestHandle(t.Context()))
-		require.NoError(t, err)
-		return p.(*Plugin)
-	}
-	require.Equal(t, []string{"x-correlation-id", "x-request-id", "x-turn-id"},
-		build(t).logHeadersList, "extras must be lowercased, de-duplicated and appended")
+	p := newTestPluginWith(t, `{"logRequests":true,"logHeaders":true,"logHeaderNames":["X-Thread-Id"]}`)
+	req := chatReq(user('a', 600))
+	req.Headers["x-thread-id"] = "t-1"
 
-	p := build(t) // build BEFORE the capture: Factory echoes its config to stdout
+	out := captureStdout(t, func() { _, _ = branchOf(t, p, req) })
+	assert.Contains(t, out, `"x-thread-id":"t-1"`)
+}
+
+// captureStdout runs fn and returns what it wrote to stdout (the instrument's
+// lines are printed, not logged).
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
 	r, w, err := os.Pipe()
 	require.NoError(t, err)
 	orig := os.Stdout
 	os.Stdout = w
 	defer func() { os.Stdout = orig }()
-	done := make(chan string, 1)
-	go func() {
-		b, _ := io.ReadAll(r)
-		done <- string(b)
-	}()
-	req := chatReq(user('a', 600))
-	req.Headers["x-correlation-id"] = "thread-9"
-	req.Headers["x-turn-id"] = "turn-3"
-	id, _ := branchOf(t, p, req)
+	fn()
 	require.NoError(t, w.Close())
-	out := <-done
+	out, err := io.ReadAll(r)
+	require.NoError(t, err)
+	return string(out)
+}
 
-	line := strings.TrimPrefix(strings.TrimSpace(out), "branch-identity: request ")
-	var rec struct {
-		Derived string            `json:"derived"`
-		Headers map[string]string `json:"headers"`
+// firstDiff is the index of the first differing token (or the shorter length).
+func firstDiff(a, b []uint32) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			return i
+		}
 	}
-	require.NoError(t, json.Unmarshal([]byte(line), &rec))
-	assert.Equal(t, id, rec.Derived)
-	assert.Equal(t, "thread-9", rec.Headers["x-correlation-id"])
-	assert.Equal(t, "turn-3", rec.Headers["x-turn-id"], "the configured extra must be copied")
+	return min(len(a), len(b))
 }

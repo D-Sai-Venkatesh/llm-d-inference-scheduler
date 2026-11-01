@@ -79,8 +79,10 @@ var (
 // backend's; a placeholder is derived from the asset's content hash, so it is
 // stable across turns either way. The output is a pure function of the body.
 //
-// This is the SIZING view: tools and thinking blocks are part of it. For the
-// identity view (branch identity's queue key) use FlattenIdentityBytes.
+// This is the SIZING view: tools and thinking blocks are part of it. The second
+// view, FlattenIdentityBytes, leaves them out; branch identity used it while its
+// queue key lived in byte space and no longer does (the key is the engine's token
+// chain now), so that view survives only as the byte-space fallback.
 //
 // Bodies without a text/chat shape (none of chat, messages, completions,
 // embeddings, responses, conversations, generate) return ErrNoCanonicalStream.
@@ -88,9 +90,10 @@ func FlattenCanonicalBytes(body *fwkrh.InferenceRequestBody) ([]byte, error) {
 	return flattenBytes(body, canonicalMode)
 }
 
-// FlattenIdentityBytes returns the byte stream that BRANCH IDENTITY is derived
-// from: the conversation as the client means it, with the two things that
-// legitimately churn mid-thread left out (see flattenMode).
+// FlattenIdentityBytes returns the conversation as the client means it, with the
+// two things that legitimately churn mid-thread left out (see flattenMode). It
+// was branch identity's byte-space key; production no longer calls it (the
+// identity is the engine's token chain), and it is kept as the byte-space view.
 //
 //   - chat completions: role + content + tool_calls per message, no top-level
 //     tools block.

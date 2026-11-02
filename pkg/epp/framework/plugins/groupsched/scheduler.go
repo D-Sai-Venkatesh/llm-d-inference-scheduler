@@ -473,8 +473,7 @@ type Scheduler struct {
 	mod modules
 	// observers are the optional metric hooks (nil in tests).
 	onExit         func(engine, reason string, resTurns int)
-	onEntry        func(engine string, waitSeconds float64)
-	onReentry      func(engine string, waitSeconds float64)
+	onEntry        func(engine, kind string, waitSeconds float64)
 	onServe        func(engine string)
 	onEvent        func(Event)
 	onRehome       func(member, from, to string)
@@ -965,16 +964,12 @@ func FCFSPick(heads []Head) int {
 	return best
 }
 
-// FCFSServed counts a pre-capacity dispatch (the gauge substrate) and returns the
-// label it is booked to. B2: it is booked to NO engine — a pre-capacity stack has
-// no engine to attribute a dispatch to, and booking it to one (the old "single"
-// label, which at N≥2 was a series that owned no pod) made a counter lie. The
-// plugin labels it "nocapacity".
-func (s *Scheduler) FCFSServed() (int64, string) {
+// FCFSServed counts a pre-capacity dispatch: it belongs to no engine (a
+// pre-capacity stack has none to attribute it to), so it is only counted.
+func (s *Scheduler) FCFSServed() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.counters.fcfsServed++
-	return s.counters.fcfsServed, "nocapacity"
 }
 
 // syncWaitersLocked reconciles the SHARED waiter queue with the queue-head
@@ -1673,26 +1668,23 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 	// at PreRequest
 	m.pendingBlocks = w.coldTokens / int64(s.blockSize)
 	g.pendingTotal += m.pendingBlocks
-	// C7: record ALL seat waits (newcomers AND re-entries — the last campaign's
-	// re-entry waits were invisible); the onEntry hook keeps its newcomer semantics.
-	kind := "re-entry"
+	// C7: record ALL seat waits, split by kind (a branch's first turn vs a returning
+	// branch): both answer "how long did admission make this branch wait".
+	eventKind := "re-entry"
+	waitKind := "reentry"
 	if w.newcomer {
-		kind = "newcomer"
-		wait := now.Sub(w.since).Seconds()
-		s.counters.entryWaits = append(s.counters.entryWaits, wait)
-		g.counters.entryWaits = append(g.counters.entryWaits, wait)
-		if s.onEntry != nil {
-			s.onEntry(engineLabel(g.id), wait)
-		}
+		eventKind = "newcomer"
+		waitKind = "new"
+		s.counters.entryWaits = append(s.counters.entryWaits, now.Sub(w.since).Seconds())
+		g.counters.entryWaits = append(g.counters.entryWaits, now.Sub(w.since).Seconds())
 	} else {
-		wait := now.Sub(w.since).Seconds()
-		s.counters.reentryWaits = append(s.counters.reentryWaits, wait)
-		g.counters.reentryWaits = append(g.counters.reentryWaits, wait)
-		if s.onReentry != nil {
-			s.onReentry(engineLabel(g.id), wait)
-		}
+		s.counters.reentryWaits = append(s.counters.reentryWaits, now.Sub(w.since).Seconds())
+		g.counters.reentryWaits = append(g.counters.reentryWaits, now.Sub(w.since).Seconds())
 	}
-	s.recordEvent("SEAT", w.id, fmt.Sprintf("kind=%s wait=%.3f fairness_id=%s", kind, now.Sub(w.since).Seconds(), fairnessOrNone(w.fairnessID)), now)
+	if s.onEntry != nil {
+		s.onEntry(engineLabel(g.id), waitKind, now.Sub(w.since).Seconds())
+	}
+	s.recordEvent("SEAT", w.id, fmt.Sprintf("kind=%s wait=%.3f fairness_id=%s", eventKind, now.Sub(w.since).Seconds(), fairnessOrNone(w.fairnessID)), now)
 	g.members[w.id] = m
 	return true
 }

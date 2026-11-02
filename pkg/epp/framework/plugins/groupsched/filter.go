@@ -48,18 +48,6 @@ import (
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 )
 
-// filterDecision labels llm_d_epp_group_filter_decisions_total. Every dispatch
-// through the Filter books exactly one, so the run artifact states what the pin
-// actually did (an arm whose decisions are all "passthrough-unseated" is not a
-// pinned arm).
-const (
-	filterPinned       = "pinned"                       // narrowed to the member's seat engine
-	filterNotCandidate = "engine-not-a-candidate"       // the seat engine is not offered → pass ALL through
-	filterUnseated     = "passthrough-unseated"         // no seat yet: the member has no placement opinion
-	filterAnonymous    = "passthrough-anonymous"        // R9: never constrained
-	filterSingle       = "passthrough-single-candidate" // nothing to narrow
-)
-
 // pinTable is the lock-light mirror of the scheduler's member→engine SEAT
 // binding. Writers are the scheduler's hooks (seat / exit / rebind), which run
 // under s.mu; the reader is the Filter, which must not.
@@ -133,17 +121,14 @@ func (p *pinTable) size() int {
 // silent request failure would be the worst possible failure mode here.
 func (r *GroupScheduler) Filter(_ context.Context, request *fwksched.InferenceRequest, pods []fwksched.Endpoint) []fwksched.Endpoint {
 	if len(pods) <= 1 {
-		r.metrics.ObserveFilterDecision(filterSingle)
 		return pods
 	}
 	member, _ := r.memberOf(request)
 	if member == "" {
-		r.metrics.ObserveFilterDecision(filterAnonymous)
 		return pods
 	}
 	engine, bound := r.pins.get(member)
 	if !bound || engine == "" {
-		r.metrics.ObserveFilterDecision(filterUnseated)
 		return pods
 	}
 	out := make([]fwksched.Endpoint, 0, 1)
@@ -155,11 +140,9 @@ func (r *GroupScheduler) Filter(_ context.Context, request *fwksched.InferenceRe
 	if len(out) == 0 {
 		// the seat engine is not a candidate: pass through and let the
 		// observed endpoint win (PreRequest rebinds + counts the violation).
-		r.metrics.ObserveFilterDecision(filterNotCandidate)
 		fmt.Printf("group-scheduler: FILTER PASS-THROUGH member=%s seated-on=%s is not among the %d candidate endpoint(s) — passing all candidates through (the observed endpoint wins and the violation is counted)\n",
 			member, engineLabel(engine), len(pods))
 		return pods
 	}
-	r.metrics.ObserveFilterDecision(filterPinned)
 	return out
 }

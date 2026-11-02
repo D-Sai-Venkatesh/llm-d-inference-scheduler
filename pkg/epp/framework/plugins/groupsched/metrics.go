@@ -22,78 +22,55 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// groupMetrics exports the CORE legibility set: per engine the seats, the queues,
-// the budget accounting, the exits by reason, the residency and entry-wait
-// histograms, the dispatch count and the SAFETY NET (its live verdict, its fire
-// events and the time spent fired). Plus the whole-stack correctness counters and
-// the placement Filter's decisions.
+// groupMetrics exports the MINIMAL set an operator needs to see liveness and fairness
+// or to diagnose a known failure class — nineteen names, and nothing else. The test for
+// every one of them: would its absence cost an operator a decision or a diagnosis?
 //
-// EVERY per-engine series carries an `engine` label, and the label value is the
-// endpoint id. `sum(llm_d_epp_group_seats)` is therefore the whole-policy seat count
-// with one engine and with N.
+//	admission state   seats · ne_blocks · budget_blocks · waiters_shared
+//	drain / cascade   exiting_branches · exiting_blocks · exiting_oldest_age_seconds
+//	valve             cold_inflight_tokens · cold_cap_tokens · cold_valve_held_total
+//	startup           capacity_missing · capacity_learned_total
+//	decisions         dispatches_total · exits_total{reason}
+//	fairness          entry_wait_seconds{kind=new|reentry}   (ONE histogram)
+//	lifecycle         engine_gone_total · rebinds_total · affinity_violations_total
+//	                  · queue_view_untrusted_passes_total
 //
-// The safety series are the ONE place the 15 s per-engine scrape reads the gate
-// (the D3 fix): they are filled from Scheduler.SafetyStates(), which answers from the
-// SAME safetyFiredLocked the decision path uses — the old metric re-derived closure
-// from the literals 0.80/5 and would report a gate that was not the gate.
+// EVERY per-engine series carries an `engine` label, whose value is the endpoint id:
+// `sum(llm_d_epp_group_seats)` is the whole-policy seat count with one engine and with N.
 type groupMetrics struct {
 	sched *Scheduler
 
 	seats        *prometheus.GaugeVec
-	uniqueBlocks *prometheus.GaugeVec
 	neBlocks     *prometheus.GaugeVec
 	budgetBlocks *prometheus.GaugeVec
 	// The EXITING ledger: the enforcement view's inputs, per engine. (iii) made the
 	// used side include members that are already leaving, so "how much of it is
 	// leaving" is a first-class number: without these three, an engine that is busy
-	// and an engine whose drains have stopped look the same in every other series —
-	// which is exactly the leak class the batch-1 anchor had to be diagnosed from the
-	// event log and the residency histogram instead of from a gauge.
-	exitingMembers *prometheus.GaugeVec
-	exitingBlocks  *prometheus.GaugeVec
-	exitingOldest  *prometheus.GaugeVec
-	waiters        *prometheus.GaugeVec
-	coldInFlight   *prometheus.GaugeVec
-	coldCap        *prometheus.GaugeVec
-	capacity       *prometheus.GaugeVec
+	// and an engine whose drains have stopped look the same in every other series.
+	exitingBranches *prometheus.GaugeVec
+	exitingBlocks   *prometheus.GaugeVec
+	exitingOldest   *prometheus.GaugeVec
+	coldInFlight    *prometheus.GaugeVec
+	coldCap         *prometheus.GaugeVec
 	// waitersShared is the SHARED waiter queue's size (one number, no engine label,
 	// because a waiter belongs to no engine until one seats it).
 	waitersShared prometheus.Gauge
-	// queueViewAge is how old the queue-head snapshot behind "has a queued head" was on
-	// the decision clock, and queueViewUntrusted counts the budget-enforcement passes
-	// that ran with it too old to trust. The C8 guard SKIPS the head-presence classes in
-	// exactly those passes, so without these two the guard's own clock is invisible — a
-	// stack whose queue view is never refreshed and one that is always fresh look
-	// identical in every other series.
-	queueViewAge       prometheus.Gauge
-	queueViewUntrusted prometheus.Counter
-	// queueViewUntrustedLast is the scheduler's cumulative counter as last exported:
-	// Refresh adds the DELTA, so the series has exactly one source of truth (the
-	// scheduler's own count) and nothing can be double-booked or forgotten.
+	// queueViewUntrusted counts the budget-enforcement passes that ran with a queue
+	// view too old to trust (the C8 guard skipped the head-presence classes in exactly
+	// those passes, so without it the guard's own input is invisible). It is exported
+	// as the DELTA of the scheduler's cumulative count: one source of truth.
+	queueViewUntrusted     prometheus.Counter
 	queueViewUntrustedLast int64
-	// eventRingDropped / eventRingDroppedLast are the same delta pattern for the ring's
-	// wrap count.
-	eventRingDropped     prometheus.Counter
-	eventRingDroppedLast int64
-	exits                *prometheus.CounterVec
-	residency            *prometheus.HistogramVec
-	entryWait            *prometheus.HistogramVec
-	reentryWait          *prometheus.HistogramVec
-	refillShare          prometheus.Gauge
-	served               *prometheus.CounterVec
-	fcfs                 *prometheus.CounterVec
+	exits                  *prometheus.CounterVec
+	// entryWait is ONE histogram for BOTH seat waits (newcomer and re-entry), split by
+	// `kind`: they answer the same question (how long did admission make this branch
+	// wait), and two names meant two bucket sets and two queries.
+	entryWait *prometheus.HistogramVec
+	served    *prometheus.CounterVec
 
 	capacityMissing *prometheus.GaugeVec
 	capacityLearned *prometheus.CounterVec
 
-	// capacityHeterogeneous is 1 when a measured num_gpu_blocks deviates >1% from
-	// the first engine's: a heterogeneous pool must never silently inherit another
-	// engine's budget.
-	capacityHeterogeneous prometheus.Gauge
-	// filterDecisions books every dispatch the scheduling Filter saw, by what it
-	// did (pinned | passthrough-*). An arm whose decisions are all passthrough-
-	// unseated is NOT a pinned arm, and that state must be visible.
-	filterDecisions *prometheus.CounterVec
 	// affinityViolations counts requests that landed off their member's seat engine.
 	affinityViolations *prometheus.CounterVec
 	rebinds            prometheus.Counter
@@ -119,58 +96,37 @@ func newGroupMetrics(sched *Scheduler) *groupMetrics {
 func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.seats = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "seats",
 		Help: "seated members (residencies) on this engine"}, engineLabels)
-	g.uniqueBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "unique_blocks",
-		Help: "distinct blocks the engine's index holds for this policy"}, engineLabels)
-	g.exitingMembers = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "exiting_members",
-		Help: "members on this engine that have been marked exiting and still hold their seat until their in-flight requests drain"}, engineLabels)
+	g.exitingBranches = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "exiting_branches",
+		Help: "branches on this engine that have been marked exiting and still hold their seat until their in-flight requests drain"}, engineLabels)
 	g.exitingBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "exiting_blocks",
 		Help: "distinct blocks of this engine's ne_blocks that belong to exiting members: the part of the used side that is already leaving (admission still refuses it, enforcement no longer evicts for it)"}, engineLabels)
 	g.exitingOldest = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "exiting_oldest_age_seconds",
-		Help: "how long this engine's OLDEST exiting member has been on its way out (a value that only grows is a drain that is not happening)"}, engineLabels)
+		Help: "how long this engine's OLDEST exiting branch has been on its way out (a value that only grows is a drain that is not happening)"}, engineLabels)
 	g.neBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "ne_blocks",
 		Help: "distinct blocks charged to this engine's budget: every seated member's set, exiting members included until they drain"}, engineLabels)
 	g.budgetBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "budget_blocks",
 		Help: "seat budget in blocks (groupBudgetFraction x this engine's num_gpu_blocks)"}, engineLabels)
-	g.waiters = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "waiters",
-		Help: "waiting heads ACCOUNTED to this engine (0 by construction: the queue is shared; see waiters_shared)"}, engineLabels)
 	g.coldInFlight = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "cold_inflight_tokens",
 		Help: "outstanding cold-entry charge in tokens against this engine's stagger cap"}, engineLabels)
 	g.coldCap = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "cold_cap_tokens",
 		Help: "DERIVED cold-entry stagger cap in tokens: floor((1-groupBudgetFraction) x this engine's num_gpu_blocks) x blockSizeTokens"}, engineLabels)
-	g.capacity = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "num_gpu_blocks",
-		Help: "measured KV capacity in blocks for this engine"}, engineLabels)
 	g.waitersShared = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "waiters_shared",
 		Help: "heads waiting in the ONE shared admission queue"})
-	g.queueViewAge = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "queue_view_age_seconds",
-		Help: "age of the queue-head snapshot the 'has a queued head' evidence comes from, on the decision clock (-1 = no snapshot yet, always > idleSeconds = the evidence is untrustworthy)"})
 	g.queueViewUntrusted = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "queue_view_untrusted_passes_total",
 		Help: "budget-enforcement passes whose victim choice ran with a queue view older than idleSeconds (the C8 guard skipped the head-presence classes)"})
-	g.eventRingDropped = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "event_ring_dropped_total",
-		Help: "SEAT/EXIT events the bounded ring has wrapped past (the DumpState tail no longer covers the whole window; the stdout event stream still does)"})
 	g.exits = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "exits_total",
 		Help: "member exits by reason"}, []string{"engine", "reason"})
-	g.residency = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "residency_turns",
-		Help: "turns per residency at exit", Buckets: prometheus.LinearBuckets(1, 1, 20)}, engineLabels)
 	g.entryWait = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "entry_wait_seconds",
-		Help: "newcomer seat waits", Buckets: prometheus.ExponentialBuckets(0.1, 2, 14)}, engineLabels)
-	g.reentryWait = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "reentry_wait_seconds",
-		Help: "re-entering member seat waits", Buckets: prometheus.ExponentialBuckets(0.1, 2, 18)}, engineLabels)
-	g.refillShare = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "refill_share",
-		Help: "uncached prompt tokens / total prompt tokens over the run"})
+		Help:    "seat waits by kind (new = a branch's first turn, reentry = a returning branch): how long admission made it wait, TOP BUCKET 13,107 s so nothing lands only in +Inf",
+		Buckets: prometheus.ExponentialBuckets(0.1, 2, 18)}, []string{"engine", "kind"})
 	g.served = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "dispatches_total",
 		Help: "dispatches served from this engine's seats"}, engineLabels)
-	g.fcfs = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "fcfs_dispatches_total",
-		Help: "pre-capacity FCFS pass-through dispatches (label: nocapacity)"}, engineLabels)
 	g.capacityMissing = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "capacity_missing",
 		Help: "1 while this engine's num_gpu_blocks is still unknown past capacityLivenessSeconds"}, engineLabels)
 	g.capacityLearned = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "capacity_learned_total",
 		Help: "how each engine's capacity was acquired"}, []string{"via", "engine"})
-	g.capacityHeterogeneous = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "capacity_heterogeneous",
-		Help: "1 when an engine's num_gpu_blocks deviates >1% from the first measured engine"})
-	g.filterDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "filter_decisions_total",
-		Help: "placement Filter outcomes (pinned | passthrough-*)"}, []string{"decision"})
 	g.affinityViolations = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "affinity_violations_total",
-		Help: "requests that landed on an engine other than the member's seat"}, []string{"from", "to"})
+		Help: "requests that landed on an engine other than the member's seat (an invariant: must be 0)"}, []string{"from", "to"})
 	g.rebinds = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "rebinds_total",
 		Help: "seat moves repaired by the observed endpoint winning"})
 	g.engineGone = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "engine_gone_total",
@@ -178,12 +134,12 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.coldValveHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "cold_valve_held_total",
 		Help: "heads the cold-entry valve held back (the budget would have admitted them; they WAIT, nothing is evicted)"}, engineLabels)
 
-	for _, c := range []prometheus.Collector{g.seats, g.uniqueBlocks, g.neBlocks, g.budgetBlocks,
-		g.waiters, g.coldInFlight, g.coldCap, g.capacity, g.waitersShared,
-		g.exitingMembers, g.exitingBlocks, g.exitingOldest, g.exits, g.residency, g.entryWait,
-		g.reentryWait, g.refillShare, g.served, g.fcfs, g.capacityMissing, g.capacityLearned,
-		g.capacityHeterogeneous, g.filterDecisions, g.affinityViolations, g.rebinds, g.engineGone,
-		g.coldValveHeld, g.queueViewAge, g.queueViewUntrusted, g.eventRingDropped,
+	for _, c := range []prometheus.Collector{g.seats, g.neBlocks, g.budgetBlocks,
+		g.exitingBranches, g.exitingBlocks, g.exitingOldest,
+		g.coldInFlight, g.coldCap, g.waitersShared,
+		g.queueViewUntrusted, g.exits, g.entryWait, g.served,
+		g.capacityMissing, g.capacityLearned,
+		g.affinityViolations, g.rebinds, g.engineGone, g.coldValveHeld,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second
@@ -217,18 +173,14 @@ func (g *groupMetrics) Refresh() {
 		seen[label] = struct{}{}
 		g.known[label] = struct{}{}
 		g.seats.WithLabelValues(label).Set(float64(es.Seats))
-		g.uniqueBlocks.WithLabelValues(label).Set(float64(es.UniqueBlocks))
 		g.neBlocks.WithLabelValues(label).Set(float64(es.NEBlocks))
 		g.budgetBlocks.WithLabelValues(label).Set(float64(es.BudgetBlocks))
-		g.capacity.WithLabelValues(label).Set(float64(es.NumBlocks))
-		g.waiters.WithLabelValues(label).Set(float64(es.Waiters))
 		g.coldInFlight.WithLabelValues(label).Set(float64(es.ColdInFlight))
 		g.coldCap.WithLabelValues(label).Set(float64(es.ColdCapTokens))
-		g.exitingMembers.WithLabelValues(label).Set(float64(es.ExitingMembers))
+		g.exitingBranches.WithLabelValues(label).Set(float64(es.ExitingMembers))
 		g.exitingBlocks.WithLabelValues(label).Set(float64(es.ExitingBlocks))
 		g.exitingOldest.WithLabelValues(label).Set(es.ExitingOldestAgeS)
 		g.served.WithLabelValues(label).Add(0)
-		g.fcfs.WithLabelValues("nocapacity").Add(0)
 		for _, reason := range []string{"quantum-complete", "idle", "exiting", "engine-idle", "ttl",
 			"exiting-drain", "budget-idle", "budget-noqueue", "budget-exiting", "engine-gone"} {
 			g.exits.WithLabelValues(label, reason).Add(0)
@@ -240,53 +192,35 @@ func (g *groupMetrics) Refresh() {
 			continue
 		}
 		delete(g.known, label)
-		for _, vec := range []*prometheus.GaugeVec{g.seats, g.uniqueBlocks, g.neBlocks,
-			g.exitingMembers, g.exitingBlocks, g.exitingOldest,
-			g.budgetBlocks, g.capacity, g.waiters, g.coldInFlight, g.coldCap} {
+		for _, vec := range []*prometheus.GaugeVec{g.seats, g.neBlocks,
+			g.exitingBranches, g.exitingBlocks, g.exitingOldest,
+			g.budgetBlocks, g.coldInFlight, g.coldCap} {
 			vec.DeleteLabelValues(label)
 		}
 	}
 	g.waitersShared.Set(float64(snap.WaitersShared))
-	g.queueViewAge.Set(snap.QueueViewAgeSeconds)
 	if d := snap.QueueViewUntrusted - g.queueViewUntrustedLast; d > 0 {
 		g.queueViewUntrusted.Add(float64(d))
 		g.queueViewUntrustedLast = snap.QueueViewUntrusted
 	}
-	if d := snap.EventRingDropped - g.eventRingDroppedLast; d > 0 {
-		g.eventRingDropped.Add(float64(d))
-		g.eventRingDroppedLast = snap.EventRingDropped
-	}
-	g.refillShare.Set(snap.RefillShare)
-	if len(snap.HeterogeneousEngines) > 0 {
-		g.capacityHeterogeneous.Set(1)
-	} else {
-		g.capacityHeterogeneous.Set(0)
-	}
 }
 
-// ObserveExit records a member exit (residency turns + the reason + engine).
-func (g *groupMetrics) ObserveExit(engine, reason string, resTurns int) {
+// ObserveExit records a member exit (the reason + engine).
+func (g *groupMetrics) ObserveExit(engine, reason string) {
 	if g == nil || g.exits == nil {
 		return
 	}
 	g.exits.WithLabelValues(engine, reason).Inc()
-	g.residency.WithLabelValues(engine).Observe(float64(resTurns))
 }
 
-// ObserveEntry records a newcomer seat wait.
-func (g *groupMetrics) ObserveEntry(engine string, waitSeconds float64) {
+// ObserveEntry records ONE seat wait, split by kind: "new" for a branch's first turn,
+// "reentry" for a returning branch. Both were separate histograms; they answer the same
+// question.
+func (g *groupMetrics) ObserveEntry(engine, kind string, waitSeconds float64) {
 	if g == nil || g.entryWait == nil {
 		return
 	}
-	g.entryWait.WithLabelValues(engine).Observe(waitSeconds)
-}
-
-// ObserveReentry records a re-entering member's seat wait.
-func (g *groupMetrics) ObserveReentry(engine string, waitSeconds float64) {
-	if g == nil || g.reentryWait == nil {
-		return
-	}
-	g.reentryWait.WithLabelValues(engine).Observe(waitSeconds)
+	g.entryWait.WithLabelValues(engine, kind).Observe(waitSeconds)
 }
 
 // ObserveServed records a dispatch.
@@ -315,15 +249,6 @@ func (g *groupMetrics) ObserveEngineGone() {
 	g.engineGone.Inc()
 }
 
-// ObserveFilterDecision books one placement-Filter outcome (nil-safe: a unit-mode
-// run has no registrar and must still take the same code path).
-func (g *groupMetrics) ObserveFilterDecision(decision string) {
-	if g == nil || g.filterDecisions == nil {
-		return
-	}
-	g.filterDecisions.WithLabelValues(decision).Inc()
-}
-
 // ObserveQuality learns how an engine's capacity arrived.
 func (g *groupMetrics) ObserveCapacityLearned(via, engine string) {
 	if g == nil || g.capacityLearned == nil {
@@ -342,15 +267,6 @@ func (g *groupMetrics) SetCapacityMissing(engine string, missing bool) {
 		v = 1
 	}
 	g.capacityMissing.WithLabelValues(engine).Set(v)
-}
-
-// ObserveFCFS records a pre-capacity FCFS dispatch (label "nocapacity": B2 — a
-// pre-capacity dispatch belongs to no engine and must not be booked to one).
-func (g *groupMetrics) ObserveFCFS(label string) {
-	if g == nil || g.fcfs == nil {
-		return
-	}
-	g.fcfs.WithLabelValues(label).Inc()
 }
 
 // ObserveColdValveHeld counts a head the cold-entry valve held back.

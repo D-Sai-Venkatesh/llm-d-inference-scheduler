@@ -134,7 +134,7 @@ tagged for removal.
 
 | constant | value | where | origin / status |
 |---|---|---|---|
-| **`groupBudgetFraction`** | **0.95** | config | **THE one policy constant, and it now has THREE readers**: (1) the seat budget = fraction × measured KV capacity; (2) the memory-only safety detector's threshold; (3) **the cold-entry stagger cap**, which IS this fraction's complement — see the `coldEntryCapTokens` row. FLAGGED as the whole safety margin: measured 5.0 % of the pool against channels that were not charged inside it (an exiting-member overhang of 14-18 %, an entry charge that outran its own cap, a possible byte bias). Fixes 5-7 exist to make the fraction mean one thing; the wave sweeps it. |
+| **`groupBudgetFraction`** | **0.95** | config | **THE one policy constant, and it has TWO readers**: (1) the seat budget = fraction × measured KV capacity; (2) **the cold-entry stagger cap**, which IS this fraction's complement — see the `coldEntryCapTokens` row. FLAGGED as the whole safety margin: measured 5.0 % of the pool against channels that were not charged inside it (an exiting-member overhang of 14-18 %, an entry charge that outran its own cap, a possible byte bias). Fixes 5-7 exist to make the fraction mean one thing; the wave sweeps it. |
 | `quantum` (Q) | 4 | config | the tenure bound in completed busy periods. ONE value; Q8 is the same code with 8. Also a policy constant (the campaign's measured knee at Q8, Q4 as the safe default). |
 | `idleSeconds` (S) | 20 | config | **inherited from f0p**, kept ONLY for golden equality. A time constant (the human's no-magic-time-constants rule): flagged for removal — the replacement candidate is "the member's own think-gap history", which was measured (F4) and then retired with the F-arms. |
 | `ttlSeconds` | 30 | config | **inherited from f0p** (the silence GC for headless records). Same flag as S: a time constant, kept for golden equality. |
@@ -146,8 +146,7 @@ tagged for removal.
 | `inflightReapSeconds` | 3700 | config | the confirmed in-flight id reap bound = the harness request timeout (3600) + 100, i.e. it reaps only true leaks. |
 | provisional reap | 30 s | `reapInflightLocked` | a Pick-time provisional id never confirmed at PreRequest is dropped after 30 s (C3). Inherited; a wiring bound on the Pick→PreRequest gap. |
 | 4-request window | 4 | `blockindex.go` | the dispatch window: the member's footprint is the union of its queued heads and its last 4 dispatches. Inherited from f0p (a "derived chain window" was tried and retired). |
-| `staleMultiple` | 3 | `safety.go` | freshness for the LIVE metric read, in framework refresh intervals — a wiring fact (3 × the poll cadence), not a policy constant. |
-| `eventRingSize` | 2048 | `scheduler.go` | the SEAT/EXIT ring bound (memory only). A ring wrap is now COUNTED (`Snapshot.EventRingDropped`, `llm_d_epp_group_event_ring_dropped_total`): the dump's `RecentEvents` covers the last 2,048 events and the counter says how much of the window lies before them, so "the ring does not span the run" is a measurement instead of an inference. |
+| `eventRingSize` | 2048 | `scheduler.go` | the SEAT/EXIT ring bound (memory only). A ring wrap is COUNTED in `Snapshot.EventRingDropped` (a dump field, not a metric: the trim keeps nineteen names), so "the ring does not span the run" is a measurement instead of an inference. |
 | `maxChains` | — | *removed* | with the derived window. |
 
 Rule: a new number in a decision path needs a table row saying why it cannot be derived.

@@ -196,8 +196,8 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 	s.onExit = func(_ string, reason string, resTurns int) {
 		exitLog = append(exitLog, fmt.Sprintf("EXIT reason=%s turns=%d", reason, resTurns))
 	}
-	s.onEntry = func(_ string, wait float64) {
-		entryLog = append(entryLog, fmt.Sprintf("SEAT wait=%.3f", wait))
+	s.onEntry = func(_ string, kind string, wait float64) {
+		entryLog = append(entryLog, fmt.Sprintf("SEAT kind=%s wait=%.3f", kind, wait))
 	}
 
 	ss := scenarioSessions()

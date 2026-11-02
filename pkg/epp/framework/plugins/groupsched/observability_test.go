@@ -171,9 +171,6 @@ func TestQueueViewAgeAndUntrustedPassesAreVisible(t *testing.T) {
 		if snap.QueueViewAgeSeconds != 0 {
 			t.Fatalf("a pass that just observed the queue reports age %v s, want 0", snap.QueueViewAgeSeconds)
 		}
-		if got, ok := gatherValue(t, reg, subsystem+"_queue_view_age_seconds", nil); !ok || got != 0 {
-			t.Fatalf("queue_view_age_seconds = %v (present=%v), want 0", got, ok)
-		}
 		if got, ok := gatherValue(t, reg, subsystem+"_queue_view_untrusted_passes_total", nil); !ok || got != 0 {
 			t.Fatalf("queue_view_untrusted_passes_total = %v (present=%v), want 0 with fresh evidence", got, ok)
 		}
@@ -200,9 +197,6 @@ func TestQueueViewAgeAndUntrustedPassesAreVisible(t *testing.T) {
 				snap.QueueViewAgeSeconds, stale, defaultConfig().IdleSeconds)
 		}
 		m.Refresh()
-		if got, ok := gatherValue(t, reg, subsystem+"_queue_view_age_seconds", nil); !ok || got <= defaultConfig().IdleSeconds {
-			t.Fatalf("queue_view_age_seconds = %v (present=%v), want > S (%v)", got, ok, defaultConfig().IdleSeconds)
-		}
 		if got, ok := gatherValue(t, reg, subsystem+"_queue_view_untrusted_passes_total", nil); !ok || got != 1 {
 			t.Fatalf("queue_view_untrusted_passes_total = %v (present=%v), want 1", got, ok)
 		}
@@ -235,17 +229,11 @@ func TestQueueViewAgeAndUntrustedPassesAreVisible(t *testing.T) {
 
 // THE EVENT RING'S COVERAGE IS VISIBLE. The ring is bounded for memory, so on a long
 // window the OLDEST SEAT/EXIT events fall out of the DumpState tail while the stdout
-// stream keeps them. That is fine as long as it is a MEASUREMENT: event_ring_dropped_total
-// (and Snapshot.EventRingDropped) says how much of the window lies before the tail. It
-// exists because a wave arm's captured ring stopped at 17:23:37 with the window running
-// to 17:57 — and nothing in the artifacts said the ring had been cut.
+// stream keeps them. That is fine as long as it is a MEASUREMENT: Snapshot.EventRingDropped
+// says how much of the window lies before the tail (it is NOT a metric any more — the trim
+// keeps nineteen names, and a campaign-only ring diagnostic is not one of them).
 func TestEventRingWrapIsCounted(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-		reg := prometheus.NewRegistry()
-		m := newGroupMetrics(fx.s)
-		if err := m.register(reg); err != nil {
-			t.Fatalf("register: %v", err)
-		}
 		// push more events than the ring holds through the ordinary seat/exit path
 		n := eventRingSize + 16
 		for i := 0; i < n; i++ {
@@ -258,15 +246,6 @@ func TestEventRingWrapIsCounted(t *testing.T) {
 		}
 		if len(snap.RecentEvents) != eventRingSize {
 			t.Fatalf("RecentEvents holds %d events, want the ring bound %d", len(snap.RecentEvents), eventRingSize)
-		}
-		m.Refresh()
-		if got, ok := gatherValue(t, reg, subsystem+"_event_ring_dropped_total", nil); !ok || got != 16 {
-			t.Fatalf("event_ring_dropped_total = %v (present=%v), want 16", got, ok)
-		}
-		// the counter is monotone and never double-booked by a second Refresh
-		m.Refresh()
-		if got, _ := gatherValue(t, reg, subsystem+"_event_ring_dropped_total", nil); got != 16 {
-			t.Fatalf("event_ring_dropped_total = %v after a second Refresh, want 16 (delta pattern)", got)
 		}
 	})
 }
@@ -314,8 +293,8 @@ func TestExitingLedgerIsVisiblePerEngine(t *testing.T) {
 			t.Fatalf("register: %v", err)
 		}
 		mtr.Refresh()
-		if got, ok := gatherValue(t, reg, subsystem+"_exiting_members", map[string]string{"engine": engineLabel(g.id)}); !ok || got != 0 {
-			t.Fatalf("a settled engine reports %v exiting members (present=%v), want 0", got, ok)
+		if got, ok := gatherValue(t, reg, subsystem+"_exiting_branches", map[string]string{"engine": engineLabel(g.id)}); !ok || got != 0 {
+			t.Fatalf("a settled engine reports %v exiting branches (present=%v), want 0", got, ok)
 		}
 
 		// the mark (the pressure valve's mid-flight class)
@@ -328,8 +307,8 @@ func TestExitingLedgerIsVisiblePerEngine(t *testing.T) {
 
 		fx.tick(7 * time.Second) // the decision clock advances; the drain has not (one request in flight)
 		mtr.Refresh()
-		if got, ok := gatherValue(t, reg, subsystem+"_exiting_members", map[string]string{"engine": engineLabel(g.id)}); !ok || got != 1 {
-			t.Fatalf("exiting_members = %v (present=%v), want 1", got, ok)
+		if got, ok := gatherValue(t, reg, subsystem+"_exiting_branches", map[string]string{"engine": engineLabel(g.id)}); !ok || got != 1 {
+			t.Fatalf("exiting_branches = %v (present=%v), want 1", got, ok)
 		}
 		if got, ok := gatherValue(t, reg, subsystem+"_exiting_blocks", map[string]string{"engine": engineLabel(g.id)}); !ok || got != 300 {
 			t.Fatalf("exiting_blocks = %v (present=%v), want 300 (the member's own footprint)", got, ok)
@@ -345,7 +324,7 @@ func TestExitingLedgerIsVisiblePerEngine(t *testing.T) {
 		// the drain: the ledger empties
 		fx.s.SettleOnUsage("gone", "r-gone", g.id, 300, 0, 0, false, fx.clock)
 		mtr.Refresh()
-		for _, name := range []string{"_exiting_members", "_exiting_blocks", "_exiting_oldest_age_seconds"} {
+		for _, name := range []string{"_exiting_branches", "_exiting_blocks", "_exiting_oldest_age_seconds"} {
 			if got, ok := gatherValue(t, reg, subsystem+name, map[string]string{"engine": engineLabel(g.id)}); !ok || got != 0 {
 				t.Fatalf("%s = %v (present=%v) after the drain, want 0", name, got, ok)
 			}

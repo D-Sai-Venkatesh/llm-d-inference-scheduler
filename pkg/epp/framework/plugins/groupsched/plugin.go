@@ -188,7 +188,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// feed are nil-safe, and a unit-mode run (no handle) must record the same
 	// accounting as a live one — the affinity-violation and engine-gone
 	// counters are CORRECTNESS signals, not decoration.
-	r.sched.onExit = r.metrics.ObserveExit
+	r.sched.onExit = func(engine, reason string, _ int) { r.metrics.ObserveExit(engine, reason) }
 	r.sched.onEntry = r.metrics.ObserveEntry
 	r.sched.onServe = r.metrics.ObserveServed
 	r.sched.onRehome = func(member, from, to string) {
@@ -792,8 +792,7 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 		r.fcfsOnce.Do(func() {
 			fmt.Println("group-scheduler: num_gpu_blocks not yet measured; serving FCFS until the endpoint metrics arrive")
 		})
-		_, label := r.sched.FCFSServed()
-		r.metrics.ObserveFCFS(label)
+		r.sched.FCFSServed()
 		if i := FCFSPick(heads); i >= 0 {
 			return queues[i], nil
 		}

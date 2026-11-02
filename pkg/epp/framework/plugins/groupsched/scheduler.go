@@ -253,19 +253,17 @@ type branch struct {
 	// seatTurns counts settled turns in this residency (the residency histogram's
 	// unit).
 	seatTurns int
-	// inflight is DERIVED each decision point from inflightIDs
+	// inflight and pending are DERIVED each decision point from the request map
 	// (derive-don't-accumulate): a leaked increment cannot persist past a
-	// reconciliation.
+	// reconciliation. They are kept on the record so a decision reads a count, not
+	// the whole map: inflight = the branch's requests at a pod, pending = the
+	// requests it RELEASED that have not reached one yet (the "on its way" window).
+	//
+	// The window is the one fact that says the branch is still busy: without it a
+	// cold-charge derivation would free the charge of a prefill that is about to
+	// start, and rotation could evict the branch that is on its way.
 	inflight int
-	// inflightIDs tracks the branch's in-flight request ids (recorded at PreRequest,
-	// dropped at settle or by the reap). m.inflight = len(inflightIDs).
-	inflightIDs map[string]inflightRec
-	// released is the request this branch released at the last Pick that has not reached
-	// PreRequest yet — the "on its way to the pod" window. A request in that window is
-	// neither queued nor in flight, so this is the one fact that says the branch is still
-	// busy: without it a cold-charge derivation would free the charge of a prefill that is
-	// about to start, and rotation could evict the branch that is on its way.
-	released string
+	pending  int
 	// busyPeriods counts completed busy periods: the branch's in-flight count reaching
 	// zero and staying there, which — one branch, one chain — is the whole of its work
 	// draining. It is the rotation quantum's unit.
@@ -282,6 +280,13 @@ type branch struct {
 	// waitingSince is the branch's oldest queued head: the wait its victims and its SEAT
 	// event are measured from, kept OLDEST across fan-out re-arrivals.
 	waitingSince time.Time
+	// headChains / headReturner are the LAST queued head observed for this branch, from the
+	// queue view of a decision pass. They exist for ONE consumer: exitLocked's re-queue.
+	// Re-queueing with the chain of the turn that just RAN charges the next turn the wrong
+	// cost (the seat path prices the head's own chain), and forcing returner=true told the
+	// entry order a branch was an incumbent when its queued head might be a newcomer.
+	headChains   []Chain
+	headReturner bool
 	// exitingSince is when this branch was marked exiting (the mid-flight class): the
 	// age of a retiree is the time between "nothing more will be admitted for it" and
 	// "its blocks are off the budget", i.e. how long the engine pays for a seat it has
@@ -293,16 +298,54 @@ type branch struct {
 	fairnessID string
 }
 
-// prefilling reports whether the branch can still be prefilling something: a request in
-// flight, or one released and not yet at a pod. It is the cold-charge derivation's input
-// and the victim CLASSIFICATION's ("a turn on its way"), and nothing else: a window must
-// never BAR the liveness rules, or a request that dies in it would freeze its engine.
-func (m *branch) prefilling() bool { return m.inflight > 0 || m.released != "" }
+// busy reports whether the branch has work in progress: a request at a pod, or a LIVE
+// released window (a turn that a Pick released and PreRequest has not yet brought to a pod).
+//
+// THE WINDOW COUNTS AS IN FLIGHT EVERYWHERE — tenure eligibility, the engine-idle rule,
+// every victim class, the drain, the cold-charge derivation, the in-flight cap. That is not
+// a convenience: the window is the COMMON case, not a corner. Every dispatch passes through
+// it and Pick runs at ~1 kHz, so a decision almost always lands inside one, and a branch on
+// its way to the pod looks IDLE to every rule that ignores the window. Measured, at N=1 and
+// N=2: the engine-idle rule evicted such a branch and the observed seat put it straight back
+// (used 1200 against a 950 budget); a marked branch was DRAINED before its request ran (used
+// 1500 against 1100); a quantum-complete or silent branch was rotated out mid-window.
+//
+// The window is bounded by S (Config.IdleSeconds, the same silence bound the tenure rule
+// uses), and m.pending counts only the windows that are still live: one that outlives S is
+// presumed dead, stops counting, and its branch becomes evictable on demand like any silent
+// branch — which is also what frees the cold charge that would otherwise close the valve.
+// Liveness is evaluated in the decision pass (reapRequestsLocked): no timer, no new
+// constant.
+func (m *branch) busy() bool { return m.inflight > 0 || m.pending > 0 }
 
-// inflightRec is one in-flight request's reconciliation record: when the request reached
-// the pod. It is the reap's input for a termination nobody observed.
-type inflightRec struct {
-	since time.Time
+// reqRec is ONE tracked request's record, and the scheduler's only memory of a request
+// that is not in a queue. It spans both halves of the request's life outside the queue:
+// the RELEASED window (a Pick released it, PreRequest has not reached a pod yet — pod is
+// zero) and the in-flight period (pod is set).
+//
+// It is keyed by request id because that is the ONLY thing the later hooks hand back.
+// The framework scopes a plugin's request-attribute access to what the plugin declares,
+// and an undeclared read RESOLVES AS ABSENT — so a branch id another plugin wrote at
+// RequestHeader is not readable at Filter/PreRequest/ResponseBody at all. Resolving the
+// branch from this record instead makes the policy's identity independent of the scoping
+// model (and of whether the flow-control Pick path is scoped: it is not, so Pick still
+// reads the arrival attributes, and it is the only hook that does).
+//
+// chains is the request's exact prefill chain as the Pick released it, so the observed
+// seat at PreRequest can charge the ENGINE the same chain the seat did, without reading
+// the request's tokens a second time.
+type reqRec struct {
+	// branch is the branch that released the request (never empty: anonymous traffic
+	// is not tracked).
+	branch string
+	// chains is the prefill chain the release was charged with.
+	chains []Chain
+	// engine is the engine the request landed on, once an observation named one.
+	engine string
+	// released is the Pick that released the request.
+	released time.Time
+	// pod is when the request reached a pod (PreRequest); zero while it is pending.
+	pod time.Time
 }
 
 // waiter is one head in the SHARED waiter queue. A waiter is not seated, so it
@@ -426,6 +469,13 @@ type Scheduler struct {
 	// s.mu. nil in tests.
 	onBind   func(branch, engine string)
 	onUnbind func(branch string)
+	// onRelease / onForget are the REQUEST-IDENTITY hooks: they fire when a Pick
+	// releases a request (branch, request id) and when its record ends (request id),
+	// so the Filter can resolve a dispatching request to its branch by request id
+	// alone — under its own lock, never s.mu (Pick holds s.mu at ~1 kHz). nil in
+	// tests.
+	onRelease func(branch, reqID string)
+	onForget  func(reqID string)
 	// onColdValveHeld fires when the cold-entry valve HOLDS a head that would fit an
 	// engine's budget. The head WAITS (the valve opens when that engine's cold prefill
 	// produces its first token); nothing is evicted for it. This is the sizing signal:
@@ -449,6 +499,12 @@ type Scheduler struct {
 	// here — the queue is where waiting is pooled, which is what makes N engines
 	// one admission system instead of N.
 	waiters map[string]*waiter
+
+	// reqs is EVERY tracked request, keyed by request id: the record written when a
+	// Pick releases a turn and dropped at its settle, its abandon, its reap, or its
+	// branch's exit. It is the scheduler's OWN answer to "which branch is this
+	// request?" for every hook the framework scopes (see reqRec).
+	reqs map[string]*reqRec
 
 	// now is the virtual clock of the CURRENT decision pass (set at the top of
 	// every public decision entry point). Nothing here calls time.Now: a replayed
@@ -504,6 +560,7 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 	s := &Scheduler{cfg: cfg, mod: mod, blockSize: cfg.BlockSizeTokens,
 		groups:   map[string]*engineGroup{},
 		bindings: map[string]string{},
+		reqs:     map[string]*reqRec{},
 		waiters:  map[string]*waiter{}}
 	s.counters.exits = map[string]int64{}
 	return s, nil
@@ -689,7 +746,7 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.now = now
-	s.reapInflightLocked(now)
+	s.reapRequestsLocked(now)
 	s.drainExitingLocked(now)
 	s.syncWaitersLocked(heads, now)
 	s.deriveColdChargesLocked()
@@ -717,7 +774,7 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 		if !seated || g.index.ExitingLocked(h.Branch) {
 			continue
 		}
-		if m.inflight >= s.cfg.InFlightCap {
+		if m.inflight+m.pending >= s.cfg.InFlightCap {
 			continue
 		}
 		perEngine[g.id] = append(perEngine[g.id], cand{i: i, h: h, engine: g.id})
@@ -758,16 +815,10 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 			g.index.GrowLocked(m.id, winner.c.h.Chains)
 		}
 		// The request is RELEASED: it is neither queued nor in flight until PreRequest
-		// records it. No synthetic id is minted and no provisional record is made — the
-		// branch carries `released` for the length of that window, and the handler forces
-		// a terminal ResponseBody whenever a pod was scheduled, so the window always ends.
-		m.released = winner.c.h.ReqID
-		if m.released == "" {
-			// An id-less request cannot be tracked: nothing names it, so no window opens and
-			// the branch is not held busy by it. It is counted, because a run that starts
-			// seeing these has lost the id the accounting joins on.
-			s.counters.emptyReqIDs++
-		}
+		// records it, and the record written here is what every later hook resolves it
+		// by. No synthetic id is minted; the handler forces a terminal ResponseBody
+		// whenever a pod was scheduled, so the record always ends.
+		s.releaseLocked(m, winner.c.h.ReqID, winner.c.h.Chains, now)
 		m.lastActivity = now
 		g.counters.served++
 		s.counters.served++
@@ -840,6 +891,8 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 				if m.waitingSince.IsZero() || h.Arrival.Before(m.waitingSince) {
 					m.waitingSince = h.Arrival
 				}
+				// the head's own cost and class, for the re-queue an exit may have to make
+				m.headChains, m.headReturner = h.Chains, h.Returner
 				m.lastActivity = now
 				continue
 			}
@@ -919,6 +972,168 @@ func (s *Scheduler) reconcileEngineLocked(id, observed string, now time.Time) *e
 	return to
 }
 
+// ---- the request map: ONE record per tracked request ----
+//
+// A request leaves the queue at Pick and comes back to the scheduler only through hooks
+// the framework SCOPES: Filter and PreRequest get a request whose attribute access is
+// confined to what this plugin declares, and an undeclared read resolves as absent. The
+// branch id another plugin wrote at RequestHeader is therefore not readable there — and
+// declaring it would fail startup (the DAG rejects a flow-control consumer of a
+// request-control producer). So the branch a later hook belongs to is resolved from THIS
+// map, by request id, which is the one thing every hook still carries.
+//
+// The map is also the released window and the in-flight set, folded into one record per
+// request rather than two branch-level fields: the window and the in-flight entry are the
+// SAME request, they differ only in whether PreRequest has reached a pod yet.
+
+// releaseLocked records the turn a Pick just released.
+func (s *Scheduler) releaseLocked(m *branch, reqID string, chains []Chain, now time.Time) {
+	if m == nil {
+		return
+	}
+	if reqID == "" {
+		// An id-less request cannot be tracked: nothing names it, so no window opens and
+		// the branch is not held busy by it. It is counted, because a run that starts
+		// seeing these has lost the id the accounting joins on.
+		s.counters.emptyReqIDs++
+		return
+	}
+	if _, tracked := s.reqs[reqID]; tracked {
+		// a RE-release of a request already tracked (a retry that re-entered the queue):
+		// replacing the record must correct the counts it was holding, or the branch is
+		// charged twice for one turn.
+		s.dropRequestLocked(reqID, now)
+	}
+	s.reqs[reqID] = &reqRec{branch: m.id, chains: chains, released: now}
+	m.pending++
+	if s.onRelease != nil {
+		s.onRelease(m.id, reqID)
+	}
+}
+
+// windowLive reports whether a released record's window is still inside S: the branch is
+// presumed to be using its seat for that long and evictable after it (see branch.busy).
+// The clock is the decision pass's, so a replayed stream decides identically.
+func (s *Scheduler) windowLive(rec *reqRec, now time.Time) bool {
+	if rec == nil || !rec.pod.IsZero() {
+		return false
+	}
+	return now.Sub(rec.released) <= time.Duration(s.cfg.IdleSeconds*float64(time.Second))
+}
+
+// atPodLocked closes the released window: the request is running on an engine.
+func (s *Scheduler) atPodLocked(rec *reqRec, m *branch, engine string, now time.Time) {
+	rec.engine = engine
+	if !rec.pod.IsZero() {
+		return // a repeated PreRequest: the record is already in flight
+	}
+	rec.pod = now
+	if m != nil && rec.branch == m.id {
+		m.pending = max(m.pending-1, 0)
+		m.inflight++
+	}
+}
+
+// dropRequestLocked deletes one record and re-derives the counts of the branch that owned
+// it. Every way a record ends (settle, abandon, the sweep on its branch's exit) goes through
+// here, so the counts cannot be updated on one path and missed on another.
+//
+// A window that already outlived S was never counted (branch.busy counts live windows
+// only), so ending it decrements nothing.
+func (s *Scheduler) dropRequestLocked(reqID string, now time.Time) {
+	rec, ok := s.reqs[reqID]
+	if !ok {
+		return
+	}
+	delete(s.reqs, reqID)
+	if g := s.groupOfLocked(rec.branch); g != nil {
+		if m := g.branches[rec.branch]; m != nil {
+			if rec.pod.IsZero() {
+				if s.windowLive(rec, now) {
+					m.pending = max(m.pending-1, 0)
+				}
+			} else {
+				m.inflight = max(m.inflight-1, 0)
+			}
+		}
+	}
+	if s.onForget != nil {
+		s.onForget(reqID)
+	}
+}
+
+// sweepBranchLocked drops every record a branch owns: they name a seat that no longer
+// exists, so no later hook could act on them (and a settle for one is a stray, not a
+// mis-charged engine). The ruling that keeps the map bounded: a dead pre-PreRequest
+// request costs one entry until its branch leaves.
+func (s *Scheduler) sweepBranchLocked(id string, now time.Time) {
+	for reqID, rec := range s.reqs {
+		if rec.branch == id {
+			s.dropRequestLocked(reqID, now)
+		}
+	}
+}
+
+// branchOfRequestLocked is the ONE resolution the scoped hooks go through: the branch a
+// request id names, or "" when nothing tracks it (anonymous traffic, a pre-capacity FCFS
+// dispatch, a request whose branch has left, or one that no Pick released).
+func (s *Scheduler) branchOfRequestLocked(reqID string) string {
+	if reqID == "" {
+		return ""
+	}
+	if rec, ok := s.reqs[reqID]; ok {
+		return rec.branch
+	}
+	return ""
+}
+
+// oldestAtPodLocked returns the branch's oldest in-flight record (its id), for the one
+// caller that cannot name a request: an id-less settle or abandon. "" when there is none.
+func (s *Scheduler) oldestAtPodLocked(branch string) string {
+	oldest, at := "", time.Time{}
+	for reqID, rec := range s.reqs {
+		if rec.branch != branch || rec.pod.IsZero() {
+			continue
+		}
+		if oldest == "" || rec.pod.Before(at) {
+			oldest, at = reqID, rec.pod
+		}
+	}
+	return oldest
+}
+
+// oldestPendingLocked returns the branch's oldest released-but-not-at-a-pod record.
+func (s *Scheduler) oldestPendingLocked(branch string) string {
+	oldest, at := "", time.Time{}
+	for reqID, rec := range s.reqs {
+		if rec.branch != branch || !rec.pod.IsZero() {
+			continue
+		}
+		if oldest == "" || rec.released.Before(at) {
+			oldest, at = reqID, rec.released
+		}
+	}
+	return oldest
+}
+
+// RequestBranch is the scheduler's own request→branch resolution, for a caller that only
+// has the request id (the scoped-hooks test asserts every hook agrees with it; nothing in the
+// hooks reads a request attribute to get the same answer).
+func (s *Scheduler) RequestBranch(reqID string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := s.branchOfRequestLocked(reqID)
+	return b, b != ""
+}
+
+// TrackedRequests is how many request records exist. Every record ends at a settle, an
+// abandon, a reap, or its branch's exit, so a growing count on a steady run is a leak.
+func (s *Scheduler) TrackedRequests() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.reqs)
+}
+
 // ---- PreRequest (post-dispatch): the in-flight record, and the observed engine ----
 
 // Dispatched records a released request at PreRequest without an observed endpoint (the
@@ -934,12 +1149,18 @@ func (s *Scheduler) DispatchedOn(id, reqID, engine string, chains []Chain, now t
 
 // DispatchedOnUsage records a released request at PreRequest on the endpoint the
 // framework ACTUALLY picked. Nothing is charged here: the seat charged the exact
-// chains at Pick, so this call only confirms the in-flight id (the drain's input) and,
+// chains at Pick, so this call only confirms the record (the drain's input) and,
 // when the observation disagrees with the seat, moves the seat.
+//
+// id is the branch, and it is normally EMPTY: the plugin cannot read a branch id out of a
+// scoped request, so it passes the request id and the branch comes from the record the
+// Pick released. A fixture that knows the branch passes it explicitly (and then a missing
+// record is not an error — the fixture's branch is the authority).
 //
 // engine=="" means "the branch's SEAT" (no observation); chains is that request's own
 // prefill chain, and it is used for ONE thing: a branch that holds no seat at all when
-// its request arrives is seated by the observation (seatObservedLocked).
+// its request arrives is seated by the observation (seatObservedLocked). It defaults to
+// the chain the release recorded, which is the same chain.
 //
 // A branch with NO seat and NO observation stays UNTRACKED, and is never given a
 // binding: a binding to an engine that no decision visits is a branch that is
@@ -947,6 +1168,18 @@ func (s *Scheduler) DispatchedOn(id, reqID, engine string, chains []Chain, now t
 func (s *Scheduler) DispatchedOnUsage(id, reqID, engine string, chains []Chain, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	rec := s.reqs[reqID]
+	if id == "" {
+		// the scoped path: the branch is OUR record's, and no record means untracked
+		// (anonymous, pre-capacity FCFS, or a branch that has already left).
+		if rec == nil {
+			return
+		}
+		id = rec.branch
+	}
+	if len(chains) == 0 && rec != nil {
+		chains = rec.chains
+	}
 	g := s.groupOfLocked(id)
 	switch {
 	case g == nil && engine == "":
@@ -971,16 +1204,20 @@ func (s *Scheduler) DispatchedOnUsage(id, reqID, engine string, chains []Chain, 
 	}
 	if m, ok := g.branches[id]; ok {
 		m.lastActivity = now
-		// THE WINDOW CLOSES: the request is at the pod.
-		s.closeReleasedLocked(m, reqID)
-		if m.inflightIDs == nil {
-			m.inflightIDs = map[string]inflightRec{}
+		switch {
+		case rec != nil:
+			// THE WINDOW CLOSES: the request is at the pod.
+			s.atPodLocked(rec, m, engine, now)
+		case reqID != "":
+			// A request the fixture dispatched without a release (a unit path that skips
+			// Pick): its record opens AT the pod, so the request is still tracked and
+			// still named. The live path always has a release first.
+			s.reqs[reqID] = &reqRec{branch: id, chains: chains, engine: engine, released: now, pod: now}
+			m.inflight++
+			if s.onRelease != nil {
+				s.onRelease(id, reqID)
+			}
 		}
-		// The record is keyed by the request id. An id-less request keys as "" — there is
-		// at most one per branch, and it is counted (the gateway always sends an id, so
-		// this reads 0 in a run).
-		m.inflightIDs[reqID] = inflightRec{since: now}
-		m.inflight = len(m.inflightIDs)
 	}
 }
 
@@ -1004,58 +1241,43 @@ func (s *Scheduler) seatObservedLocked(g *engineGroup, id string, chains []Chain
 	}
 	g.index.SeatForceLocked(id, chains)
 	g.index.MarkExitingLocked(id)
-	m := &branch{id: id, engine: g.id, seatTime: now, lastActivity: now, exitingSince: now,
-		inflightIDs: map[string]inflightRec{}}
+	m := &branch{id: id, engine: g.id, seatTime: now, lastActivity: now, exitingSince: now}
 	g.branches[id] = m
 	s.bindings[id] = g.id
 	g.counters.forcedSeats++
-	s.countExitLocked(g, "exiting")
-	if s.onExit != nil {
-		s.onExit(engineLabel(g.id), "exiting", 0)
-	}
+	// the observed seat is a MARK too (it leaves at the drain): one departure, one booking,
+	// and it is booked when it actually leaves, not here
 	if s.onBind != nil {
 		s.onBind(id, g.id) // the placement pin follows the seat
 	}
 	return m, true
 }
 
-// closeReleasedLocked closes a branch's released window when an event proves the request
-// is no longer only "on its way". Every caller matches the request id: an id-less callback
-// (the legacy form) can only mean the released request when the branch has nothing in
-// flight to name instead.
-func (s *Scheduler) closeReleasedLocked(m *branch, reqID string) {
-	if m == nil || m.released == "" {
-		return
-	}
-	if reqID == "" && len(m.inflightIDs) > 0 {
-		return // ambiguous: two requests, one unnamed
-	}
-	if reqID != "" && m.released != reqID {
-		return // a different request: never clear a live window
-	}
-	m.released = ""
-}
-
-// closeReleasedByEngine closes every window on an engine (its teardown).
-func (s *Scheduler) closeReleasedByEngine(g *engineGroup) {
-	for _, m := range g.branches {
-		m.released = ""
-	}
-}
-
-// Abandon closes a released window from OUTSIDE the decision path: the request is gone, so
-// the branch is not waiting on anything any more. Nothing else changes — a seat is not a
-// per-request resource, and an idle seat is evicted on demand.
+// Abandon ends a request's record from OUTSIDE the decision path: the request is gone
+// before a pod served it (the pinned engine vanished, a screener refused it, scheduling
+// failed), so the branch is not waiting on anything any more. Nothing else changes — a
+// seat is not a per-request resource, and an idle seat is evicted on demand.
+//
+// id is normally empty: the hook is handed a request, and the branch comes from the
+// record. An id-less abandon (the legacy form) drops the branch's oldest pending record,
+// which is the one it could mean.
 func (s *Scheduler) Abandon(id, reqID string) {
-	if id == "" {
-		return
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if g := s.groupOfLocked(id); g != nil {
-		if m, ok := g.branches[id]; ok {
-			s.closeReleasedLocked(m, reqID)
+	if id == "" {
+		id = s.branchOfRequestLocked(reqID)
+		if id == "" {
+			return // nothing tracks this request: nothing to close
 		}
+	}
+	if reqID == "" {
+		reqID = s.oldestPendingLocked(id)
+		if reqID == "" {
+			return
+		}
+	}
+	if rec, ok := s.reqs[reqID]; ok && rec.branch == id {
+		s.dropRequestLocked(reqID, s.now)
 	}
 }
 
@@ -1075,6 +1297,22 @@ func (s *Scheduler) ChunkAt(id string, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.now = now
+	if g := s.groupOfLocked(id); g != nil {
+		s.releaseColdLocked(g, id)
+	}
+}
+
+// ChunkForRequest is ChunkAt for the scoped hook, which is handed a request and not a
+// branch: the branch comes from the request's record. A request nothing tracks releases
+// nothing (there is no branch whose charge it could be).
+func (s *Scheduler) ChunkForRequest(reqID string, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.now = now
+	id := s.branchOfRequestLocked(reqID)
+	if id == "" {
+		return
+	}
 	if g := s.groupOfLocked(id); g != nil {
 		s.releaseColdLocked(g, id)
 	}
@@ -1112,9 +1350,22 @@ func (s *Scheduler) SettleOn(id, reqID, engine string, usage struct{ Prompt, Cac
 }
 
 // SettleOnUsage is SettleOn with the completion token count.
+//
+// id is normally EMPTY: the ResponseBody hook is handed a request, and the branch comes
+// from the request's record (the scoped hook cannot read the branch id out of the
+// request). A settle for a request nothing tracks is counted as a stray and changes
+// nothing — after a late reap or a duplicate settle the record is gone, and inventing a
+// branch for it would charge an engine twice.
 func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cachedTokens, completionTokens int, natural bool, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if id == "" {
+		id = s.branchOfRequestLocked(reqID)
+		if id == "" {
+			s.counters.straySettles++
+			return
+		}
+	}
 	g := s.groupOfLocked(id)
 	if g == nil && engine != "" {
 		g = s.existingGroupLocked(engine) // never resurrect a torn-down engine
@@ -1122,47 +1373,44 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 	if g == nil {
 		return
 	}
-	if engine != "" && g.id != engine {
+	// WHERE IT LANDED is the record's engine (the endpoint the observation named at
+	// PreRequest), falling back to the seat binding when nothing recorded one. The binding
+	// can have moved since (a rebind), so comparing against it alone would miss a request
+	// that ran on an engine other than the one it was seen landing on.
+	landed := g.id
+	if rec, ok := s.reqs[reqID]; ok && rec.engine != "" {
+		landed = rec.engine
+	}
+	if engine != "" && landed != engine {
 		s.counters.affinityViolations++
-		s.recordEvent("AFFINITY-VIOLATION", id, fmt.Sprintf("bound=%s settled_on=%s", engineLabel(g.id), engineLabel(engine)), now)
+		s.recordEvent("AFFINITY-VIOLATION", id, fmt.Sprintf("bound=%s settled_on=%s", engineLabel(landed), engineLabel(engine)), now)
 	}
 	m, seated := g.branches[id]
 	if seated {
-		// remove the in-flight record; the counter follows the map
-		// (derive-don't-accumulate). A missing reqID removes the OLDEST record
-		// (defensive: an id-less caller cannot name one).
+		// THE RECORD ENDS HERE, and the counts follow the map (derive-don't-accumulate).
+		// A missing reqID ends the OLDEST record (defensive: an id-less caller cannot name
+		// one). A NON-EMPTY id that names no record ends NOTHING and is counted: the
+		// oldest-fallback would delete a different live request's record after a late reap
+		// or a duplicate settle — the branch would undercount and evict mid-flight.
 		removed := false
 		if reqID != "" {
-			// a known id removes itself; an UNKNOWN non-empty id removes NOTHING (the
-			// oldest-fallback would delete a different live request's record after a late
-			// reap or a duplicate settle — the branch would undercount and evict
-			// mid-flight). Counted as a stray.
-			if _, had := m.inflightIDs[reqID]; had {
-				delete(m.inflightIDs, reqID)
+			if rec, had := s.reqs[reqID]; had && rec.branch == id {
+				s.dropRequestLocked(reqID, now)
 				removed = true
 			} else {
 				s.counters.straySettles++
 			}
-		} else if len(m.inflightIDs) > 0 {
-			key, oldest := "", time.Time{}
-			for rid, rec := range m.inflightIDs {
-				if key == "" || rec.since.Before(oldest) {
-					key, oldest = rid, rec.since
-				}
-			}
-			if _, had := m.inflightIDs[key]; had {
-				delete(m.inflightIDs, key)
-				removed = true
-			}
+		} else if oldest := s.oldestAtPodLocked(id); oldest != "" {
+			s.dropRequestLocked(oldest, now)
+			removed = true
+		} else if pending := s.oldestPendingLocked(id); pending != "" {
+			// THE TERMINAL CALLBACK ENDS A PENDING RECORD TOO: a request that died between
+			// its release and PreRequest has no in-flight record, so this is the only event
+			// that can say it is gone — and the handler forces this call whenever a pod was
+			// scheduled.
+			s.dropRequestLocked(pending, now)
+			removed = true
 		}
-		if removed {
-			m.inflight = len(m.inflightIDs)
-		}
-		// THE TERMINAL CALLBACK CLOSES THE WINDOW TOO: a request that died between its
-		// release and PreRequest has no in-flight record, so this is the only event that
-		// can say it is gone — and the handler forces this call whenever a pod was
-		// scheduled.
-		s.closeReleasedLocked(m, reqID)
 		m.lastActivity = now
 		s.releaseColdLocked(g, id) // any termination releases the charge
 		// THE BUSY PERIOD: the branch's in-flight count reached zero, and one branch is one
@@ -1214,38 +1462,76 @@ func (s *Scheduler) deriveLocked() {
 	}
 }
 
-// reapInflightLocked drops in-flight ids that outlived InflightReapSeconds. The handler
-// forces a terminal ResponseBody whenever a pod was scheduled, so this should never fire: it
-// is the belt to that braces, and it is counted.
-func (s *Scheduler) reapInflightLocked(now time.Time) {
+// reapRequestsLocked re-derives every branch's request counts from the map
+// (derive-don't-accumulate: a leaked increment cannot survive a decision pass) and drops the
+// records that outlived InflightReapSeconds. The handler forces a terminal ResponseBody
+// whenever a pod was scheduled, so this should never fire: it is the belt to that braces.
+//
+// A PENDING record is reaped by the same bound. Nothing else would ever end one whose hooks
+// never arrive (a request finalized while it was being dispatched, an endpoint set that
+// emptied at the director's entry), and a record that never ends is the one way this map
+// could grow without bound.
+func (s *Scheduler) reapRequestsLocked(now time.Time) {
 	for _, g := range s.groups {
 		for _, m := range g.branches {
-			if len(m.inflightIDs) == 0 {
+			m.pending, m.inflight = 0, 0
+		}
+	}
+	limit := time.Duration(s.cfg.reapSeconds() * float64(time.Second))
+	reaped := map[string]*branch{} // branch id → its record, for the cold-charge release
+	for rid, rec := range s.reqs {
+		g := s.groupOfLocked(rec.branch)
+		var m *branch
+		if g != nil {
+			m = g.branches[rec.branch]
+		}
+		if m == nil {
+			// the branch left without its records being swept (defensive): a record that
+			// names no seat can never be acted on.
+			delete(s.reqs, rid)
+			if s.onForget != nil {
+				s.onForget(rid)
+			}
+			continue
+		}
+		if rec.pod.IsZero() {
+			if now.Sub(rec.released) > limit {
+				delete(s.reqs, rid)
+				if s.onForget != nil {
+					s.onForget(rid)
+				}
 				continue
 			}
-			reaped := false
-			for rid, rec := range m.inflightIDs {
-				limit := time.Duration(s.cfg.reapSeconds() * float64(time.Second))
-				if now.Sub(rec.since) > limit {
-					delete(m.inflightIDs, rid)
-					reaped = true
-				}
+			if s.windowLive(rec, now) {
+				m.pending++
 			}
-			if reaped {
-				m.inflight = len(m.inflightIDs)
-				if m.inflight == 0 {
-					m.lastCompletion = now
-					// the branch's requests are all dead — release its cold charge, or the
-					// valve freezes the queue until the reap bound.
-					s.releaseColdLocked(g, m.id)
-				}
+			continue
+		}
+		if now.Sub(rec.pod) > limit {
+			delete(s.reqs, rid)
+			if s.onForget != nil {
+				s.onForget(rid)
 			}
+			reaped[rec.branch] = m
+			continue
+		}
+		m.inflight++
+	}
+	for id, m := range reaped {
+		if m.inflight != 0 {
+			continue
+		}
+		m.lastCompletion = now
+		// the branch's requests are all dead — release its cold charge, or the valve
+		// freezes the queue until the reap bound.
+		if g := s.groupOfLocked(id); g != nil {
+			s.releaseColdLocked(g, id)
 		}
 	}
 }
 
 // deriveColdChargesLocked releases a cold charge whose owner can no longer be prefilling:
-// no queued head, no released-but-not-yet-dispatched request, and nothing in flight.
+// no queued head, no LIVE released window, and nothing in flight.
 //
 // A cold charge left behind CLOSES THE ENGINE'S VALVE for everyone — the valve, not the
 // budget, is what binds admission — so it is derived from the branch's own records at
@@ -1254,7 +1540,7 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 func (s *Scheduler) deriveColdChargesLocked() {
 	for _, g := range s.activeGroupsLocked() {
 		for _, m := range g.branches {
-			if m.coldEntry == 0 || m.prefilling() || !m.waitingSince.IsZero() {
+			if m.coldEntry == 0 || m.busy() || !m.waitingSince.IsZero() {
 				continue
 			}
 			s.releaseColdLocked(g, m.id)
@@ -1274,9 +1560,13 @@ func (s *Scheduler) drainExitingLocked(now time.Time) {
 	for _, g := range s.activeGroupsLocked() {
 		var ids []string
 		for id, m := range g.branches {
-			if m.inflight == 0 && g.index.ExitingLocked(id) {
-				ids = append(ids, id)
+			// a LIVE window is in flight: a marked branch may not be drained out from
+			// under its own request (measured: the request then ran on an unseated branch
+			// and the observed seat put 1500 blocks back against a 1100 budget)
+			if m.busy() || !g.index.ExitingLocked(id) {
+				continue
 			}
+			ids = append(ids, id)
 		}
 		if len(ids) == 0 {
 			continue
@@ -1314,7 +1604,7 @@ func (s *Scheduler) pressureCtxLocked(g *engineGroup, now time.Time) PressureCtx
 		RotationVictim: func() (string, *branch) { return s.rotationVictimLocked(g, now) },
 		Silent:         tctx.Silent,
 		// the classification's view: a released window is a turn on its way
-		Headless: func(m *branch) bool { return m.waitingSince.IsZero() && m.released == "" },
+		Headless: func(m *branch) bool { return m.waitingSince.IsZero() && m.pending == 0 },
 	}
 }
 
@@ -1355,7 +1645,7 @@ func (s *Scheduler) rotationVictimLocked(g *engineGroup, now time.Time) (string,
 	// blocked (a livelock guard: the seats are held by branches that cannot use them)
 	idle := true
 	for _, m := range g.branches {
-		if m.inflight > 0 || !m.waitingSince.IsZero() {
+		if m.busy() || !m.waitingSince.IsZero() {
 			idle = false
 			break
 		}
@@ -1409,11 +1699,6 @@ func (s *Scheduler) budgetVictimLocked(g *engineGroup, now time.Time) (string, *
 // binding, so an exiting branch keeps no placement claim: its next seat is chosen
 // fresh, by the fit/most-free-budget rule, and may land on a different engine.
 func (s *Scheduler) exitLocked(g *engineGroup, m *branch, reason string, now time.Time) {
-	// the chains come OUT with the branch: a re-entering waiter must carry the cost it
-	// will pay, or the pass that evicted it would hand the seat straight back for nothing
-	// (its head's chain is only re-read at the NEXT sync, and rotation re-picks the queue
-	// inside this very pass).
-	chains := g.index.ChainsLocked(m.id)
 	s.releaseColdLocked(g, m.id) // unseat releases the charge
 	g.index.UnseatLocked(m.id)   // and the exact chains leave the budget here
 	delete(g.branches, m.id)
@@ -1426,11 +1711,19 @@ func (s *Scheduler) exitLocked(g *engineGroup, m *branch, reason string, now tim
 	if s.onUnbind != nil {
 		s.onUnbind(m.id)
 	}
+	// THE RECORDS GO WITH THE BRANCH: they name a seat that no longer exists, so no later
+	// hook could act on one (and its settle, if it ever comes, is a stray rather than a
+	// charge against an engine that never ran it).
+	s.sweepBranchLocked(m.id, now)
 	// a branch with a queued head re-enters at its ORIGINAL waiting-since (the queue position
-	// survives the exit) — back in the SHARED queue, with no engine attached and with the
-	// chain its head will run.
+	// survives the exit) — back in the SHARED queue, with no engine attached, carrying the
+	// cost its HEAD will pay and the class its head has. Both come from the head itself (the
+	// last queue view that showed it), never from the turn that just ran and never from an
+	// assumption: rotation re-picks the queue inside this very pass, so the cost has to be
+	// right before the next sync reads the head again.
 	if !m.waitingSince.IsZero() {
-		s.waiters[m.id] = &waiter{id: m.id, since: m.waitingSince, returner: true, chains: chains}
+		s.waiters[m.id] = &waiter{id: m.id, since: m.waitingSince,
+			returner: m.headReturner, chains: m.headChains, fairnessID: m.fairnessID}
 	}
 }
 
@@ -1443,8 +1736,10 @@ func fairnessOrNone(id string) string {
 	return id
 }
 
-// countExitLocked books an exit (or an exiting-mark) on the engine AND in the
-// global tally (Snapshot.Exits stays the whole-policy view).
+// countExitLocked books ONE departure on the engine AND in the global tally (Snapshot.Exits
+// stays the whole-policy view). Marks are states, never departures: a mid-flight branch is
+// marked exiting (exitingBranches/exitingBlocks/exitingOldest) and booked here exactly once, at
+// the exit that actually releases its seat.
 func (s *Scheduler) countExitLocked(g *engineGroup, reason string) {
 	if g != nil {
 		g.counters.exits[reason]++
@@ -1473,9 +1768,12 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, coldTokens int64, now 
 		lastActivity: now,
 		// the head that triggered this seating is still queued (the serve happens after the
 		// seat): inherit its presence so the engine-idle rule cannot evict a branch that is
-		// about to dispatch.
+		// about to dispatch — and its own chains and class, so a later exit re-queues with
+		// this head's cost rather than the chain of whatever ran.
 		waitingSince: w.since,
 		fairnessID:   w.fairnessID,
+		headChains:   w.chains,
+		headReturner: w.returner,
 	}
 	// EVERY entry carries a cold charge (in tokens), CAPPED at the engine's own stagger
 	// cap: the valve's job is to serialise cold prefills inside the budget's headroom, not
@@ -1539,7 +1837,7 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 		if victim == nil {
 			return
 		}
-		if victim.prefilling() {
+		if victim.busy() {
 			if g.index.ExitingLocked(victim.id) {
 				// Already on its way out. Its blocks stay charged until it drains, so
 				// marking it again frees nothing: this pass is DONE (continuing would
@@ -1548,13 +1846,11 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 			}
 			g.index.MarkExitingLocked(victim.id)
 			victim.exitingSince = now
-			s.countExitLocked(g, "exiting")
-			// the series has to see it: the branch is on its way out NOW (it drains, then
-			// exits as "exiting-drain"), and counting it only in the snapshot left
-			// llm_d_epp_group_exits_total{reason="exiting"} permanently at zero.
-			if s.onExit != nil {
-				s.onExit(engineLabel(g.id), "exiting", victim.seatTurns)
-			}
+			// THE MARK IS A STATE, NOT AN EVENT: one departure is booked ONCE, when the
+			// branch actually leaves (reason "exiting-drain"). Booking the mark as an exit
+			// too double-counted every mid-flight departure in the same series — and the
+			// mark is already visible as state (ExitingMembers / ExitingBlocks /
+			// ExitingOldestAgeS), which is where an operator looks for "on its way out".
 			continue
 		}
 		s.exitLocked(g, victim, reason, now)
@@ -1581,11 +1877,12 @@ func (s *Scheduler) Tick(now time.Time) {
 	defer s.mu.Unlock()
 	s.now = now
 	// DECISIONS LIVE IN PICK. A Tick only does what has no event to hang on: derive the
-	// aggregates from the records, reap in-flight ids that outlived the reap bound, and
-	// release branches whose drain has nothing left to wait for. Admission, enforcement and
-	// rotation run in the Pick pass, on the queue view that pass just synced.
+	// aggregates from the records, end the request records that outlived the reap bound,
+	// and release branches whose drain has nothing left to wait for. Admission,
+	// enforcement and rotation run in the Pick pass, on the queue view that pass just
+	// synced.
 	s.deriveLocked()
-	s.reapInflightLocked(now)
+	s.reapRequestsLocked(now)
 	s.drainExitingLocked(now)
 }
 
@@ -1621,7 +1918,6 @@ func (s *Scheduler) RemoveEngine(engine string, now time.Time) int {
 	}
 	sort.Strings(ids)
 	n := 0
-	s.closeReleasedByEngine(g)
 	for _, id := range ids {
 		if m, ok := g.branches[id]; ok {
 			s.exitLocked(g, m, "engine-gone", now)

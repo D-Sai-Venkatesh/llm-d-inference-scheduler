@@ -78,14 +78,13 @@ func openWindow(t *testing.T, fx *engineSet, reqID string) {
 	}
 }
 
+// windowOf is the request the branch has released and not yet brought to a pod ("" when
+// none): the record's own view, never a copy of it.
 func windowOf(t *testing.T, fx *engineSet, id string) string {
 	t.Helper()
 	fx.s.mu.Lock()
 	defer fx.s.mu.Unlock()
-	if m, ok := fx.g().branches[id]; ok {
-		return m.released
-	}
-	return "-gone-"
+	return fx.s.oldestPendingLocked(id)
 }
 
 // Every EVENT that proves a request is no longer only "on its way" closes the window.
@@ -139,9 +138,11 @@ func TestStaleWindowNeverBarsLiveness(t *testing.T) {
 		openWindow(t, fx, "r-stale")
 		fx.s.mu.Lock()
 		m := fx.g().branches["m"]
-		m.inflightIDs = map[string]inflightRec{} // its other request is over
-		m.inflight = 0
-		m.lastActivity = fx.clock.Add(-time.Hour) // silent: the window is dead
+		noInFlightLocked(fx.s, m) // its other request is over
+		// the release is an HOUR old: past S, so the window is presumed dead (a live one
+		// counts as in flight and is protected — see branch.busy)
+		pendingLocked(fx.s, m, fx.clock.Add(-time.Hour), "r-stale")
+		m.lastActivity = fx.clock.Add(-time.Hour) // silent
 		fx.s.mu.Unlock()
 		// one pass with no heads: the released turn is no longer queued (the next Pick in
 		// production clears it the same way)
@@ -159,17 +160,16 @@ func TestStaleWindowNeverBarsLiveness(t *testing.T) {
 	})
 }
 
-// A LIVE window (a release a few milliseconds old) is protected: a valve-held head may not
-// evict it, because S has not elapsed.
+// A LIVE window (a release a few milliseconds old) is IN FLIGHT: a valve-held head waits for
+// it (S has not elapsed), and no rule may evict the branch out from under its request.
 func TestLiveWindowIsNotEvicted(t *testing.T) {
 	forEnginesCap(t, defaultConfig(), 10000, func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "holder", 600, time.Second)                // its cold charge fills the engine's cap
 		fx.closeEnginesExcept(t, fx.engineOf(t, "holder"), 9000) // no sibling may take the head
 		fx.s.mu.Lock()
 		m := fx.g().branches["holder"]
-		m.inflightIDs = map[string]inflightRec{}
-		m.inflight = 0
-		m.released = "r-live" // a request on its way, released just now
+		noInFlightLocked(fx.s, m)
+		pendingLocked(fx.s, m, fx.clock, "r-live") // a request on its way, released just now
 		m.lastActivity = fx.clock
 		fx.s.mu.Unlock()
 		fx.pick() // the released turn is no longer queued
@@ -188,30 +188,37 @@ func TestLiveWindowIsNotEvicted(t *testing.T) {
 	})
 }
 
-// THE I2 HOLDER CORRECTION: a valve-held head MAY evict the branch holding the charge, once
-// the tenure rule releases it — evicting the holder frees the valve, and that is the one
-// case where I2's premise ("evicting frees budget, never the valve") is false.
-func TestValveHeldHeadEvictsItsEligibleHolder(t *testing.T) {
+// A DEAD window (> S) frees its valve BY ITSELF: the derivation releases a charge nothing
+// explains any more, so the head that the valve was holding is served — and NOTHING is
+// evicted for it.
+//
+// This replaces the I2 holder correction. That rule let a valve-held head evict the branch
+// holding the charge; with the window counted as in flight and bounded by S, the charge is
+// released at the pass the window is presumed dead, exactly when an eviction would have been
+// taken — so the rule was redundant, and the code that could evict a resident for a head
+// that fits its budget is gone.
+func TestDeadWindowFreesTheValveWithoutEviction(t *testing.T) {
 	forEnginesCap(t, defaultConfig(), 10000, func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "holder", 600, time.Second)                // charges min(cost, cap) = the whole cap
 		fx.closeEnginesExcept(t, fx.engineOf(t, "holder"), 9000) // no sibling may take it instead
 		fx.s.mu.Lock()
 		m := fx.g().branches["holder"]
-		m.inflightIDs = map[string]inflightRec{}
-		m.inflight = 0
-		m.released = "r-dead" // a window nothing will ever close
+		noInFlightLocked(fx.s, m)
+		pendingLocked(fx.s, m, fx.clock.Add(-21*time.Second), "r-dead") // dead: 21s > S
 		m.lastActivity = fx.clock.Add(-21 * time.Second)
 		fx.s.mu.Unlock()
-		fx.pick() // the released turn is no longer queued
+		fx.pick() // the released turn is no longer queued; the charge has nothing to explain it
+		if got := fx.g().coldInFlight; got != 0 {
+			t.Fatalf("a dead window's charge must be released by the derivation, coldInFlight=%d", got)
+		}
 		if _, i := fx.pickEngine(head("cold", time.Second, 900)); i < 0 {
-			t.Fatal("the valve-held head must be served once the holder is releasable: it frees the valve")
+			t.Fatal("the head the valve was holding must be served once the dead window's charge is released")
 		}
-		if fx.s.Seated("holder") {
-			t.Fatal("the HOLDER must be the victim (its charge is what holds the head back)")
+		if !fx.s.Seated("holder") {
+			t.Fatal("nothing may be evicted for a head that fits the budget: the holder keeps its seat")
 		}
-		if fx.s.Snapshot().Exits["exiting-drain"]+fx.s.Snapshot().Exits["engine-idle"] == 0 &&
-			fx.s.Snapshot().Exits["idle"] == 0 {
-			t.Fatalf("the holder must leave through the tenure rule, exits=%v", fx.s.Snapshot().Exits)
+		if exits := fx.s.Snapshot().Exits; len(exits) != 0 {
+			t.Fatalf("a dead window needs no eviction at all, exits=%v", exits)
 		}
 	})
 }
@@ -230,8 +237,7 @@ func TestValveHeldHeadNeverEvictsANonHolder(t *testing.T) {
 		fx.closeEnginesExcept(t, fx.engineOf(t, "holder"), 9000)
 		fx.s.mu.Lock()
 		m := fx.g().branches["innocent"]
-		m.inflightIDs = map[string]inflightRec{}
-		m.inflight = 0
+		noInFlightLocked(fx.s, m)
 		m.lastActivity = fx.clock.Add(-time.Hour) // it looks idle — but it holds no charge
 		fx.s.mu.Unlock()
 		before := fx.s.Snapshot()
@@ -249,25 +255,31 @@ func TestValveHeldHeadNeverEvictsANonHolder(t *testing.T) {
 }
 
 // Two releases of the same branch before either reaches a pod (a retry merged into one
-// queue): a callback closes only the window it NAMES, in either order, and nothing is left
-// open at the end.
+// queue) are TWO records — the branch is held busy by either of them — and a callback ends
+// only the record it NAMES, in either order, leaving nothing open at the end.
 func TestTwoReleasesClearOnlyTheirOwnWindow(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		openWindow(t, fx, "r-first")
 		fx.s.mu.Lock()
 		m := fx.g().branches["m"]
-		m.released = "r-second" // the retry replaced the window
-		// a callback for the FIRST request must not clear the second's window
-		fx.s.closeReleasedLocked(m, "r-first")
-		after := m.released
+		// the retry released a second request before the first reached a pod
+		fx.s.reqs["r-second"] = &reqRec{branch: "m", released: fx.clock}
+		m.pending++
 		fx.s.mu.Unlock()
-		if after != "r-second" {
-			t.Fatalf("a callback for the first request cleared the second's window (%q)", after)
+		// a callback for the FIRST request ends the first record only
+		fx.s.Abandon("m", "r-first")
+		if got := windowOf(t, fx, "m"); got != "r-second" {
+			t.Fatalf("a callback for the first request closed the second's window: it names %q", got)
 		}
-		// and the matching one does close it
+		// and the matching one ends the second
 		fx.s.Abandon("m", "r-second")
 		if got := windowOf(t, fx, "m"); got != "" {
 			t.Fatalf("the matching callback must close the window, it is %q", got)
+		}
+		// a late callback for an ended request invents nothing
+		fx.s.Abandon("m", "r-first")
+		if got := windowOf(t, fx, "m"); got != "" {
+			t.Fatalf("a late callback reopened the window (%q)", got)
 		}
 	})
 	// the same, in the other order
@@ -275,16 +287,16 @@ func TestTwoReleasesClearOnlyTheirOwnWindow(t *testing.T) {
 		openWindow(t, fx, "r-first")
 		fx.s.mu.Lock()
 		m := fx.g().branches["m"]
-		m.released = "r-second"
-		fx.s.closeReleasedLocked(m, "r-second")
-		after := m.released
+		fx.s.reqs["r-second"] = &reqRec{branch: "m", released: fx.clock}
+		m.pending++
 		fx.s.mu.Unlock()
-		if after != "" {
-			t.Fatalf("the matching callback must close the window, it is %q", after)
+		fx.s.Abandon("m", "r-second")
+		if got := windowOf(t, fx, "m"); got != "r-first" {
+			t.Fatalf("the older window must still be open, it names %q", got)
 		}
-		fx.s.Abandon("m", "r-first") // a late callback for the older request: nothing to do
+		fx.s.Abandon("m", "r-first")
 		if got := windowOf(t, fx, "m"); got != "" {
-			t.Fatalf("a late callback reopened nothing, it must leave %q", got)
+			t.Fatalf("the matching callback must close the window, it is %q", got)
 		}
 	})
 	_ = context.Background()
@@ -324,16 +336,24 @@ func TestReleasedWindowVictimIsAccountedAtPreRequest(t *testing.T) {
 			t.Fatalf("the released window must name b's request, it names %q", got)
 		}
 
-		// the pressure pass marks b EXITING, and the next pass's drain lets it go: nothing
-		// was in flight to wait for
+		// THE WINDOW IS IN FLIGHT WHILE IT IS LIVE, so the branch is not draggable out from
+		// under it: for S the pass leaves it alone even though it is over budget.
 		fx.pick()
-		snap := fx.s.Snapshot()
-		if got := snap.Engines[engineLabel(engine)].ExitingMembers; got != 1 {
-			t.Fatalf("the over-budget pass must mark the window-only branch exiting (exiting=%d, exits=%v)", got, snap.Exits)
+		if !fx.s.Seated("b") {
+			t.Fatal("a LIVE window is a turn on its way: the branch must not be drained before it runs")
 		}
+		// past S the window is presumed dead (its request never arrived): it stops counting
+		// as in flight, so the pressure pass takes the branch like any other headless
+		// resident — a quarter of the engine's budget, nothing running.
+		fx.clock = fx.clock.Add(time.Duration(fx.s.cfg.IdleSeconds+1) * time.Second)
 		fx.pick()
 		if fx.s.Seated("b") {
-			t.Fatal("the drain must have released the window-only branch before its request arrived")
+			t.Fatal("the dead window must no longer bar the pressure pass: the branch is evictable on demand")
+		}
+		// the mark was taken while the window was still live (the branch was over budget and
+		// in flight — a state, not an exit); the departure is booked once, here
+		if exits := fx.s.Snapshot().Exits; exits["exiting-drain"] == 0 {
+			t.Fatalf("the dead-window branch must leave at the drain, exits=%v", exits)
 		}
 		before := fx.s.Snapshot()
 
@@ -362,5 +382,121 @@ func TestReleasedWindowVictimIsAccountedAtPreRequest(t *testing.T) {
 		if got := fx.s.Snapshot().NEBlocks; got != before.NEBlocks {
 			t.Fatalf("the drained seat must release its blocks: used %d, want %d", got, before.NEBlocks)
 		}
+	})
+}
+
+// ---- THE THREE PROBES, as regressions ----
+//
+// The window is the COMMON case, not a corner: every dispatch passes through it and Pick
+// runs at ~1 kHz, so a decision almost always lands inside one. Each probe below pins one
+// rule that used to read a branch on its way to the pod as IDLE, and the damage that
+// followed (the numbers are the measured ones: two engines, in-flight cap 4).
+
+// usedWithinBudget asserts the engine's used side never exceeds its budget plus what is
+// already on its way out: the invariant every probe broke (used 1200 against 950; 1500
+// against 1100).
+func usedWithinBudget(t *testing.T, g *engineGroup) {
+	t.Helper()
+	used, budget, exiting := g.index.UniqueBlocksLocked(), g.budgetBlocks, int(g.index.ExitingBlocksLocked())
+	if used > budget+exiting {
+		t.Fatalf("the engine is over its budget with nothing on the way out to excuse it: used %d, budget %d, exiting %d", used, budget, exiting)
+	}
+}
+
+// (i) THE ENGINE-IDLE RULE never evicts a branch whose request is on its way. Evicting it
+// left the engine 250 blocks over budget when the observed seat put the branch straight back.
+func TestEngineIdleRuleNeverEvictsALiveWindow(t *testing.T) {
+	forEnginesCap(t, defaultConfig(), 1000, func(t *testing.T, fx *engineSet) {
+		engine := fx.ids[0]
+		fx.seatOne(t, "m", 900, 2*time.Second)
+		fx.s.Chunk("m")
+		fx.closeEnginesExcept(t, engine, 950) // no sibling may take the new head instead
+		fx.s.mu.Lock()
+		m := fx.g().branches["m"]
+		noInFlightLocked(fx.s, m) // nothing at a pod: the window is m's ONLY claim
+		pendingLocked(fx.s, m, fx.clock, "r-live")
+		fx.s.mu.Unlock()
+		before := fx.s.Snapshot().Seats
+		// a head that does not fit the budget: the old rule read "nothing in flight, nothing
+		// dispatchable" and evicted m for it
+		if _, i := fx.pickEngine(head("cold", time.Second, 500)); i >= 0 {
+			t.Fatalf("a head that does not fit must wait, got %d", i)
+		}
+		if !fx.s.Seated("m") {
+			t.Fatal("the engine-idle rule evicted a branch whose request is on its way")
+		}
+		if after := fx.s.Snapshot().Seats; after != before {
+			t.Fatalf("no seat may move for a live window: %d -> %d", before, after)
+		}
+		if exits := fx.s.Snapshot().Exits; len(exits) != 0 {
+			t.Fatalf("nothing may leave for a live window, exits=%v", exits)
+		}
+		usedWithinBudget(t, fx.g())
+	})
+}
+
+// (ii) A MARKED branch is not DRAINED inside a live window: the drain used to release it
+// before its request ran, and the observed seat then put 1500 blocks back against 1100.
+func TestMarkedBranchIsNotDrainedInsideALiveWindow(t *testing.T) {
+	forEnginesCap(t, defaultConfig(), 1000, func(t *testing.T, fx *engineSet) {
+		fx.seatOne(t, "m", 900, 2*time.Second)
+		fx.s.Chunk("m")
+		fx.s.mu.Lock()
+		m := fx.g().branches["m"]
+		noInFlightLocked(fx.s, m)
+		pendingLocked(fx.s, m, fx.clock, "r-live") // a turn on its way
+		fx.g().index.MarkExitingLocked("m")        // the pressure pass already marked it
+		fx.s.mu.Unlock()
+		fx.pick() // the pass runs the drain
+		if !fx.s.Seated("m") {
+			t.Fatal("a marked branch must not be drained while its window is live: its request is on its way")
+		}
+		if exits := fx.s.Snapshot().Exits; exits["exiting-drain"] != 0 {
+			t.Fatalf("the drain released a branch mid-window, exits=%v", exits)
+		}
+		usedWithinBudget(t, fx.g())
+		// past S the window is presumed dead and the drain lets it go — exactly once
+		fx.tick(time.Duration(fx.s.cfg.IdleSeconds+1) * time.Second)
+		if fx.s.Seated("m") {
+			t.Fatal("a dead window must not hold a marked branch's seat")
+		}
+		if exits := fx.s.Snapshot().Exits; exits["exiting-drain"] != 1 {
+			t.Fatalf("the departure must be booked exactly once, exits=%v", exits)
+		}
+	})
+}
+
+// (iii) NO ROTATION EXIT inside a live window, even for a branch the tenure rule would
+// release on its own (Q complete).
+func TestNoRotationExitInsideALiveWindow(t *testing.T) {
+	forEnginesCap(t, defaultConfig(), 1000, func(t *testing.T, fx *engineSet) {
+		engine := fx.ids[0]
+		fx.seatOne(t, "m", 800, 2*time.Second)
+		fx.s.Chunk("m")
+		fx.closeEnginesExcept(t, engine, 950)
+		fx.s.mu.Lock()
+		m := fx.g().branches["m"]
+		m.busyPeriods = fx.s.cfg.quantum() // the rotation quantum is complete
+		noInFlightLocked(fx.s, m)
+		pendingLocked(fx.s, m, fx.clock, "r-live") // and a turn is on its way
+		m.lastActivity = fx.clock.Add(-time.Hour)
+		fx.s.mu.Unlock()
+		fx.s.mu.Lock()
+		reason, victim := fx.s.rotationVictimLocked(fx.g(), fx.clock)
+		fx.s.mu.Unlock()
+		if victim != nil {
+			t.Fatalf("the tenure rule released %q (%s) inside a live window", victim.id, reason)
+		}
+		// and a blocked head does not get the seat by eviction either
+		if _, i := fx.pickEngine(head("cold", time.Second, 500)); i >= 0 {
+			t.Fatalf("a head that does not fit must wait, got %d", i)
+		}
+		if !fx.s.Seated("m") {
+			t.Fatal("a quantum-complete branch with a live window must keep its seat until the window ends")
+		}
+		if exits := fx.s.Snapshot().Exits; len(exits) != 0 {
+			t.Fatalf("no rotation exit may be taken inside a live window, exits=%v", exits)
+		}
+		usedWithinBudget(t, fx.g())
 	})
 }

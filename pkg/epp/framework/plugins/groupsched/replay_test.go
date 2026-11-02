@@ -308,6 +308,7 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 			// the dispatched turn's context is the one the head carried
 			g.turn++
 			g.blocks += g.turnBlocks()
+			s.PickFromHeads(nil, now) // the released window: a pass before PreRequest
 			s.Dispatched(g.id, reqID, now)
 			// schedule the settle; cancellers fail their 3rd turn
 			natural := true

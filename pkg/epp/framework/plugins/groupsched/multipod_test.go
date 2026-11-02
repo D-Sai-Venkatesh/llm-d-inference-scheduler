@@ -178,6 +178,7 @@ func TestPerEngineDedupAndIndependence(t *testing.T) {
 		if i := s.PickFromHeads([]Head{h}, now); i != 0 {
 			t.Fatalf("%s must seat", id)
 		}
+		releasedWindow(s, now)
 		s.Dispatched(id, "r-"+id, now)
 		s.Chunk(id) // its prefill lands: the cold charge is released, the valve reopens
 	}
@@ -207,6 +208,7 @@ func TestPerEngineDedupAndIndependence(t *testing.T) {
 	if i := s.PickFromHeads([]Head{filler}, now); i != 0 {
 		t.Fatal("the filler must seat")
 	}
+	releasedWindow(s, now)
 	s.Dispatched("filler", "r-filler", now)
 	s.Chunk("filler")
 	s.mu.Lock()
@@ -219,6 +221,7 @@ func TestPerEngineDedupAndIndependence(t *testing.T) {
 	if i := s.PickFromHeads([]Head{m3}, now); i != 0 {
 		t.Fatal("the third copy must seat on b (a is full)")
 	}
+	releasedWindow(s, now)
 	s.Dispatched("m3", "r-m3", now)
 	snap = s.Snapshot()
 	if snap.Engines["b"].NEBlocks != 200 {
@@ -250,6 +253,7 @@ func TestPlacementIsDedupAware(t *testing.T) {
 		if i := s.PickFromHeads([]Head{h}, now); i != 0 {
 			t.Fatalf("%s must seat", id)
 		}
+		releasedWindow(s, now)
 		s.Dispatched(id, "r-"+id, now)
 		s.Chunk(id) // its prefill lands: the cold charge goes, the valve reopens
 		s.mu.Lock()
@@ -303,6 +307,7 @@ func TestEngineGoneReleasesMembersToTheSharedQueue(t *testing.T) {
 		if i := s.PickFromHeads([]Head{head(id, time.Second, 300)}, now); i != 0 {
 			t.Fatalf("%s must seat", id)
 		}
+		releasedWindow(s, now)
 		s.Dispatched(id, "r-"+id, now)
 		s.Chunk(id)
 		s.Settle(id, "r-"+id, struct{ Prompt, Cached int }{300, 300}, true, now)

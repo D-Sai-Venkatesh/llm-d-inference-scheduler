@@ -103,8 +103,7 @@ func markExitingInflight(t *testing.T, fx *engineSet, g *engineGroup, reqID stri
 	fx.s.mu.Lock()
 	m := g.branches["gone"]
 	before, beforeU := g.index.UniqueBlocksLocked(), g.index.UniqueBlocksLocked()
-	m.inflightIDs = map[string]inflightRec{reqID: {since: fx.clock}}
-	m.inflight = 1
+	inFlightLocked(fx.s, m, fx.clock, reqID)
 	g.index.MarkExitingLocked("gone")
 	n, u := g.index.UniqueBlocksLocked(), g.index.UniqueBlocksLocked()
 	fx.s.mu.Unlock()
@@ -172,8 +171,7 @@ func TestChargedDrainWaitsForTheLastRequest(t *testing.T) {
 		markExitingInflight(t, fx, g, "r1")
 		fx.s.mu.Lock()
 		m := g.branches["gone"]
-		m.inflightIDs["r2"] = inflightRec{since: fx.clock}
-		m.inflight = 2
+		addInFlightLocked(fx.s, m, fx.clock, "r2")
 		fx.s.mu.Unlock()
 
 		fx.s.SettleOnUsage("gone", "r1", g.id, 300, 0, 0, false, fx.clock)
@@ -195,8 +193,7 @@ func TestChargedDrainStraySettleDoesNotRelease(t *testing.T) {
 		markExitingInflight(t, fx, g, "r1")
 		fx.s.mu.Lock()
 		m := g.branches["gone"]
-		m.inflightIDs["r2"] = inflightRec{since: fx.clock}
-		m.inflight = 2
+		addInFlightLocked(fx.s, m, fx.clock, "r2")
 		fx.s.mu.Unlock()
 
 		fx.s.SettleOnUsage("gone", "not-a-known-id", g.id, 300, 0, 0, false, fx.clock)
@@ -246,27 +243,34 @@ func TestChargedDrainReapOfCancelledRequestReleases(t *testing.T) {
 
 // A request that died between the RELEASE and PreRequest (an error before the first
 // chunk). Nothing was ever recorded in flight, so there is nothing to drain: the branch is
-// exiting with a live cold charge and no live request, and the derivation at the next
-// decision point releases it — cold charge and all. No timer.
+// exiting with a live cold charge and no live request. While the window is LIVE it counts as
+// in flight (the branch may be about to run), so nothing happens; once it outlives S it is
+// presumed dead, and the derivation at that decision point releases it — cold charge and
+// all. No timer.
 func TestChargedDrainReleasedWindowReleases(t *testing.T) {
 	cfg := defaultConfig()
-	cfg.IdleSeconds = 1e5 // no idle rescue: the derivation must do it
+	cfg.IdleSeconds = 5
 	chargedPath(t, cfg, "released-window", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		fx.s.mu.Lock()
 		m := g.branches["gone"]
 		charged := m.coldEntry
-		m.inflightIDs = map[string]inflightRec{}
-		m.inflight = 0
-		m.released = "r-gone" // released at the last Pick, never reached a pod
+		noInFlightLocked(fx.s, m)
+		pendingLocked(fx.s, m, fx.clock, "r-gone") // released at the last Pick, never reached a pod
 		g.index.MarkExitingLocked("gone")
 		fx.s.mu.Unlock()
 		if charged == 0 {
 			t.Fatal("fixture: the entry's cold charge must still be outstanding (no chunk, no settle)")
 		}
+		// a LIVE window is in flight: the branch must not be released out from under it
 		if i := fx.pick(); i != -1 {
 			t.Fatalf("no heads: nothing to dispatch, got %d", i)
 		}
-		assertReleased(t, fx, g, "released window (error before PreRequest)")
+		if !fx.s.Seated("gone") {
+			t.Fatal("a LIVE window must keep the branch: its request may be at the pod any moment")
+		}
+		// past S the window is presumed dead, and the same derivation releases it
+		fx.tick(6 * time.Second)
+		assertReleased(t, fx, g, "dead released window (error before PreRequest)")
 		if got := g.coldInFlight; got != 0 {
 			t.Fatalf("the cold-entry charge leaked on the released-window path: %d want 0", got)
 		}
@@ -288,8 +292,7 @@ func TestLeakedColdChargeIsReleasedWithoutEvicting(t *testing.T) {
 		// "gone" leaked: it was charged at its seat, then its request vanished without a
 		// chunk, a settle or a PreRequest. Nothing explains its charge.
 		m := g.branches["gone"]
-		m.inflightIDs = map[string]inflightRec{}
-		m.inflight = 0
+		noInFlightLocked(fx.s, m)
 		m.waitingSince = time.Time{}
 		leaked := m.coldEntry
 		fx.s.mu.Unlock()
@@ -332,8 +335,7 @@ func TestChargedDrainHeadlessIdleReleases(t *testing.T) {
 		markExitingInflight(t, fx, g, "r-gone")
 		fx.s.mu.Lock()
 		m := g.branches["gone"]
-		m.inflightIDs = map[string]inflightRec{}
-		m.inflight = 0
+		noInFlightLocked(fx.s, m)
 		m.lastActivity = fx.clock
 		m.waitingSince = time.Time{} // headless: nothing queued for it
 		fx.s.mu.Unlock()
@@ -353,8 +355,7 @@ func TestChargedDrainExitingWithQueuedHeadReleases(t *testing.T) {
 		markExitingInflight(t, fx, g, "r-gone")
 		fx.s.mu.Lock()
 		m := g.branches["gone"]
-		m.inflightIDs = map[string]inflightRec{}
-		m.inflight = 0
+		noInFlightLocked(fx.s, m)
 		m.lastActivity = fx.clock
 		m.waitingSince = fx.clock.Add(-10 * time.Second) // its next turn is queued
 		fx.s.mu.Unlock()

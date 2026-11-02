@@ -66,10 +66,13 @@ func livePods(eps ...*fwkdl.ModelServer) []fwkdl.Endpoint {
 // podsOf is the Filter's input: scheduling-layer endpoints.
 func podsOf(eps ...fwksched.Endpoint) []fwksched.Endpoint { return eps }
 
-// requestFor builds an InferenceRequest carrying the derived-branch attribute (the
-// core's identity input) — "" means anonymous.
+// requestFor builds the request the Filter and PreRequest are handed for a branch's
+// released turn — "" means an untracked (anonymous) request. Its id is the one the queue
+// head carried (head()/headWithChain() mint "r-"+id), because that id is how a hook
+// resolves its branch: the branch attribute rides along exactly as the real request has it,
+// and reading it is what the scoped hooks must NOT need.
 func requestFor(branch string) *fwksched.InferenceRequest {
-	ir := &fwksched.InferenceRequest{RequestID: "req-" + branch, RequestSizeBytes: 4096}
+	ir := &fwksched.InferenceRequest{RequestID: "r-" + branch, RequestSizeBytes: 4096}
 	if branch != "" {
 		ir.PutAttribute(branchidentity.BranchIdentityKey, branch)
 	}
@@ -92,9 +95,13 @@ func newTestPlugin(t *testing.T, cfg Config, n, blocks int) *GroupScheduler {
 	p := &GroupScheduler{typedName: fwkplugin.TypedName{Type: PluginType, Name: "gs"},
 		cfg: cfg, sched: s, metrics: newGroupMetrics(s), pins: newPinTable(),
 		endpoints: map[string]*endpointState{}, hetero: map[string]struct{}{}}
-	// the pin table follows the seats, exactly as Factory wires it
+	// the pin table follows the seats AND the request identities, exactly as Factory
+	// wires it (a Filter resolves a scoped request's branch from the mirror, not from an
+	// attribute the scope would refuse)
 	s.onBind = func(branch, engine string) { p.pins.set(branch, engine) }
 	s.onUnbind = func(branch string) { p.pins.del(branch) }
+	s.onRelease = func(branch, reqID string) { p.pins.setRequest(reqID, branch) }
+	s.onForget = func(reqID string) { p.pins.delRequest(reqID) }
 	return p
 }
 

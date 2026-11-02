@@ -63,11 +63,8 @@ func TestEnforcementDoesNotMarkAnotherWhileOneIsLeaving(t *testing.T) {
 		fx.seatOne(t, "m2", 250, 5*time.Second)
 		markExitingInflight(t, fx, g, "r-gone") // the 300-block branch leaves
 		fx.s.mu.Lock()
-		for _, id := range []string{"m2"} { // give the sibling a request too (mid-flight)
-			m := g.branches[id]
-			m.inflightIDs = map[string]inflightRec{"r-" + id: {since: fx.clock}}
-			m.inflight = 1
-		}
+		// give the sibling a request too (mid-flight)
+		inFlightLocked(fx.s, g.branches["m2"], fx.clock, "r-m2")
 		// THE OVERAGE IS EXACTLY THE EXITING MEMBER'S OWN FOOTPRINT: 950 total seated
 		// (400 + 300 + 250) against a budget of 100 more... make it precise:
 		g.budgetBlocks = 700 // NE is 950: over by 250, and "gone" (300) already covers it
@@ -94,8 +91,7 @@ func TestEnforcementTakesOneMoreWhenTheOverageExceedsTheRetirees(t *testing.T) {
 		fx.seatOne(t, "m2", 250, 5*time.Second)
 		markExitingInflight(t, fx, g, "r-gone")
 		fx.s.mu.Lock()
-		g.branches["m2"].inflightIDs = map[string]inflightRec{"r-m2": {since: fx.clock}}
-		g.branches["m2"].inflight = 1
+		inFlightLocked(fx.s, g.branches["m2"], fx.clock, "r-m2")
 		// NE 950, budget 300: over by 650; "gone" excuses 300, so 350 is still over —
 		// more than m2's 250, so exactly ONE further mark can be justified... and after
 		// that (250 excused, 100 left) the pass must stop: nobody else may be marked
@@ -160,8 +156,7 @@ func TestExitingVictimDoesNotSpinEnforcementAfterTheCascadeFix(t *testing.T) {
 		fx.seatOne(t, "m", 900, 2*time.Second)
 		m, g := fx.branch(t, "m")
 		fx.s.mu.Lock()
-		m.inflightIDs = map[string]inflightRec{"r-m": {since: fx.clock}}
-		m.inflight = 1
+		inFlightLocked(fx.s, m, fx.clock, "r-m")
 		g.index.MarkExitingLocked("m")
 		g.budgetBlocks = 100
 		fx.s.mu.Unlock()
@@ -281,7 +276,8 @@ func TestSharedBlockWithAStayingBranchIsNotExcused(t *testing.T) {
 		g.index.TrySeatLocked("keep", []Chain{{Keys: keep, Tokens: len(keep) * 64}}, 1<<20)
 		g.branches["keep"] = &branch{id: "keep", engine: g.id, waitingSince: fx.clock}
 		g.index.TrySeatLocked("gone", []Chain{{Keys: gone, Tokens: len(gone) * 64}}, 1<<20)
-		g.branches["gone"] = &branch{id: "gone", engine: g.id, inflightIDs: map[string]inflightRec{"r-gone": {since: fx.clock}}, inflight: 1}
+		g.branches["gone"] = &branch{id: "gone", engine: g.id}
+		inFlightLocked(fx.s, g.branches["gone"], fx.clock, "r-gone")
 		g.index.MarkExitingLocked("gone")
 		used, stay := g.index.UniqueBlocksLocked(), g.index.StayBlocksLocked()
 		fx.s.mu.Unlock()

@@ -112,6 +112,7 @@ func (f *metricFixture) seat(t *testing.T, id string, blocks int, now time.Time)
 	if i := f.s.PickFromHeads([]Head{head(id, time.Second, blocks)}, now); i != 0 {
 		t.Fatalf("%s must seat", id)
 	}
+	releasedWindow(f.s, now) // the release → PreRequest gap every dispatch passes through
 	f.s.Dispatched(id, "r-"+id, now)
 }
 

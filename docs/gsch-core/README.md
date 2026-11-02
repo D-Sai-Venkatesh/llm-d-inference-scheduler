@@ -137,7 +137,7 @@ The wave's BALANCE gate reads the per-engine series every 15 s. A core arm must 
 | `llm_d_epp_group_seats{engine}` | seats per engine |
 | `llm_d_epp_group_waiters_shared` | the ONE shared queue's depth |
 | `llm_d_epp_group_budget_blocks{engine}` / `num_gpu_blocks{engine}` / `ne_blocks{engine}` | sizing + the budget's used side |
-| `llm_d_epp_group_exits_total{engine,reason}` | exits by reason (`budget-*`, `quantum-complete`, `idle`, `engine-idle`, `exiting*`). `ttl` is gone with the knob |
+| `llm_d_epp_group_exits_total{engine,reason}` | DEPARTURES by reason (`budget-*`, `quantum-complete`, `idle`, `engine-idle`, `exiting-drain`, `engine-gone`). `ttl` is gone with the knob. **`reason="exiting"` no longer exists**: the mid-flight mark is a STATE (`exitingBranches`/`exitingBlocks`/`exitingOldest`) and the departure is booked once, as `exiting-drain` (a reducer that summed `exiting*` was double-counting every mid-flight exit) |
 | `llm_d_epp_group_dispatches_total{engine}` | served per engine |
 | `llm_d_epp_group_entry_wait_seconds{engine}` / `reentry_wait_seconds{engine}` | the wait ladder |
 | `llm_d_epp_group_detector_pool_score` | what the detector handed the flow controller (0 = open, the default) |

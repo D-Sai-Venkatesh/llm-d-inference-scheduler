@@ -120,11 +120,19 @@ type GroupScheduler struct {
 	// (fwksched.NewEndpoint → metrics.Clone()), so the capacity retry reads THIS set.
 	candidates atomic.Pointer[[]fwkdl.Endpoint]
 
-	// pins mirrors the scheduler's branch→engine SEAT binding so the Filter can
-	// read it WITHOUT taking s.mu (see filter.go's lock discipline). The
-	// scheduler pushes every seat/unseat/rebind through onBind/onUnbind; nothing
-	// here infers anything.
+	// pins mirrors the scheduler's branch→engine SEAT binding AND its request id →
+	// branch mapping, so the Filter and the scheduler can each answer "which branch is
+	// this request?" WITHOUT taking s.mu (see filter.go's lock discipline). The
+	// scheduler pushes every seat/unseat/rebind and every release/forget through
+	// onBind/onUnbind/onRelease/onForget; nothing here infers anything.
 	pins *pinTable
+
+	// chains memoizes each QUEUED request's exact prefill chain, keyed by request id and
+	// pruned to the ids the last Pick saw: Pick runs at ~1 kHz over the same requests, and
+	// the chain is a hash of the whole prompt. Our own state, never a request attribute
+	// (a scoped hook may not write one — see chainsFor).
+	chainsMu sync.Mutex
+	chains   map[string][]Chain
 }
 
 // endpointState is one discovered endpoint's capacity-acquisition state.
@@ -169,6 +177,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		endpoints: map[string]*endpointState{},
 		hetero:    map[string]struct{}{},
 		pins:      newPinTable(),
+		chains:    map[string][]Chain{},
 		// the handle is held for the RegisterDependencies-time gate: plugin
 		// construction order is NOT the config order (the runner may build
 		// the fairness policy first), so the token-producer check cannot
@@ -199,6 +208,11 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// The pin table follows the SEATS: one map write per seat, one delete per exit.
 	r.sched.onBind = func(branch, engine string) { r.pins.set(branch, engine) }
 	r.sched.onUnbind = func(branch string) { r.pins.del(branch) }
+	// The pin table also follows the REQUESTS: a release names its branch, and the record's
+	// end forgets it. This is what makes the Filter able to resolve a scoped request to its
+	// branch by request id alone.
+	r.sched.onRelease = func(branch, reqID string) { r.pins.setRequest(reqID, branch) }
+	r.sched.onForget = func(reqID string) { r.pins.delRequest(reqID) }
 	r.sched.onColdValveHeld = func(engine string) {
 		r.metrics.ObserveColdValveHeld(engineLabel(engine))
 	}
@@ -264,19 +278,28 @@ func (r *GroupScheduler) runTicker(ctx context.Context) {
 
 func (r *GroupScheduler) TypedName() fwkplugin.TypedName { return r.typedName }
 
-// Consumes declares the attribute keys the policy READS. The BRANCH keys it reads are
-// deliberately NOT declared, because the data layer's DAG validator rejects a dependency
-// whose PRODUCER sits in a later layer than its consumer: this policy is a FairnessPolicy
-// (flow-control layer, 0) and branch identity implements PreRequest (request-control layer,
-// 1), so declaring its key makes the EPP refuse to start with an invalid plugin execution
-// order. Nothing is lost — branch identity's RequestHeader hook runs before admission, so
-// the values are present on every request — and the layer model is the thing to fix
-// upstream (a draft note for the human; never opened by an agent). The agent-identity key
-// stays declared because its plugin implements only RequestHeader and is a harmless
-// declaration.
+// Consumes declares the ONE request attribute the policy reads under a scope: agent
+// identity, Optional, because a config may run without it.
+//
+// The BRANCH keys are deliberately NOT declared, and that is a startup constraint, not a
+// preference: the DAG's layer validator rejects a dependency whose PRODUCER sits in a later
+// layer than its consumer, and branch identity implements PreRequest (request-control layer)
+// while this policy is a FairnessPolicy (flow-control layer 0) — declaring its key makes the
+// EPP refuse to start with "invalid plugin layer execution order". The layer model is the
+// thing to fix upstream (a draft note in README §5; never opened by an agent).
+//
+// AND THAT IS FINE, because this policy does not read the branch from a request: the only
+// hook that reads the arrival attributes is Pick, which receives the flow controller's own
+// queue item UNSCOPED (processor.go: fairnessP.Pick — the flow-control package applies no
+// request scope). Every other hook is handed a SCOPED request (ScopeInvocation in
+// scheduler_profile.go, ScopeRequest in requestcontrol/director.go) where an undeclared read
+// RESOLVES AS ABSENT, so a branch id read that way would silently be "" — an unseated,
+// unstarved, FCFS-pass-through scheduler that looks healthy in every outcome metric. Those
+// hooks resolve the branch from the scheduler's own record of the release instead
+// (Scheduler.branchOfRequestLocked), by request id.
 //
 // The key is optional at the data layer; validateBranchProducer is the fail-closed startup
-// check instead (the identity plugin must EXIST in the same config).
+// check instead (an identity plugin must EXIST in the same config).
 func (r *GroupScheduler) Consumes() fwkplugin.DataDependencies {
 	return fwkplugin.DataDependencies{
 		Optional: map[fwkplugin.DataKey]any{
@@ -285,15 +308,11 @@ func (r *GroupScheduler) Consumes() fwkplugin.DataDependencies {
 	}
 }
 
-// Produces declares no request attribute: the schedule needs nothing published back onto
-// the request. The chains are computed once at Pick and cached ON the request, which is an
-// internal cache, not a contract with another plugin.
+// Produces declares no request attribute, and that is now the whole truth: the plugin
+// publishes NOTHING onto the request. Its own bookkeeping (the per-request chains, the
+// released record) lives in its own state, so no scoped hook can lose a write here and no
+// scoped read can come back empty.
 func (r *GroupScheduler) Produces() map[fwkplugin.DataKey]any { return nil }
-
-// requestChainsKey carries a request's exact prefill chains between Picks. Pick runs at
-// ~1 kHz over the same queued request, so hashing a prompt per pass would be absurd; the
-// request is where the tokens it is derived from already live.
-var requestChainsKey = fwkplugin.NewDataKey("group-chains", PluginType)
 
 // maxChainBlocks bounds a prompt's chain. It is effectively unbounded: a cap here would
 // silently stop counting a long prompt's tail, which is exactly the occupancy the budget
@@ -304,11 +323,21 @@ const maxChainBlocks = 1 << 20
 // token producer rendered at arrival. Each prompt is hashed independently because the
 // engine runs it as its own sequence, and its last block is partial — so its key is
 // private to that exact token sequence, which is why a new turn is never free.
-func (r *GroupScheduler) chainsFor(ctx context.Context, request *fwksched.InferenceRequest) []Chain {
+//
+// THE MEMO IS OURS, NOT THE REQUEST'S. Pick runs at ~1 kHz over the same queued request, so
+// re-hashing a prompt per pass would be absurd; the memo is keyed by request id and pruned
+// to the ids this pass saw, so it is bounded by the queue depth. It used to be a request
+// attribute — an undeclared WRITE, which at Pick (unscoped) happened to survive and at
+// PreRequest (scoped) would have been DROPPED and reported as a violation, failing the
+// request (director.go: violations.Write() fails PreRequest).
+func (r *GroupScheduler) chainsFor(ctx context.Context, reqID string, request *fwksched.InferenceRequest) []Chain {
 	if request == nil || request.Body == nil || request.Body.TokenizedRequest == nil {
 		return nil
 	}
-	if cached, ok := fwksched.ReadRequestAttribute[[]Chain](request, requestChainsKey); ok {
+	r.chainsMu.Lock()
+	cached, ok := r.chains[reqID]
+	r.chainsMu.Unlock()
+	if ok {
 		return cached
 	}
 	hashed, promptTokens := prefixhash.GetBlockHashesWithPromptTokens(ctx, request, r.cfg.BlockSizeTokens, maxChainBlocks)
@@ -320,8 +349,25 @@ func (r *GroupScheduler) chainsFor(ctx context.Context, request *fwksched.Infere
 		}
 		chains = append(chains, Chain{Keys: keys, Tokens: promptTokens[i]})
 	}
-	request.PutAttribute(requestChainsKey, chains)
+	if reqID != "" {
+		r.chainsMu.Lock()
+		r.chains[reqID] = chains
+		r.chainsMu.Unlock()
+	}
 	return chains
+}
+
+// pruneChains drops every memo entry this pass did not see: a request that left the queue
+// (dispatched, cancelled, expired) needs no chain any more, and at Pick its chain has
+// already been handed to the release record that carries it from here on.
+func (r *GroupScheduler) pruneChains(seen map[string]struct{}) {
+	r.chainsMu.Lock()
+	for id := range r.chains {
+		if _, keep := seen[id]; !keep {
+			delete(r.chains, id)
+		}
+	}
+	r.chainsMu.Unlock()
 }
 
 // readID is the string attribute at key ("" when it is absent).
@@ -352,15 +398,30 @@ func (r *GroupScheduler) otherDetectors() []string {
 	return out
 }
 
-// branchOf is the request's branch id — the queue key, read from branch identity. A
-// request without one is ANONYMOUS: it is never seated and never starved (FCFS
-// pass-through). The branch is the identity, and a session header is an attribute, never a
-// key: nothing here falls back to it.
+// branchOf is the request's branch id — the queue key, read from branch identity (or, in a
+// config with no branch identity, from agent identity: see below). A request with neither is
+// ANONYMOUS: it is never seated and never starved (FCFS pass-through). The branch is the
+// identity, and a session header is an attribute, never a key: nothing here falls back to it.
+//
+// PICK ONLY. This is the one hook whose request is the flow controller's own queue item,
+// unscoped (processor.go: fairnessP.Pick(ctx, flowGroup) — the flow-control package applies
+// no request scope), so the arrival attributes are readable exactly here. Every other hook
+// is handed a scoped copy of the request and resolves the branch from the scheduler's
+// record of the release (Scheduler.branchOfRequestLocked) instead.
 func (r *GroupScheduler) branchOf(request *fwksched.InferenceRequest) string {
 	if request == nil {
 		return ""
 	}
-	return readID(request, branchidentity.BranchIdentityKey)
+	if id := readID(request, branchidentity.BranchIdentityKey); id != "" {
+		return id
+	}
+	// AGENT-IDENTITY-ONLY CONFIG: the other source the identity gate accepts. The director
+	// derives the flow queue key from the same order (branch → agent → default), so with no
+	// branch identity the agent id IS the queue key, and the policy's unit has to be the same
+	// or every request would be anonymous while validateBranchProducer reported a healthy
+	// wiring — the exact failure mode the gate exists to prevent. The key is declared
+	// Optional in Consumes(), so this read is inside the plugin's own contract.
+	return readID(request, agentidentity.AgentIdentityKey)
 }
 
 // isReturner reports whether the request is NOT its branch's first turn — the
@@ -369,6 +430,11 @@ func (r *GroupScheduler) branchOf(request *fwksched.InferenceRequest) string {
 // identity minted as new or forked. A request with no arrival record (identity not
 // in the config, or a render failure) is a NEWCOMER: nothing is known about its
 // history, and the safe direction is to give it the seat ahead of incumbents.
+//
+// PICK ONLY, for the same reason as branchOf — and note the failure mode if that ever
+// stops holding: under a scope this read resolves as absent, so every request would
+// classify as a NEWCOMER. That is the safe direction by construction (a newcomer is never
+// demoted), which is why the class is phrased as the exception.
 func isReturner(request *fwksched.InferenceRequest) bool {
 	if request == nil {
 		return false
@@ -736,6 +802,14 @@ func (r *GroupScheduler) readSamples(candidates []fwkdl.Endpoint, now time.Time)
 
 // Pick is the dispatch decision. The waiting set is the queue-head
 // snapshot; pre-capacity it degrades to FCFS pass-through.
+//
+// THIS IS THE ONLY HOOK THAT READS THE REQUEST'S ATTRIBUTES. The flow controller hands it
+// its own queue items (processor.go: fairnessP.Pick(ctx, flowGroup)), and the flow-control
+// package applies no request scope — so the branch id and the arrival record branch identity
+// wrote at RequestHeader are readable here, and nowhere else. Every later hook is handed a
+// SCOPED request (Filter/Scorer via scheduler_profile.go, PreRequest via director.go,
+// producers via plugin_executor.go) and resolves its branch from the record this Pick
+// releases, by request id.
 func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccessor) (fwkfc.FlowQueueAccessor, error) {
 	if band == nil {
 		return nil, nil //nolint:nilnil
@@ -743,6 +817,7 @@ func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccess
 	now := time.Now()
 	var queues []fwkfc.FlowQueueAccessor
 	var heads []Head
+	seen := map[string]struct{}{}
 	band.IterateQueues(func(q fwkfc.FlowQueueAccessor) bool {
 		if q == nil || q.Len() == 0 {
 			return true
@@ -761,7 +836,10 @@ func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccess
 				reqID = ir.RequestID
 				fid = ir.FairnessID // the wire-level identity (the queue key)
 				returner = isReturner(ir)
-				chains = r.chainsFor(ctx, ir)
+				chains = r.chainsFor(ctx, reqID, ir)
+				if reqID != "" {
+					seen[reqID] = struct{}{}
+				}
 			}
 		}
 		queues = append(queues, q)
@@ -770,6 +848,8 @@ func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccess
 		})
 		return true
 	})
+	// the memo is bounded by the queue: an id this pass did not see has left it
+	r.pruneChains(seen)
 	if len(heads) == 0 {
 		return nil, nil //nolint:nilnil
 	}
@@ -806,20 +886,27 @@ func (r *GroupScheduler) Produce(context.Context, *fwksched.InferenceRequest, []
 	return nil
 }
 
-// RequestAbandoned closes the released window for a request that left the request path
-// without reaching PreRequest. It is safe when no window exists, and it only ever clears the
-// window that names this request.
+// RequestAbandoned ends the record of a request that left the request path without
+// reaching PreRequest. It is safe when no record exists. The branch is the record's — this
+// hook's request is the framework's (unscoped today), but the scheduler's own record is the
+// one source of truth everywhere, so the branch is never read off the request at all.
 func (r *GroupScheduler) RequestAbandoned(_ context.Context, request *fwksched.InferenceRequest) {
 	if request == nil {
 		return
 	}
-	r.sched.Abandon(r.branchOf(request), request.RequestID)
+	r.sched.Abandon("", request.RequestID)
 }
 
 // PreRequest runs after the request leaves the queue (dispatch). It records the in-flight
 // request and reconciles the engine the framework ACTUALLY picked with the one the seat
 // assumed; nothing is charged here, because the seat charged the exact chains.
-func (r *GroupScheduler) PreRequest(ctx context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) error {
+//
+// THE BRANCH IS NOT READ FROM THE REQUEST. This hook's request is SCOPED
+// (datalayer.ScopeRequest, director.go), so an attribute read the plugin did not declare
+// resolves as absent and an undeclared write is DROPPED and turns into a failed PreRequest
+// (violations.Write()). The branch — and the chain the release charged — come from the
+// record the Pick wrote, resolved by request id.
+func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) error {
 	// capacity first (belt-and-braces, third acquisition path): it must not
 	// depend on the request being trackable — anonymous traffic used to
 	// return before ever teaching the budget.
@@ -831,31 +918,28 @@ func (r *GroupScheduler) PreRequest(ctx context.Context, request *fwksched.Infer
 			return err // the loud mismatch failure
 		}
 	}
-	id := r.branchOf(request)
-	if id == "" {
+	if request == nil {
 		return nil
 	}
 	// The engine here is AUTHORITATIVE: the seat was placed on the branch's engine at
-	// Pick, and the framework's actual choice moves it if it disagrees. The request's own
-	// chain comes along because a branch that holds no seat at all is seated by the
-	// observation (the chains are cached on the request at Pick, so this is a read).
-	r.sched.DispatchedOnUsage(id, request.RequestID, engine, r.chainsFor(ctx, request), time.Now())
+	// Pick, and the framework's actual choice moves it if it disagrees. The chain is the
+	// one the release recorded, so a branch that holds no seat at all is seated by the
+	// observation with exactly the cost its head was charged.
+	r.sched.DispatchedOnUsage("", request.RequestID, engine, nil, time.Now())
 	return nil
 }
 
 // ResponseBody: the first chunk is prefill complete (the cold-entry charge is released
 // there); EndOfStream is the finalizer for every termination cause (the in-flight decrement
-// always, the payback ledger only for a natural one).
+// always, the payback ledger only for a natural one). Both are branch-level facts, and the
+// branch is the record's, by request id (this hook is unscoped today; the record is used
+// regardless so one source of truth covers every hook).
 func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.InferenceRequest, response *fwkrc.Response, target *fwkdl.EndpointMetadata) {
 	if request == nil || response == nil {
 		return
 	}
-	id := r.branchOf(request)
-	if id == "" {
-		return
-	}
 	if response.StartOfStream {
-		r.sched.ChunkAt(id, time.Now())
+		r.sched.ChunkForRequest(request.RequestID, time.Now())
 	}
 	if !response.EndOfStream {
 		return
@@ -873,7 +957,7 @@ func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.Infer
 	if target != nil && target.ID.String() != "" {
 		engine = target.ID.String()
 	}
-	r.sched.SettleOnUsage(id, request.RequestID, engine, promptTokens, cachedTokens, completionTokens,
+	r.sched.SettleOnUsage("", request.RequestID, engine, promptTokens, cachedTokens, completionTokens,
 		response.TerminationCause == fwkrc.TerminationCauseNatural, time.Now())
 }
 

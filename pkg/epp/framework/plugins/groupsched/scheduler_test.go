@@ -79,10 +79,17 @@ func headWithChain(id string, ago time.Duration, chains []Chain) Head {
 	return Head{Branch: id, ReqID: "r-" + id, Arrival: time.Now().Add(-ago), Chains: chains}
 }
 
-// dispatch drives the released-request path: Pick chose the head, the framework picked
-// the engine, PreRequest records the in-flight request.
+// dispatch drives the released-request path: Pick chose the head, the framework picked the
+// engine, PreRequest records the in-flight request.
+//
+// IT TAKES A DECISION PASS FIRST, at the pass clock, with the released turn no longer queued:
+// that is the released WINDOW (between the release and PreRequest), and in production a
+// ~1 kHz Pick lands inside it. Calling Dispatched straight after the Pick hid every rule that
+// read the window as idle (B2); the pass is part of the lifecycle now, so a fixture cannot
+// skip it by accident.
 func dispatch(t *testing.T, s *Scheduler, id string) {
 	t.Helper()
+	s.PickFromHeads(nil, s.now)
 	s.Dispatched(id, "r-"+id, time.Now())
 }
 
@@ -90,6 +97,59 @@ func dispatch(t *testing.T, s *Scheduler, id string) {
 func settle(s *Scheduler, id string, prompt, cached int) {
 	s.Chunk(id)
 	s.Settle(id, "", struct{ Prompt, Cached int }{prompt, cached}, true, time.Now())
+}
+
+// ---- the request map, for a test that declares a branch's request state directly ----
+//
+// A request is tracked by ONE record (scheduler.go's reqRec), so a test that wants "this
+// branch has a request at a pod" writes that record the way PreRequest does and lets the
+// branch's derived counts follow it — never the fields directly, which is exactly the
+// duplication the record removed.
+
+// inFlightLocked replaces m's at-a-pod records with reqID (the caller holds s.mu).
+func inFlightLocked(s *Scheduler, m *branch, now time.Time, reqID string) {
+	noInFlightLocked(s, m)
+	addInFlightLocked(s, m, now, reqID)
+}
+
+// addInFlightLocked adds one at-a-pod record to m (the caller holds s.mu).
+func addInFlightLocked(s *Scheduler, m *branch, now time.Time, reqID string) {
+	s.reqs[reqID] = &reqRec{branch: m.id, released: now, pod: now}
+	m.inflight++
+}
+
+// noInFlightLocked drops m's at-a-pod records (the caller holds s.mu).
+func noInFlightLocked(s *Scheduler, m *branch) {
+	for rid, rec := range s.reqs {
+		if rec.branch == m.id && !rec.pod.IsZero() {
+			delete(s.reqs, rid)
+		}
+	}
+	m.inflight = 0
+}
+
+// pendingLocked replaces m's released-but-not-at-a-pod record with reqID ("" clears it).
+// The caller holds s.mu.
+func pendingLocked(s *Scheduler, m *branch, now time.Time, reqID string) {
+	for rid, rec := range s.reqs {
+		if rec.branch == m.id && rec.pod.IsZero() {
+			delete(s.reqs, rid)
+		}
+	}
+	m.pending = 0
+	if reqID == "" {
+		return
+	}
+	s.reqs[reqID] = &reqRec{branch: m.id, released: now}
+	m.pending = 1
+}
+
+// releasedWindow is the decision pass that lands between a release and PreRequest in
+// production (Pick runs at ~1 kHz; a fixture that dispatches immediately has no window at
+// all, which is how every rule that read the window as idle stayed hidden). The released turn
+// is no longer queued, so the pass is given no heads.
+func releasedWindow(s *Scheduler, now time.Time) {
+	s.PickFromHeads(nil, now)
 }
 
 // engineSet is one twin fixture: n engines each with measured capacity.
@@ -396,6 +456,13 @@ func TestNoEvictionWhileInFlight(t *testing.T) {
 		if i := fx.pick(head("m", time.Millisecond, 700)); i != 0 {
 			t.Fatalf("the branch's second head must be served (in-flight cap), got %d", i)
 		}
+		// THE RELEASED WINDOW: between the release and PreRequest nothing has reached a pod
+		// yet, and in production a ~1 kHz Pick lands HERE. That pass must not evict the
+		// branch (the old fixture dispatched immediately, which hid the window entirely).
+		fx.s.PickFromHeads(nil, fx.clock)
+		if !fx.s.Seated("m") {
+			t.Fatal("a released window is in flight: the branch must never be evicted inside it")
+		}
 		dispatch(t, fx.s, "m")
 		fx.s.PickFromHeads(nil, fx.clock) // the next pass enforces the growth
 		if !fx.s.Seated("m") {
@@ -406,6 +473,44 @@ func TestNoEvictionWhileInFlight(t *testing.T) {
 		fx.s.PickFromHeads(nil, fx.clock)
 		if fx.s.Seated("m") {
 			t.Fatal("after the drain the exiting branch must leave")
+		}
+	})
+}
+
+// m8: a branch evicted while it has a QUEUED head re-enters the shared queue with THAT HEAD's
+// cost and class — not with the chain the engine last ran, and not with a forced "returner".
+// The old re-queue used index.ChainsLocked (the turn that just finished) and returner=true, so
+// the next seat was priced for the wrong prompt and the entry order was told an incumbent was
+// an incumbent whatever its queued head was.
+func TestExitRequeuesWithTheQueuedHead(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		fx.seatOne(t, "m", 100, time.Second) // it ran a 100-block turn
+		queued := head("m", time.Second, 300)
+		queued.Returner = false // a NEWCOMER's turn, whatever the branch's history
+		fx.s.mu.Lock()
+		g := fx.g()
+		m := g.branches["m"]
+		fx.s.syncWaitersLocked([]Head{queued}, fx.clock)
+		ran := g.index.ChainsLocked("m")
+		fx.s.mu.Unlock()
+		if len(ran) == 0 {
+			t.Fatal("premise: the engine accounts the chain it is running")
+		}
+		if sameChains(ran, queued.Chains) {
+			t.Fatal("premise: the queued head must differ from the turn that ran")
+		}
+		fx.s.mu.Lock()
+		fx.s.exitLocked(g, m, "test", fx.clock)
+		w := fx.s.waiters["m"]
+		fx.s.mu.Unlock()
+		if w == nil {
+			t.Fatal("a branch with a queued head must re-enter the shared queue")
+		}
+		if !sameChains(w.chains, queued.Chains) {
+			t.Fatal("the re-queue carried the WRONG chain: it must be the queued head's own cost, never the turn that ran")
+		}
+		if w.returner {
+			t.Fatal("the re-queued head must keep its own class: a newcomer's turn was forced to returner=true")
 		}
 	})
 }
@@ -431,8 +536,7 @@ func TestExitingMemberStaysOnTheUsedSideUntilDrain(t *testing.T) {
 		min, g := fx.branch(t, "m0")
 		fx.s.mu.Lock()
 		// in flight and marked exiting (the mid-flight pressure class)
-		min.inflightIDs = map[string]inflightRec{"r-m0": {since: fx.clock}}
-		min.inflight = 1
+		inFlightLocked(fx.s, min, fx.clock, "r-m0")
 		freeBefore := fx.s.freeBudgetLocked(g)
 		neBefore := g.index.UniqueBlocksLocked()
 		g.index.MarkExitingLocked("m0")
@@ -468,8 +572,7 @@ func TestExitingVictimDoesNotSpinEnforcement(t *testing.T) {
 		fx.seatOne(t, "m", 900, 2*time.Second)
 		m, g := fx.branch(t, "m")
 		fx.s.mu.Lock()
-		m.inflightIDs = map[string]inflightRec{"r-m": {since: fx.clock}}
-		m.inflight = 1
+		inFlightLocked(fx.s, m, fx.clock, "r-m")
 		g.index.MarkExitingLocked("m")
 		// way over budget with the only branch already exiting
 		g.budgetBlocks = 100
@@ -705,18 +808,45 @@ func TestNoStarvation(t *testing.T) {
 	})
 }
 
-// C8: a branch with a queued head is not idle — gate closure (no Picks) must not
-// manufacture idle exits.
+// C8, MADE TO BITE: a branch with a QUEUED TURN is not idle — even silent past S, and even
+// while that turn cannot dispatch (the in-flight cap holds it). The fixture used to set
+// waitingSince by hand and then run a Tick; a Tick no longer decides anything (R5), so the
+// assertion could not fail. This one drives the REAL sync with the head in the queue view, and
+// asserts the tenure rule refuses the branch.
 func TestWaitingMemberIsNotIdleEvicted(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 400, time.Second)
 		settle(fx.s, "m", 400, 400)
 		fx.s.mu.Lock()
-		fx.g().branches["m"].waitingSince = fx.clock.Add(-time.Minute)
+		m := fx.g().branches["m"]
+		m.lastActivity = fx.clock.Add(-time.Hour) // silent past S
+		for i := 0; i < fx.s.cfg.InFlightCap; i++ {
+			// the cap is full, so the head below stays QUEUED while the pass reads it
+			addInFlightLocked(fx.s, m, fx.clock, fmt.Sprintf("r-cap-%d", i))
+		}
 		fx.s.mu.Unlock()
-		fx.tick(5 * time.Minute) // no Picks at all: the gate is "closed"
+		h := head("m", time.Minute, 400)
+		if i := fx.pick(h); i >= 0 {
+			t.Fatalf("the in-flight cap must hold the head, got %d", i)
+		}
+		fx.s.mu.Lock()
+		waiting := !fx.g().branches["m"].waitingSince.IsZero()
+		reason, victim := fx.s.rotationVictimLocked(fx.g(), fx.clock)
+		fx.s.mu.Unlock()
+		if !waiting {
+			t.Fatal("premise: the pass must have seen the branch's queued head")
+		}
+		if victim != nil {
+			t.Fatalf("a branch with a queued turn was rotation-eligible as %q (C8: a queued turn is not idle)", reason)
+		}
 		if !fx.s.Seated("m") {
-			t.Fatal("a branch with a queued turn must not be idle-evicted while no Picks run (C8)")
+			t.Fatal("a branch with a queued turn must not be evicted (C8)")
+		}
+		// and a Tick alone decides nothing (R5): no decision point, no eviction — the gate
+		// being closed can never manufacture one
+		fx.tick(5 * time.Minute)
+		if !fx.s.Seated("m") {
+			t.Fatal("a Tick must not evict: decisions live in Pick (R5)")
 		}
 	})
 }
@@ -742,7 +872,7 @@ func TestNoRecordBeforePreRequest(t *testing.T) {
 		}
 		fx.s.mu.Lock()
 		m := fx.g().branches["m"]
-		afterPick, released := m.inflight, m.released
+		afterPick, released := m.inflight, fx.s.oldestPendingLocked("m")
 		fx.s.mu.Unlock()
 		if afterPick != 1 {
 			t.Fatalf("a picked-but-not-dispatched request made an in-flight record: %d want 1", afterPick)
@@ -756,7 +886,7 @@ func TestNoRecordBeforePreRequest(t *testing.T) {
 		// the terminal callback closes the window, and the branch is free again
 		fx.s.Settle("m", "r-m-2", struct{ Prompt, Cached int }{100, 0}, false, fx.clock)
 		fx.s.mu.Lock()
-		releasedAfter := fx.g().branches["m"].released
+		releasedAfter := fx.s.oldestPendingLocked("m")
 		fx.s.mu.Unlock()
 		if releasedAfter != "" {
 			t.Fatalf("the terminal callback left the released window open (%q)", releasedAfter)
@@ -894,8 +1024,10 @@ func TestStaleQueueViewNeverIdleEvicts(t *testing.T) {
 	})
 }
 
-// BUG 4(a): a mid-flight exit reaches the exit HOOK (the metric series), not only the
-// snapshot. BUG 4(b): a rotation victim is never a branch with something in flight.
+// ONE DEPARTURE, ONE BOOKING. A mid-flight branch is MARKED exiting (a state: ExitingMembers
+// and friends, no event), and the departure reaches the exit hook ONCE, at the drain — the
+// mark used to be booked as an exit too, so every mid-flight departure counted twice in the
+// same series. BUG 4(b): a rotation victim is never a branch with something in flight.
 func TestExitingIsCountedAndRotationNeverPicksInflight(t *testing.T) {
 	cfg := defaultConfig()
 	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
@@ -923,15 +1055,26 @@ func TestExitingIsCountedAndRotationNeverPicksInflight(t *testing.T) {
 		if rv != nil && rv.inflight > 0 {
 			t.Fatal("BUG 4(b): a rotation victim must never have requests in flight")
 		}
-		// (a) every booked exit reason reaches the hook
-		found := false
+		// (a) the MARK is state, not an exit: it must not reach the exit hook at all, and the
+		// snapshot must show it
 		for _, r := range hooked {
 			if r == "exiting" || r == "budget-exiting" {
-				found = true
+				t.Fatalf("the mark of a mid-flight branch was booked as an EXIT (%v): one departure, one booking", hooked)
 			}
 		}
-		if !found {
-			t.Fatalf("BUG 4(a): a mid-flight exit must reach the exit hook, got %v", hooked)
+		var marked int
+		fx.s.mu.Lock()
+		for id := range fx.g().branches {
+			if fx.g().index.ExitingLocked(id) {
+				marked++
+			}
+		}
+		fx.s.mu.Unlock()
+		if marked == 0 && len(hooked) == 0 {
+			t.Fatal("the mid-flight branch was neither marked exiting nor exited: nothing happened at all")
+		}
+		if len(hooked) == 1 && hooked[0] == "exiting-drain" {
+			t.Fatalf("a branch cannot be drained while it is in flight (%v)", hooked)
 		}
 	})
 }

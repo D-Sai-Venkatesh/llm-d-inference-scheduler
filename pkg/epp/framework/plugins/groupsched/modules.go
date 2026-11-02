@@ -93,7 +93,9 @@ type FixedQuantum struct {
 func (FixedQuantum) Name() string { return "quantum" }
 
 func (p FixedQuantum) Eligible(m *branch, ctx TenureCtx) (string, bool) {
-	if m.inflight > 0 {
+	if m.busy() {
+		// a request at a pod, OR a live released window: a turn is in progress either
+		// way, and rotating it out would evict a branch that is about to run
 		return "", false
 	}
 	if m.busyPeriods >= p.Q {
@@ -119,9 +121,9 @@ type PressureCtx struct {
 	// Silent is the same idle test the tenure policy uses.
 	Silent func(m *branch) bool
 	// Headless reports whether the branch has no turn wanting to run: no queued head AND no
-	// request released and on its way to a pod. A window counts here (it is a turn on its
-	// way, so a branch that has one is never "done"), and it does NOT count for the tenure
-	// rule's silence test — liveness must never be barred by a window.
+	// LIVE released window. A live window counts here (it is a turn on its way, so a branch
+	// that has one is never "done"); a DEAD one does not, which is exactly how a branch
+	// whose request died in the window becomes evictable on demand after S.
 	Headless func(m *branch) bool
 }
 
@@ -151,7 +153,7 @@ func (BudgetValve) Victim(branches []*branch, ctx PressureCtx) (string, *branch)
 	}
 	var best *branch
 	for _, m := range branches {
-		if ctx.Exiting(m.id) || m.inflight > 0 {
+		if ctx.Exiting(m.id) || m.busy() {
 			continue
 		}
 		if ctx.Headless(m) || ctx.Silent(m) {
@@ -169,7 +171,7 @@ func (BudgetValve) Victim(branches []*branch, ctx PressureCtx) (string, *branch)
 	// (measured: 100 % of the old class-3 victims had a queued head, 53/54 had served
 	// ZERO turns in the residency). Only then "oldest last completion", then id.
 	for _, m := range branches {
-		if ctx.Exiting(m.id) || m.inflight > 0 {
+		if ctx.Exiting(m.id) || m.busy() {
 			continue
 		}
 		if best == nil || class3Less(m, best) {
@@ -268,10 +270,6 @@ type EngineCandidate struct {
 	// HasVictim is LAZY (it costs a scan): may the engine evict an eligible
 	// incumbent right now?
 	HasVictim func() bool
-	// HasValveHolder is LAZY: may the engine evict the branch HOLDING its cold-entry
-	// charge right now (tenure permitting)? That is the ONE eviction a valve-held head may
-	// take, because it frees the valve rather than the budget.
-	HasValveHolder func() bool
 }
 
 // EngineChooser answers "which engine takes this head?".
@@ -314,24 +312,16 @@ func (MostFreeBudget) Choose(cands []EngineCandidate) int {
 		return best
 	}
 	// The cold valve is holding this head somewhere: WAIT — never evict — because evicting
-	// frees budget and never the valve. The one exception is the branch HOLDING the charge
-	// on that engine: evicting IT releases the charge and opens the valve, and it is only
-	// ever a branch the tenure rule already releases (see valveHolderVictimLocked).
+	// frees budget and never the valve. The valve opens by itself: the charge holding it is
+	// released when its owner's prefill produces a token, and — the case that used to need
+	// an eviction exception — when its owner's released window outlives S and the branch
+	// stops counting as busy (F1's derivation releases the charge at that same pass).
 	for i := range cands {
-		if !cands[i].BudgetFits {
-			continue
+		if cands[i].BudgetFits {
+			return -1
 		}
-		if cands[i].HasValveHolder != nil && cands[i].HasValveHolder() {
-			if best < 0 || betterEngine(cands[i], cands[best]) {
-				best = i
-			}
-			continue
-		}
-		return -1 // the valve holds it and nothing may be evicted for it
 	}
-	if best >= 0 {
-		return best
-	}
+	// Nothing fits by BUDGET either: eviction is the way forward.
 	for i := range cands {
 		if cands[i].HasVictim == nil || !cands[i].HasVictim() {
 			continue

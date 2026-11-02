@@ -378,6 +378,10 @@ func (w *workload) dispatchTurn(logical string) {
 	}
 	delete(w.queued, logical)
 	branch := q.head.Branch
+	// the released WINDOW: a decision pass runs while the turn is on its way to the pod
+	// (in production the ~1 kHz Pick lands here), so the workload model sees the same
+	// order the live path does
+	w.fx.s.PickFromHeads(nil, w.fx.clock)
 	w.fx.s.Dispatched(branch, q.req.RequestID, w.fx.clock)
 	if err := w.bi.PreRequest(context.Background(), q.req, nil); err != nil {
 		w.t.Fatalf("branch identity PreRequest: %v", err)

@@ -165,10 +165,13 @@ func invRun(t *testing.T, seed int64, engines, capacity int, events int) string 
 			if !s.Seated(h.Branch) {
 				t.Fatalf("event %d: %s was dispatched without a seat", i, h.Branch)
 			}
-			// the request left the queue and is now in flight (PreRequest follows the
-			// release in the same goroutine: the handler forces a terminal hook on any
-			// failure once a pod is chosen)
+			// the request left the queue and is NOT yet in flight: PreRequest is the
+			// director's own call, on another goroutine, and the ~1 kHz Pick runs in between
+			// (the released window). So a decision pass happens HERE, on the queue view that
+			// no longer contains the released turn — the step whose absence hid B2, where
+			// every rule read a branch on its way to the pod as idle.
 			delete(queued, h.Branch)
+			s.PickFromHeads(nil, clock)
 			trace.WriteString("dispatch " + h.Branch + " " + engine + "\n")
 			s.DispatchedOn(h.Branch, h.ReqID, engine, h.Chains, clock)
 			flying[h.Branch] = h.ReqID

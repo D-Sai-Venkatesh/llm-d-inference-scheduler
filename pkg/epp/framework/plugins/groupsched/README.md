@@ -44,8 +44,9 @@ hold an engine's own dispatches and new seats; by default it does nothing.
 | `safety.go` | the safety module's state (fires, fired seconds, the pushed per-engine sample) |
 | `metrics.go` | the Prometheus series (one per engine, labelled `engine`) |
 | `plugin.go` | the framework plugin: FairnessPolicy + Filter + SaturationDetector, capacity learning |
-| `filter.go` | the placement Filter (pin dispatch to the member's seat engine) |
+| `filter.go` | the placement Filter (pin dispatch to the member's seat engine) + the request-identity mirror |
 | `blockindex.go` | the per-engine block index (dedup, NE accounting, the 4-request window) |
+| `scoped_hooks_test.go` | **the scoped-hooks test class (F13)**: every hook driven through the framework's REAL `ScopeRequest`/`ScopeInvocation`, failing on any violation — see §2b |
 | `golden_test.go`, `scheduler_test.go`, `multipod_test.go`, `plugin_core_test.go`, `config_conformance_test.go`, `entryorder_test.go` | the test suite; every behavioural test runs at N=1 AND N=2 |
 
 ## 2. The golden, and the seven declared fixes
@@ -76,7 +77,7 @@ apply to; their counts are lines differing from the 5,033-line 0-4 trace.
 | 1 | the cold-entry valve never evicts (a valve-held head WAITS) | **0 differing lines** at the shipped cap; at a cap-binding replay: f0p took **20 evictions for nothing** (3,220 valve-blocked passes), served 1,201 → 1,253 (+4.3 %) | eviction frees budget, never the valve — so f0p evicted every eligible member and left the seats cold-empty. **Replay: 0 at the shipped cap, 20 at a tiny cap. Live: measured by the anchor** (f0p logged 913,162 valve-blocked passes live and those evictions are indistinguishable from ordinary exits in the banked artifacts, so the live effect is UNKNOWN and bounded by the rotation exits, ~40-45 % of exits). |
 | 2 | class-3 (mid-quantum) victims: an UNSTARTED or WANTING member sorts LAST | 0 differing lines | f0p's class-3 victims: 100 % had a queued head and 53/54 had served ZERO turns in the residency — a seat taken back before its first turn. The order fix has no effect on this replay because its class-3 candidate set is entirely unstarted; its value is on real workloads. |
 | 3 | a STALE queue view never justifies an eviction (the C8 race) | +9 class-3 exits, 14 differing lines, served unchanged | `waitingSince` is only maintained by a pass over the queue, so with the flow controller's gate closed the flag goes stale and an eviction rule trusting "no head" took seats from members whose head was queued the whole time (victims' heads then waited 4.7-25 min, cold). Tick now re-syncs from the last head snapshot, and classes 2-3 are skipped when the view is older than S. |
-| 4 | accounting: mid-flight exits reach the exit hook; the unreachable rotation in-flight branch deleted | +62 `EXIT reason=exiting` lines, 0 decisions | `llm_d_epp_group_exits_total{reason="exiting"}` was permanently 0. The rotation in-flight branch was dead code (the tenure rule refuses in-flight members) and is gone; the mid-flight class lives in the pressure module. |
+| 4 | accounting: mid-flight exits reach the exit hook; the unreachable rotation in-flight branch deleted | +62 `EXIT reason=exiting` lines, 0 decisions | `llm_d_epp_group_exits_total{reason="exiting"}` was permanently 0. **Superseded (§2b): the mark is a state and the departure is booked once as `exiting-drain`, so the `reason="exiting"` series is gone** — it counted every mid-flight departure twice. The rotation in-flight branch was dead code (the tenure rule refuses in-flight members) and is gone; the mid-flight class lives in the pressure module. |
 | 5 | **an EXITING member's blocks stay on the budget's used side until it drains** | **6,378 differing lines; served 1,231 → 1,049 (−14.8 %)** | The budget's used side excluded exiting members *by definition*, so it forgot **14-18 % of the pool** (p50, per engine, on the multi-pod wave) while the engine was still pinning those blocks — measured as `(unique_blocks − ne_blocks)/pool` and as `NE < L` in 19-59 % of samples (preempt-rootcause §7.3). The replay's engine is small (950-block budget), so the cost shows up as throughput; on the campaign engine the same fix is what puts the corrected occupancy in the preemption zone the wave exists to measure. Also closes a latent enforcement livelock: a pass that re-picked an already-exiting in-flight victim freed nothing and spun (`TestExitingVictimDoesNotSpinEnforcement`). |
 | 6 | **the cold-entry cap is DERIVED per engine (the budget's headroom) and ENFORCED** | **5,907 differing lines; served 1,231 → 1,185 (−3.7 %)** | `coldEntryCapTokens` was a config constant in TOKENS (131,072) describing the same 5 % margin the budget describes in BLOCKS, and its "one cold entry is always allowed" clause was an EXCEPTION to it, so the charge ran **1.44-1.53× over its own cap in 20-30 % of samples**. The cap is now `floor((1 − fraction) × num_gpu_blocks) × blockSizeTokens` per engine and the CHARGE is capped at it, which makes the cap an invariant and R11's liveness a consequence. The replay divergence is the replay's own shape: its engine is 1,000 blocks, so the derived cap is 50 blocks where the constant was 2,048; on the campaign engine (40,183 blocks) the derived cap is **2,009 blocks = 128,576 tokens**, i.e. the constant it replaces to within one block. |
 | 7 | **token-exact block counting: the trailing partial block is counted** (keys AND the admission estimate round up) | **0 differing lines** on this replay; measured on the token-level replay (`TestSeatIndexBlockCountReadings`): every request with a partial tail gains its block | The tier-A keys were `len(tokens)/blockSize` — full blocks only — while the engine allocates a block for the trailing partial tokens, so the index was short by up to one block per request in the direction that costs headroom. The replay cannot see it (its driver feeds keys directly and its wire sizes are whole blocks); the A/B replay can, and it also shows the seat index is otherwise **token-exact** (§2a). |
@@ -126,6 +127,62 @@ uses. The root cause's prose says "≈ 4.47 bytes/token", which would make a byt
 read HIGH; the measurement it reports (0.895) is LOW, and the measurement is the one that
 matches the artifacts.
 
+## 2b. The scoped hooks, and the window that is in flight
+
+**The framework confines a plugin's request attributes.** `datalayer.ScopeRequest` /
+`ScopeInvocation` hand a plugin a request whose attribute access is limited to the keys the
+plugin declares: an undeclared read RESOLVES AS ABSENT, an undeclared write is DROPPED. That
+is applied at `Filter`, `Scorer`, `PreRequest`, the profile/scheduling points and every
+`DataProducer`. The flow-control `Pick` path applies NO scope (processor.go:
+`fairnessP.Pick(ctx, flowGroup)`).
+
+**So the policy reads a request attribute in exactly one hook.** `Pick` takes the branch id
+and the arrival record from the flow controller's own queue item — that is the only place
+they are readable, and the only place they are read. Every later hook (Filter, PreRequest,
+ResponseBody, RequestAbandoned) resolves the branch from the scheduler's OWN record of the
+release, by request id:
+
+* a **request record** (`reqRec`) is written when a Pick releases a turn and ends at its
+  settle, its abandon, the reap, or its branch's exit (which sweeps the branch's records);
+  it carries the branch, the exact prefill chains the release was charged with, and the
+  engine the observation named. Every released request has its own record — two releases of
+  one branch coexist;
+* the **Filter** resolves request → branch through the pin table's request mirror, which the
+  same release hook writes, so it still never takes the scheduler's mutex (it runs on every
+  dispatch, Pick holds the mutex at ~1 kHz);
+* the plugin declares `Produces() = nil` — honestly: it publishes nothing onto a request, so
+  no scoped hook can lose a write. `Consumes()` declares only agent identity (Optional), and
+  the branch keys stay undeclared because declaring them fails startup (the DAG rejects a
+  flow-control consumer of a request-control producer — a draft note for upstream, never
+  opened by an agent). In a config with no branch identity the agent identity IS the branch,
+  exactly as the director derives the queue key.
+
+Why this matters: reading the branch from an attribute under a scope returns `""`, and the
+policy then looks perfectly healthy — nothing seated, nothing starved, FCFS pass-through in
+every outcome metric. It shipped once. `scoped_hooks_test.go` is the test class that catches
+it: at N=1 and N=2, for an arm's request, an explicit-fairness-header request, an anonymous
+request and an agent-identity-only config, it drives Pick through the REAL flow controller and
+Filter/PreRequest/ResponseBody/Abandon through the REAL scope, and fails on any violation
+counted or any branch that fails to resolve.
+
+**`busy()` = in flight, OR a LIVE released window.** A request that a Pick has released and
+PreRequest has not yet brought to a pod is a turn ON ITS WAY, and it counts as in flight
+everywhere: tenure eligibility, the engine-idle rule, every victim class, the drain, the
+cold-charge derivation, the in-flight cap. The window is the COMMON case, not a corner — every
+dispatch passes through it and Pick runs at ~1 kHz, so a decision almost always lands inside
+one, and a branch on its way to the pod looks idle to any rule that ignores it (measured at
+N=1 and N=2: evicted and re-seated by the observed seat, used 1200 against a 950 budget; a
+marked branch drained before its request ran, used 1500 against 1100; a quantum-complete branch
+rotated out mid-window). A window is **live for at most S** (`idleSeconds`, the tenure rule's
+own silence bound), evaluated in the decision pass — no timer, no new constant. Past S the
+window is presumed dead: it stops counting, the branch becomes evictable on demand, and the
+cold charge it was holding is released by the derivation (which is why a valve-held head needs
+no eviction rule: the valve opens by itself).
+
+A mark is a STATE, not an event: enforcement marking a mid-flight branch exiting shows up as
+`exitingBranches` / `exitingBlocks` / `exitingOldest`, and the departure is booked ONCE in
+`llm_d_epp_group_exits_total{reason="exiting-drain"}`.
+
 ## 3. Constants
 
 Everything the code still holds as a number, with its origin. A number that cannot be
@@ -144,7 +201,8 @@ tagged for removal.
 | `blockSizeTokens` | 64 | config | **a wiring fact, not a knob**: it must equal the engine's `--block-size`. A measured mismatch fails loudly per engine. |
 | `capacityLivenessSeconds` | 120 | config | how long an endpoint may go without a measured capacity before the loud `capacity_missing` alarm. An alarm deadline, not a decision input. |
 | `inflightReapSeconds` | 3700 | config | the confirmed in-flight id reap bound = the harness request timeout (3600) + 100, i.e. it reaps only true leaks. |
-| provisional reap | 30 s | `reapInflightLocked` | a Pick-time provisional id never confirmed at PreRequest is dropped after 30 s (C3). Inherited; a wiring bound on the Pick→PreRequest gap. |
+| the released window | S = `idleSeconds` | `scheduler.windowLive` | how long a released request counts as IN FLIGHT before it is presumed dead (§2b). Not a new number: it is the tenure rule's own silence bound, evaluated per decision pass. |
+| request reap | `inflightReapSeconds` | `reapRequestsLocked` | the record of a request whose termination nobody observed (at a pod, or still released) is dropped at the same bound as the in-flight id reap. It is the belt to the terminal callback's braces, and the only thing that bounds the map when no hook ever arrives. |
 | 4-request window | 4 | `blockindex.go` | the dispatch window: the member's footprint is the union of its queued heads and its last 4 dispatches. Inherited from f0p (a "derived chain window" was tried and retired). |
 | `eventRingSize` | 2048 | `scheduler.go` | the SEAT/EXIT ring bound (memory only). A ring wrap is COUNTED in `Snapshot.EventRingDropped` (a dump field, not a metric: the trim keeps nineteen names), so "the ring does not span the run" is a measurement instead of an inference. |
 | `maxChains` | — | *removed* | with the derived window. |
@@ -184,6 +242,14 @@ key is absent, so removing it from the templates is safe for the older pinned di
 
 ## 5. Known live risk / open items
 
+* **UPSTREAM DRAFT (not opened; for the human).** The DAG's layer validator
+  (`datalayer/data_graph.go`, `pluginToLayerExecutionOrder`) rejects a dependency whose
+  producer sits in a LATER layer than its consumer, which is why a flow-control policy may not
+  declare the branch keys: branch identity writes them at `RequestHeader` (a request-control
+  hook, layer 3) while the policy is layer 0 — even though `RequestHeader` runs BEFORE
+  admission, so the value is always there in time. The layer model should admit "a producer
+  whose hook runs before my hook", not just "a producer in my layer or lower". Until it does,
+  the request map (§2b) is the workaround — and it is the better design anyway.
 * The evidence behind the memory-only detector: vLLM's `kv_cache_usage_perc` is
   `ref_cnt > 0` blocks (in-use work, cached-idle prefixes are free), so it is a valid
   **preemption-headroom** signal — but it LAGS newly admitted large requests and it can

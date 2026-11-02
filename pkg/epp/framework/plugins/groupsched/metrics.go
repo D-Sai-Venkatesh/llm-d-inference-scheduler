@@ -177,8 +177,13 @@ func (g *groupMetrics) Refresh() {
 		g.exitingBlocks.WithLabelValues(label).Set(float64(es.ExitingBlocks))
 		g.exitingOldest.WithLabelValues(label).Set(es.ExitingOldestAgeS)
 		g.served.WithLabelValues(label).Add(0)
-		for _, reason := range []string{"quantum-complete", "idle", "exiting", "engine-idle",
-			"exiting-drain", "budget-idle", "budget-noqueue", "budget-exiting", "engine-gone"} {
+		// One series per DEPARTURE reason. "exiting" is not one: the mark of a mid-flight
+		// branch is a STATE (exitingBranches / exitingBlocks / exitingOldest), and booking it
+		// as an exit too counted every mid-flight departure twice in this same series.
+		// "budget-exiting" survives only as the name enforcement would use if a marked
+		// branch could not be re-marked — it is never a departure either.
+		for _, reason := range []string{"quantum-complete", "idle", "engine-idle",
+			"exiting-drain", "budget-idle", "budget-noqueue", "engine-gone"} {
 			g.exits.WithLabelValues(label, reason).Add(0)
 		}
 	}

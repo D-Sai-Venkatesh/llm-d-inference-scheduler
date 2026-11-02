@@ -17,9 +17,12 @@ limitations under the License.
 package groupsched
 
 import (
-	"fmt"
+	"context"
+
+	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // groupMetrics exports the MINIMAL set an operator needs to see liveness and fairness
@@ -146,7 +149,9 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 			// plugin config in the same test binary) must not fail startup: the series
 			// exist and belong to the first instance.
 			if _, dup := err.(prometheus.AlreadyRegisteredError); dup {
-				fmt.Printf("group-scheduler: WARNING metrics already registered in this process — this instance will not emit its own series (one group scheduler per process is the supported configuration)\n")
+				// One group scheduler per process is the supported configuration; a second
+				// instance would double-register every series.
+				log.FromContext(context.Background()).V(logutil.DEFAULT).Info("group-scheduler: WARNING metrics already registered in this process — this instance will not emit its own series")
 				continue
 			}
 			return err

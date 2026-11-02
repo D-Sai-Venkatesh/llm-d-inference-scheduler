@@ -42,9 +42,9 @@ package groupsched
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
+	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 )
 
@@ -140,8 +140,8 @@ func (r *GroupScheduler) Filter(_ context.Context, request *fwksched.InferenceRe
 	if len(out) == 0 {
 		// the seat engine is not a candidate: pass through and let the
 		// observed endpoint win (PreRequest rebinds + counts the violation).
-		fmt.Printf("group-scheduler: FILTER PASS-THROUGH member=%s seated-on=%s is not among the %d candidate endpoint(s) — passing all candidates through (the observed endpoint wins and the violation is counted)\n",
-			member, engineLabel(engine), len(pods))
+		r.logger.V(logutil.DEBUG).Info("group-scheduler: FILTER PASS-THROUGH — the seat engine is not a candidate; passing every candidate through (the observed endpoint wins the rebind)",
+			"member", member, "seatedOn", engineLabel(engine), "candidates", len(pods))
 		return pods
 	}
 	return out

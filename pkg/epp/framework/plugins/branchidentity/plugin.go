@@ -20,9 +20,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/go-logr/logr"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 
 	"github.com/cespare/xxhash/v2"
 
@@ -254,6 +260,10 @@ type Plugin struct {
 	// dispatch / settle times through the real hooks.
 	now func() time.Time
 
+	// logger carries the startup echo (default level) and the per-request instrument
+	// (V(DEBUG), off by default).
+	logger logr.Logger
+
 	anonSeq atomic.Uint64
 	// logSeq orders the LogRequests instrument's lines in arrival order.
 	logSeq atomic.Uint64
@@ -302,16 +312,16 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		logHeaders:     params.LogRequests && params.LogHeaders,
 		logHeadersList: loggedHeaderList(params.LogHeaderNames),
 		sessions:       sessionHeaders(params.SessionHeaders),
+		logger:         log.FromContext(ctx).WithName(PluginType + "/" + name),
 		now:            time.Now,
 	}
 	p.idx = newBranchIndex(params.BlockSizeTokens, p.markerTTL, params.MaxBranches)
 	p.metrics = newBranchMetrics()
 
-	// The effective config is echoed at startup so a run's arm is verifiable from
-	// its artifacts.
-	if echo, err := json.Marshal(params); err == nil {
-		fmt.Printf("%s: effective config %s\n", PluginType, echo)
-	}
+	// The effective config is echoed at the DEFAULT level, always: a run's arm —
+	// including the render backend — must be verifiable from its own log. Rendered as
+	// key=value pairs, not JSON: a logger escapes quotes inside a message.
+	p.logger.V(logutil.DEFAULT).Info(PluginType + ": effective config " + paramsEcho(params))
 
 	if handle != nil {
 		if reg := handle.Metrics(); reg != nil {
@@ -324,6 +334,28 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		}
 	}
 	return p, nil
+}
+
+// paramsEcho renders the parameters as sorted key=value pairs (the startup echo's form).
+func paramsEcho(params Parameters) string {
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return ""
+	}
+	fields := map[string]any{}
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return string(raw)
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%v", k, fields[k]))
+	}
+	return strings.Join(parts, " ")
 }
 
 // TypedName returns the type and name of the plugin.
@@ -496,30 +528,37 @@ func (p *Plugin) logRequest(request *fwksched.InferenceRequest, res ResolveResul
 	if !p.logRequests {
 		return
 	}
-	line, err := json.Marshal(struct {
-		Seq      uint64            `json:"seq"`
-		TS       string            `json:"ts"`
-		Scope    string            `json:"scope"`
-		Derived  string            `json:"derived"`
-		Outcome  string            `json:"outcome"`
-		Turn     int               `json:"turn"`
-		Retry    bool              `json:"retry,omitempty"`
-		Sticky   bool              `json:"sticky,omitempty"`
-		Explicit bool              `json:"explicit"`
-		Blocks   int               `json:"blocks"`
-		Tokens   int               `json:"tokens"`
-		Marker   string            `json:"marker"`
-		Headers  map[string]string `json:"headers,omitempty"`
-	}{
-		Seq: p.logSeq.Add(1), TS: p.now().UTC().Format(time.RFC3339Nano), Scope: scope,
-		Derived: res.ID, Outcome: string(res.Outcome), Turn: res.Turn, Retry: res.Retry, Sticky: res.StickyBusy,
-		Explicit: explicit, Blocks: c.fullBlocks, Tokens: c.tokens, Marker: markerOf(request),
-		Headers: p.loggedHeaders(request),
-	})
-	if err != nil {
+	// One line per request is measurement detail: V(DEBUG), so it is off unless asked for.
+	l := p.logger.V(logutil.DEBUG)
+	if !l.Enabled() {
 		return
 	}
-	fmt.Printf("branch-identity: request %s\n", line)
+	// STRUCTURED fields, not a JSON blob: the logger escapes an embedded object, which
+	// no parser can read. The keys are the instrument's contract.
+	kv := []any{
+		"seq", p.logSeq.Add(1),
+		"ts", p.now().UTC().Format(time.RFC3339Nano),
+		"scope", scope,
+		"derived", res.ID,
+		"outcome", string(res.Outcome),
+		"turn", res.Turn,
+		"explicit", explicit,
+		"blocks", c.fullBlocks,
+		"tokens", c.tokens,
+		"marker", markerOf(request),
+	}
+	if res.Retry {
+		kv = append(kv, "retry", true)
+	}
+	if res.StickyBusy {
+		kv = append(kv, "sticky", true)
+	}
+	if hdrs := p.loggedHeaders(request); len(hdrs) > 0 {
+		for k, v := range hdrs {
+			kv = append(kv, "header_"+k, v)
+		}
+	}
+	l.Info(PluginType+": request", kv...)
 }
 
 // loggedHeaders copies the whitelisted client headers from the request (lowercase

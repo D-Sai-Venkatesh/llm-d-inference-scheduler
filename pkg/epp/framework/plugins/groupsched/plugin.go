@@ -39,6 +39,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-logr/logr"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkfc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
@@ -86,6 +91,10 @@ type GroupScheduler struct {
 	sched   *Scheduler
 	metrics *groupMetrics
 	handle  fwkplugin.Handle
+	// logger is the plugin's logger: startup state at the default level (a run's arm
+	// and its wiring must be readable from the artifacts), per-request detail at V(DEBUG)
+	// — off unless the operator asks for it.
+	logger logr.Logger
 
 	fcfsOnce sync.Once
 
@@ -152,8 +161,13 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		return nil, fmt.Errorf("invalid parameters of the '%s' plugin: %w", PluginType, err)
 	}
 
+	logCtx := context.Background()
+	if handle != nil {
+		logCtx = handle.Context()
+	}
 	r := &GroupScheduler{
 		typedName: fwkplugin.TypedName{Type: PluginType, Name: name},
+		logger:    log.FromContext(logCtx).WithName(PluginType + "/" + name),
 		cfg:       cfg,
 		sched:     sched,
 		endpoints: map[string]*endpointState{},
@@ -170,20 +184,12 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// BUILD-PLAN §1(ii): echo EVERY knob at startup — each arm's config
 	// is verifiable afterwards from the run artifacts (also carried in
 	// DumpState/Snapshot.Config).
-	if echo, err := json.Marshal(cfg); err == nil {
-		fmt.Printf("group-scheduler: effective config %s\n", echo)
-	}
-	// The policy has no MODES left, so the echo states the six things it does in
-	// words — a run's artifacts then say what ran without decoding knob names.
-	fmt.Printf("group-scheduler: CORE policy — identity: derived branch (member = queue key; nothing is written into the session slot)\n")
-	fmt.Printf("group-scheduler: CORE policy — sizing: per-engine seat budget = %v x that engine's measured num_gpu_blocks; footprint from the engine's own block index (dedup + cold-token estimate)\n", cfg.GroupBudgetFraction)
-	fmt.Printf("group-scheduler: CORE policy — admission: ONE shared waiter queue, newcomer-first then oldest; the head goes to the engine with the MOST FREE BUDGET where it fits (tie -> lowest engine id); the binding lasts only while seated\n")
-	fmt.Printf("group-scheduler: CORE policy — rotation: fixed quantum Q=%d completed busy periods (plus silence > %vs); memory pressure: the budget valve\n", cfg.quantum(), cfg.IdleSeconds)
-	if cfg.Safety == "none" {
-		fmt.Printf("group-scheduler: CORE policy — safety: NONE (the seat budget IS the admission control; run-level safety is preemptions <= the FCFS arm's)\n")
-	} else {
-		fmt.Printf("group-scheduler: CORE policy — safety: MEMORY-ONLY net per engine, fires at measured kv >= %v (the budget's own fraction; no queue term), holds that engine's own dispatches and new seats, never influences placement\n", cfg.GroupBudgetFraction)
-	}
+	// The effective config is echoed at the DEFAULT level, always: a run's arm must be
+	// verifiable from its own log. It is rendered as sorted key=value pairs, NOT as JSON:
+	// a logger escapes quotes inside a message, which no tool can parse afterwards.
+	r.logger.V(logutil.DEFAULT).Info("group-scheduler: effective config " + configEcho(cfg))
+	r.logPolicy()
+
 	// The observation hooks are installed UNCONDITIONALLY: the metrics they
 	// feed are nil-safe, and a unit-mode run (no handle) must record the same
 	// accounting as a live one — the affinity-violation and engine-gone
@@ -193,8 +199,8 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	r.sched.onServe = r.metrics.ObserveServed
 	r.sched.onRehome = func(member, from, to string) {
 		r.metrics.ObserveAffinityViolation(engineLabel(from), engineLabel(to))
-		fmt.Printf("group-scheduler: AFFINITY VIOLATION member=%s charged=%s observed=%s — rebound (the observed endpoint wins)\n",
-			member, engineLabel(from), engineLabel(to))
+		r.logger.V(logutil.DEFAULT).Info("group-scheduler: AFFINITY VIOLATION — a request landed off its seat; rebound to the observed endpoint",
+			"member", member, "charged", engineLabel(from), "observed", engineLabel(to))
 	}
 	// The pin table follows the SEATS: one map write per seat, one delete per exit.
 	r.sched.onBind = func(member, engine string) { r.pins.set(member, engine) }
@@ -204,8 +210,8 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	}
 	r.sched.onEngineGone = func(engine string, members int) {
 		r.metrics.ObserveEngineGone()
-		fmt.Printf("group-scheduler: ENGINE GONE %s — exited %d member(s) and dropped the group; their homing is released for re-placement\n",
-			engineLabel(engine), members)
+		r.logger.V(logutil.DEFAULT).Info("group-scheduler: ENGINE GONE — members exited and the group dropped",
+			"engine", engineLabel(engine), "members", members)
 	}
 	if handle != nil {
 		// THE DETECTOR-IDENTITY GATE. The loader FABRICATES the stock utilization
@@ -216,9 +222,11 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		// (flowControl.saturationDetector.pluginRef: <this plugin's name>). Any other
 		// detector instance in the same config is announced as a conflict.
 		if others := r.otherDetectors(); len(others) > 0 {
-			fmt.Printf("group-scheduler: WARNING DETECTOR CONFLICT — %v is also configured as a saturation detector. Exactly one detector may answer the flow-control gate, and on a CORE arm it must be this plugin: set flowControl.saturationDetector.pluginRef to this plugin's name. If the stock detector is the one answering, this arm is running the 0.80 kv / 5-waiting roofline, not the core.\n", others)
+			r.logger.V(logutil.DEFAULT).Info(
+				"group-scheduler: WARNING DETECTOR CONFLICT — another plugin answers the flow-control saturation gate; point flowControl.saturationDetector.pluginRef at this one",
+				"others", others)
 		} else {
-			fmt.Printf("group-scheduler: detector: THIS plugin answers the flow-control saturation gate (default answer: NOT saturated — the seat budget is the admission control; safety=%s).\n", r.cfg.Safety)
+			r.logger.V(logutil.DEFAULT).Info("group-scheduler: this plugin answers the flow-control saturation gate; it answers NOT saturated (the seat budget is the admission control)")
 		}
 		if reg := handle.Metrics(); reg != nil {
 			if err := r.metrics.register(reg); err != nil {
@@ -226,7 +234,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 			}
 		}
 		r.sched.onMemberSource = func(source string) {
-			fmt.Printf("group-scheduler: member source in effect at dispatch: %s\n", source)
+			r.logger.V(logutil.DEBUG).Info("group-scheduler: member source in effect at dispatch", "source", source)
 		}
 		// the per-id SEAT/EXIT event log (one debug line each; the
 		// campaign's spans could not see seat membership).
@@ -236,10 +244,15 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		// (`t=<ts> kind=<KIND> id=<id> <detail>`) and the detail keys
 		// (kind=/wait=/reason=) keep matching unchanged, so a wave-1 parser
 		// reads a multi-pod log without modification.
+		// The per-id SEAT/EXIT stream: V(DEBUG), i.e. OFF by default — one line per
+		// seat and per exit is measurement detail, not startup state.
 		r.sched.onEvent = func(ev Event) {
-			fmt.Printf("group-scheduler event t=%s kind=%s id=%s %s engine=%s member=%s\n",
-				ev.T.UTC().Format(time.RFC3339Nano), ev.Kind, ev.ID, ev.Detail,
-				ev.Engine, ev.Member)
+			if !r.logger.V(logutil.DEBUG).Enabled() {
+				return
+			}
+			r.logger.V(logutil.DEBUG).Info("group-scheduler event",
+				"t", ev.T.UTC().Format(time.RFC3339Nano), "kind", ev.Kind, "id", ev.ID,
+				"detail", ev.Detail, "engine", ev.Engine, "member", ev.Member)
 		}
 		go r.runTicker(handle.Context())
 	}
@@ -438,7 +451,7 @@ func (r *GroupScheduler) validateMemberProducer() error {
 			branchidentity.PluginType, agentidentity.PluginType)
 	}
 	if b && !s {
-		fmt.Printf("group-scheduler: no '%s' plugin in the config — the SESSION attribute is absent, so the derived branch is the member key on every request (base mode)\n", agentidentity.PluginType)
+		r.logger.V(logutil.DEFAULT).Info("group-scheduler: no session-identity plugin in the config — the derived branch is the member key on every request")
 	}
 	return nil
 }
@@ -519,9 +532,10 @@ func (r *GroupScheduler) learnCapacity(engine string, m *fwkdl.Metrics, via stri
 	}
 	r.capMu.Unlock()
 	label := r.sched.GroupLabel(engine)
-	fmt.Printf("group-scheduler: capacity learned via %s engine=%s after %.1fs: cacheBlockSize=%d numGpuBlocks=%d budgetBlocks=%d (that engine's 95%%)\n",
-		via, label, wait.Seconds(), m.CacheBlockSize, m.CacheNumBlocks,
-		int(r.cfg.GroupBudgetFraction*float64(m.CacheNumBlocks)))
+	r.logger.V(logutil.DEFAULT).Info("group-scheduler: capacity learned",
+		"via", via, "engine", label, "afterSeconds", wait.Seconds(),
+		"cacheBlockSize", m.CacheBlockSize, "numGpuBlocks", m.CacheNumBlocks,
+		"budgetBlocks", int(r.cfg.GroupBudgetFraction*float64(m.CacheNumBlocks)))
 	r.metrics.ObserveCapacityLearned(via, label)
 	r.metrics.SetCapacityMissing(label, false)
 	r.reportHeterogeneousCapacity()
@@ -552,8 +566,8 @@ func (r *GroupScheduler) reportHeterogeneousCapacity() {
 		return
 	}
 	sort.Strings(fresh)
-	fmt.Printf("group-scheduler: CAPACITY HETEROGENEOUS — engine(s) %s deviate >1%% from the first measured engine. Per-engine budgets are taking each engine's OWN num_gpu_blocks, but a heterogeneous pool means the stack is not the homogeneous replica set the experiment assumes (a half-ready or differently-configured engine).\n",
-		strings.Join(fresh, ", "))
+	r.logger.V(logutil.DEFAULT).Info("group-scheduler: CAPACITY HETEROGENEOUS — an engine's num_gpu_blocks deviates >1% from the first measured one; each budget still uses its own engine's value, but the pool is not homogeneous",
+		"engines", strings.Join(fresh, ", "))
 }
 
 // metricsSource is the narrow poll target: anything whose metrics can be
@@ -623,7 +637,8 @@ func (r *GroupScheduler) pushEngineLoad(now time.Time) {
 		if sm.blockSz > 0 && sm.numBlk > 0 && !r.sched.HasCapacityFor(engine) {
 			if err := r.learnCapacity(engine, &fwkdl.Metrics{CacheBlockSize: sm.blockSz,
 				CacheNumBlocks: sm.numBlk}, "live-detector"); err != nil {
-				fmt.Printf("group-scheduler: CAPACITY REJECTED from the live detector engine=%s: %v\n", r.sched.GroupLabel(engine), err)
+				r.logger.V(logutil.DEFAULT).Info("group-scheduler: CAPACITY REJECTED from the live detector",
+					"engine", r.sched.GroupLabel(engine), "err", err.Error())
 			}
 		}
 	}
@@ -676,8 +691,8 @@ func (r *GroupScheduler) pollCapacity(now time.Time) {
 		}
 		r.capMu.Unlock()
 		r.metrics.SetCapacityMissing(r.sched.GroupLabel(t.key), true)
-		fmt.Printf("group-scheduler: CAPACITY MISSING engine=%s — its num_gpu_blocks is still unknown %.0fs after the endpoint was observed (%d endpoint(s) tracked): that engine seats nothing while the policy looks healthy, and any dispatch it takes is FCFS pass-through (A5). Check that the endpoint metrics carry cache block size/num blocks (--refresh-metrics-interval) and that the flow controller names this plugin as its saturationDetector (the live metrics path).\n",
-			engineLabel(t.key), now.Sub(t.firstSeen).Seconds(), len(targets))
+		r.logger.V(logutil.DEFAULT).Info("group-scheduler: CAPACITY MISSING — this engine's num_gpu_blocks is still unknown, so it seats nothing while the policy looks healthy; check that its metrics carry the cache geometry",
+			"engine", engineLabel(t.key), "afterSeconds", now.Sub(t.firstSeen).Seconds(), "enginesTracked", len(targets))
 	}
 }
 
@@ -790,7 +805,7 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 	// per process log; the gauge counts it)
 	if !r.sched.HasCapacity() {
 		r.fcfsOnce.Do(func() {
-			fmt.Println("group-scheduler: num_gpu_blocks not yet measured; serving FCFS until the endpoint metrics arrive")
+			r.logger.V(logutil.DEFAULT).Info("group-scheduler: num_gpu_blocks not yet measured; serving FCFS until the endpoint metrics arrive")
 		})
 		r.sched.FCFSServed()
 		if i := FCFSPick(heads); i >= 0 {
@@ -904,4 +919,39 @@ func pickedEndpoint(schedulingResult *fwksched.SchedulingResult) fwksched.Endpoi
 		return nil
 	}
 	return result.TargetEndpoints[0]
+}
+
+// configEcho renders the config as sorted key=value pairs (the startup echo's form).
+func configEcho(cfg Config) string {
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return ""
+	}
+	fields := map[string]any{}
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return string(raw)
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%v", k, fields[k]))
+	}
+	return strings.Join(parts, " ")
+}
+
+// logPolicy states what the wired policy DOES, in words, at the default level: a run's
+// artifact then says what ran without decoding knob names. One line per module.
+func (r *GroupScheduler) logPolicy() {
+	cfg := r.cfg
+	r.logger.V(logutil.DEFAULT).Info("group-scheduler: policy",
+		"identity", "derived branch (the member is the queue key)",
+		"sizing", "seat budget = groupBudgetFraction x num_gpu_blocks, footprint from the engine's own block index",
+		"admission", "one shared queue, newcomer-first then oldest; most free budget where the head fits, tie -> lowest engine id",
+		"rotation", fmt.Sprintf("fixed quantum Q=%d completed busy periods, or silence > %vs", cfg.quantum(), cfg.IdleSeconds),
+		"safety", "none (the seat budget is the admission control)",
+		"dispatch", "none (an admitted turn runs)")
 }

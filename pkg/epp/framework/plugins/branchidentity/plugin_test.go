@@ -23,10 +23,15 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/go-logr/logr/funcr"
+
+	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -641,21 +646,21 @@ func TestFactory_FailsClosedWithoutARender(t *testing.T) {
 // TestFactory_EchoesTheEffectiveConfig: the arm is verifiable from its artifacts —
 // the render backend included, since a wrong one silently changes the identity.
 func TestFactory_EchoesTheEffectiveConfig(t *testing.T) {
-	r, w, err := os.Pipe()
-	require.NoError(t, err)
-	saved := os.Stdout
-	os.Stdout = w
-	t.Cleanup(func() { os.Stdout = saved })
-
-	built, err := Factory("echo", json.NewDecoder(strings.NewReader(withTestProducer(t, `{"logRequests":true}`))), nil)
+	c := &logCapture{}
+	// verbosity 2 IS the default level (logutil.DEFAULT): the echo must appear there.
+	ctx := log.IntoContext(t.Context(), funcr.New(func(_, args string) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.lines = append(c.lines, args)
+	}, funcr.Options{Verbosity: logutil.DEFAULT}))
+	built, err := Factory("echo", json.NewDecoder(strings.NewReader(withTestProducer(t, `{"logRequests":true}`))),
+		testutils.NewTestHandle(ctx))
 	require.NoError(t, err)
 	require.NotNil(t, built)
-	require.NoError(t, w.Close())
-	os.Stdout = saved
-	out, err := io.ReadAll(r)
-	require.NoError(t, err)
-	assert.Contains(t, string(out), "effective config")
-	assert.Contains(t, string(out), "tokenProducer")
+	lines := c.snapshot()
+	require.NotEmpty(t, lines, "the effective config must be echoed at the default level")
+	assert.Contains(t, lines[0], "effective config")
+	assert.Contains(t, lines[0], "tokenProducer")
 }
 
 // TestFactory_MetricsRegistered: the derivation's counters and the table gauge are
@@ -729,14 +734,16 @@ func TestLogRequests(t *testing.T) {
 	req := chatReq(user('a', 600))
 	req.Headers["x-session-scope"] = "session-3"
 	var id string
-	out := captureStdout(t, func() { id, _ = branchOf(t, on, req) })
-	assert.Contains(t, out, `"scope":"session-3"`)
-	assert.Contains(t, out, `"derived":"`+id+`"`)
-	assert.Contains(t, out, `"outcome":"new"`)
+	lines := captureLogs(t, on, func() { id, _ = branchOf(t, on, req) })
+	require.Len(t, lines, 1, "one line per request, and only when the instrument is on")
+	out := lines[0]
+	assert.Contains(t, out, `"scope"="session-3"`)
+	assert.Contains(t, out, `"derived"="`+id+`"`)
+	assert.Contains(t, out, `"outcome"="new"`)
 
 	off := newTestPlugin(t)
-	out = captureStdout(t, func() { _, _ = branchOf(t, off, chatReq(user('a', 600))) })
-	assert.Empty(t, out, "the instrument is off by default")
+	assert.Empty(t, captureLogs(t, off, func() { _, _ = branchOf(t, off, chatReq(user('a', 600))) }),
+		"the instrument is off by default")
 }
 
 // TestLogHeadersKeepResolveOutcomeIdentical: the header copies are a pure observer.
@@ -768,24 +775,43 @@ func TestLogHeaderNamesConfigured(t *testing.T) {
 	req := chatReq(user('a', 600))
 	req.Headers["x-thread-id"] = "t-1"
 
-	out := captureStdout(t, func() { _, _ = branchOf(t, p, req) })
-	assert.Contains(t, out, `"x-thread-id":"t-1"`)
+	out := captureLogs(t, p, func() { _, _ = branchOf(t, p, req) })
+	require.Len(t, out, 1)
+	assert.Contains(t, out[0], `"header_x-thread-id"="t-1"`)
 }
 
-// captureStdout runs fn and returns what it wrote to stdout (the instrument's
-// lines are printed, not logged).
-func captureStdout(t *testing.T, fn func()) string {
+// logCapture collects what a test's plugin LOGS (the startup echo at the default level,
+// the per-request instrument at V(DEBUG)) — the shipped code logs, it does not print.
+type logCapture struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (c *logCapture) sink() *logCapture { return c }
+
+// attach points the plugin's logger at the capture, at V(DEBUG) so a test can assert on
+// the per-request lines too (the DEFAULT level would drop them, which is the point).
+func (c *logCapture) attach(p *Plugin) {
+	p.logger = funcr.New(func(_, args string) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.lines = append(c.lines, args)
+	}, funcr.Options{Verbosity: 10}).WithName(PluginType)
+}
+
+func (c *logCapture) snapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.lines...)
+}
+
+// captureLogs runs fn with a capturing logger attached to p.
+func captureLogs(t *testing.T, p *Plugin, fn func()) []string {
 	t.Helper()
-	r, w, err := os.Pipe()
-	require.NoError(t, err)
-	orig := os.Stdout
-	os.Stdout = w
-	defer func() { os.Stdout = orig }()
+	c := &logCapture{}
+	c.attach(p)
 	fn()
-	require.NoError(t, w.Close())
-	out, err := io.ReadAll(r)
-	require.NoError(t, err)
-	return string(out)
+	return c.snapshot()
 }
 
 // firstDiff is the index of the first differing token (or the shorter length).

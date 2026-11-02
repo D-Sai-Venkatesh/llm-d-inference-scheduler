@@ -552,7 +552,15 @@ func (ix *branchIndex) EnforceCap(now time.Time) int {
 			victims = append(victims, rec)
 		}
 	}
-	sort.Slice(victims, func(i, j int) bool { return victims[i].lastSeen.Before(victims[j].lastSeen) })
+	// A TOTAL order (idlest first, then the id): the victims come from a map, so a
+	// lastSeen-only comparison leaves ties to map order and two replays of one scenario can
+	// drop DIFFERENT branches for good.
+	sort.Slice(victims, func(i, j int) bool {
+		if !victims[i].lastSeen.Equal(victims[j].lastSeen) {
+			return victims[i].lastSeen.Before(victims[j].lastSeen)
+		}
+		return victims[i].id < victims[j].id
+	})
 	removed := 0
 	for i := 0; i < len(victims) && len(ix.branches) > ix.maxBranches; i++ {
 		ix.unindexLocked(victims[i])

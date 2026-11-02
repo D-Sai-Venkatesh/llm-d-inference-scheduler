@@ -557,3 +557,30 @@ func keySet(m map[string]time.Time) map[string]bool {
 	}
 	return out
 }
+
+// TestCap_EvictsDeterministicallyOnATie: the cap's victim order is TOTAL. The victims come
+// from a map, so an equal lastSeen leaves the choice to map iteration order — two replays of
+// one scenario then drop different branches FOR GOOD, and nothing downstream can tell which.
+func TestCap_EvictsDeterministicallyOnATie(t *testing.T) {
+	// twenty identical-lastSeen idle branches against a cap of one: exactly one survives, and
+	// it must be the same one every time
+	run := func() string {
+		ix := newBranchIndex(testBlockSize, time.Hour, 1)
+		for i := 0; i < 20; i++ {
+			complete(t, ix, clockZero, arr(t, "", nil, fmt.Sprintf("r%d", i), tokens(uint32(i+1), 2*testBlockSize)))
+		}
+		require.Len(t, ix.branches, 20)
+		require.Equal(t, 19, ix.EnforceCap(clockZero.Add(time.Minute)))
+		require.Len(t, ix.branches, 1)
+		for id := range ix.branches {
+			return id
+		}
+		return ""
+	}
+	first := run()
+	for i := 0; i < 5; i++ {
+		if again := run(); again != first {
+			t.Fatalf("run %d kept a different branch across the cap (%s vs %s): the victim order is not total", i, again, first)
+		}
+	}
+}

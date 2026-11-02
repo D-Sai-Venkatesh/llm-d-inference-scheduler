@@ -236,11 +236,10 @@ func TestNewcomerFirstThenOldest(t *testing.T) {
 		fx.seatOne(t, "filler", 800, 5*time.Second)
 		settle(fx.s, "filler", 800, 800)
 		fx.tighten(t)
-		// the returning branch HAS been served before (non-newcomer); the other has not
-		fx.s.mu.Lock()
-		fx.s.everSeated["ret"] = struct{}{}
-		fx.s.mu.Unlock()
-		hs := []Head{head("ret", 30*time.Second, bytesFor(100)), head("new", time.Second, bytesFor(100))}
+		// the returning branch's turn is a continuation; the other's is its first
+		ret := head("ret", 30*time.Second, bytesFor(100))
+		ret.Returner = true
+		hs := []Head{ret, head("new", time.Second, bytesFor(100))}
 		fx.pick(hs...)
 		if !fx.s.Seated("new") {
 			t.Fatal("the newcomer must be seated first (D1 newcomer-first)")
@@ -566,111 +565,113 @@ func TestHoldTheLine(t *testing.T) {
 	})
 }
 
-// No starvation: under steady load every waiter is eventually seated (rotation and
-// the valve both fire, the queue keeps moving).
+// No starvation: under steady load every branch with a queued turn is eventually
+// seated. The fixture is production-shaped (arrival_fixture_test.go): a head exists
+// from its arrival until it is dispatched, an unserved branch keeps its head however
+// long it waits, and the newcomer class is branch identity's arrival record.
 func TestNoStarvation(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-		// three residents fill the budget; eight waiters queue
-		for _, id := range []string{"m0", "m1", "m2"} {
-			fx.seatOne(t, id, 300, time.Second)
-			settle(fx.s, id, 300, 300)
+		w := newWorkload(t, fx)
+
+		// THE SHAPE — every engine FULL, and the same shape at any engine count: one
+		// small anchor per engine (a headless branch that holds 40 of the 950 blocks)
+		// and three residents per engine on top of it. Without the anchors the
+		// residents would spread and an engine would keep room for a waiter; with
+		// them, "no seat fits" is true at N=1 and at N=2 alike.
+		for _, engine := range fx.ids {
+			w.seatStatic(t, "anchor-"+engine, engine, 40)
 		}
+		var residents []string
+		for i := 0; i < 3*len(fx.ids); i++ {
+			residents = append(residents, fmt.Sprintf("m%d", i))
+		}
+		for _, id := range residents {
+			w.arrive(id, fx.clock.Add(-time.Second))
+		}
+		// each resident completes one turn, so every later arrival is a continuation
+		settled := func() bool {
+			for _, id := range residents {
+				if !w.everSeated(id) || w.served[id] == 0 {
+					return false
+				}
+			}
+			return true
+		}
+		for round := 0; round < 400 && !settled(); round++ {
+			hs, ids := w.heads(fx.clock)
+			if i := fx.pick(hs...); i >= 0 {
+				w.dispatchTurn(ids[i])
+			}
+			w.step(roundStep)
+		}
+		if !settled() {
+			for _, id := range residents {
+				t.Logf("resident %s seated=%v turns=%d", id, w.everSeated(id), w.served[id])
+			}
+			t.Fatal("the fixture could not seat and turn over its residents")
+		}
+		// NON-VACUITY, per engine: the budgets really are full, so every waiter's seat
+		// costs a rotation (the check is the fixture's, not the scheduler's)
+		fx.s.mu.Lock()
+		for _, g := range fx.s.activeGroupsLocked() {
+			if free := fx.s.freeBudgetLocked(g); free >= 300 {
+				fx.s.mu.Unlock()
+				t.Fatalf("the fixture is not contended on %s: %d blocks free", g.id, free)
+			}
+		}
+		fx.s.mu.Unlock()
+
+		// eight branches nobody has served: each has ONE queued turn (its first) from
+		// now until it dispatches
 		var waiters []string
 		for i := 0; i < 8; i++ {
 			waiters = append(waiters, fmt.Sprintf("w%d", i))
 		}
-		gotSeat := map[string]bool{}
-		// The synthetic head list has to rotate: with the cold-entry cap derived from
-		// the engine (50 blocks here) a seam is only admitted while the engine's cold
-		// slot is free, and a slot is freed when the seated branch's head RUNS. Two
-		// heads with the same synthetic arrival let one branch win every Pick, so the
-		// other stayed seated-but-never-dispatched and the test measured that artifact
-		// instead of starvation. The least-served branch gets the oldest head.
-		served := map[string]int{}
-		maxServed := func() int {
-			m := 0
-			for _, n := range served {
-				if n > m {
-					m = n
-				}
-			}
-			return m
+		for i, id := range waiters {
+			w.arrive(id, fx.clock.Add(-time.Duration(len(waiters)-i)*100*time.Millisecond))
 		}
-		seatedCount := func() int {
-			n := 0
-			for _, id := range waiters {
-				if fx.s.Seated(id) || gotSeat[id] {
-					gotSeat[id] = true
-					n++
-				}
-			}
-			return n
+		hs, ids := w.heads(fx.clock)
+		if i := fx.pick(hs...); i >= 0 {
+			w.dispatchTurn(ids[i])
 		}
-		allHeads := func() []Head {
-			hs := make([]Head, 0, len(waiters)+3)
-			age := func(id string) time.Duration {
-				return time.Duration(maxServed()+1-served[id]) * time.Millisecond
-			}
-			for _, id := range []string{"m0", "m1", "m2"} {
-				if fx.s.Seated(id) {
-					hs = append(hs, head(id, age(id), bytesFor(300)))
-				}
-			}
-			for i, id := range waiters {
-				if fx.s.Seated(id) {
-					hs = append(hs, head(id, age(id), bytesFor(300)))
-				} else {
-					hs = append(hs, head(id, time.Duration(len(waiters)-i)*100*time.Millisecond, bytesFor(300)))
-				}
-			}
-			return hs
-		}
-		for cycles := 0; seatedCount() < len(waiters) && cycles < 80; cycles++ {
-			for round := 0; round < 6; round++ {
-				hs := allHeads()
-				i := fx.pick(hs...)
-				if i < 0 {
-					break
-				}
-				id := hs[i].Branch
-				if id != "" && fx.s.Seated(id) {
-					dispatch(t, fx.s, id, keys(300, Hash(uint64(id[len(id)-1]))), bytesFor(300))
-					settle(fx.s, id, 300, 300)
-					served[id]++
-				}
-			}
-			fx.tick(time.Second)
-		}
-		if n := seatedCount(); n < len(waiters) {
-			t.Fatalf("starvation: only %d/%d waiters were ever seated", n, len(waiters))
-		}
-	})
-}
 
-// TTL: a silent, unseated record is forgotten; a branch with a live head is not.
-func TestTTLForgetsSilentRecordsKeepsWaiters(t *testing.T) {
-	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-		fx.seatOne(t, "quiet", 100, time.Second)
-		settle(fx.s, "quiet", 100, 100)
-		// a second branch seats, then leaves so it is a returning WAITER — its record
-		// must survive any TTL while it has a live head
-		fx.seatOne(t, "waiter", 100, time.Second)
-		settle(fx.s, "waiter", 100, 100)
-		m, g := fx.branch(t, "waiter")
-		fx.s.mu.Lock()
-		fx.s.exitLocked(g, m, "test", fx.clock)
-		fx.s.mu.Unlock()
-		longAgo := fx.clock.Add(-time.Duration(10*defaultConfig().TTLSeconds) * time.Second)
-		fx.clock = longAgo
-		fx.pick(head("waiter", 10*time.Second, bytesFor(100)))
-		fx.clock = longAgo.Add(time.Duration(3*defaultConfig().TTLSeconds) * time.Second)
-		fx.s.PickFromHeads(nil, fx.clock)
-		if fx.s.Sessions() == 0 {
-			t.Fatal("a waiter with a live head must never be forgotten (R2)")
+		for cycles := 0; cycles < 80; cycles++ {
+			for round := 0; round < 12; round++ {
+				hs, ids := w.heads(fx.clock)
+				if i := fx.pick(hs...); i >= 0 {
+					if !fx.s.Seated(hs[i].Branch) {
+						t.Fatalf("%s was dispatched without a seat", ids[i])
+					}
+					w.dispatchTurn(ids[i])
+				}
+				w.step(roundStep)
+			}
+			done := 0
+			for _, id := range waiters {
+				if w.everSeated(id) {
+					done++
+				}
+			}
+			if done == len(waiters) {
+				break
+			}
 		}
-		if fx.s.isNewcomerLocked("waiter") {
-			t.Fatal("a returning waiter keeps its non-newcomer status while it waits")
+		for _, id := range waiters {
+			if !w.everSeated(id) {
+				t.Errorf("starvation: %s never held a seat", id)
+			}
 		}
+		// CONTENTION, restated from the scheduler's own books: the budgets were full when
+		// the waiters arrived and nothing frees blocks except an exit, so every waiter's
+		// seat must have cost at least one eviction
+		exits := int64(0)
+		for _, n := range fx.s.Snapshot().Exits {
+			exits += n
+		}
+		if exits < int64(len(waiters)) {
+			t.Errorf("%d exits for %d waiter seats: the fixture was not contended", exits, len(waiters))
+		}
+		t.Logf("%d/%d waiters seated on %v; exits=%v", len(waiters), len(waiters), fx.ids, fx.s.Snapshot().Exits)
 	})
 }
 

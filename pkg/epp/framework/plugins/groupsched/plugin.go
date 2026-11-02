@@ -379,7 +379,25 @@ func (r *GroupScheduler) branchOf(request *fwksched.InferenceRequest) string {
 	return readID(request, branchidentity.BranchIdentityKey)
 }
 
+// isReturner reports whether the request is NOT its branch's first turn — the
+// fairness class the entry order sorts on. It is branch identity's arrival record,
+// not a history the scheduler keeps: a branch's first turn is exactly a request the
+// identity minted as new or forked. A request with no arrival record (identity not
+// in the config, or a render failure) is a NEWCOMER: nothing is known about its
+// history, and the safe direction is to give it the seat ahead of incumbents.
+func isReturner(request *fwksched.InferenceRequest) bool {
+	if request == nil {
+		return false
+	}
+	rec, ok := fwksched.ReadRequestAttribute[branchidentity.BranchArrival](request, branchidentity.BranchArrivalKey)
+	if !ok {
+		return false
+	}
+	return rec.Turn > 1
+}
+
 // sessionAttr is the request's SESSION attribute: the system's agent-identity
+
 // session first (the session the rest of the stack sees), else the branch
 // plugin's copy of the same client header. Read-only.
 func (r *GroupScheduler) sessionAttr(request *fwksched.InferenceRequest) string {
@@ -760,11 +778,13 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 		}
 		branch := ""
 		reqID, size, fid := "", int64(0), ""
+		returner := false
 		if req := h.OriginalRequest(); req != nil {
 			if ir := req.InferenceRequest(); ir != nil {
 				branch = r.branchOf(ir)
 				reqID = ir.RequestID
 				fid = ir.FairnessID // the wire-level identity (the queue key)
+				returner = isReturner(ir)
 				size = int64(ir.RequestSizeBytes)
 				if size <= 0 {
 					size = int64(req.ByteSize())
@@ -772,7 +792,7 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 			}
 		}
 		queues = append(queues, q)
-		heads = append(heads, Head{Branch: branch,
+		heads = append(heads, Head{Branch: branch, Returner: returner,
 			FairnessID: fid, ReqID: reqID, Arrival: h.EnqueueTime(), SizeBytes: size,
 		})
 		return true

@@ -75,7 +75,9 @@ base block with the core's:
 -     nMax: @@NMAX@@
 +     quantum: @@CORE_QUANTUM@@
       idleSeconds: @@IDLE_SECONDS@@
-      ttlSeconds: @@TTL_SECONDS@@
+      # NO ttlSeconds: no timer frees a seat nobody asked for, and a head that waits
+      # keeps its place. The newcomer class comes from branch identity's arrival
+      # record. The strict decode REJECTS the old key.
       # the cold-entry cap is DERIVED per engine (the budget's headroom): no key
       inFlightCap: @@INFLIGHT_CAP@@
       blockSizeTokens: @@BLOCK_SIZE_TOKENS@@
@@ -120,7 +122,11 @@ export CORE_MODULE_BLOCK
   accepts `none` only. (Historically it was refused unless the arm was explicitly a backstop arm
   (it is not part of the wave);
 * `CORE_DETECTOR` must be `group` on a core arm and `utilization-detector` on FCFS;
-* `AFFINITY_FILTER=0` and `BRANCH_PLUGIN=1` are mandatory on a core arm.
+* `AFFINITY_FILTER=0` and `BRANCH_PLUGIN=1` are mandatory on a core arm;
+* `TTL_SECONDS` no longer renders: no timer frees a seat and a waiting head keeps its
+  place, so `ttlSeconds` is now an UNKNOWN key the strict decode rejects. The
+  arm env files under this directory are the past runs' record; a NEW arm must not set
+  it.
 
 ## 3. The collector (the 15 s series)
 
@@ -131,7 +137,7 @@ The wave's BALANCE gate reads the per-engine series every 15 s. A core arm must 
 | `llm_d_epp_group_seats{engine}` | seats per engine |
 | `llm_d_epp_group_waiters_shared` | the ONE shared queue's depth |
 | `llm_d_epp_group_budget_blocks{engine}` / `num_gpu_blocks{engine}` / `ne_blocks{engine}` | sizing + the budget's used side |
-| `llm_d_epp_group_exits_total{engine,reason}` | exits by reason (`budget-*`, `quantum-complete`, `idle`, `ttl`, `engine-idle`, `exiting*`) |
+| `llm_d_epp_group_exits_total{engine,reason}` | exits by reason (`budget-*`, `quantum-complete`, `idle`, `engine-idle`, `exiting*`). `ttl` is gone with the knob |
 | `llm_d_epp_group_dispatches_total{engine}` | served per engine |
 | `llm_d_epp_group_entry_wait_seconds{engine}` / `reentry_wait_seconds{engine}` | the wait ladder |
 | `llm_d_epp_group_detector_pool_score` | what the detector handed the flow controller (0 = open, the default) |

@@ -48,7 +48,6 @@ package groupsched
 //	  groupBudgetFraction: 0.95
 //	  quantum: 4
 //	  idleSeconds: 20
-//	  ttlSeconds: 30
 //	  inFlightCap: 64
 //	  blockSizeTokens: 64
 //	  capacityLivenessSeconds: 120
@@ -104,7 +103,6 @@ var emittedBlocks = []emittedBlock{
 		body: `groupBudgetFraction: 0.95
 quantum: 4
 idleSeconds: 20
-ttlSeconds: 30
 inFlightCap: 64
 blockSizeTokens: 64
 capacityLivenessSeconds: 120

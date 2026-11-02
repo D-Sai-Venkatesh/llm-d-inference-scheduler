@@ -338,8 +338,14 @@ func TestMultiEngineGoldenProperties(t *testing.T) {
 	var seats int
 	for _, es := range snapTwo.Engines {
 		seats += es.Seats
-		if es.NEBlocks > es.BudgetBlocks {
-			t.Fatalf("engine %s is over its budget at the end of the run (%d > %d)", es.ID, es.NEBlocks, es.BudgetBlocks)
+		// THE BUDGET, I1 + R4: admission counts the blocks an exiting branch still pins
+		// (the engine holds them until its drain), so the USED side may exceed the budget
+		// by exactly those and by nothing else. Enforcement acts on the STAY side and
+		// evicts until that is inside the budget, so anything beyond the exiting blocks
+		// here is a real over-commit.
+		if es.NEBlocks > es.BudgetBlocks+es.ExitingBlocks {
+			t.Fatalf("engine %s is over its budget at the end of the run: used %d > budget %d + exiting %d",
+				es.ID, es.NEBlocks, es.BudgetBlocks, es.ExitingBlocks)
 		}
 		// the derived cold-entry cap is per engine and the charge never exceeds it
 		if es.ColdCapTokens <= 0 {

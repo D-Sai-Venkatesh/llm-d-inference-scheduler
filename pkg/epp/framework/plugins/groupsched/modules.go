@@ -240,8 +240,8 @@ func (NewcomerFirst) Head(waiters map[string]*waiter, _ EntryCtx) *waiter {
 
 // newcomerLess is the default entry order's total comparison (lower wins).
 func newcomerLess(a, b *waiter) bool {
-	if a.newcomer != b.newcomer {
-		return a.newcomer // newcomers first
+	if a.returner != b.returner {
+		return !a.returner // newcomers first
 	}
 	if !a.since.Equal(b.since) {
 		return a.since.Before(b.since) // oldest first

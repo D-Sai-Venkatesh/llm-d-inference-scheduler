@@ -229,14 +229,13 @@ func TestChargedDrainEngineGoneReleases(t *testing.T) {
 // in-flight count reaches zero. reapInflightLocked drops ids whose termination was
 // never observed — a client cancel whose forced EndOfStream never reached the plugin,
 // or a request that errored before its first chunk. Dropping the LAST id IS a drain, so
-// it must finish the exit; the TTL is not a rescue (its idle test needs no queued turn,
+// it must finish the exit; the idle exit is not a rescue (its test needs no queued turn,
 // and a branch that still has a head is exactly the branch that is waiting).
 //
-// The TTL is pushed out of reach (1e5 s) so the test can only pass on the reap path.
+// Idle is pushed out of reach (1e5 s) so the test can only pass on the reap path.
 func TestChargedDrainReapOfCancelledRequestReleases(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.InflightReapSeconds = 60 // the campaign shape's bound, scaled down
-	cfg.TTLSeconds = 1e5         // no TTL rescue: the reap must do it
 	cfg.IdleSeconds = 1e5
 	chargedPath(t, cfg, "reap-cancelled", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-cancelled", true)
@@ -250,7 +249,6 @@ func TestChargedDrainReapOfCancelledRequestReleases(t *testing.T) {
 // still outstanding here (no chunk ever released it), so the exit must release that too.
 func TestChargedDrainReapOfUnconfirmedRequestReleases(t *testing.T) {
 	cfg := defaultConfig()
-	cfg.TTLSeconds = 1e5
 	cfg.IdleSeconds = 1e5
 	chargedPath(t, cfg, "reap-provisional", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-provisional", false)

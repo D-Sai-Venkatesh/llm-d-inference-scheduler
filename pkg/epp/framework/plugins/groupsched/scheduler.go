@@ -61,9 +61,6 @@ type Config struct {
 	// IdleSeconds is S: a resident with no queued turn and no activity for S is
 	// rotation-eligible (it is not going to use its seat).
 	IdleSeconds float64 `json:"idleSeconds"`
-	// TTLSeconds is how long a headless, unseated record is remembered (the
-	// silence GC — a waiter with a live head is never forgotten).
-	TTLSeconds float64 `json:"ttlSeconds"`
 	// (The cold-entry stagger cap is NOT a knob: it is DERIVED per engine as the
 	// seat budget's own headroom — floor((1 - groupBudgetFraction) x
 	// num_gpu_blocks) blocks x blockSizeTokens — so the valve can only ever spend
@@ -130,7 +127,6 @@ func defaultConfig() Config {
 		GroupBudgetFraction:     0.95,
 		Quantum:                 4,
 		IdleSeconds:             20,
-		TTLSeconds:              30,
 		InFlightCap:             64,
 		BlockSizeTokens:         64,
 		CapacityLivenessSeconds: 120,
@@ -158,9 +154,6 @@ func (c Config) effective() Config {
 	}
 	if c.IdleSeconds == 0 {
 		c.IdleSeconds = def.IdleSeconds
-	}
-	if c.TTLSeconds == 0 {
-		c.TTLSeconds = def.TTLSeconds
 	}
 	if c.InFlightCap == 0 {
 		c.InFlightCap = def.InFlightCap
@@ -205,8 +198,8 @@ func (c Config) validate() error {
 	if c.Quantum < 1 {
 		return fmt.Errorf("quantum must be >= 1 (Q is the fixed tenure in completed busy periods; the pause arm is gone), got %d", c.Quantum)
 	}
-	if c.IdleSeconds <= 0 || c.TTLSeconds <= 0 {
-		return fmt.Errorf("idleSeconds and ttlSeconds must be > 0")
+	if c.IdleSeconds <= 0 {
+		return fmt.Errorf("idleSeconds must be > 0")
 	}
 	if c.InFlightCap <= 0 {
 		return fmt.Errorf("inFlightCap must be > 0")
@@ -250,6 +243,13 @@ type Head struct {
 	// records (measured 0/768 matches), so every SEAT/EXIT event must carry this
 	// too or a run's seat membership cannot be joined to its own requests.
 	FairnessID string
+	// Returner reports whether this request is NOT its branch's first turn — the
+	// fairness class, from branch identity's arrival record. It is phrased as the
+	// exception on purpose: the zero value must be the NEWCOMER (a head whose arrival
+	// record is missing is a branch with no history we know of, and branch identity
+	// defaults the same way), so a caller that forgets the field cannot demote a
+	// first-turn branch behind incumbents.
+	Returner bool
 }
 
 // ---- per-branch scheduling state ----
@@ -335,9 +335,12 @@ type estEntry struct {
 // cost on each engine, from that engine's own index) and the engine is chosen at
 // SEAT time (admission.go).
 type waiter struct {
-	id       string
-	since    time.Time // the OLDEST arrival (B5)
-	newcomer bool
+	id    string
+	since time.Time // the OLDEST arrival (B5)
+	// returner is the fairness class: this branch's queued turn is NOT its first
+	// one. It comes from the head (Head.Returner), i.e. from branch identity's
+	// arrival record — never from a history the scheduler keeps.
+	returner bool
 	// sizeBytes is the last seen head's wire size (the C4 refresh input).
 	sizeBytes int64
 	// coldTokens is the head's cold-prefill estimate in TOKENS (R1: one unit
@@ -364,8 +367,8 @@ type waiter struct {
 // single-engine special case.
 //
 // What is NOT here (identity, because a branch's identity is a property of the
-// client, not of the seat): everSeated (the newcomer test), lastSeen (the silence
-// GC), the branch→engine bindings, and the SHARED waiter queue.
+// client, not of the seat): the fairness class (it arrives on the request, from
+// branch identity), the branch→engine bindings, and the SHARED waiter queue.
 type engineGroup struct {
 	// id is the endpoint id the EPP discovered.
 	id string
@@ -491,13 +494,6 @@ type Scheduler struct {
 
 	blockSize int
 
-	// everSeated is the NEWCOMER test: a branch that has never been seated queues
-	// ahead of the branches that have (D1's newcomer-first order).
-	everSeated map[string]struct{}
-	// lastSeen is the per-record activity time for the silence GC (R2): updated at
-	// Dispatched and Settle; a headless, unseated record older than TTL is
-	// forgotten.
-	lastSeen map[string]time.Time
 	// bindings is the branch→engine association. It IS the seat: created when the
 	// branch is seated, dropped the moment it exits. An unseated branch has no
 	// placement opinion at all.
@@ -568,11 +564,9 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 		return nil, err
 	}
 	s := &Scheduler{cfg: cfg, mod: mod, blockSize: cfg.BlockSizeTokens,
-		groups:     map[string]*engineGroup{},
-		everSeated: map[string]struct{}{},
-		lastSeen:   map[string]time.Time{},
-		bindings:   map[string]string{},
-		waiters:    map[string]*waiter{}}
+		groups:   map[string]*engineGroup{},
+		bindings: map[string]string{},
+		waiters:  map[string]*waiter{}}
 	s.counters.exits = map[string]int64{}
 	return s, nil
 }
@@ -971,9 +965,12 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 		// unseated: its demand is ADMISSION, so it waits in the one shared queue
 		w, ok := s.waiters[h.Branch]
 		if !ok {
-			w = &waiter{id: h.Branch, newcomer: s.isNewcomerLocked(h.Branch)}
+			w = &waiter{id: h.Branch}
 			s.waiters[h.Branch] = w
 		}
+		// the class rides with the HEAD: branch identity knows whether this is the
+		// branch's first turn
+		w.returner = h.Returner
 		w.fairnessID = h.FairnessID
 		// B5: keep the OLDEST arrival across fan-out re-arrivals
 		if w.since.IsZero() || h.Arrival.Before(w.since) {
@@ -1226,7 +1223,6 @@ func (s *Scheduler) SettleOn(id, reqID, engine string, usage struct{ Prompt, Cac
 func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cachedTokens, completionTokens int, natural bool, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.lastSeen[id] = now
 	g := s.groupOfLocked(id)
 	if g == nil && engine != "" {
 		g = s.existingGroupLocked(engine) // never resurrect a torn-down engine
@@ -1582,7 +1578,6 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 	if ok, _ := g.index.TrySeatLocked(w.id, g.budgetBlocks); !ok {
 		return false
 	}
-	s.everSeated[w.id] = struct{}{}
 	s.bindings[w.id] = g.id
 	if s.onBind != nil {
 		s.onBind(w.id, g.id) // the placement pin's mirror (filter.go)
@@ -1620,7 +1615,7 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 	// branch): both answer "how long did admission make this branch wait".
 	eventKind := "re-entry"
 	waitKind := "reentry"
-	if w.newcomer {
+	if !w.returner {
 		eventKind = "newcomer"
 		waitKind = "new"
 		s.counters.entryWaits = append(s.counters.entryWaits, now.Sub(w.since).Seconds())
@@ -1737,30 +1732,6 @@ func (s *Scheduler) Tick(now time.Time) {
 	s.drainExitingLocked(now)
 }
 
-// gcSilentRecordsLocked forgets headless, unseated records whose last activity is
-// older than the TTL (R2: silence, not queue age — a waiter with a live head is
-// NEVER forgotten, however long it waits). A forgotten record loses its
-// "ever seated" mark with it, so a branch that has been gone long enough arrives as
-// a NEWCOMER again (which is what it is: nothing about its cache survived).
-func (s *Scheduler) gcSilentRecordsLocked(now time.Time) {
-	ttl := time.Duration(s.cfg.TTLSeconds * float64(time.Second))
-	for id, seen := range s.lastSeen {
-		if s.seatedAnywhereLocked(id) {
-			continue
-		}
-		if s.waiterAnywhereLocked(id) {
-			continue // has a live head (syncWaiters keeps waiters honest)
-		}
-		if now.Sub(seen) > ttl {
-			for _, g := range s.groups {
-				g.index.ForgetLocked(id)
-			}
-			s.forgetEverSeatedLocked(id)
-			delete(s.lastSeen, id)
-		}
-	}
-}
-
 func (s *Scheduler) seatedAnywhereLocked(id string) bool {
 	for _, g := range s.groups {
 		if _, ok := g.branches[id]; ok {
@@ -1769,19 +1740,6 @@ func (s *Scheduler) seatedAnywhereLocked(id string) bool {
 	}
 	return false
 }
-
-func (s *Scheduler) waiterAnywhereLocked(id string) bool {
-	_, ok := s.waiters[id]
-	return ok
-}
-
-func (s *Scheduler) isNewcomerLocked(id string) bool {
-	_, seen := s.everSeated[id]
-	return !seen
-}
-
-// forgetEverSeatedLocked drops a record's "was served" mark.
-func (s *Scheduler) forgetEverSeatedLocked(id string) { delete(s.everSeated, id) }
 
 // observeMemberSourceLocked counts a dispatch by its branch-key source and fires
 // the once-per-source hook (the run's effective-branch-source echo).

@@ -126,7 +126,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.engineGone = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "engine_gone_total",
 		Help: "engines torn down by an endpoint delete"})
 	g.coldValveHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "cold_valve_held_total",
-		Help: "heads the cold-entry valve held back (the budget would have admitted them; they WAIT, nothing is evicted)"}, engineLabels)
+		Help: "Pick passes in which the queue head was held by this engine's cold-entry valve (the budget would have admitted it; it WAITS, nothing is evicted). A PASS count, not a head count: Pick runs at ~1 kHz, so a head held for a second counts about a thousand times"}, engineLabels)
 
 	for _, c := range []prometheus.Collector{g.seats, g.neBlocks, g.budgetBlocks,
 		g.exitingBranches, g.exitingBlocks, g.exitingOldest,

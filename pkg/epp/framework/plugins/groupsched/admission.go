@@ -43,8 +43,8 @@ package groupsched
 //     and nothing else touches it — so a branch's next seat is chosen afresh, by the
 //     state of the engines at that moment. There is no TTL and no pre-seat homing:
 //     there is nothing to keep warm between seats, because the blocks die during the
-//     unseated interval (measured, not assumed — the unseated interval IS a
-//     multi-minute admission wait).
+//     unseated interval — and that interval IS a multi-minute admission wait (the wait
+//     ladder measures it), not a gap worth preserving state across.
 //
 // At N=1 every rule above collapses to "the head goes to the only engine that
 // fits", which is the shape the single-engine tests pin.

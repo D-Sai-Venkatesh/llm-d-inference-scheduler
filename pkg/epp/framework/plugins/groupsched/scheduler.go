@@ -824,8 +824,9 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 		}
 		// The request is RELEASED: it is neither queued nor in flight until PreRequest
 		// records it, and the record written here is what every later hook resolves it
-		// by. No synthetic id is minted; the handler forces a terminal ResponseBody
-		// whenever a pod was scheduled, so the record always ends.
+		// by. No synthetic id is minted. The record ends at its settle, its abandon, its
+		// branch's exit — or the reap, which is what bounds the map on the paths where no
+		// hook ever arrives.
 		s.releaseLocked(m, winner.c.h.ReqID, winner.c.h.Chains, now)
 		m.lastActivity = now
 		g.counters.served++
@@ -1479,7 +1480,10 @@ func (s *Scheduler) deriveLocked() {
 // reapRequestsLocked re-derives every branch's request counts from the map
 // (derive-don't-accumulate: a leaked increment cannot survive a decision pass) and drops the
 // records that outlived InflightReapSeconds. The handler forces a terminal ResponseBody
-// whenever a pod was scheduled, so this should never fire: it is the belt to that braces.
+// whenever a pod was scheduled, so in the common case this never fires; it is the belt to
+// the terminal callback's braces, and on a path that reaches NO hook (an admission rejection
+// after the release, a director that returned before its abort hook) it is the only end the
+// record gets.
 //
 // A PENDING record is reaped by the same bound. Nothing else would ever end one whose hooks
 // never arrive (a request finalized while it was being dispatched, an endpoint set that

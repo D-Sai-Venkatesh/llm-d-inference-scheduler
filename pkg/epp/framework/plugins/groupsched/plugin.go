@@ -97,13 +97,13 @@ type GroupScheduler struct {
 	// ---- capacity acquisition (the capacity race) ----
 	//
 	// num_gpu_blocks arrives on the endpoint's METRICS, and an endpoint's
-	// creation event fires BEFORE the first scrape has populated them, so
-	// the event path alone can miss the capacity for the whole process
-	// lifetime (measured twice: capacity was only recovered by a metadata
-	// nudge). The plugin therefore keeps the endpoint HANDLES it has seen
-	// and re-reads their metrics on the ticker: the datalayer refreshes a
-	// ModelServer's metrics IN PLACE (atomic pointer swap inside the same
-	// endpoint object), so a stored handle is a live poll target.
+	// creation event fires BEFORE the first scrape has populated them, so the
+	// event path alone can miss the capacity for the whole process lifetime (it
+	// did, live: the only thing that ever recovered it was a metadata nudge). The
+	// plugin therefore keeps the endpoint HANDLES it has seen and re-reads their
+	// metrics on the ticker: the datalayer refreshes a ModelServer's metrics IN
+	// PLACE (atomic pointer swap inside the same endpoint object), so a stored
+	// handle is a live poll target.
 	//
 	// MULTI-POD: capacity, the liveness deadline and the acquisition audit
 	// are PER ENDPOINT. "First capacity wins" was a single-pool assumption;
@@ -452,7 +452,7 @@ func (r *GroupScheduler) validateTokenProducer() error {
 		}
 	}
 	return fmt.Errorf(
-		"the '%s' plugin requires a token-producer (tier-A block keys; tier B failed the CP2 trust measurements and there is no fallback) — add the token-producer with the vllm render backend",
+		"the '%s' plugin requires a token-producer: every cost comes from the request's own tokens, and there is no byte-derived fallback — add the token-producer with the vllm render backend",
 		PluginType)
 }
 
@@ -501,8 +501,10 @@ func (r *GroupScheduler) validateBranchProducer() error {
 // full-outage misconfiguration (every request would error at PreRequest,
 // the backstop), burning an arm before anyone noticed. The producer's
 // BACKEND is not inspectable from outside the plugin — an estimate-backend
-// producer still passes this gate (it produces tokens; tier-A quality is
-// the config author's responsibility, guarded by the config comment).
+// producer still passes this gate (it produces tokens; whether those tokens are the
+// ENGINE's own is the config author's responsibility — the render backend must be the
+// sidecar serving the deployed model's tokenizer, and a blockSizeTokens mismatch fails
+// loudly at the first measured engine).
 func (r *GroupScheduler) RegisterDependencies(reg fwkdl.Registrar) error {
 	if err := r.validateTokenProducer(); err != nil {
 		return err

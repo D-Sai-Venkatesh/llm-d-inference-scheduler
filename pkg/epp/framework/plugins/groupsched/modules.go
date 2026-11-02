@@ -167,9 +167,10 @@ func (BudgetValve) Victim(branches []*branch, ctx PressureCtx) (string, *branch)
 	}
 	// class (3): mid-quantum. THE ORDER MATTERS: a branch that has not served a turn
 	// in this residency, or that has a queued head right now, is the LAST choice —
-	// taking its seat back before its first turn makes it wait another admission cycle
-	// (measured: 100 % of the old class-3 victims had a queued head, 53/54 had served
-	// ZERO turns in the residency). Only then "oldest last completion", then id.
+	// taking its seat back before its first turn makes it wait another admission cycle.
+	// (measured on the old build, which took seats from branches whose head had been queued
+	// the whole time; the campaign notes carry the counts). Only then "oldest last
+	// completion", then id.
 	for _, m := range branches {
 		if ctx.Exiting(m.id) || m.busy() {
 			continue
@@ -454,6 +455,15 @@ func (NoopDispatchGate) Allows(DispatchCtx) bool { return true }
 
 // SafetyDetector is the SAFETY seam. The ONE wired value is NoopSafety: the seat
 // budget is the whole admission control ("safety: none").
+//
+// THE PRECONDITION A FUTURE NET INHERITS (R5): it may be consulted ONLY inside the
+// decision pass — Pick, under the scheduler's own mutex, on the queue view that pass just
+// synced — and never from the ticker, a hook or a background read. A net priced at one
+// moment and acted on at another is the SECOND DECISION PATH R5 removed (a stale view
+// justified evictions nobody asked for), so the seam takes its inputs as arguments from
+// the pass and reads nothing of its own. The only wired value answers a constant, which is
+// why nothing can violate the rule today; the rule is what keeps a new one from re-opening
+// the hole.
 //
 // The memory-only net (threshold = the budget's own fraction, live kv scrape) was the
 // parked alternative and is REMOVED with its readers: the per-engine holds that asked

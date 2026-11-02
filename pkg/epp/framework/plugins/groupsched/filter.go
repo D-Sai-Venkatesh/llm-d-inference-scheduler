@@ -158,7 +158,7 @@ func (p *pinTable) requestCount() int {
 // Filter narrows the candidate endpoints to the branch's CURRENT SEAT ENGINE.
 // Contract, in order:
 //
-//  1. ≤1 candidate → pass through (nothing to narrow; still counted).
+//  1. ≤1 candidate → pass through (there is nothing to narrow).
 //  2. The request is UNTRACKED (nothing released it: anonymous traffic, a pre-capacity
 //     FCFS dispatch, a branch that has left) → pass through freely (the policy never
 //     tracks, seats or constrains untracked traffic).
@@ -168,8 +168,8 @@ func (p *pinTable) requestCount() int {
 //     (observed-endpoint-wins, PreRequest). The pin is created at SEAT time
 //     (seatLocked → onBind), and the seat happens in Pick BEFORE the request
 //     dispatches, so a branch's FIRST dispatch after being seated is ALREADY
-//     pinned — "passthrough-unseated" covers only heads dispatched while unseated
-//     (the anonymous and pre-capacity classes), which on a healthy run is ≈ 0.
+//     pinned — the pass-through covers only heads dispatched while unseated (the
+//     anonymous and pre-capacity classes), which on a healthy run is ≈ 0.
 //  4. SEATED branch → return ONLY the seat engine.
 //
 // THE BRANCH COMES FROM THE REQUEST ID, through the pin table's request mirror — not

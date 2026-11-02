@@ -323,3 +323,57 @@ func TestRuleOIsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// TestSoleOversizeStaysSeatedWithoutWaiters: the (b) fix — the sole-oversize
+// guard runs BEFORE the rotation-victim class. A sole oversize branch past Q
+// with NO waiters stays seated across many passes (enforcement never takes
+// it); a waiter arrives and it rotates out by tenure, making room.
+func TestSoleOversizeStaysSeatedWithoutWaiters(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+			budget := int64(fx.g().budgetBlocks)
+			// Seat the oversize branch by Rule O and run it past Q busy periods.
+			h := head("big", time.Second, int(budget)+250)
+			engine, i := fx.pickEngine(h)
+			if i < 0 {
+				t.Fatal("Rule O did not seat the oversize head")
+			}
+			fx.s.DispatchedOn("", h.ReqID, engine, nil, fx.clock)
+			for j := 0; j < 5; j++ { // Q + 1 busy periods
+				settleTurn(fx, "big", h.ReqID, int(budget)+250)
+				h = head("big", time.Second, int(budget)+250)
+				if _, k := fx.pickEngine(h); k < 0 {
+					t.Fatalf("turn %d: the oversize branch lost its seat mid-residency", j)
+				}
+				fx.s.DispatchedOn("", h.ReqID, engine, nil, fx.clock)
+			}
+			// Settle the final turn: the branch must be idle (not in flight) for the
+			// tenure rule to see it as eligible.
+			settleTurn(fx, "big", h.ReqID, int(budget)+250)
+			// Many Pick passes with NO waiters: the branch must stay seated.
+			small := head("small", 500*time.Millisecond, 100)
+			for p := 0; p < 20; p++ {
+				if i := fx.pick(); i != -1 {
+					t.Fatalf("pass %d: something was dispatched with no waiters (index %d)", p, i)
+				}
+				if !fx.s.Seated("big") {
+					t.Fatalf("pass %d: the sole oversize branch was evicted with no waiters", p)
+				}
+			}
+			// A waiter arrives: tenure rotation makes room for it.
+			fx.pick(small)
+			for p := 0; p < 3 && !fx.s.Seated("small"); p++ {
+				fx.pick(small)
+			}
+			if !fx.s.Seated("small") {
+				t.Fatal("the waiter never seated — the oversize branch did not rotate out by tenure")
+			}
+			// At N=1 the waiter must take the oversize branch's engine (it rotated out
+			// by tenure). At N=2 the waiter may seat on the other engine — in that case
+			// the oversize branch keeps its seat, which is correct: nobody needed the
+			// room. The assertion is: the waiter is seated, and if it took the same
+			// engine, the oversize branch is gone.
+			if smallEngine := fx.s.bindings["small"]; smallEngine == engine && fx.s.Seated("big") {
+				t.Fatal("the waiter took the oversize engine but the oversize branch is still seated")
+			}
+	})
+}

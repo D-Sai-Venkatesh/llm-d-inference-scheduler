@@ -155,15 +155,11 @@ type BudgetValve struct{}
 func (BudgetValve) Name() string { return "valve" }
 
 func (BudgetValve) Victim(branches []*branch, ctx PressureCtx) (string, *branch) {
-	if ctx.RotationVictim != nil {
-		if reason, m := ctx.RotationVictim(); m != nil {
-			return reason, m
-		}
-	}
-	// RULE O's NO-THRASH clause, before every pressure class (and after the tenure class:
-	// tenure is still the way such a branch leaves). An oversize seat is over budget by
-	// construction, so without this the pass would mark its own resident on every Pick — the
-	// cascade the two-view accounting exists to prevent, with one branch instead of dozens.
+	// RULE O's NO-THRASH clause, FIRST — before the rotation victim and every pressure
+	// class. A sole oversize stay-member is never an enforcement victim: it is over
+	// budget by construction, so any pass would otherwise mark its own resident — the
+	// cascade the two-view accounting exists to prevent. It leaves only through
+	// rotateLocked, by tenure, when a waiter needs the room.
 	if ctx.SoleOversize != nil {
 		var sole *branch
 		stay := 0
@@ -178,6 +174,11 @@ func (BudgetValve) Victim(branches []*branch, ctx PressureCtx) (string, *branch)
 		}
 		if stay == 1 && ctx.SoleOversize(sole) {
 			return "", nil
+		}
+	}
+	if ctx.RotationVictim != nil {
+		if reason, m := ctx.RotationVictim(); m != nil {
+			return reason, m
 		}
 	}
 	var best *branch

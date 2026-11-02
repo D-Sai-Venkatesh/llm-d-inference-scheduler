@@ -211,7 +211,7 @@ func TestExitingLedgerIsVisiblePerEngine(t *testing.T) {
 
 		// the mark (the pressure valve's mid-flight class)
 		fx.s.mu.Lock()
-		m.inflightIDs = map[string]inflightRec{"r-gone": {since: fx.clock, confirmed: true}}
+		m.inflightIDs = map[string]inflightRec{"r-gone": {since: fx.clock}}
 		m.inflight = 1
 		g.index.MarkExitingLocked("gone")
 		m.exitingSince = fx.clock

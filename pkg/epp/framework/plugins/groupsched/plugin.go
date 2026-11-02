@@ -392,17 +392,6 @@ func isReturner(request *fwksched.InferenceRequest) bool {
 	return rec.Turn > 1
 }
 
-// sessionAttr is the request's SESSION attribute: the system's agent-identity
-
-// session first (the session the rest of the stack sees), else the branch
-// plugin's copy of the same client header. Read-only.
-func (r *GroupScheduler) sessionAttr(request *fwksched.InferenceRequest) string {
-	if s := readID(request, agentidentity.AgentIdentityKey); s != "" {
-		return s
-	}
-	return readID(request, branchidentity.BranchSessionKey)
-}
-
 // validateTokenProducer is the gate body (testable without a registrar).
 func (r *GroupScheduler) validateTokenProducer() error {
 	if r.handle == nil {
@@ -845,7 +834,7 @@ func (r *GroupScheduler) RequestAbandoned(_ context.Context, request *fwksched.I
 // PreRequest runs after the request leaves the queue (dispatch). It records the in-flight
 // request and reconciles the engine the framework ACTUALLY picked with the one the seat
 // assumed; nothing is charged here, because the seat charged the exact chains.
-func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) error {
+func (r *GroupScheduler) PreRequest(ctx context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) error {
 	// capacity first (belt-and-braces, third acquisition path): it must not
 	// depend on the request being trackable — anonymous traffic used to
 	// return before ever teaching the budget.
@@ -862,8 +851,10 @@ func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.Inferen
 		return nil
 	}
 	// The engine here is AUTHORITATIVE: the seat was placed on the branch's engine at
-	// Pick, and the framework's actual choice moves it if it disagrees.
-	r.sched.DispatchedOnUsage(id, request.RequestID, engine, time.Now())
+	// Pick, and the framework's actual choice moves it if it disagrees. The request's own
+	// chain comes along because a branch that holds no seat at all is seated by the
+	// observation (the chains are cached on the request at Pick, so this is a read).
+	r.sched.DispatchedOnUsage(id, request.RequestID, engine, r.chainsFor(ctx, request), time.Now())
 	return nil
 }
 

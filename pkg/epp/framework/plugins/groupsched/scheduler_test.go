@@ -431,7 +431,7 @@ func TestExitingMemberStaysOnTheUsedSideUntilDrain(t *testing.T) {
 		min, g := fx.branch(t, "m0")
 		fx.s.mu.Lock()
 		// in flight and marked exiting (the mid-flight pressure class)
-		min.inflightIDs = map[string]inflightRec{"r-m0": {since: fx.clock, confirmed: true}}
+		min.inflightIDs = map[string]inflightRec{"r-m0": {since: fx.clock}}
 		min.inflight = 1
 		freeBefore := fx.s.freeBudgetLocked(g)
 		neBefore := g.index.UniqueBlocksLocked()
@@ -468,7 +468,7 @@ func TestExitingVictimDoesNotSpinEnforcement(t *testing.T) {
 		fx.seatOne(t, "m", 900, 2*time.Second)
 		m, g := fx.branch(t, "m")
 		fx.s.mu.Lock()
-		m.inflightIDs = map[string]inflightRec{"r-m": {since: fx.clock, confirmed: true}}
+		m.inflightIDs = map[string]inflightRec{"r-m": {since: fx.clock}}
 		m.inflight = 1
 		g.index.MarkExitingLocked("m")
 		// way over budget with the only branch already exiting
@@ -802,7 +802,7 @@ func TestSeatExitEventsCarryFairnessIDAndEngine(t *testing.T) {
 		if seat == nil {
 			t.Fatal("a SEAT event must be recorded")
 		}
-		if seat.Engine == "" || seat.Engine == "single" && len(fx.ids) > 1 {
+		if seat.Engine == "" {
 			t.Fatalf("the SEAT event must carry the engine, got %q", seat.Engine)
 		}
 		if want := "fairness_id=thread-7"; !contains(seat.Detail, want) {
@@ -949,4 +949,18 @@ func (fx *engineSet) dispatchBig(t *testing.T, id string, blocks int) {
 	if i := fx.pick(h); i >= 0 {
 		fx.s.Dispatched(id, h.ReqID, fx.clock)
 	}
+}
+
+// When no branch head is dispatchable, the pass-through fallback serves the OLDEST
+// anonymous (or uncostable) head. The snapshot's head order is the queue iteration order,
+// so taking the first such head would serve an arbitrary one of them.
+func TestPassThroughServesTheOldest(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		young := Head{Branch: "", ReqID: "anon-young", Arrival: fx.clock}
+		old := Head{Branch: "", ReqID: "anon-old", Arrival: fx.clock.Add(-30 * time.Second)}
+		blind := Head{Branch: "blind", ReqID: "r-blind", Arrival: fx.clock.Add(-20 * time.Second)}
+		if i := fx.pick(young, old, blind); i != 1 {
+			t.Fatalf("the oldest pass-through head is the second one, got %d", i)
+		}
+	})
 }

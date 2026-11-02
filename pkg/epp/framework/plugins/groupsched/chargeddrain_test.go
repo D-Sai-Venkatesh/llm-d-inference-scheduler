@@ -98,12 +98,12 @@ func chargedPath(t *testing.T, cfg Config, path string, fn func(t *testing.T, fx
 // markExitingInflight makes "gone" an exiting branch with one in-flight request,
 // exactly as the pressure valve's mid-flight class does, and asserts the mark moved no
 // counter (the whole point of (iii): it is a mark, not a release).
-func markExitingInflight(t *testing.T, fx *engineSet, g *engineGroup, reqID string, confirmed bool) {
+func markExitingInflight(t *testing.T, fx *engineSet, g *engineGroup, reqID string) {
 	t.Helper()
 	fx.s.mu.Lock()
 	m := g.branches["gone"]
 	before, beforeU := g.index.UniqueBlocksLocked(), g.index.UniqueBlocksLocked()
-	m.inflightIDs = map[string]inflightRec{reqID: {since: fx.clock, confirmed: confirmed}}
+	m.inflightIDs = map[string]inflightRec{reqID: {since: fx.clock}}
 	m.inflight = 1
 	g.index.MarkExitingLocked("gone")
 	n, u := g.index.UniqueBlocksLocked(), g.index.UniqueBlocksLocked()
@@ -157,7 +157,7 @@ func assertReleased(t *testing.T, fx *engineSet, g *engineGroup, path string) {
 
 func TestChargedDrainSettleReleases(t *testing.T) {
 	chargedPath(t, defaultConfig(), "settle-drain", func(t *testing.T, fx *engineSet, g *engineGroup) {
-		markExitingInflight(t, fx, g, "r-gone", true)
+		markExitingInflight(t, fx, g, "r-gone")
 		// the request terminates: the finalizer removes the record, sees the branch
 		// exiting and drained, and unseats it.
 		fx.s.SettleOnUsage("gone", "r-gone", g.id, 300, 0, 0, false, fx.clock)
@@ -169,10 +169,10 @@ func TestChargedDrainSettleReleases(t *testing.T) {
 // release: the blocks are still pinned. Release happens on the LAST drain, once.
 func TestChargedDrainWaitsForTheLastRequest(t *testing.T) {
 	chargedPath(t, defaultConfig(), "settle-drain-last", func(t *testing.T, fx *engineSet, g *engineGroup) {
-		markExitingInflight(t, fx, g, "r1", true)
+		markExitingInflight(t, fx, g, "r1")
 		fx.s.mu.Lock()
 		m := g.branches["gone"]
-		m.inflightIDs["r2"] = inflightRec{since: fx.clock, confirmed: true}
+		m.inflightIDs["r2"] = inflightRec{since: fx.clock}
 		m.inflight = 2
 		fx.s.mu.Unlock()
 
@@ -192,10 +192,10 @@ func TestChargedDrainWaitsForTheLastRequest(t *testing.T) {
 // nothing, so it must not be read as a drain (and must not exit anybody).
 func TestChargedDrainStraySettleDoesNotRelease(t *testing.T) {
 	chargedPath(t, defaultConfig(), "stray-settle", func(t *testing.T, fx *engineSet, g *engineGroup) {
-		markExitingInflight(t, fx, g, "r1", true)
+		markExitingInflight(t, fx, g, "r1")
 		fx.s.mu.Lock()
 		m := g.branches["gone"]
-		m.inflightIDs["r2"] = inflightRec{since: fx.clock, confirmed: true}
+		m.inflightIDs["r2"] = inflightRec{since: fx.clock}
 		m.inflight = 2
 		fx.s.mu.Unlock()
 
@@ -213,7 +213,7 @@ func TestChargedDrainStraySettleDoesNotRelease(t *testing.T) {
 
 func TestChargedDrainEngineGoneReleases(t *testing.T) {
 	chargedPath(t, defaultConfig(), "engine-gone", func(t *testing.T, fx *engineSet, g *engineGroup) {
-		markExitingInflight(t, fx, g, "r-gone", true)
+		markExitingInflight(t, fx, g, "r-gone")
 		if n := fx.s.RemoveEngine(g.id, fx.clock); n == 0 {
 			t.Fatal("the teardown must exit the branches it tears down")
 		}
@@ -238,7 +238,7 @@ func TestChargedDrainReapOfCancelledRequestReleases(t *testing.T) {
 	cfg.InflightReapSeconds = 60 // the campaign shape's bound, scaled down
 	cfg.IdleSeconds = 1e5
 	chargedPath(t, cfg, "reap-cancelled", func(t *testing.T, fx *engineSet, g *engineGroup) {
-		markExitingInflight(t, fx, g, "r-cancelled", true)
+		markExitingInflight(t, fx, g, "r-cancelled")
 		fx.tick(61 * time.Second) // the confirmed-id reap bound
 		assertReleased(t, fx, g, "reap (cancel, no settle)")
 	})
@@ -329,7 +329,7 @@ func TestChargedDrainHeadlessIdleReleases(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.InflightReapSeconds = 60
 	chargedPath(t, cfg, "ttl", func(t *testing.T, fx *engineSet, g *engineGroup) {
-		markExitingInflight(t, fx, g, "r-gone", true)
+		markExitingInflight(t, fx, g, "r-gone")
 		fx.s.mu.Lock()
 		m := g.branches["gone"]
 		m.inflightIDs = map[string]inflightRec{}
@@ -350,7 +350,7 @@ func TestChargedDrainExitingWithQueuedHeadReleases(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.InflightReapSeconds = 60
 	chargedPath(t, cfg, "exiting-with-head", func(t *testing.T, fx *engineSet, g *engineGroup) {
-		markExitingInflight(t, fx, g, "r-gone", true)
+		markExitingInflight(t, fx, g, "r-gone")
 		fx.s.mu.Lock()
 		m := g.branches["gone"]
 		m.inflightIDs = map[string]inflightRec{}
@@ -370,7 +370,7 @@ func TestChargedDrainExitingWithQueuedHeadReleases(t *testing.T) {
 // queued head: the seat is not being handed out twice on the way out.
 func TestChargedDrainExitingIsNeverDispatched(t *testing.T) {
 	chargedPath(t, defaultConfig(), "exiting-no-dispatch", func(t *testing.T, fx *engineSet, g *engineGroup) {
-		markExitingInflight(t, fx, g, "r-gone", true)
+		markExitingInflight(t, fx, g, "r-gone")
 		if _, i := fx.pickEngine(head("gone", 10*time.Second, 300)); i >= 0 {
 			t.Fatal("an exiting branch must not be dispatched for its queued head")
 		}
@@ -388,7 +388,7 @@ func TestChargedDrainExitingIsNeverDispatched(t *testing.T) {
 // underflow and panic), and the next residency starts non-exiting and charges once.
 func TestChargedDrainUnseatIsExactlyOnce(t *testing.T) {
 	chargedPath(t, defaultConfig(), "unseat-once", func(t *testing.T, fx *engineSet, g *engineGroup) {
-		markExitingInflight(t, fx, g, "r-gone", true)
+		markExitingInflight(t, fx, g, "r-gone")
 
 		fx.s.mu.Lock()
 		g.index.UnseatLocked("gone")

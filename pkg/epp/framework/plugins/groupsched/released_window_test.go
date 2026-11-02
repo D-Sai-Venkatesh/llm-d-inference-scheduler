@@ -289,3 +289,78 @@ func TestTwoReleasesClearOnlyTheirOwnWindow(t *testing.T) {
 	})
 	_ = context.Background()
 }
+
+// A branch evicted while its ONLY claim on the engine was a released window is seated by
+// the OBSERVATION when its request reaches PreRequest, and drains when the request ends.
+//
+// Enforcement marks such a branch exiting (it is prefilling — a turn is on its way), and the
+// drain reads in-flight only, so the branch is unseated BEFORE its request arrives. Without
+// the observed seat, that request would run untracked: its blocks absent from the index and
+// its cold charge gone, and the engine's next admission would hand its blocks away twice.
+func TestReleasedWindowVictimIsAccountedAtPreRequest(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		engine := fx.ids[0]
+		// a keeps a request in flight for the whole test, so no idle/done victim class exists
+		fx.seatOne(t, "a", 300, 5*time.Second)
+		fx.s.Chunk("a") // its prefill landed: the cold-entry valve is a separate budget
+		// nothing may escape to a sibling engine (the N=1 shape must hold at N=2)
+		fx.closeEnginesExcept(t, engine, 950)
+		// b joins a on the same engine and completes one turn
+		fx.seatOne(t, "b", 300, 4*time.Second)
+		if got := fx.engineOf(t, "b"); got != engine {
+			t.Fatalf("b must share a's engine for this shape, it is on %q", got)
+		}
+		settle(fx.s, "b", 300*64, 300*64)
+
+		// b's next turn is released with a prompt that grew past the engine's headroom:
+		// charged at the dispatch, so 300 (a) + 900 (b) > the 950-block budget, and b has
+		// nothing in flight — its only claim on the seat is the window.
+		h := headWithChain("b", time.Second, chainOf("b", 900))
+		h.ReqID = "r-b2"
+		if i := fx.pick(h); i != 0 {
+			t.Fatalf("b's grown turn must dispatch on its seat, got %d", i)
+		}
+		if got := windowOf(t, fx, "b"); got != "r-b2" {
+			t.Fatalf("the released window must name b's request, it names %q", got)
+		}
+
+		// the pressure pass marks b EXITING, and the next pass's drain lets it go: nothing
+		// was in flight to wait for
+		fx.pick()
+		snap := fx.s.Snapshot()
+		if got := snap.Engines[engineLabel(engine)].ExitingMembers; got != 1 {
+			t.Fatalf("the over-budget pass must mark the window-only branch exiting (exiting=%d, exits=%v)", got, snap.Exits)
+		}
+		fx.pick()
+		if fx.s.Seated("b") {
+			t.Fatal("the drain must have released the window-only branch before its request arrived")
+		}
+		before := fx.s.Snapshot()
+
+		// PreRequest: the request IS on the engine, and the observation wins
+		fx.s.DispatchedOn("b", "r-b2", engine, chainOf("b", 900), fx.clock)
+		if !fx.s.Seated("b") {
+			t.Fatal("the observation must seat the branch its request landed on: otherwise it runs untracked")
+		}
+		after := fx.s.Snapshot()
+		if got, want := after.NEBlocks, before.NEBlocks+900; got != want {
+			t.Fatalf("the observed seat must account the request's chain: used %d, want %d", got, want)
+		}
+		if got := after.Engines[engineLabel(engine)].ForcedSeats; got != 1 {
+			t.Fatalf("the observed seat must be counted, forcedSeats=%d", got)
+		}
+		// the observed seat is not an admission: it never dispatches a turn
+		if i := fx.pick(h); i >= 0 {
+			t.Fatalf("an exiting branch must not dispatch, got %d", i)
+		}
+
+		// the request drains: the seat goes with it, and the blocks leave the budget
+		fx.s.Settle("b", "r-b2", struct{ Prompt, Cached int }{900 * 64, 900 * 64}, true, fx.clock)
+		if fx.s.Seated("b") {
+			t.Fatal("the observed seat must leave when its request drains")
+		}
+		if got := fx.s.Snapshot().NEBlocks; got != before.NEBlocks {
+			t.Fatalf("the drained seat must release its blocks: used %d, want %d", got, before.NEBlocks)
+		}
+	})
+}

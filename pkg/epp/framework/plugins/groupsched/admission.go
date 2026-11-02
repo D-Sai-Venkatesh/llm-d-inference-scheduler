@@ -53,8 +53,6 @@ import (
 	"time"
 )
 
-var dbgNoFit, dbgNoVictim, dbgEvict, dbgValveHeld, dbgSeat int
-
 // queuedPerSeatLocked is the engine's OWN queued demand per seat it holds: seated
 // branches that have a head waiting right now, divided by its seats. It orders the
 // DISPATCH pass across engines (the engine whose own residents are waiting most per
@@ -262,15 +260,14 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 		}
 		cand := s.seatEngineLocked(head, now)
 		if cand == nil || cand.g == nil {
-			dbgNoFit++
 			// nothing to do this pass. If the reason is the cold-entry valve holding a
 			// head that WOULD fit the budget, book it AGAINST THAT ENGINE: the head waits
 			// for the prefill slot, and that is a measurable cost of the stagger (never a
 			// reason to evict — see EngineCandidate.Fits). The attribution is the engine
-			// id, not "": cold_valve_held_total read `engine="single"` on a two-engine
-			// stack while this passed the empty id (2026-11-01).
+			// id, not "": the series must name the engine the head is actually waiting for
+			// (it read `engine="single"` on a two-engine stack while this passed an empty
+			// id).
 			if engine, held := s.coldValveHeldOn(head); held {
-				dbgValveHeld++
 				if s.onColdValveHeld != nil {
 					s.onColdValveHeld(engine)
 				}
@@ -281,7 +278,6 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 			// ONE number, one moment: the fit test the chooser just ran and the seat's
 			// own cost are the same computation inside the same critical section, so
 			// TrySeat cannot reject a head the chooser admitted.
-			dbgSeat++
 			s.seatLocked(cand.g, head, cand.costTokens, now)
 			continue
 		}
@@ -294,10 +290,8 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 			reason, victim = s.valveHolderVictimLocked(cand.g, now)
 		}
 		if victim == nil {
-			dbgNoVictim++
 			return // this engine can free nothing; another pass will re-evaluate
 		}
-		dbgEvict++
 		// NOTE: a rotation victim is never in flight — the tenure rule refuses in-flight
 		// branches — so there is no mid-flight exit to handle here (the mid-flight class
 		// lives in the PRESSURE module, which does reach running branches).

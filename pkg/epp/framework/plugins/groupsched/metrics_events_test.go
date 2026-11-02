@@ -212,7 +212,7 @@ func TestCountersAffinityAndRebindMoveOnTheirEvent(t *testing.T) {
 		t.Fatalf("before any rebound: %v", got)
 	}
 	// the framework lands the request on e1 although the seat is on e0
-	f.s.DispatchedOn("m", "r-m2", "e1", now)
+	f.s.DispatchedOn("m", "r-m2", "e1", nil, now)
 	if got := f.value(t, "rebinds_total", nil); got != 1 {
 		t.Fatalf("rebinds_total: %v, want 1", got)
 	}

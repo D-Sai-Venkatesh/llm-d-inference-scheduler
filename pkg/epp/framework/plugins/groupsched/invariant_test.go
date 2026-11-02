@@ -170,7 +170,7 @@ func invRun(t *testing.T, seed int64, engines, capacity int, events int) string 
 			// failure once a pod is chosen)
 			delete(queued, h.Branch)
 			trace.WriteString("dispatch " + h.Branch + " " + engine + "\n")
-			s.DispatchedOn(h.Branch, h.ReqID, engine, clock)
+			s.DispatchedOn(h.Branch, h.ReqID, engine, h.Chains, clock)
 			flying[h.Branch] = h.ReqID
 		case evSettle:
 			if rid, ok := flying[ev.branch]; ok {

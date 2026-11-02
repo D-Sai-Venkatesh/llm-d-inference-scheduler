@@ -61,11 +61,11 @@ func TestEnforcementDoesNotMarkAnotherWhileOneIsLeaving(t *testing.T) {
 		// three branches in flight on one engine; the engine's budget is exactly full
 		fx.s.Chunk("gone") // its prefill completed: the cold valve is free for the third seat
 		fx.seatOne(t, "m2", 250, 5*time.Second)
-		markExitingInflight(t, fx, g, "r-gone", true) // the 300-block branch leaves
+		markExitingInflight(t, fx, g, "r-gone") // the 300-block branch leaves
 		fx.s.mu.Lock()
 		for _, id := range []string{"m2"} { // give the sibling a request too (mid-flight)
 			m := g.branches[id]
-			m.inflightIDs = map[string]inflightRec{"r-" + id: {since: fx.clock, confirmed: true}}
+			m.inflightIDs = map[string]inflightRec{"r-" + id: {since: fx.clock}}
 			m.inflight = 1
 		}
 		// THE OVERAGE IS EXACTLY THE EXITING MEMBER'S OWN FOOTPRINT: 950 total seated
@@ -92,9 +92,9 @@ func TestEnforcementTakesOneMoreWhenTheOverageExceedsTheRetirees(t *testing.T) {
 	chargedPath(t, defaultConfig(), "one-more", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		fx.s.Chunk("gone")
 		fx.seatOne(t, "m2", 250, 5*time.Second)
-		markExitingInflight(t, fx, g, "r-gone", true)
+		markExitingInflight(t, fx, g, "r-gone")
 		fx.s.mu.Lock()
-		g.branches["m2"].inflightIDs = map[string]inflightRec{"r-m2": {since: fx.clock, confirmed: true}}
+		g.branches["m2"].inflightIDs = map[string]inflightRec{"r-m2": {since: fx.clock}}
 		g.branches["m2"].inflight = 1
 		// NE 950, budget 300: over by 650; "gone" excuses 300, so 350 is still over —
 		// more than m2's 250, so exactly ONE further mark can be justified... and after
@@ -124,7 +124,7 @@ func TestEnforcementTakesOneMoreWhenTheOverageExceedsTheRetirees(t *testing.T) {
 // were free must WAIT — and then be admitted the moment that branch actually drains.
 func TestAdmissionRefusesWhatOnlyTheRetireesBlocksWouldMakeRoomFor(t *testing.T) {
 	chargedPath(t, defaultConfig(), "admission-refuses", func(t *testing.T, fx *engineSet, g *engineGroup) {
-		markExitingInflight(t, fx, g, "r-gone", true) // NE = 700 of a 950 budget
+		markExitingInflight(t, fx, g, "r-gone") // NE = 700 of a 950 budget
 		fx.s.mu.Lock()
 		// shrink the budget so that the newcomer only fits if "gone"'s 300 were free
 		g.budgetBlocks = 650
@@ -160,7 +160,7 @@ func TestExitingVictimDoesNotSpinEnforcementAfterTheCascadeFix(t *testing.T) {
 		fx.seatOne(t, "m", 900, 2*time.Second)
 		m, g := fx.branch(t, "m")
 		fx.s.mu.Lock()
-		m.inflightIDs = map[string]inflightRec{"r-m": {since: fx.clock, confirmed: true}}
+		m.inflightIDs = map[string]inflightRec{"r-m": {since: fx.clock}}
 		m.inflight = 1
 		g.index.MarkExitingLocked("m")
 		g.budgetBlocks = 100
@@ -281,7 +281,7 @@ func TestSharedBlockWithAStayingBranchIsNotExcused(t *testing.T) {
 		g.index.TrySeatLocked("keep", []Chain{{Keys: keep, Tokens: len(keep) * 64}}, 1<<20)
 		g.branches["keep"] = &branch{id: "keep", engine: g.id, waitingSince: fx.clock}
 		g.index.TrySeatLocked("gone", []Chain{{Keys: gone, Tokens: len(gone) * 64}}, 1<<20)
-		g.branches["gone"] = &branch{id: "gone", engine: g.id, inflightIDs: map[string]inflightRec{"r-gone": {since: fx.clock, confirmed: true}}, inflight: 1}
+		g.branches["gone"] = &branch{id: "gone", engine: g.id, inflightIDs: map[string]inflightRec{"r-gone": {since: fx.clock}}, inflight: 1}
 		g.index.MarkExitingLocked("gone")
 		used, stay := g.index.UniqueBlocksLocked(), g.index.StayBlocksLocked()
 		fx.s.mu.Unlock()

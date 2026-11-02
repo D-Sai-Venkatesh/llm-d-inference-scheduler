@@ -250,6 +250,9 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 					ReqID:   fmt.Sprintf("%s-r%02d", g.id, reqSeq[g.id]+1),
 					Arrival: scenarioT0.Add(time.Duration(g.nextTurn) * time.Second),
 					Chains:  g.turnChain(),
+					// the arrival record branch identity publishes: a branch's FIRST turn is a
+					// newcomer, every later one a returner
+					Returner: g.turn > 0,
 				})
 			}
 		}

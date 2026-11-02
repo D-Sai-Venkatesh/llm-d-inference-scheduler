@@ -1036,8 +1036,13 @@ func TestExitingIsCountedAndRotationNeverPicksInflight(t *testing.T) {
 	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
 		var hooked []string
 		fx.s.onExit = func(engine, reason string, turns int) { hooked = append(hooked, reason) }
-		// a branch filling most of the budget, in flight
+		// a branch filling most of the budget, in flight — and a SIBLING on the SAME engine,
+		// also in flight, so the growth cannot be RULE O's sole oversize resident (that one
+		// is deliberately not a pressure victim at all: see TestRuleOWaitsForTenureNotPressure)
 		fx.seatOne(t, "run", 800, 5*time.Second)
+		fx.s.Chunk("run") // its prefill landed: the cold valve is free for the sibling
+		fx.closeEnginesExcept(t, fx.ids[0], 950)
+		fx.seatOne(t, "sib", 100, 4*time.Second)
 		// over budget by growth: the pressure module takes the mid-flight class
 		fx.s.mu.Lock()
 		m := fx.g().branches["run"]

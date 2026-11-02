@@ -26,7 +26,9 @@ package groupsched
 //	       stay  = the union over the branches that are not exiting
 //	       no refcount below zero (the index panics on underflow, so this is the panic)
 //	R4     after every pass: |stay| <= budget, OR no eligible victim was left — always
-//	       one of the two, and it is recorded which
+//	       one of the two, and it is recorded which. (RULE O's exception: an engine whose
+//	       SOLE staying resident is an oversize seat is over budget BY DESIGN, and pressure
+//	       must not touch it — tenure releases it.)
 //	B2     an engine's cold charge never exceeds its derived cap
 //	B10    every seated branch is bound to EXACTLY ONE engine, and the binding names it
 //	I6     nothing is seated on an engine whose capacity is unknown
@@ -71,8 +73,11 @@ type invStream struct {
 }
 
 // newInvStream builds a seeded event stream: arrivals grow a branch's prompt (a turn),
-// and every collision of lifetimes is possible.
-func newInvStream(seed int64, n int) *invStream {
+// and every collision of lifetimes is possible. capacity is the per-engine measured block
+// count, so the stream can also produce an OVERSIZE head (a prompt whose exact cost exceeds
+// the seat budget on every engine) — RULE O's trigger, which has to be exercised randomly,
+// not only by the hand-written cases.
+func newInvStream(seed int64, n, capacity int) *invStream {
 	rng := rand.New(rand.NewSource(seed))
 	s := &invStream{}
 	for i := 0; i < 12; i++ {
@@ -83,7 +88,13 @@ func newInvStream(seed int64, n int) *invStream {
 		b := s.branches[rng.Intn(len(s.branches))]
 		switch rng.Intn(20) {
 		case 0, 1, 2, 3, 4: // an arrival: a new turn, a bigger prompt
-			sizes[b] += 20 + rng.Intn(120)
+			if rng.Intn(6) == 0 {
+				// an OVERSIZE prompt: past the whole seat budget (0.95 of capacity), so it
+				// cannot fit an occupied engine and only RULE O can admit it anywhere
+				sizes[b] = capacity + 50 + rng.Intn(capacity/2+1)
+			} else {
+				sizes[b] += 20 + rng.Intn(120)
+			}
 			s.events = append(s.events, invEvent{kind: evArrive, branch: b, blocks: sizes[b]})
 		case 5, 6, 7, 8, 9, 10, 11, 12: // a decision pass
 			s.events = append(s.events, invEvent{kind: evPick})
@@ -118,7 +129,7 @@ func invRun(t *testing.T, seed int64, engines, capacity int, events int) string 
 		}
 	}
 	clock := time.Unix(1793000000, 0).UTC()
-	stream := newInvStream(seed, events)
+	stream := newInvStream(seed, events, capacity)
 
 	// the fixture's own model of what is queued and what is running
 	queued := map[string]Head{}   // branch -> its pending head
@@ -238,10 +249,11 @@ func checkInvariants(t *testing.T, s *Scheduler, event int, capacity int) {
 		// R4's postcondition: inside the budget, or nothing left to evict
 		if over := s.overBudgetLocked(g); over > 0 {
 			_, victim := s.rotationVictimLocked(g, s.now)
-			if victim != nil {
+			if victim != nil && !s.soleOversizeLocked(g, victim) {
 				t.Fatalf("event %d: %s is %d blocks over its budget with an eligible victim %s (R4)", event, g.id, over, victim.id)
 			}
-			// no victim: the pass is DONE by construction (exiting/in-flight only)
+			// no victim — or the only candidate is RULE O's sole oversize resident, which
+			// pressure must leave alone: the pass is DONE either way
 		}
 		for id := range g.branches {
 			if prev, dup := seats[id]; dup {
@@ -352,9 +364,30 @@ func TestStrictHeadOfLineUnderI2(t *testing.T) {
 				break
 			}
 		}
-		// now a BIG head arrives (bigger than any engine's budget) and a small one behind
-		// it: the big one fits nowhere, so the small one must not be seated either
-		// a prompt three times the seat budget: it can never fit an engine
+		// EVERY RESIDENT GOES IN FLIGHT and nothing settles again: a branch with a request at
+		// a pod is never evictable, and an engine whose residents are all running is not
+		// engine-idle — the one state in which a head that fits nowhere truly has no victim.
+		// (RULE O grants an EMPTY engine one oversize head, so the strict-head-of-line shape
+		// has to be "no seat can be freed", not "the head is bigger than the budget".)
+		for _, id := range residents {
+			w.arrive(id, fx.clock.Add(-time.Second))
+		}
+		for round := 0; round < 200; round++ {
+			hs, ids := w.heads(fx.clock)
+			i := fx.pick(hs...)
+			if i < 0 {
+				break
+			}
+			w.dispatchTurn(ids[i])
+		}
+		for _, id := range residents {
+			if _, flying := w.flying[id]; !flying {
+				t.Fatalf("fixture: %s must be in flight, so nothing is evictable", id)
+			}
+		}
+		// now a BIG head arrives (three times any seat budget, so it fits no engine even
+		// empty) and a small one behind it: no victim exists anywhere, so the head keeps the
+		// queue and the small one must not be seated
 		w.setPromptBytes("big", maxBudget(fx)*3*256)
 		w.arrive("big", fx.clock.Add(-time.Minute))
 		w.arrive("small", fx.clock.Add(-time.Second))

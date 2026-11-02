@@ -36,7 +36,9 @@ package groupsched
 //	            left AFTER the seat, among the engines where it fits, tie → lowest id.
 //	TENURE      RotationPolicy: when a resident may be released. Default the fixed
 //	            quantum Q (one value, default 4; Q8 is the same code with 8).
-//	PRESSURE    VictimChooser: who leaves under MEMORY pressure. Default: the budget valve.
+//	PRESSURE    VictimChooser: who leaves under MEMORY pressure. Default: the budget valve
+//	            (with RULE O's no-thrash clause: an engine's sole, oversize resident is
+//	            never a pressure victim — it leaves by tenure).
 //	SAFETY      SafetyDetector: a seam with ONE wired value, NONE — the seat budget is the
 //	            whole admission control, so a net has nothing to add and no implementation
 //	            ships (a future one brings its own evidence and one config value).
@@ -120,6 +122,13 @@ type PressureCtx struct {
 	RotationVictim func() (string, *branch)
 	// Silent is the same idle test the tenure policy uses.
 	Silent func(m *branch) bool
+	// SoleOversize reports RULE O's no-thrash case: this branch is the engine's ONLY staying
+	// resident AND its own footprint alone exceeds the engine's budget — the seat Rule O
+	// granted on an empty engine. Such a branch is never a pressure victim: evicting it
+	// frees the engine and admits nothing (the head that displaced it already left), so the
+	// pass is DONE. It leaves by TENURE like everyone else (Q busy periods, or S of silence
+	// when a waiter needs the room).
+	SoleOversize func(m *branch) bool
 	// Headless reports whether the branch has no turn wanting to run: no queued head AND no
 	// LIVE released window. A live window counts here (it is a turn on its way, so a branch
 	// that has one is never "done"); a DEAD one does not, which is exactly how a branch
@@ -149,6 +158,26 @@ func (BudgetValve) Victim(branches []*branch, ctx PressureCtx) (string, *branch)
 	if ctx.RotationVictim != nil {
 		if reason, m := ctx.RotationVictim(); m != nil {
 			return reason, m
+		}
+	}
+	// RULE O's NO-THRASH clause, before every pressure class (and after the tenure class:
+	// tenure is still the way such a branch leaves). An oversize seat is over budget by
+	// construction, so without this the pass would mark its own resident on every Pick — the
+	// cascade the two-view accounting exists to prevent, with one branch instead of dozens.
+	if ctx.SoleOversize != nil {
+		var sole *branch
+		stay := 0
+		for _, m := range branches {
+			if ctx.Exiting(m.id) {
+				continue
+			}
+			sole = m
+			if stay++; stay > 1 {
+				break
+			}
+		}
+		if stay == 1 && ctx.SoleOversize(sole) {
+			return "", nil
 		}
 	}
 	var best *branch
@@ -261,6 +290,10 @@ type EngineCandidate struct {
 	CostBlocks int64
 	// FreeBudget is what the engine can still admit (budget − accounted footprint).
 	FreeBudget int64
+	// Budget is the engine's SEAT BUDGET in blocks (fraction × its own num_gpu_blocks):
+	// the number an EMPTY engine could admit, which is what RULE O's trigger is measured
+	// against.
+	Budget int64
 	// BudgetFits reports CostBlocks <= FreeBudget.
 	BudgetFits bool
 	// Fits reports BudgetFits AND that the COLD-ENTRY VALVE allows this head on this
@@ -289,9 +322,20 @@ type EngineChooser interface {
 // resident on A costs almost nothing there, so it lands on A unless B is genuinely
 // emptier — no separate affinity rule, and nothing to tune.
 //
+//   - RULE O (the liveness fix): a head whose EXACT cost exceeds every engine's seat
+//     budget cannot fit even an empty engine, and the 0.95 margin alone used to refuse it
+//     for ever. An EMPTY engine takes it instead (the candidate's Fits already says so —
+//     the scheduler computes it, because the empty-engine case is a fact about the engine,
+//     not a placement preference). With no empty engine, eviction is the way forward on
+//     THIS module's own choice of engine (most free budget, then id), and the order
+//     converges: every eviction raises that engine's free budget, so the same engine stays
+//     the pick until it is empty — never a spread of evictions across the pool.
 //   - If NOTHING fits but some engine fits BY BUDGET (i.e. the cold-entry valve is
 //     holding the head), the answer is "wait": the valve opens by itself when that
-//     engine's cold prefill produces its first token, and no eviction can hurry it.
+//     engine's cold prefill produces its first token, and no eviction can hurry it. (This
+//     guard is what RULE O drops for its own case: there, evicting DOES lead to a seat —
+//     the empty engine — so holding the head back instead would destroy nothing and admit
+//     nothing.)
 //   - Only when nothing fits by BUDGET either is eviction the way forward: the engine
 //     that can free a seat by an eligible rotation, again most free budget first
 //     (evicting on the least-pressured engine gives up the least warm state).
@@ -310,6 +354,22 @@ func (MostFreeBudget) Choose(cands []EngineCandidate) int {
 		}
 	}
 	if best >= 0 {
+		return best
+	}
+	if oversizeEverywhere(cands) {
+		// RULE O, the no-empty-engine half: evict on the engine this module would pick
+		// anyway, and let the next iteration re-ask. Nothing is evicted that the tenure
+		// rule does not already release (HasVictim is the same scan the rotation uses), so
+		// this is the ordinary demand-driven exit — it just is not refused because the head
+		// can never fit a NON-empty budget.
+		for i := range cands {
+			if cands[i].HasVictim == nil || !cands[i].HasVictim() {
+				continue
+			}
+			if best < 0 || betterEngine(cands[i], cands[best]) {
+				best = i
+			}
+		}
 		return best
 	}
 	// The cold valve is holding this head somewhere: WAIT — never evict — because evicting
@@ -341,6 +401,23 @@ func betterFit(c, best EngineCandidate) bool {
 		return c.FreeBudget-c.CostBlocks > best.FreeBudget-best.CostBlocks
 	}
 	return c.Engine < best.Engine
+}
+
+// oversizeEverywhere reports RULE O's trigger: the head's exact cost exceeds the SEAT BUDGET
+// of every candidate engine, so it could not fit one even if that engine were empty. (An
+// engine's free budget equals its budget exactly when it is empty, which is why the empty
+// case is decided per candidate and this predicate only decides "may eviction happen at
+// all".)
+func oversizeEverywhere(cands []EngineCandidate) bool {
+	if len(cands) == 0 {
+		return false
+	}
+	for i := range cands {
+		if cands[i].CostBlocks <= cands[i].Budget {
+			return false
+		}
+	}
+	return true
 }
 
 // betterEngine is the placement total order for the engines that cannot take the head (and

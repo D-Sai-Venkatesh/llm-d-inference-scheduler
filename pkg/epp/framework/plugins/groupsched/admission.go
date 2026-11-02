@@ -128,15 +128,25 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatChoice {
 		tokens := g.index.ColdTokensLocked(head.chains)
 		blocks := int64(g.index.CostLocked(head.chains))
 		free := s.freeBudgetLocked(g)
+		budget := int64(g.budgetBlocks)
 		budgetFits := blocks <= free
+		// RULE O — the EMPTY ENGINE ADMITS ONE. A head whose cost exceeds even the seat
+		// budget cannot fit an occupied engine, and refusing it on an EMPTY one turned the
+		// 0.95 margin into a permanent refusal (the engine's whole cache is available and
+		// vLLM itself refuses to start unless max-model-len fits it, so any admissible
+		// request physically fits). The seat then charges the FULL exact chain and the engine
+		// reads over budget, which is the truth: the branch uses nearly the whole GPU. The
+		// valve is not a problem here — an empty engine holds no cold charge, and a capped
+		// charge always fits the cap.
+		ruleO := len(g.branches) == 0 && blocks > budget
 		gg := g
 		cands = append(cands, EngineCandidate{
 			Engine: gg.id, CostTokens: tokens, CostBlocks: blocks,
-			FreeBudget: free, BudgetFits: budgetFits,
-			// FITS = budget AND cold valve: a head the valve holds must wait for the
-			// valve, never evict for it (the defect this replaces evicted every
-			// eligible branch on the engine and left the seats cold-empty).
-			Fits:      budgetFits && s.coldAllowsTokens(g, tokens),
+			FreeBudget: free, Budget: budget, BudgetFits: budgetFits,
+			// FITS = (budget OR Rule O's empty engine) AND the cold valve: a head the valve
+			// holds must wait for the valve, never evict for it (the defect this replaces
+			// evicted every eligible branch on the engine and left the seats cold-empty).
+			Fits:      (budgetFits || ruleO) && s.coldAllowsTokens(g, tokens),
 			HasVictim: func() bool { return s.hasRotationVictimLocked(gg, now) },
 		})
 		owners = append(owners, gg)
@@ -227,8 +237,12 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 		if cand.fits {
 			// ONE number, one moment: the fit test the chooser just ran and the seat's
 			// own cost are the same computation inside the same critical section, so
-			// TrySeat cannot reject a head the chooser admitted.
-			s.seatLocked(cand.g, head, cand.costTokens, now)
+			// TrySeat can only reject a head the chooser admitted if the two disagree —
+			// and then the loop must STOP, not re-pick the same head until the budget runs
+			// out under the scheduler's mutex.
+			if !s.seatLocked(cand.g, head, cand.costTokens, now) {
+				return
+			}
 			continue
 		}
 		// Nothing fits BY BUDGET on the chosen engine: eviction is the only way a

@@ -1658,6 +1658,8 @@ func (s *Scheduler) pressureCtxLocked(g *engineGroup, now time.Time) PressureCtx
 		Silent:         tctx.Silent,
 		// the classification's view: a released window is a turn on its way
 		Headless: func(m *branch) bool { return m.waitingSince.IsZero() && m.pending == 0 },
+		// RULE O's no-thrash clause, in this engine's own terms
+		SoleOversize: func(m *branch) bool { return s.soleOversizeLocked(g, m) },
 	}
 }
 
@@ -1840,8 +1842,19 @@ func (s *Scheduler) countExitLocked(g *engineGroup, reason string) {
 // coldTokens is the head's exact cold cost on THIS engine (the same number the placement
 // module's fit test used), so the charge and the fit can never disagree.
 func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, coldTokens int64, now time.Time) bool {
-	if ok, _ := g.index.TrySeatLocked(w.id, w.chains, g.budgetBlocks); !ok {
-		return false // unreachable: the chooser tested the same number in the same pass
+	if ok, cost := g.index.TrySeatLocked(w.id, w.chains, g.budgetBlocks); !ok {
+		// RULE O — AN EMPTY ENGINE ADMITS ONE OVERSIZE HEAD, charging its FULL exact chain.
+		// The index stays exact (no capping trick): the engine reads over budget because it
+		// IS — the branch occupies nearly the whole cache, and the accounting says so.
+		// Enforcement will not touch it (the no-thrash clause in the pressure module) and
+		// nothing else seats on that engine while its free budget is negative.
+		if len(g.branches) != 0 || cost <= g.budgetBlocks {
+			// Not Rule O: the chooser and this seat read the same numbers in the same
+			// critical section, so this means they disagreed. Refuse — the admission loop
+			// stops instead of re-picking the same head (a bounded spin under s.mu).
+			return false
+		}
+		g.index.SeatForceLocked(w.id, w.chains)
 	}
 	s.bindings[w.id] = g.id
 	if s.onBind != nil {
@@ -1944,6 +1957,27 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 		}
 		s.exitLocked(g, victim, reason, now)
 	}
+}
+
+// soleOversizeLocked reports RULE O's no-thrash case for ONE candidate: it is the engine's
+// ONLY staying resident, and its own charged footprint alone exceeds the engine's budget. That
+// is exactly the seat Rule O grants on an empty engine, so pressure must leave it alone —
+// evicting it frees the engine and admits nothing (the head it was admitted for is gone), and
+// without the rule the pass would mark its own resident on every Pick.
+func (s *Scheduler) soleOversizeLocked(g *engineGroup, m *branch) bool {
+	if g == nil || m == nil || g.budgetBlocks <= 0 {
+		return false
+	}
+	stay := 0
+	for id := range g.branches {
+		if g.index.ExitingLocked(id) {
+			continue
+		}
+		if stay++; stay > 1 {
+			return false
+		}
+	}
+	return stay == 1 && g.index.ChargedBlocksLocked(m.id) > g.budgetBlocks
 }
 
 // overBudgetLocked is enforcement's view of the overage, in blocks: the STAY side (the

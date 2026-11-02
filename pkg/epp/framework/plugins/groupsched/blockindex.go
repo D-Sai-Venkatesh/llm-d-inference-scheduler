@@ -408,6 +408,16 @@ func (b *BlockIndex) HasNELocked(h Hash) bool {
 	return ok
 }
 
+// ChargedBlocksLocked is the number of DISTINCT blocks this seat holds on the engine: the
+// footprint a single branch costs the budget. RULE O's no-thrash rule asks whether one
+// branch's own footprint exceeds the engine's budget, and that is this number.
+func (b *BlockIndex) ChargedBlocksLocked(id string) int {
+	if s, ok := b.seats[id]; ok {
+		return len(s.charged)
+	}
+	return 0
+}
+
 // ChainsLocked is a seated branch's chains: what a rebind carries to the engine that is
 // observed to be serving it.
 func (b *BlockIndex) ChainsLocked(id string) []Chain {

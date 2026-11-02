@@ -19,6 +19,7 @@ package groupsched
 import (
 	"fmt"
 	"math/rand"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -101,7 +102,7 @@ func TestChainedHashPositionSensitive(t *testing.T) {
 	tailX := []byte(strings.Repeat("X", 256))
 	h1 := idx.HashBody(append(append([]byte{}, sysA...), tailX...))
 	h2 := idx.HashBody(append(append([]byte{}, sysB...), tailX...))
-	if sameHashes(h1[2:], h2[2:]) {
+	if slices.Equal(h1[2:], h2[2:]) {
 		t.Fatal("identical content after divergent prefixes must hash differently (chaining)")
 	}
 }

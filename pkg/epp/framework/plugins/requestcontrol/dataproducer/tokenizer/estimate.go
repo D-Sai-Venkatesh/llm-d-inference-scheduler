@@ -208,14 +208,14 @@ func (b estimateBackend) produce(ctx context.Context, body *fwkrh.InferenceReque
 	// Chat and Anthropic messages fold multimodal placeholders into the stream
 	// and report them as features.
 	if body.ChatCompletions != nil {
-		raw, features := b.chatCompletionsBytes(body.ChatCompletions, mmMetadataFromContext(ctx), canonicalMode)
+		raw, features := b.chatCompletionsBytes(body.ChatCompletions, mmMetadataFromContext(ctx))
 		return &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{
 			TokenIDs:           packBytes(raw),
 			MultiModalFeatures: features,
 		}}}, nil
 	}
 	if body.Messages != nil {
-		raw, features := b.messagesBytes(body.Messages, canonicalMode)
+		raw, features := b.messagesBytes(body.Messages)
 		tokens := packBytes(raw)
 		log.FromContext(ctx).V(logutil.DEBUG).Info("Anthropic messages prefix-cache estimation",
 			"messageCount", len(body.Messages.Messages),
@@ -230,7 +230,7 @@ func (b estimateBackend) produce(ctx context.Context, body *fwkrh.InferenceReque
 		}}}, nil
 	}
 	if body.Responses != nil {
-		raw, features := b.responsesBytes(body.Responses, canonicalMode)
+		raw, features := b.responsesBytes(body.Responses)
 		return &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{
 			TokenIDs:           packBytes(raw),
 			MultiModalFeatures: features,
@@ -261,13 +261,6 @@ func estimateMultiStringCompletions(req *fwkrh.CompletionsRequest) (*fwkrh.Token
 // stream. Coverage matches the protocols the approximate prefix-cache scorer
 // handles. The chat path is handled separately to emit multimodal features.
 func estimateBytes(body *fwkrh.InferenceRequestBody) ([]byte, error) {
-	return estimateBytesMode(body, canonicalMode)
-}
-
-// estimateBytesMode is estimateBytes under a flatten mode: the identity mode
-// drops the tool DEFINITIONS from a /v1/responses body for the same reason the
-// chat path does (a tool-set change must not break the prefix).
-func estimateBytesMode(body *fwkrh.InferenceRequestBody, mode flattenMode) ([]byte, error) {
 	switch {
 	case body.Conversations != nil:
 		return json.Marshal(body.Conversations.Items)
@@ -314,16 +307,16 @@ func audioGenerateText(r *fwkrh.AudioGenerateRequest) string {
 // multimodal assets in on aligned boundaries. Each asset occupies N placeholder
 // pseudo-tokens (its content hash repeated N times) so it carries weight in the
 // stream, and is reported as a MultiModalFeature with its token offset and span.
-func (b estimateBackend) chatCompletionsBytes(chat *fwkrh.ChatCompletionsRequest, meta mmMetadata, mode flattenMode) ([]byte, []fwkrh.MultiModalFeature) {
+func (b estimateBackend) chatCompletionsBytes(chat *fwkrh.ChatCompletionsRequest, meta mmMetadata) ([]byte, []fwkrh.MultiModalFeature) {
 	var out []byte
 	var features []fwkrh.MultiModalFeature
-	if mode.tools && len(chat.Tools) > 0 {
+	if len(chat.Tools) > 0 {
 		if raw, err := json.Marshal(chat.Tools); err == nil {
 			out = append(out, raw...)
 		}
 	}
 	for _, msg := range chat.Messages {
-		out, features = b.appendChatMessage(out, features, msg, meta, mode)
+		out, features = b.appendChatMessage(out, features, msg, meta)
 	}
 	return out, features
 }
@@ -341,11 +334,7 @@ func (b estimateBackend) chatCompletionsBytes(chat *fwkrh.ChatCompletionsRequest
 // a conversation prefix key (branch identity), so the function name and its
 // arguments are folded in here. Bodies without tool calls are byte-identical to
 // before.
-//
-// `mode` selects the two identity properties described on flattenMode; the
-// canonical (sizing) mode leaves every body byte-identical to its pre-mode
-// rendering.
-func (b estimateBackend) appendChatMessage(out []byte, features []fwkrh.MultiModalFeature, msg fwkrh.Message, meta mmMetadata, mode flattenMode) ([]byte, []fwkrh.MultiModalFeature) {
+func (b estimateBackend) appendChatMessage(out []byte, features []fwkrh.MultiModalFeature, msg fwkrh.Message, meta mmMetadata) ([]byte, []fwkrh.MultiModalFeature) {
 	if msg.Role != "" {
 		out = append(out, []byte(msg.Role)...)
 	}
@@ -403,10 +392,10 @@ func appendChatToolCalls(out []byte, toolCalls []any) []byte {
 
 // messagesBytes flattens an Anthropic /v1/messages request into pseudo-token
 // bytes.
-func (b estimateBackend) messagesBytes(req *fwkrh.MessagesRequest, mode flattenMode) ([]byte, []fwkrh.MultiModalFeature) {
+func (b estimateBackend) messagesBytes(req *fwkrh.MessagesRequest) ([]byte, []fwkrh.MultiModalFeature) {
 	var out []byte
 	var features []fwkrh.MultiModalFeature
-	if mode.tools && len(req.Tools) > 0 {
+	if len(req.Tools) > 0 {
 		if raw, err := json.Marshal(req.Tools); err == nil {
 			out = append(out, raw...)
 		}
@@ -431,9 +420,7 @@ func (b estimateBackend) messagesBytes(req *fwkrh.MessagesRequest, mode flattenM
 					out, features = appendMMAsset(out, features, reqcommon.ModalityImage, content, count)
 				}
 			case blockTypeThinking:
-				if mode.thinking {
-					out = append(out, []byte(block.Thinking)...)
-				}
+				out = append(out, []byte(block.Thinking)...)
 			case blockTypeToolUse:
 				out = append(out, []byte(block.ID)...)
 				out = append(out, []byte(block.Name)...)
@@ -456,10 +443,10 @@ func (b estimateBackend) messagesBytes(req *fwkrh.MessagesRequest, mode flattenM
 // string Instructions contribute their bytes ahead of Input, matching
 // messagesBytes. Input is a string or an array of items (see
 // appendResponsesItem for per-item coverage).
-func (b estimateBackend) responsesBytes(r *fwkrh.ResponsesRequest, mode flattenMode) ([]byte, []fwkrh.MultiModalFeature) {
+func (b estimateBackend) responsesBytes(r *fwkrh.ResponsesRequest) ([]byte, []fwkrh.MultiModalFeature) {
 	var out []byte
 	var features []fwkrh.MultiModalFeature
-	if mode.tools && r.Tools != nil {
+	if r.Tools != nil {
 		if raw, err := json.Marshal(r.Tools); err == nil {
 			out = append(out, raw...)
 		}
@@ -467,18 +454,18 @@ func (b estimateBackend) responsesBytes(r *fwkrh.ResponsesRequest, mode flattenM
 	if sys, ok := r.Instructions.(string); ok && sys != "" {
 		out = append(out, []byte(sys)...)
 	}
-	return b.appendResponsesInput(out, features, r.Input, mode)
+	return b.appendResponsesInput(out, features, r.Input)
 }
 
 // appendResponsesInput flattens the Responses Input field: a plain string, or
 // an array of items.
-func (b estimateBackend) appendResponsesInput(out []byte, features []fwkrh.MultiModalFeature, input any, mode flattenMode) ([]byte, []fwkrh.MultiModalFeature) {
+func (b estimateBackend) appendResponsesInput(out []byte, features []fwkrh.MultiModalFeature, input any) ([]byte, []fwkrh.MultiModalFeature) {
 	switch v := input.(type) {
 	case string:
 		out = append(out, []byte(v)...)
 	case []any:
 		for _, item := range v {
-			out, features = b.appendResponsesItem(out, features, item, mode)
+			out, features = b.appendResponsesItem(out, features, item)
 		}
 	}
 	return out, features
@@ -494,7 +481,7 @@ func (b estimateBackend) appendResponsesInput(out []byte, features []fwkrh.Multi
 // and prefix-hash scoring, all of which read this backend's token count. An
 // item of any other type contributes nothing, since this code does not know
 // its shape.
-func (b estimateBackend) appendResponsesItem(out []byte, features []fwkrh.MultiModalFeature, item any, mode flattenMode) ([]byte, []fwkrh.MultiModalFeature) {
+func (b estimateBackend) appendResponsesItem(out []byte, features []fwkrh.MultiModalFeature, item any) ([]byte, []fwkrh.MultiModalFeature) {
 	m, ok := item.(map[string]any)
 	if !ok {
 		return out, features

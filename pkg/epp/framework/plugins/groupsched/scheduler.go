@@ -306,11 +306,6 @@ type member struct {
 	// releases at exit. Without it a newcomer seats at index-cost 0 and the budget
 	// understates until the exact keys land.
 	pendingBlocks int64
-	// awaitingEngine marks a pendingBlocks charge made at SEAT time on the engine
-	// the seat chose. PreRequest's pickedEndpoint is AUTHORITATIVE and MOVES the
-	// charge when it disagrees (reconcileEngineLocked) — the estimate error is
-	// bounded to admissions in flight between Pick and PreRequest.
-	awaitingEngine bool
 	// waitingSince is the member's oldest queued head (B5: kept oldest).
 	waitingSince time.Time
 	// exitingSince is when this member was marked exiting (the mid-flight class): the
@@ -1166,7 +1161,6 @@ func (s *Scheduler) DispatchedOnUsage(id, reqID, engine string, keys []Hash, siz
 	if m, ok := g.members[id]; ok {
 		m.lastActivity = now
 		m.lastSizeBytes = sizeBytes
-		m.awaitingEngine = false
 		// C3/M1/R1: reconcile the in-flight id. A non-empty reqID confirms-or-adds.
 		// An EMPTY reqID must not mint a second id (Pick already recorded a
 		// provisional one — two records for one request leak past the reap): confirm
@@ -1678,7 +1672,6 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 	// the budget counts the admission estimate (blocks) until the exact keys land
 	// at PreRequest
 	m.pendingBlocks = w.coldTokens / int64(s.blockSize)
-	m.awaitingEngine = true
 	g.pendingTotal += m.pendingBlocks
 	// C7: record ALL seat waits (newcomers AND re-entries — the last campaign's
 	// re-entry waits were invisible); the onEntry hook keeps its newcomer semantics.

@@ -635,18 +635,6 @@ func sameCounts(a, c map[Hash]int) bool {
 	return true
 }
 
-func sameHashes(a, b []Hash) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 // ---- the scheduler-facing core: Locked variants and waiting-order queries ----
 // The scheduler holds its own lock and calls these; the public API above
 // wraps the same logic for standalone use and tests.

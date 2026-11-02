@@ -1121,3 +1121,42 @@ func TestPassThroughServesTheOldest(t *testing.T) {
 func (s *Scheduler) SetNumBlocks(blockSizeTokens, numBlocks int) error {
 	return s.SetNumBlocksFor("", blockSizeTokens, numBlocks)
 }
+
+// THE ENGINE-IDLE RULE NEVER FIRES WHILE A BRANCH IS DISPATCHABLE (the must-keep lesson M19/
+// F7 had no regression test). The rule exists to free a seat when the seats are held by
+// branches that cannot use them; a resident with a queued turn that this very pass will
+// dispatch CAN use its seat, so taking it away is the seat-swapping livelock the guard
+// prevents — an eviction followed by the same branch's re-admission, on every pass.
+//
+// The witness is the pass itself: the blocked waiter and the dispatchable resident arrive
+// together, nothing is evicted, and the resident's turn is what goes out.
+func TestEngineIdleNeverFiresWhileABranchIsDispatchable(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		var exits []string
+		fx.s.onExit = func(engine, reason string, _ int) { exits = append(exits, reason) }
+
+		fx.seatOne(t, "res", 800, 5*time.Second)
+		settle(fx.s, "res", 800, 800) // nothing in flight, nothing silent: only its HEAD says it is alive
+		// N=2: the blocked waiter must not escape to a sibling engine
+		fx.closeEnginesExcept(t, fx.ids[0], 950)
+
+		dispatchable := head("res", time.Second, 800)     // its own next turn, queued NOW
+		blocked := head("new", 500*time.Millisecond, 300) // 300 blocks against 150 free
+		engine, i := fx.pickEngine(dispatchable, blocked)
+		if i < 0 {
+			t.Fatal("the resident's queued turn must dispatch")
+		}
+		if got := fx.s.bindings["res"]; got != engine {
+			t.Fatalf("the served engine is %s, want the resident's %s", got, engine)
+		}
+		if len(exits) != 0 {
+			t.Fatalf("a dispatchable branch was evicted (%v): the engine-idle rule fired while a resident could use its seat", exits)
+		}
+		if !fx.s.Seated("res") {
+			t.Fatal("the dispatchable resident must keep its seat")
+		}
+		if fx.s.Seated("new") {
+			t.Fatal("the blocked waiter cannot fit: it must not be seated by an eviction it should not have caused")
+		}
+	})
+}

@@ -27,7 +27,7 @@ package groupsched
 //     no placement opinion.
 //
 //  2. THE HEAD IS THE HEAD. Entry order is newcomer-first, then oldest arrival,
-//     then id (f0p's order). The pool hands out ONE head per step, and the head
+//     then id. The pool hands out ONE head per step, and the head
 //     is never skipped: if no engine can take it, it keeps its place. (A head that
 //     could jump the queue to a roomier engine would be served before older
 //     demand — the queue would stop being a queue.)
@@ -81,20 +81,14 @@ func (s *Scheduler) freeBudgetLocked(g *engineGroup) int64 {
 	return int64(g.budgetBlocks) - int64(g.index.UniqueBlocksLocked())
 }
 
-// coldAllowsTokens is coldAllows against an EXPLICIT per-engine cost (the placement
-// candidate's own estimate), so the fit test and the valve agree on the number.
+// coldAllowsTokens asks whether this head's cold prefill fits the engine's stagger, for the
+// exact cost it brings.
 //
-// THE CAP IS AN INVARIANT, not a threshold: the charge a seat will register is
-// min(cost, cap) (seatLocked), so the test is exactly "after this entry, is the
-// engine's outstanding cold charge inside its headroom?". Two consequences fall out
-// of that single rule:
-//
-//   - an EMPTY valve always admits one entry whatever its size (R11's liveness: a
-//     branch bigger than the headroom still gets seated), because its capped charge
-//     is the headroom itself;
-//   - the charge can never exceed the cap, which it did in 20-30 % of the wave's
-//     samples when "one cold entry is always allowed" was an EXCEPTION to the cap
-//     instead of a consequence of it (measured 1.44-1.53x, preempt-rootcause §7.1).
+// The cap is an INVARIANT, not a threshold. A seat charges min(cost, cap), so the test is
+// exactly "after this entry, is the engine's outstanding cold charge inside its headroom?" —
+// and two properties fall out of that single rule: an EMPTY valve always admits one entry
+// whatever its size (its capped charge IS the headroom), and the outstanding charge can
+// never exceed the cap.
 func (s *Scheduler) coldAllowsTokens(g *engineGroup, tokens int64) bool {
 	cap := g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize)
 	if cap <= 0 {
@@ -211,9 +205,9 @@ func (s *Scheduler) hasRotationVictimLocked(g *engineGroup, now time.Time) bool 
 // frees the valve. That premise is false for exactly one member: the branch HOLDING the
 // cold charge. Evicting it releases the charge, which opens the valve — and it is only ever
 // done on demand, by the head that is waiting, for ONE holder, and only one the TENURE rule
-// already releases (nothing in flight, and Q complete or silent past S). BUG1 — the defect
-// that evicted every eligible member and left the seats cold-empty — cannot come back: this
-// evicts exactly the holder, never "every eligible member".
+// already releases (nothing in flight, and Q complete or silent past S). It evicts exactly
+// the holder, never "every eligible member" — the eviction storm that leaves seats cold-empty
+// (the eviction-storm class) cannot come back.
 //
 // The silence bound is what protects a LIVE window: a release a few milliseconds old
 // belongs to a branch whose S has not elapsed, so its charge stays.

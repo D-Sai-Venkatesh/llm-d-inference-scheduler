@@ -38,7 +38,7 @@ package groupsched
 //	            budget among the engines where it fits, tie → lowest engine id.
 //	TENURE      RotationPolicy: when a resident may be released. Default the fixed
 //	            quantum Q (one value, default 4; Q8 is the same code with 8).
-//	PRESSURE    VictimChooser: who leaves under MEMORY pressure. Default f0p's
+//	PRESSURE    VictimChooser: who leaves under MEMORY pressure. Default: the valve's
 //	            budget valve.
 //	SAFETY      SafetyDetector: the per-engine net. DEFAULT = NONE: the seat budget
 //	            is the whole admission control (the human's model). The memory-only
@@ -69,14 +69,14 @@ type TenureCtx struct {
 	// reproducible).
 	Now time.Time
 	// IdleSeconds is S, the silence bound: a branch silent that long (and with no
-	// queued head — the C8 fix) is not going to use its seat.
+	// queued head) is not going to use its seat.
 	IdleSeconds float64
 }
 
 // Headless reports that this branch has no queued head. Decisions run INSIDE Pick, where
 // `waitingSince` was just synced from the live queue, so the absence is a fact of this
-// pass rather than a guess about an old snapshot (the C8 race is gone with the decision
-// that wandered out of Pick).
+// pass rather than a guess about an old snapshot: every decision runs inside Pick, on the
+// queue view that pass just synced.
 func (c TenureCtx) Headless(m *branch) bool { return m.waitingSince.IsZero() }
 
 // Silent reports the idle test for a branch: no queued head and no activity for S.
@@ -139,7 +139,7 @@ type VictimChooser interface {
 	Victim(branches []*branch, ctx PressureCtx) (string, *branch)
 }
 
-// BudgetValve is f0p's memory-pressure order, unchanged:
+// BudgetValve is the memory-pressure order:
 //
 //	(1) a rotation victim (the tenure rule already releases this branch);
 //	(2) DONE or SILENT — no queued turn, or silent past S;
@@ -173,7 +173,7 @@ func (BudgetValve) Victim(branches []*branch, ctx PressureCtx) (string, *branch)
 	// class (3): mid-quantum. THE ORDER MATTERS: a branch that has not served a turn
 	// in this residency, or that has a queued head right now, is the LAST choice —
 	// taking its seat back before its first turn makes it wait another admission cycle
-	// (measured on f0p's class-3 victims: 100 % had a queued head and 53/54 had served
+	// (measured: 100 % of the old class-3 victims had a queued head, 53/54 had served
 	// ZERO turns in the residency). Only then "oldest last completion", then id.
 	for _, m := range branches {
 		if ctx.Exiting(m.id) || m.inflight > 0 {
@@ -268,13 +268,9 @@ type EngineCandidate struct {
 	// BudgetFits reports CostBlocks <= FreeBudget.
 	BudgetFits bool
 	// Fits reports BudgetFits AND that the COLD-ENTRY VALVE allows this head on this
-	// engine. Both halves matter, and keeping them apart is the fix for a real defect
-	// (inherited from f0p): a head that fits by budget but is held by the valve must
-	// WAIT, because evicting branches frees budget and never frees the valve — the old
-	// loop therefore evicted every eligible branch on the engine and left the seats
-	// empty until the cold prefill finished (measured on f0p's final-epp.prom:
-	// 913,162 valve-blocked passes, and every one that found a victim evicted for
-	// nothing).
+	// engine. Both halves are kept apart on purpose: a head that fits by budget but is held
+	// by the valve must WAIT, because evicting frees budget and never frees the valve — a
+	// loop that evicted for such a head emptied the seats and hurried nothing.
 	Fits bool
 	// HasVictim is LAZY (it costs a scan): may the engine evict an eligible
 	// incumbent right now?

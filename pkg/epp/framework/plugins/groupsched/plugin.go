@@ -14,18 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package groupsched implements the group scheduler (ALGORITHM-group.md).
-// See scheduler.go's header for the algorithm summary.
+// Package groupsched implements the group scheduler: one shared queue of branches, a seat
+// budget per engine, and the rules in SCHEDULER-REDESIGN.md.
 //
-// Hook wiring (the director's order, S0-1's reality): a request blocks in
-// flow control at admission → the fairness Pick (HERE) sees it as a
-// queue head → the chosen queue is released → the data producers run
-// (the tokenizer sets TokenizedRequest) → PreRequest (HERE) corrects the
-// estimate with the exact tier-A keys → the engine → ResponseBody
-// (HERE) settles. The waiting set therefore comes from the queues at
-// Pick time; queued-request admission cost = persisted history blocks +
-// a conservative wire-size delta; the exact keys land at PreRequest and
-// D13's growth enforcement absorbs the estimate error.
+// Hook wiring: a request blocks in flow control at admission → the fairness Pick (here)
+// sees it as a queue head, with its tokens already rendered by branch identity at arrival →
+// the chosen queue is released → PreRequest (here) records the in-flight request and
+// reconciles the engine the framework actually picked → the engine → ResponseBody (here)
+// settles. So the waiting set and every cost come from the queues at Pick time, and nothing
+// is estimated.
 package groupsched
 
 import (
@@ -233,16 +230,11 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 				return nil, fmt.Errorf("failed to register metrics of the '%s' plugin: %w", PluginType, err)
 			}
 		}
-		// the per-id SEAT/EXIT event log (one debug line each; the
-		// campaign's spans could not see seat membership).
-		//
-		// The engine label is appended to the DETAIL, never inserted before
-		// it: the pre-multi-pod reducer regex
-		// (`t=<ts> kind=<KIND> id=<id> <detail>`) and the detail keys
-		// (kind=/wait=/reason=) keep matching unchanged, so a wave-1 parser
-		// reads a multi-pod log without modification.
-		// The per-id SEAT/EXIT stream: V(DEBUG), i.e. OFF by default — one line per
-		// seat and per exit is measurement detail, not startup state.
+		// the per-id SEAT/EXIT event stream, at V(DEBUG): off by default, because one
+		// line per seat and per exit is measurement detail, not startup state. The detail
+		// carries what a run's forensics need without the event ring — branch id, wire id,
+		// engine, reason, waiting-since, turns served — and the engine is also its own
+		// field, never spliced into the detail.
 		r.sched.onEvent = func(ev Event) {
 			if !r.logger.V(logutil.DEBUG).Enabled() {
 				return
@@ -275,45 +267,19 @@ func (r *GroupScheduler) runTicker(ctx context.Context) {
 
 func (r *GroupScheduler) TypedName() fwkplugin.TypedName { return r.typedName }
 
-// Consumes declares the attribute keys the policy READS. Only the agent-identity
-// key is declared here; the BRANCH keys are read the same way but are NOT
-// declared, and that is deliberate (WAVE-1 build fix, 2026-10-30):
+// Consumes declares the attribute keys the policy READS. The BRANCH keys it reads are
+// deliberately NOT declared, because the data layer's DAG validator rejects a dependency
+// whose PRODUCER sits in a later layer than its consumer: this policy is a FairnessPolicy
+// (flow-control layer, 0) and branch identity implements PreRequest (request-control layer,
+// 1), so declaring its key makes the EPP refuse to start with an invalid plugin execution
+// order. Nothing is lost — branch identity's RequestHeader hook runs before admission, so
+// the values are present on every request — and the layer model is the thing to fix
+// upstream (a draft note for the human; never opened by an agent). The agent-identity key
+// stays declared because its plugin implements only RequestHeader and is a harmless
+// declaration.
 //
-//	the data layer's DAG validator rejects a dependency whose PRODUCER sits in a
-//	later layer than its CONSUMER, with the layer of a plugin derived from the
-//	interfaces it implements (FlowControlLayer=0 < RequestControlLayer=1). The
-//	group scheduler is a FairnessPolicy (layer 0); branch-identity implements
-//	PreRequest (it clears the busy flag at dispatch) and is therefore layer 1, so
-//	declaring branchidentity.BranchIdentityKey here made the EPP refuse to start:
-//	"invalid plugin layer execution order: producer branch-identity/branch-identity
-//	needs to be executed before consumer group/group-scheduler" (measured live,
-//	wave-1 build 5e851b18, 2026-10-30T03:54Z, the three branch arms only; the
-//	group-scheduler unit tests construct the policy directly and never build the
-//	plugin DAG, which is why 75 green tests missed it).
-//
-//	Nothing is lost by omitting them: the attributes are produced by
-//	branch-identity's RequestHeader hook, which the request path always runs
-//	before admission and therefore before this policy; stage 1 ran exactly this
-//	way (its Consumes listed the agent-identity key only) and the values were
-//	present on every request. agentidentity.AgentIdentityKey stays because its
-//	plugin implements only RequestHeader (layer -1) and the declaration is
-//	harmless. The real fix belongs upstream in the layer model (flow control listed
-//	before request control while the code comments assume the opposite order) —
-//	filed as a draft note for the human, never opened by an agent.
-//
-// Both identity keys are OPTIONAL at the data layer because which one is the branch
-// depends on Config.MemberKey (and on which identity plugin the arm deployed); the
-// fail-closed check is validateMemberProducer at startup, which requires the
-// producer of the configured branch source to EXIST. Making the keys required
-// unconditionally would have made base mode (no session header, branch
-// identity only) a startup failure.
-//
-// The tokenizer's output is enforced at RUNTIME instead: the data layer
-// forbids a FairnessPolicy (flow control layer) from declaring a
-// DataProducer's key in Consumes (the layer order is request-control before
-// flow-control), so the fail-closed gate is PreRequest's error on a missing
-// TokenizedRequest — without the token-producer EVERY request fails loudly at
-// dispatch; nothing ever falls back to tier B (CP2's M3 verdict).
+// The key is optional at the data layer; validateMemberProducer is the fail-closed startup
+// check instead (the identity plugin must EXIST in the same config).
 func (r *GroupScheduler) Consumes() fwkplugin.DataDependencies {
 	return fwkplugin.DataDependencies{
 		Optional: map[fwkplugin.DataKey]any{
@@ -452,11 +418,10 @@ func (r *GroupScheduler) validateTokenProducer() error {
 		PluginType)
 }
 
-// validateMemberProducer is the fail-closed MEMBER-SOURCE gate: the configured
-// branchKey needs its identity plugin in the same config. Without it every
-// request is anonymous and Pick degrades to R9 FCFS pass-through — the worst
-// arm of the campaign, and a failure that is silent in the outcome metrics
-// (Amendment 4 measured it twice), so it must fail at startup.
+// validateMemberProducer is the fail-closed branch-source gate: the identity plugin that
+// produces the branch attribute must be in the same config. Without it every request is
+// anonymous and Pick degrades to FCFS pass-through — a failure that looks healthy in every
+// outcome metric, so it fails at startup instead.
 func (r *GroupScheduler) validateMemberProducer() error {
 	if r.handle == nil {
 		return nil // unit/test mode
@@ -546,7 +511,13 @@ func (r *GroupScheduler) learnCapacity(engine string, m *fwkdl.Metrics, via stri
 		return nil
 	}
 	if err := r.sched.SetNumBlocksFor(engine, m.CacheBlockSize, m.CacheNumBlocks); err != nil {
-		return err // the loud mismatch failure
+		// EVERY mismatched engine is named, not just the one that failed first: a single
+		// engine's misconfigured block size must not hide behind another's.
+		for bad, berr := range r.sched.BlockSizeMismatches() {
+			r.logger.V(logutil.DEFAULT).Info("group-scheduler: BLOCK SIZE MISMATCH — this engine's measured block size disagrees with the configured one, so its budget would be in the wrong unit; fix --block-size or blockSizeTokens",
+				"engine", bad, "err", berr.Error())
+		}
+		return err
 	}
 	if !r.sched.HasCapacityFor(engine) {
 		return nil
@@ -790,7 +761,7 @@ func (r *GroupScheduler) readSamples(candidates []fwkdl.Endpoint, now time.Time)
 }
 
 // Pick is the dispatch decision (§5). The waiting set is the queue-head
-// snapshot (S0-1); pre-capacity it degrades to FCFS pass-through (A5).
+// snapshot; pre-capacity it degrades to FCFS pass-through.
 func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccessor) (fwkfc.FlowQueueAccessor, error) {
 	if band == nil {
 		return nil, nil //nolint:nilnil
@@ -849,12 +820,14 @@ func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccess
 // NewState satisfies the FairnessPolicy contract.
 func (r *GroupScheduler) NewState(_ context.Context) any { return nil }
 
-// Produce is the DataProducer half of the RELEASE path, and it produces nothing. Being in
-// the director's producer list is what makes this plugin a recipient of RequestAbandoned —
-// the one event that covers a request the flow controller released but that never reached
-// PreRequest (the pinned engine vanished, a screener or an admitter refused it, scheduling
-// failed). It is a no-op by construction: the scheduler reads the request, it produces no
-// data for anyone.
+// Produce implements DataProducer ONLY to receive RequestAbandoned (see the upstream draft
+// note: the framework has the right event, but exposes it to data producers only). It
+// produces nothing — the scheduler reads the request, it publishes no data for anyone.
+//
+// RequestAbandoned is what covers a request the flow controller released but that never
+// reached PreRequest (the pinned engine vanished, a screener or an admitter refused it,
+// scheduling failed): without it such a request would leave its branch's released window
+// open forever.
 func (r *GroupScheduler) Produce(context.Context, *fwksched.InferenceRequest, []fwksched.Endpoint) error {
 	return nil
 }

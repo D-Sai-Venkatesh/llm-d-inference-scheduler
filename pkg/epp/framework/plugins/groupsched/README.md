@@ -19,7 +19,8 @@ Six questions, one module each, one config value selecting the implementation:
 | placement | `EngineChooser` | `MostFreeBudget` ("most-free-budget") | which engine takes the head |
 | tenure | `RotationPolicy` | `FixedQuantum` ("quantum") | when may a resident be released |
 | pressure | `VictimChooser` | `BudgetValve` ("valve") | who leaves when an engine is over budget |
-| safety | `SafetyDetector` | `NoopSafety` ("none") | is the engine's net firing (off by default) |
+| safety | `SafetyDetector` | `NoopSafety` ("none") | is the engine's net firing (always no: the seat budget is the control) |
+| dispatch | `DispatchGate` | `NoopDispatchGate` ("none") | may this seated turn RUN now (the seam is empty: no gate is wired) |
 
 The policy in one paragraph: a member is **seated** on exactly one engine, and its seat
 is its footprint on that engine's block index (dedup against what the engine already

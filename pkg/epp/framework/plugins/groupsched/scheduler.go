@@ -132,10 +132,10 @@ type Config struct {
 	//	Safety       "none"            no net (the seat budget IS the control) |
 	//	             "budget-fraction" memory-only net at the budget's own fraction
 	//	ExecutionBudget
-	//	             "none"            no dispatch gate (an admitted turn runs) |
-	//	             "execution-budget" the engine's RUNNING set may not grow past the same
-	//	                               fraction of num_gpu_blocks: the CPU tier widens
-	//	                               RESIDENCY (seating), never EXECUTION
+	//	             "none"            no dispatch gate (an admitted turn runs) — the ONE
+	//	                               value: the seam stays (modules.go DispatchGate) but
+	//	                               its parked execution-budget implementation, and the
+	//	                               running-set accounting it priced, are gone
 	Sizing          string `json:"sizing"`
 	EntryOrder      string `json:"entryOrder"`
 	EngineChoice    string `json:"engineChoice"`
@@ -218,9 +218,6 @@ func (c Config) effective() Config {
 	if c.Safety == "" {
 		c.Safety = def.Safety
 	}
-	if c.ExecutionBudget == "" {
-		c.ExecutionBudget = def.ExecutionBudget
-	}
 	return c
 }
 
@@ -292,13 +289,6 @@ type Head struct {
 	ReqID     string
 	Arrival   time.Time
 	SizeBytes int64
-	// MaxTokens is the client-requested output cap (max_tokens / max_completion_tokens /
-	// max_output_tokens, as the parser normalises it); 0 when the client set none. It is
-	// the DISPATCH gate's growth term: the turn will allocate ceil(MaxTokens/blockSize)
-	// blocks of KV while it decodes, and under the campaign harness's ignore_eos that
-	// count is EXACT (every output grows to its cap). 0 means "no cap known", and such a
-	// turn reserves no growth.
-	MaxTokens int64
 	// Source names the attribute the member id came from ("branch" |
 	// "session" | ""). Counted per dispatch (the run is auditable from the
 	// artifacts without re-deriving it from the config).
@@ -387,11 +377,6 @@ type member struct {
 	predResident float64
 	predBlocks   int64
 	predSet      bool
-	// gateHeldSince is when the DISPATCH gate first denied this member's queued turn
-	// (zero = not held). It is the measurement the two-budget interaction needs: how long
-	// a turn waited at the EPP because of the execution budget, booked at the moment the
-	// turn finally dispatches (and cleared when its head leaves the queue).
-	gateHeldSince time.Time
 }
 
 // inflightRec is one in-flight request's reconciliation record (C3).
@@ -404,25 +389,6 @@ type inflightRec struct {
 	// storing them) and settle otherwise carries no hash list — re-deriving the set
 	// from the index at settle would insert blocks of turns that have NOT run yet.
 	keys []Hash
-	// charge is what this record adds to the engine's used side OUTSIDE its key set (the
-	// sum of every record's charge is engineGroup.reserved):
-	//
-	//	provisional  the estimate the gate admitted the turn with — its chain blocks
-	//	             (deduped against the running set) PLUS its output growth. That is the
-	//	             RESERVATION that closes the Pick -> PreRequest race: without it the
-	//	             running set does not move until the exact keys arrive, and every Pick
-	//	             in that window sees the same stale count and admits another turn.
-	//	confirmed    the output growth only — the exact chain keys are in blocksRun.
-	//
-	// It is released on EVERY path that ends the record (PreRequest replaces it, settle
-	// and the reap clear it, a re-pick releases the old one, an exit takes it with the
-	// member) and re-derived from these records once per tick.
-	charge int64
-	// grow is the GROWTH part of charge (0 <= grow <= charge). It exists so PreRequest can
-	// replace the charge with only the growth term — the chain estimate must NOT survive
-	// the moment its exact keys land, or the chain would be priced twice — without having
-	// to reconstruct what the Pick's estimate was after the running set has moved.
-	grow int64
 }
 
 // estEntry is one cached admission estimate (M2): blocks for a given head size;
@@ -430,23 +396,6 @@ type inflightRec struct {
 type estEntry struct {
 	sizeBytes int64
 	blocks    int64
-	// total is the head's WHOLE estimated footprint in blocks — its chain plus the
-	// wire-size growth, i.e. the sizer's cold + resident. The DISPATCH gate reads it
-	// (the running-set union needs the whole footprint, not just the cold part), so it
-	// rides the same cache instead of costing a second scan per pass. It is 0 in the
-	// tier-cost cache, whose entries only ever carry the cold term.
-	total int64
-}
-
-// gateEntry is one cached "what would this head ADD to the engine's running set":
-// footprint(minus)shared. It is keyed on BOTH versions because it moves when the member's
-// chain moves (the index's version) and when the running set moves (the run version) —
-// and Picks repeat at ~1 kHz, so the per-turn scan must not run per pass.
-type gateEntry struct {
-	indexVer  uint64
-	runVer    uint64
-	sizeBytes int64
-	chain     int64
 }
 
 // waiter is one head in the SHARED waiter queue. A waiter is not seated, so it
@@ -535,48 +484,11 @@ type engineGroup struct {
 	estTierIndexVer uint64
 	estTierTierVer  uint64
 
-	// gateCache is the DISPATCH gate's per-head answer (what this head would add to the
-	// running set), valid while the index version, the running-set version and the head
-	// size are unchanged. It is created lazily, so an arm whose gate is the noop never
-	// allocates it — the comparator arms pay nothing for this module.
-	gateCache map[string]gateEntry
-
-	// reserved is this engine's used side OUTSIDE the exact key set: the sum of its
-	// in-flight records' charges (DispatchCtx.ReservedBlocks). It is the PROVISIONAL
-	// chain estimate of every turn the gate admitted at Pick that has not reached
-	// PreRequest yet, PLUS the output growth of every dispatched turn. Without it the
-	// gate prices a turn only after it has already been admitted — the race the
-	// execution budget overran on (c128: 73.6 % of samples over budget, max 1.71).
-	//
-	// Maintained incrementally (Pick / PreRequest / settle / reap / exit, where the
-	// numbers are already in hand) and RE-DERIVED once per tick (deriveLocked), exactly
-	// like the key set itself, so a DOUBLE release or a missed add cannot outlive one
-	// second. A reservation whose release was never attempted at all is not drift — it is
-	// owed by a record, and it ends with that record (the provisional reap bound), which
-	// is what keeps the reservation's lifetime tied to the turn's.
-	reserved int64
-
 	counters struct {
 		served     int64 // dispatches served on this engine
 		fcfsServed int64 // pre-capacity FCFS dispatches counted here
 		// safetySkips counts dispatches the SAFETY NET held back (safety.go).
 		safetySkips int64
-		// dispatchHolds counts DECISION PASSES on which the DISPATCH gate (modules.go)
-		// held at least one of this engine's turns back — the execution budget's measured
-		// cost, the way coldValveHeld is the stagger's.
-		dispatchHolds int64
-		// dispatchHeldTurns counts TURNS the gate held for at least one pass (a turn is
-		// counted once, at its first denial), and dispatchHeldWaits samples how long each
-		// held turn waited before it finally dispatched — the distribution the arm's
-		// report needs ("held-turn count and duration").
-		dispatchHeldTurns int64
-		dispatchHeldWaits []float64
-		// valveHeldGated counts the cold-entry VALVE's holds that happened while the
-		// charge owning that slot belonged to a turn the EXECUTION BUDGET was holding —
-		// the one place the two budgets touch (see README §4g). Non-zero is the measured
-		// size of that interaction; if it is large, the refinement is suspending a held
-		// turn's charge while it is held and re-charging it at dispatch.
-		valveHeldGated int64
 		// safetyFires / safetyFiredSeconds are the net's events and fired time.
 		safetyFires        int64
 		safetyFiredSeconds float64
@@ -667,18 +579,6 @@ type Scheduler struct {
 	// produces its first token); nothing is evicted for it. This is the sizing signal:
 	// how often the stagger makes demand wait.
 	onColdValveHeld func(engine string)
-	// onDispatchHold fires when the DISPATCH gate (modules.go) holds at least one of an
-	// engine's turns back on a decision pass. The turn stays in the EPP's ordered queue and
-	// the next pass re-checks it; nothing is evicted and no seat moves. This is the
-	// execution budget's measured cost — the counterpart of onColdValveHeld.
-	onDispatchHold func(engine string)
-	// onDispatchHeldTurn fires when a turn the gate had held finally DISPATCHES, with how
-	// long it waited (the held-turn duration distribution).
-	onDispatchHeldTurn func(engine string, heldSeconds float64)
-	// onColdValveHeldGated fires when the cold-entry valve holds a head on an engine whose
-	// outstanding charge belongs to a turn the DISPATCH gate is holding — the two
-	// budgets' one intersection, counted so a run can size it.
-	onColdValveHeldGated func(engine string)
 	// onSafetyFire fires when an engine's safety net OPENS (a fire event).
 	onSafetyFire func(engine string)
 	// onShadowValidation receives one (predicted resident fraction, measured
@@ -1081,14 +981,6 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 		i      int
 		h      Head
 		engine string
-		// charge is the CHAIN part of what this head's turn would hold on the engine's
-		// used side outside its (not yet known) keys: its deduped chain estimate. grow is
-		// the rest of that number — the turn's output growth. Together they are exactly
-		// what the gate priced, so the winner's RESERVATION is closed under the gate's own
-		// arithmetic. Both are set only when the execution budget is wired (the default
-		// arm reserves nothing).
-		charge int64
-		grow   int64
 	}
 	perEngine := make(map[string][]cand, len(groups))
 	for i, h := range heads {
@@ -1128,57 +1020,7 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 			continue
 		}
 		sort.SliceStable(cands, func(x, y int) bool { return cands[x].h.Arrival.Before(cands[y].h.Arrival) })
-		pick := 0
-		if s.mod.gateOn {
-			// THE EXECUTION BUDGET (modules.go, "execution-budget"). The engine's RUNNING
-			// set — the dedup-exact union of its in-flight requests' chain blocks — may not
-			// grow past the same fraction of num_gpu_blocks the seat budget assumes. A turn
-			// that would not fit stays QUEUED here, in the EPP's ordered queue, instead of
-			// being dispatched and then preempted inside vLLM: the wait moves from the
-			// engine's preempting queue to ours, where it is ordered and can be measured.
-			//
-			// FIFO AMONG THE DISPATCH-ELIGIBLE: the candidates are already oldest-first, so
-			// the first one that FITS is the head. A head that does not fit does not block
-			// its engine (a smaller turn behind it may run — the budget is about blocks, not
-			// turns), and it keeps its priority: when it fits again it is again the oldest
-			// eligible, so later arrivals can never overtake it once the room exists.
-			//
-			// EVERY TERM OF THE LEDGER IS PRICED HERE, at the moment the answer is given:
-			// the exact chain keys of what is running, the RESERVATIONS outstanding (turns
-			// admitted in the previous Picks' Pick->PreRequest windows), and this head's own
-			// deduped chain estimate plus its output growth. The winner's charge is put
-			// down as a reservation before the pass returns (the winner path below), so the
-			// next Pick — ~1 ms later — cannot see the same stale count.
-			budget := s.mod.gate.BudgetBlocks(g.numBlocks)
-			used := s.usedBlocksLocked(g)
-			held := false
-			pick = -1
-			for i := range cands {
-				ok, charge, grow := s.dispatchDecisionLocked(g, &cands[i].h, budget, used)
-				if ok {
-					pick = i
-					cands[i].charge, cands[i].grow = charge, grow
-					break
-				}
-				held = true
-				// MEASUREMENT: the turn's hold CLOCK starts at the first denial and is
-				// read out when the turn finally dispatches (the winner path below), so
-				// the arm reports the wait the execution budget actually caused.
-				if m := g.members[cands[i].h.Member]; m != nil && m.gateHeldSince.IsZero() {
-					m.gateHeldSince = now
-					g.counters.dispatchHeldTurns++
-					if s.onDispatchHold != nil {
-						s.onDispatchHold(engineLabel(g.id))
-					}
-				}
-			}
-			if held {
-				g.counters.dispatchHolds++
-			}
-			if pick < 0 {
-				continue // every head on this engine is over the execution budget this pass
-			}
-		}
+		pick := 0 // FIFO: the candidates are oldest-first, so the head is the first one
 		chosen := &cands[pick]
 		score := s.queuedPerSeatLocked(g)
 		if winner == nil || score > winner.score ||
@@ -1201,40 +1043,8 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 		if m.inflightIDs == nil {
 			m.inflightIDs = map[string]inflightRec{}
 		}
-		if s.mod.gateOn {
-			// a re-picked id replaces a record that may still carry the OLD turn's charge:
-			// both halves come out with it — its exact chain blocks (if it had reached
-			// PreRequest) and its reservation. A turn that is picked again has NOT
-			// dispatched twice, so nothing may be left standing for the first pick.
-			if old, had := m.inflightIDs[rid]; had {
-				g.index.DropRunningLocked(old.keys)
-				s.releaseChargeLocked(g, old.charge)
-			}
-		}
-		// provisional (C3): confirmed at Dispatched. The charge is the reservation taken
-		// just below — the same number the gate admitted the turn with.
-		charge := winner.c.charge + winner.c.grow
-		m.inflightIDs[rid] = inflightRec{since: now, charge: charge, grow: winner.c.grow}
-		if s.mod.gateOn {
-			// THE RESERVATION: the blocks the gate just admitted this turn with are on the
-			// engine's used side from NOW, not from PreRequest. This is the fix for the
-			// steady overrun's dominant term — flow control calls Pick about every 1 ms, and
-			// without this line every turn inside the window would be admitted against the
-			// same stale count.
-			s.addChargeLocked(g, charge)
-		}
-		if !m.gateHeldSince.IsZero() {
-			// the held turn RUNS: book the wait it spent behind the execution budget
-			heldSeconds := now.Sub(m.gateHeldSince).Seconds()
-			m.gateHeldSince = time.Time{}
-			if heldSeconds < 0 {
-				heldSeconds = 0
-			}
-			g.counters.dispatchHeldWaits = append(g.counters.dispatchHeldWaits, heldSeconds)
-			if s.onDispatchHeldTurn != nil {
-				s.onDispatchHeldTurn(engineLabel(g.id), heldSeconds)
-			}
-		}
+		// provisional (C3): confirmed at Dispatched.
+		m.inflightIDs[rid] = inflightRec{since: now}
 		m.inflight = len(m.inflightIDs)
 		m.lastActivity = now
 		g.counters.served++
@@ -1253,156 +1063,6 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 		}
 	}
 	return "", -1
-}
-
-// gatedChargeOwnerLocked reports whether ANY of the named engine's members is a turn the
-// DISPATCH gate is holding while it still carries an unreleased cold-entry charge — the
-// state in which the execution budget is what keeps this engine's valve closed.
-func (s *Scheduler) gatedChargeOwnerLocked(engine string) bool {
-	g := s.groups[engine]
-	if g == nil {
-		return false
-	}
-	for _, m := range g.members {
-		if !m.gateHeldSince.IsZero() && m.coldEntry > 0 && !m.coldDone {
-			return true
-		}
-	}
-	return false
-}
-
-// gateChargeHoldSecondsLocked is how long the OLDEST such member has been holding that
-// charge (0 when none is): a value that only grows while admissions stay off is the
-// interaction becoming an admission stall.
-func (s *Scheduler) gateChargeHoldSecondsLocked(g *engineGroup, now time.Time) float64 {
-	var oldest float64
-	for _, m := range g.members {
-		if m.gateHeldSince.IsZero() || m.coldEntry <= 0 || m.coldDone {
-			continue
-		}
-		if age := now.Sub(m.gateHeldSince).Seconds(); age > oldest {
-			oldest = age
-		}
-	}
-	return oldest
-}
-
-// dispatchAllowedLocked is the DISPATCH GATE's answer for ONE seated head on ONE engine
-// ("may this turn RUN now?"), with the facts the module is allowed to see.
-func (s *Scheduler) dispatchAllowedLocked(g *engineGroup, h *Head, budget int64) bool {
-	ok, _, _ := s.dispatchDecisionLocked(g, h, budget, s.usedBlocksLocked(g))
-	return ok
-}
-
-// dispatchDecisionLocked is that answer WITH the CHARGE it was given on: the blocks the
-// turn would hold outside its (not yet known) chain keys — its deduped chain estimate plus
-// its own output growth. The Pick path puts exactly that number down as the turn's
-// RESERVATION, so what the gate priced and what the used side then carries are one value.
-//
-// EVERY number here is the EPP's own accounting: the running set is the BlockIndex's
-// refcount over the in-flight requests' chain blocks, the head's footprint is the sizing
-// module's estimate (the same one the seat budget was charged with), and the budget is the
-// measured num_gpu_blocks. Nothing is scraped from an engine, so there is no metrics
-// handle to freeze, no staleness rule and no latch — the class of failure the deleted
-// per-engine gate produced.
-func (s *Scheduler) dispatchDecisionLocked(g *engineGroup, h *Head, budget, used int64) (allowed bool, chain, growth int64) {
-	chain = s.dispatchChainBlocksLocked(g, h.Member, h.SizeBytes, used)
-	growth = s.growthBlocksLocked(h.MaxTokens)
-	if used == 0 && chain == 0 {
-		// IDLE: the gate answers by its liveness rule and prices nothing, but the
-		// RESERVATION must still be this turn's real estimate — otherwise the next Pick
-		// in the same window would see an empty used side and the liveness rule would
-		// admit a second turn as well (the race, one turn later).
-		chain = s.estimateFootprintCachedLocked(g, h.Member, h.SizeBytes)
-	}
-	ok := s.mod.gate.Allows(DispatchCtx{
-		Engine:         g.id,
-		Member:         h.Member,
-		RunningBlocks:  int64(g.index.RunningBlocksLocked()),
-		ReservedBlocks: g.reserved,
-		ChainBlocks:    chain + growth,
-		BudgetBlocks:   budget,
-		Idle:           used == 0,
-	})
-	return ok, chain, growth
-}
-
-// usedBlocksLocked is the engine's DISPATCH used side as the budget must read it: the
-// dedup-exact key set PLUS the outstanding charges (the provisional estimates of turns in
-// the Pick->PreRequest window and the output growth of every dispatched turn).
-func (s *Scheduler) usedBlocksLocked(g *engineGroup) int64 {
-	return int64(g.index.RunningBlocksLocked()) + g.reserved
-}
-
-// growthBlocksLocked is the OUTPUT GROWTH a turn reserves: ceil(max_tokens / blockSize)
-// blocks of KV, from the request's own cap (0 when it declares none). The trailing
-// partial block is counted, like every other block count here. Under the campaign
-// harness's ignore_eos the count is EXACT — every output grows to its cap — which is
-// why the growth term needs no estimate and no constant of its own.
-func (s *Scheduler) growthBlocksLocked(maxTokens int64) int64 {
-	if maxTokens <= 0 || s.blockSize <= 0 {
-		return 0
-	}
-	return (maxTokens + int64(s.blockSize) - 1) / int64(s.blockSize)
-}
-
-// addChargeLocked / releaseChargeLocked keep engineGroup.reserved in step with the
-// records that own the charges. The release CLAMPS at zero: a release that would go
-// negative would mean the key set and the charges had drifted apart, and a negative
-// reservation would make the gate MORE permissive than the state it describes — the one
-// direction that must never happen by arithmetic accident. (The tick's derive is the
-// authority either way; the clamp only bounds the damage to one pass.)
-func (s *Scheduler) addChargeLocked(g *engineGroup, charge int64) {
-	if charge > 0 {
-		g.reserved += charge
-	}
-}
-
-func (s *Scheduler) releaseChargeLocked(g *engineGroup, charge int64) {
-	if charge <= 0 {
-		return
-	}
-	g.reserved -= charge
-	if g.reserved < 0 {
-		g.reserved = 0
-	}
-}
-
-// dispatchChainBlocksLocked is what this head would ADD to the engine's running set: its
-// whole estimated footprint MINUS the blocks the running set already holds. The subtraction
-// is the dedup (a turn that shares its prefix with a request already running pays for the
-// new blocks only), and the whole thing is cached on (the member's chain version, the
-// running set's version, the head's size) because Picks repeat at ~1 kHz while the answers
-// only move when something is dispatched or settled.
-//
-// used is the engine's used side (running keys + outstanding reservations). When it is 0
-// the engine is IDLE and the number cannot matter: the gate's liveness rule decides, and
-// skipping the scan keeps the FIRST turn on an idle engine free whatever its size. When a
-// reservation is outstanding but no key is running yet (the Pick->PreRequest window) the
-// scan runs, and the dedup term is 0 by construction — a reservation has no keys to share
-// with, which is what makes it conservative rather than exact (it can only ever charge
-// MORE than the turn will use, never less).
-func (s *Scheduler) dispatchChainBlocksLocked(g *engineGroup, id string, sizeBytes int64, used int64) int64 {
-	if used == 0 {
-		// nothing running and nothing reserved: the gate's liveness rule decides, and the
-		// number cannot matter.
-		return 0
-	}
-	iv, rv := g.index.VersionLocked(), g.index.RunVersionLocked()
-	if e, ok := g.gateCache[id]; ok && e.indexVer == iv && e.runVer == rv && e.sizeBytes == sizeBytes {
-		return e.chain
-	}
-	// the head's whole footprint (chain + growth) from the sizing module's cache, less
-	// what is already running: |run ∪ chain| = |run| + (|chain| + growth) − |chain ∩ run|.
-	chain := s.estimateFootprintCachedLocked(g, id, sizeBytes) - g.index.setSharedWithRunningLocked(id)
-	if chain < 0 {
-		chain = 0 // defensive: the estimates are conservative, never negative
-	}
-	if g.gateCache == nil {
-		g.gateCache = map[string]gateEntry{}
-	}
-	g.gateCache[id] = gateEntry{indexVer: iv, runVer: rv, sizeBytes: sizeBytes, chain: chain}
-	return chain
 }
 
 // FCFSPick returns the oldest head (the pre-capacity pass-through, A5).
@@ -1473,9 +1133,6 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 		for id, m := range g.members {
 			if _, ok := present[id]; !ok {
 				m.waitingSince = time.Time{}
-				// no queued head: a hold clock (the execution budget's measurement) is
-				// about a turn that no longer exists — the next one starts its own
-				m.gateHeldSince = time.Time{}
 			}
 		}
 	}
@@ -1509,23 +1166,6 @@ func (s *Scheduler) reconcileEngineLocked(id, observed string, now time.Time) *e
 	s.counters.rebinds++
 	from.coldInFlight = max(from.coldInFlight-m.coldEntry, 0)
 	from.pendingTotal -= m.pendingBlocks
-	if s.mod.gateOn {
-		// the running set is PER ENGINE and the member is now accounted on another one:
-		// its in-flight chains move with it (the observed endpoint wins, and the blocks
-		// are running THERE). The CHARGES move with the same records — a reservation that
-		// stayed on the engine the turn left would keep pricing a turn that is no longer
-		// there, and release nothing on the one where it now runs.
-		for _, rec := range m.inflightIDs {
-			from.index.DropRunningLocked(rec.keys)
-			to.index.AddRunningLocked(rec.keys)
-			if rec.charge > 0 {
-				to.reserved += rec.charge
-			}
-		}
-		for _, rec := range m.inflightIDs {
-			s.releaseChargeLocked(from, rec.charge)
-		}
-	}
 	from.index.UnseatLocked(id) // the blocks are NOT on this engine (observation wins)
 	delete(from.members, id)
 	to.members[id] = m
@@ -1557,18 +1197,8 @@ func (s *Scheduler) estimateCostCachedLocked(g *engineGroup, id string, sizeByte
 	return s.estimateEntryLocked(g, id, sizeBytes).blocks
 }
 
-// estimateFootprintCachedLocked is the head's WHOLE estimated footprint in blocks — its
-// chain (resident here or not) plus the wire-size growth — from the SAME cache the cold
-// estimate uses, so the dispatch gate costs no scan of its own.
-func (s *Scheduler) estimateFootprintCachedLocked(g *engineGroup, id string, sizeBytes int64) int64 {
-	return s.estimateEntryLocked(g, id, sizeBytes).total
-}
-
-// estimateEntryLocked is the cached estimate PAIR (cold, total) for one head on one
-// engine. Both terms come from ONE call of the sizing module: the interface guarantees
-// that Cost IS TierCost's cold term with no tier configured ("Cost is this function's
-// cold term"), and the total is that call's third return. Filling both from one scan is
-// what keeps the default seat path and the execution-budget arm on the same number.
+// estimateEntryLocked is the cached admission estimate for one head on one engine, from
+// the sizing module's own scan (dedup against the engine's index + the wire-size growth).
 func (s *Scheduler) estimateEntryLocked(g *engineGroup, id string, sizeBytes int64) estEntry {
 	v := g.index.VersionLocked()
 	if g.estVersion != v {
@@ -1578,8 +1208,7 @@ func (s *Scheduler) estimateEntryLocked(g *engineGroup, id string, sizeBytes int
 	if e, ok := g.estCache[id]; ok && e.sizeBytes == sizeBytes {
 		return e
 	}
-	cold, _, total := s.mod.sizer.TierCost(g.index, nil, id, sizeBytes)
-	e := estEntry{sizeBytes: sizeBytes, blocks: cold, total: total}
+	e := estEntry{sizeBytes: sizeBytes, blocks: s.mod.sizer.Cost(g.index, id, sizeBytes)}
 	g.estCache[id] = e
 	return e
 }
@@ -1618,18 +1247,11 @@ func (s *Scheduler) Dispatched(id, reqID string, keys []Hash, sizeBytes int64, n
 	s.DispatchedOn(id, reqID, "", keys, sizeBytes, now)
 }
 
-// DispatchedOn is DispatchedOnUsage without the request's output cap — a caller that does
-// not know the turn's max_tokens (a unit fixture, or an observation without a parsed body).
-// The PROVISIONAL charge taken at Pick is kept for the growth term it already carried, so a
-// Pick that priced the turn does not lose that price here.
+// DispatchedOn is the endpoint-aware Dispatched (a unit fixture's form).
 func (s *Scheduler) DispatchedOn(id, reqID, engine string, keys []Hash, sizeBytes int64, now time.Time) {
-	s.DispatchedOnUsage(id, reqID, engine, keys, sizeBytes, 0, now)
+	s.DispatchedOnUsage(id, reqID, engine, keys, sizeBytes, now)
 }
 
-// DispatchedOnUsage is DispatchedOn with the request's own OUTPUT CAP (max_tokens; 0 = the
-// client set none), which is where the GROWTH RESERVATION comes from: ceil(cap/blockSize)
-// blocks the turn will occupy while it decodes, released at settle.
-//
 // It records a released request at PreRequest on the endpoint the
 // framework ACTUALLY picked: the exact keys replace the estimate (D13 absorbs the
 // error at the next enforcement), in-flight and the cold charge are taken, and the
@@ -1642,7 +1264,7 @@ func (s *Scheduler) DispatchedOn(id, reqID, engine string, keys []Hash, sizeByte
 // a member could be bound to an engine that no decision ever visits — permanently
 // unseated while the pool size and the dump counted it. There is no pooled group
 // here to fall back to: no seat, no charge, no binding.
-func (s *Scheduler) DispatchedOnUsage(id, reqID, engine string, keys []Hash, sizeBytes, maxTokens int64, now time.Time) {
+func (s *Scheduler) DispatchedOnUsage(id, reqID, engine string, keys []Hash, sizeBytes int64, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	g := s.groupOfLocked(id)
@@ -1700,32 +1322,7 @@ func (s *Scheduler) DispatchedOnUsage(id, reqID, engine string, keys []Hash, siz
 		if m.inflightIDs == nil {
 			m.inflightIDs = map[string]inflightRec{}
 		}
-		// THE RUNNING SET (the dispatch budget's used side): a replaced record's keys
-		// come out before the new ones go in, or a re-dispatched reqID would be counted
-		// twice and the engine would look fuller than it is. Off by default: with the
-		// noop gate nothing is maintained.
-		//
-		// THE CHARGE IS REPLACED, NOT RELEASED: what a turn holds on the used side
-		// outside its keys is its OUTPUT GROWTH from here on — the exact chain keys are
-		// in blocksRun now, so keeping the provisional estimate would double-price the
-		// chain. A caller that does not know the cap passes 0 and the PICK'S growth is
-		// kept (the estimate stays priced until a settle or the reap releases it).
-		var newGrow int64 // the confirmation's charge; 0 unless the dispatch gate is wired
-		if s.mod.gateOn {
-			newGrow = s.growthBlocksLocked(maxTokens)
-			old, had := m.inflightIDs[reqID]
-			if had {
-				g.index.DropRunningLocked(old.keys)
-				s.releaseChargeLocked(g, old.charge)
-				if newGrow == 0 {
-					// a caller that does not know the cap keeps the growth the PICK priced
-					newGrow = old.grow
-				}
-			}
-			g.index.AddRunningLocked(keys)
-			s.addChargeLocked(g, newGrow)
-		}
-		m.inflightIDs[reqID] = inflightRec{since: now, confirmed: true, main: onMain, keys: keys, charge: newGrow, grow: newGrow}
+		m.inflightIDs[reqID] = inflightRec{since: now, confirmed: true, main: onMain, keys: keys}
 		m.inflight = len(m.inflightIDs)
 		m.mainInflight = 0
 		for _, rec := range m.inflightIDs {
@@ -1824,7 +1421,6 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 		// (defensive legacy path — never blind).
 		removed := false
 		removedMain := false
-		var releasedCharge int64 // the settled record's charge (released below)
 		var settledKeys []Hash
 		if reqID != "" {
 			// R2: a known id removes itself; an UNKNOWN non-empty id removes NOTHING
@@ -1834,7 +1430,6 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 			if rec, had := m.inflightIDs[reqID]; had {
 				delete(m.inflightIDs, reqID)
 				removed, removedMain, settledKeys = true, rec.main, rec.keys
-				releasedCharge = rec.charge
 			} else {
 				s.counters.straySettles++
 			}
@@ -1848,15 +1443,7 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 			if rec, had := m.inflightIDs[key]; had {
 				delete(m.inflightIDs, key)
 				removed, removedMain, settledKeys = true, rec.main, rec.keys
-				releasedCharge = rec.charge
 			}
-		}
-		// THE RUNNING SET: a settled request's blocks stop RUNNING (they may still be
-		// resident — the tier hook below stores them — but nothing refers to them), and
-		// its CHARGE — the growth it reserved for its own decode — is released with them.
-		if removed && s.mod.gateOn {
-			g.index.DropRunningLocked(settledKeys)
-			s.releaseChargeLocked(g, releasedCharge)
 		}
 		// THE TIER SHADOW's SETTLE HOOK: a settled request's blocks are now STORED in
 		// this engine's CPU tier (vLLM keeps them; the LRU evicts past capacity). The
@@ -1954,51 +1541,7 @@ func (s *Scheduler) deriveLocked() {
 		}
 		g.coldInFlight = cold
 		g.pendingTotal = pend
-		if s.mod.gateOn {
-			// THE RUNNING SET is derived the same way, once per tick: it is maintained
-			// incrementally at every dispatch/settle (where the exact keys are already in
-			// hand, so the update is free) and RE-DERIVED here from the in-flight records,
-			// so a path that forgot to drop its keys cannot outlive one second.
-			g.index.SetRunningLocked(s.deriveRunningLocked(g))
-			// the same for the CHARGES: the estimate/growth blocks the records hold
-			// outside their key sets. The counter is corrected to the sum the records
-			// carry, so an over- or under-release cannot outlive one tick — and a
-			// reservation whose turn is still in flight is KEPT, because it is derived
-			// from the records that own it, not from a counter.
-			g.reserved = s.deriveChargeLocked(g)
-		}
 	}
-}
-
-// deriveRunningLocked is the RUNNING SET recomputed from first principles: the
-// refcounted union of the chain blocks of every request the scheduler believes is in
-// flight on this engine. It is the derive-don't-accumulate twin of the incremental
-// maintenance in DispatchedOn/SettleOnUsage/reapInflightLocked (which exists because a
-// per-pass derivation would scan every in-flight chain at ~1 kHz).
-func (s *Scheduler) deriveRunningLocked(g *engineGroup) map[Hash]int {
-	want := make(map[Hash]int)
-	for _, m := range g.members {
-		for _, rec := range m.inflightIDs {
-			for _, h := range rec.keys {
-				want[h]++
-			}
-		}
-	}
-	return want
-}
-
-// deriveChargeLocked is engineGroup.reserved recomputed from first principles: the blocks
-// the in-flight records hold OUTSIDE their chain keys (a provisional turn's estimate, a
-// dispatched turn's output growth). It is the derive-don't-accumulate twin of the
-// incremental maintenance at Pick / PreRequest / settle / reap / exit.
-func (s *Scheduler) deriveChargeLocked(g *engineGroup) int64 {
-	var charge int64
-	for _, m := range g.members {
-		for _, rec := range m.inflightIDs {
-			charge += rec.charge
-		}
-	}
-	return charge
 }
 
 // reapInflightLocked drops in-flight ids whose termination was never observed
@@ -2019,13 +1562,6 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 				}
 				if now.Sub(rec.since) > limit {
 					delete(m.inflightIDs, rid)
-					if s.mod.gateOn {
-						// a reaped id's blocks are not running any more either (its
-						// termination was never observed, and the engine has dropped it),
-						// and neither is the charge it reserved
-						g.index.DropRunningLocked(rec.keys)
-						s.releaseChargeLocked(g, rec.charge)
-					}
 					reaped = true
 				}
 			}
@@ -2219,17 +1755,6 @@ func (s *Scheduler) exitLocked(g *engineGroup, m *member, reason string, now tim
 	s.releaseColdLocked(g, m.id) // S0-2: unseat releases the charge
 	g.pendingTotal -= m.pendingBlocks
 	m.pendingBlocks = 0
-	if s.mod.gateOn && len(m.inflightIDs) > 0 {
-		// THE RUNNING SET follows the RECORD, not the engine: this member's in-flight ids
-		// leave with it (a member the accounting can no longer see cannot be charged to
-		// the dispatch budget either — the same reason Unseat releases its NE blocks).
-		for _, rec := range m.inflightIDs {
-			g.index.DropRunningLocked(rec.keys)
-			// and its charge leaves with it: a member the accounting can no longer see
-			// cannot keep blocks reserved against the dispatch budget
-			s.releaseChargeLocked(g, rec.charge)
-		}
-	}
 	g.index.UnseatLocked(m.id)
 	delete(g.members, m.id)
 	s.countExitLocked(g, reason)
@@ -2785,33 +2310,6 @@ type EngineSnapshot struct {
 	// store traffic the tier was sized for never arrived.
 	TierShadowBlocks   int `json:"tierShadowBlocks"`
 	TierCapacityBlocks int `json:"tierCapacityBlocks"`
-	// RunningBlocks is the EXECUTION budget's used side: the dedup-exact union of this
-	// engine's in-flight requests' chain blocks (the dispatch gate's own accounting).
-	// ExecutionBudgetBlocks is what it is tested against — groupBudgetFraction x
-	// num_gpu_blocks — and is 0 when no dispatch gate is wired ("0 = not enforced").
-	// ReservedBlocks is the part of the used side that carries no keys: the provisional
-	// estimates of turns admitted in the Pick->PreRequest window plus the output growth
-	// every dispatched turn reserves from its max_tokens. The budget is tested against
-	// runningBlocks + reservedBlocks, so a run that reads only runningBlocks sees the
-	// engine as emptier than the gate does.
-	// DispatchHolds counts decision passes on which the gate held a turn back. Read the
-	// four together: the two-budget arm's whole story is (runningBlocks + reservedBlocks)
-	// against executionBudgetBlocks, and whether the holds it caused bought fewer
-	// preemptions.
-	RunningBlocks         int   `json:"runningBlocks"`
-	ReservedBlocks        int64 `json:"reservedBlocks"`
-	ExecutionBudgetBlocks int64 `json:"executionBudgetBlocks"`
-	DispatchHolds         int64 `json:"dispatchHolds"`
-	// The INTERACTION measurement (README §4g): DispatchHeldTurns counts turns the gate
-	// held at least once, DispatchHeldWaitP50/Peak is how long they waited before they
-	// dispatched, ValveHeldGated counts cold-entry valve holds whose charge belonged to a
-	// held turn, and ChargeHoldSeconds is the age of the oldest such charge RIGHT NOW (0 =
-	// no admission is blocked by this interaction; a value that only grows is one that is).
-	DispatchHeldTurns   int64   `json:"dispatchHeldTurns"`
-	DispatchHeldWaitP50 float64 `json:"dispatchHeldWaitP50"`
-	DispatchHeldWaitMax float64 `json:"dispatchHeldWaitPeak"`
-	ValveHeldGated      int64   `json:"valveHeldGated"`
-	ChargeHoldSeconds   float64 `json:"chargeHoldSeconds"`
 }
 
 // SnapshotLite is Snapshot without the event ring and config echo — the metrics
@@ -2882,19 +2380,11 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 			SafetyFiring:  st.Fired, SafetyFires: st.Fires,
 			SafetyFiredSeconds: st.FiredSeconds, SafetySkips: g.counters.safetySkips,
 			SafetyKV: st.KV, SafetyWaitingQueue: st.Waiting,
-			EntryWaitP50:          p50(g.counters.entryWaits),
-			ReentryWaitP50:        p50(g.counters.reentryWaits),
-			TierShadowBlocks:      g.tier.Len(),
-			TierCapacityBlocks:    g.tier.Capacity(),
-			RunningBlocks:         g.index.RunningBlocksLocked(),
-			ReservedBlocks:        g.reserved,
-			ExecutionBudgetBlocks: s.mod.gate.BudgetBlocks(g.numBlocks),
-			DispatchHolds:         g.counters.dispatchHolds,
-			DispatchHeldTurns:     g.counters.dispatchHeldTurns,
-			DispatchHeldWaitP50:   p50(g.counters.dispatchHeldWaits),
-			DispatchHeldWaitMax:   maxOf(g.counters.dispatchHeldWaits),
-			ValveHeldGated:        g.counters.valveHeldGated,
-			ChargeHoldSeconds:     s.gateChargeHoldSecondsLocked(g, s.now)}
+			EntryWaitP50:       p50(g.counters.entryWaits),
+			ReentryWaitP50:     p50(g.counters.reentryWaits),
+			TierShadowBlocks:   g.tier.Len(),
+			TierCapacityBlocks: g.tier.Capacity(),
+		}
 		if g.blockSizeMismatch != nil {
 			es.BlockSizeErr = g.blockSizeMismatch.Error()
 		}

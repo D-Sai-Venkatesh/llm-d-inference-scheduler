@@ -98,7 +98,6 @@ flowControl:
 // The offload arm's loader gate (below) therefore SKIPS when another test already started
 // a runner, and is run on its own:
 //
-//	go test ./cmd/epp/runner/ -run TestGroupSchedulerCoreChainStartsWithTheCPUTier
 //	go test ./cmd/epp/runner/ -run TestGroupSchedulerCoreChainStartsWithTierInclusiveSizing
 var runnerStartedInProcess atomic.Bool
 
@@ -219,37 +218,5 @@ func TestGroupSchedulerCoreChainStartsWithTierInclusiveSizing(t *testing.T) {
 	ds := datastore.NewDatastore(ctx, r.setupMetricsCollection(opts))
 	_, err = r.parseConfigurationPhaseTwo(ctx, rawConfig, ds, opts.RefreshMetricsInterval)
 	require.NoError(t, err, "the tier-sized budget arm's config must parse, decode and pass the plugin-DAG/layer-order validation")
-	runnerStartedInProcess.Store(true)
-}
-
-// TestGroupSchedulerCoreChainStartsWithTheExecutionBudget is the TWO-BUDGET arm's loader
-// gate (docs/gsch-core/core-q4-offload-tierinclusive-execbudget.env): the tier-inclusive
-// seat budget AND the execution budget, i.e. the config the next pair runs on one side.
-// `executionBudget` is a NEW key, so this is the path that must fail if the plugin's
-// parameters stop decoding it — the emitter renders the value verbatim and the EPP decodes
-// strictly, and buildModules fails closed on a value it does not know. Two checks in one:
-// the arm starts, and the value survives the decode.
-func TestGroupSchedulerCoreChainStartsWithTheExecutionBudget(t *testing.T) {
-	if runnerStartedInProcess.Load() {
-		t.Skip("a runner has already been instantiated in this process (plugin metrics are process-global): run this gate on its own with -run TestGroupSchedulerCoreChainStartsWithTheExecutionBudget")
-	}
-	cfg := strings.Replace(corePluginConfig, `sizing: "index"`, `sizing: "tier-inclusive"`, 1)
-	cfg = strings.Replace(cfg, "    inflightReapSeconds: 3700\n",
-		"    inflightReapSeconds: 3700\n    cpuTierBytes: 549755813888\n    kvBlockBytes: 6291456\n", 1)
-	cfg = strings.Replace(cfg, `executionBudget: "none"`, `executionBudget: "execution-budget"`, 1)
-	require.Contains(t, cfg, `executionBudget: "execution-budget"`, "the fixture must carry the dispatch selector")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	opts := runserver.NewOptions()
-	opts.ConfigText = cfg
-	opts.PoolName = "core-execbudget"
-	opts.AllowExperimentalPlugins = true
-	r := NewRunner()
-	rawConfig, err := r.parseConfigurationPhaseOne(ctx, opts)
-	require.NoError(t, err)
-	ds := datastore.NewDatastore(ctx, r.setupMetricsCollection(opts))
-	_, err = r.parseConfigurationPhaseTwo(ctx, rawConfig, ds, opts.RefreshMetricsInterval)
-	require.NoError(t, err, "the two-budget arm's config must parse, decode and pass the plugin-DAG/layer-order validation")
 	runnerStartedInProcess.Store(true)
 }

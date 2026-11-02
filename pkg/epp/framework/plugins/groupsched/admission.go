@@ -279,19 +279,6 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 				if s.onColdValveHeld != nil {
 					s.onColdValveHeld(engine)
 				}
-				// THE TWO BUDGETS' ONE INTERSECTION, MEASURED: if the charge filling this
-				// engine's valve slot belongs to a turn the DISPATCH gate is holding, the
-				// valve is closed BECAUSE of the execution budget. Counted so the arm can
-				// size it (README §4g, "one interaction, stated").
-				if s.gatedChargeOwnerLocked(engine) {
-					g := s.groups[engine]
-					if g != nil {
-						g.counters.valveHeldGated++
-					}
-					if s.onColdValveHeldGated != nil {
-						s.onColdValveHeldGated(engine)
-					}
-				}
 			}
 			return
 		}

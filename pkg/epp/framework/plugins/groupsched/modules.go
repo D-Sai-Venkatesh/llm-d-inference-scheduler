@@ -555,22 +555,17 @@ type DispatchCtx struct {
 	// Member is the head's member id (reporting only; the gate decides on blocks).
 	Member string
 	// RunningBlocks is the engine's running set: the dedup-exact union of its in-flight
-	// requests' chain blocks, from the EPP's own accounting (BlockIndex.blocksRun). It is
-	// NEVER an endpoint metric — that is what keeps this gate out of the old per-engine
-	// gate's failure class (a metrics clone that latched and locked an engine out).
+	// requests' chain blocks, from the EPP's own accounting. It is NEVER an endpoint
+	// metric — that is what keeps a gate out of the old per-engine gate's failure class
+	// (a metrics clone that latched and locked an engine out).
 	RunningBlocks int64
 	// ReservedBlocks is the engine's used side OUTSIDE that key set: the charges its
-	// in-flight requests hold that carry no keys — the PROVISIONAL estimate a Pick puts
-	// down for a turn that has not reached PreRequest yet, and the OUTPUT GROWTH
-	// (ceil(max_tokens / blockSize) blocks) every dispatched turn reserves for its own
-	// decode. Both are blocks the engine will occupy and neither is a chain block, so
-	// the budget must price them or it over-admits by construction (the c128 defect:
-	// 73.6 % of samples over budget, max 1.71).
+	// in-flight requests hold that carry no chain keys (a provisional estimate before
+	// PreRequest, and a dispatched turn's output growth).
 	ReservedBlocks int64
 	// ChainBlocks is what THIS head would ADD to the running set: its whole estimated
-	// footprint (its chain plus the wire-size growth, the same estimate the seat budget
-	// is charged with) MINUS the blocks the running set already holds (dedup), PLUS its
-	// own output growth (the blocks its decode will allocate, from its max_tokens).
+	// footprint MINUS the blocks the running set already holds (dedup), PLUS its own
+	// output growth.
 	ChainBlocks int64
 	// BudgetBlocks is this engine's dispatch budget in blocks (DispatchGate.BudgetBlocks).
 	BudgetBlocks int64
@@ -583,19 +578,16 @@ type DispatchCtx struct {
 // DispatchGate answers exactly one question: may this seated member's turn RUN on its
 // engine now?
 //
-// It is the EXECUTION half of the two-budget model (PREREG-multipod-offload, "BATCH 2 +
-// THE EXECUTION BUDGET"). The SEATING budget asks how much residency an engine may hold;
-// a CPU offload tier widens exactly that (an idle chain lives in the tier and comes back
-// for ~1-4% of a prefill). It does not widen what can RUN: a running request needs HBM
-// blocks, and when more of them are running than the GPU holds, vLLM queues and preempts
-// (measured at c64: 43 preemptions vs 0, TTFT p50 0.9 s -> 17.8 s, newcomer p90 9.9 s ->
-// 142 s). So dispatch gets its OWN budget, always sized from the GPU alone.
-//
-// The default is NoopDispatchGate: the seat budget is the whole control, and the arm
-// without this value is byte-identical to the one before it. That default is also what
-// keeps this module from resurrecting the deleted per-engine gate: that gate read
-// ENDPOINT METRICS (a construction-time clone, which froze and latched) and a raw request
-// COUNT; this one reads the EPP's own block accounting, per engine, by construction.
+// THE SEAM IS EMPTY, DELIBERATELY. The seat budget is the whole admission control: an
+// admitted turn runs, which is what NoopDispatchGate answers and the only value the
+// config accepts. A gate that BINDS needs the engine's running-set accounting (the
+// dedup-exact union of its in-flight requests' chain blocks, plus the charges those
+// requests hold outside their keys); the trim removed that accounting with its parked
+// implementation, so a future gate re-adds the numbers it prices — one implementation of
+// this interface plus one config value, per the module contract. What must NOT come back
+// with it is the OLD per-engine gate's input: endpoint metrics (a construction-time
+// clone that froze and latched) or a raw request count. The accounting must be the EPP's
+// own, per engine, by construction.
 //
 // A gate does not RANK: it excludes a head for this pass, and the scheduler keeps its
 // own order (FIFO by turn arrival among the dispatch-eligible — see PickFromHeadsEngine).
@@ -612,11 +604,7 @@ type DispatchGate interface {
 }
 
 // NoopDispatchGate never holds a dispatch: the seat budget is the admission control and
-// an admitted turn runs.
-//
-// It is the DEFAULT ("none") deliberately, exactly like NoopSafety: every comparator
-// arm of the offload wave must be byte-identical to the build before this module existed.
-// The execution budget is a value an arm ASKS for.
+// an admitted turn runs. It is the ONE wired value ("none").
 type NoopDispatchGate struct{}
 
 func (NoopDispatchGate) Name() string { return "none" }
@@ -624,67 +612,6 @@ func (NoopDispatchGate) Name() string { return "none" }
 func (NoopDispatchGate) BudgetBlocks(int) int64 { return 0 }
 
 func (NoopDispatchGate) Allows(DispatchCtx) bool { return true }
-
-// ExecutionBudget is the dispatch gate "execution-budget": a running set may not grow
-// past the SAME fraction of the engine's GPU blocks that the seat budget assumes —
-//
-//	runningBlocks + reservedBlocks + thisHead'sAddedBlocks <= floor(fraction x num_gpu_blocks)
-//
-// — with ONE liveness rule: a turn is always allowed when nothing is in flight on the
-// engine (otherwise a single chain larger than the budget could never start, and the
-// engine would idle while waiting for itself).
-//
-// THE THREE TERMS ARE ONE LEDGER, and each is priced where it becomes known: the exact
-// chain keys when the request reaches PreRequest, the PROVISIONAL estimate the moment a
-// Pick admits the turn (the Pick -> PreRequest window is where flow control calls back
-// at ~1 kHz, so an unpriced window over-admits by construction), and the turn's own
-// output growth from its max_tokens when it dispatches.
-//
-// WHY THE SAME FRACTION AND NO SECOND CONSTANT. The fraction is the deployment's own
-// statement about how much of an engine's KV is in use rather than headroom (the seat
-// budget already assumes an engine may run to it, and the memory-only net fires at it).
-// The dispatch budget is that statement applied to the OTHER quantity: residency is
-// priced against the engine's UNIQUE capacity (max of GPU and tier — the tier is
-// inclusive), execution against the GPU alone, and both are the same fraction of a
-// measured capacity. There is nothing to tune and no unit of its own.
-//
-// WHY IT IS SAFE WHERE THE OLD GATE WAS NOT. Three differences, each of which the old
-// per-engine gate got wrong: (1) the input is the EPP's OWN accounting of the blocks its
-// own dispatched requests hold — not a scraped kv_cache_usage whose meaning (in-use vs
-// cache occupancy) was never verified, and not a metrics clone that froze when dispatch
-// stopped; (2) the gate is per engine by construction (one running map per engine), so it
-// cannot pool two engines' pressure into one verdict; (3) it holds ONE engine's
-// dispatches for ONE pass and never touches placement, so a held turn waits in the EPP's
-// ordered queue and the engine stays available to every turn that fits.
-//
-// WHAT IT DOES NOT DO. It does not seat, evict, rotate, or reorder: a held turn keeps its
-// place in its member's queue and the next pass re-checks. And it never admits against a
-// number it does not have: an engine with no measured capacity has no budget, so the gate
-// is open and the (already closed) admission path decides.
-type ExecutionBudget struct {
-	// Fraction is groupBudgetFraction: the one value the deployment states, read here for
-	// the other half of the same sentence (see the type's doc).
-	Fraction float64
-}
-
-func (ExecutionBudget) Name() string { return "execution-budget" }
-
-func (e ExecutionBudget) BudgetBlocks(numBlocks int) int64 {
-	if numBlocks <= 0 {
-		return 0 // unmeasured: no dispatch budget, and the seat path refuses these engines
-	}
-	return int64(e.Fraction * float64(numBlocks))
-}
-
-func (e ExecutionBudget) Allows(c DispatchCtx) bool {
-	if c.BudgetBlocks <= 0 {
-		return true // no measured capacity: nothing to enforce (the seat path is closed)
-	}
-	if c.Idle {
-		return true // LIVENESS: the first turn on an engine always runs, whatever its size
-	}
-	return c.RunningBlocks+c.ReservedBlocks+c.ChainBlocks <= c.BudgetBlocks
-}
 
 // ---- SAFETY ------------------------------------------------------------------
 
@@ -772,13 +699,6 @@ type modules struct {
 	pressure VictimChooser
 	safety   SafetyDetector
 	gate     DispatchGate
-	// gateOn reports that the wired DISPATCH gate is not the noop, so the scheduler
-	// should (a) ask it on every candidate head and (b) maintain the running set the
-	// question needs. It is a fact about the module set, not a second knob: with the
-	// default ("none") NOTHING is maintained — no per-dispatch key scan, no per-tick
-	// rebuild, no cache — so a comparator arm's CPU (a hidden TTFT variable on this
-	// stack) is identical to the build before the module existed.
-	gateOn bool
 }
 
 // buildModules resolves one implementation per interface from the config's single
@@ -828,11 +748,8 @@ func buildModules(cfg Config) (modules, error) {
 	switch cfg.ExecutionBudget {
 	case "", "none":
 		m.gate = NoopDispatchGate{}
-	case "execution-budget":
-		m.gate = ExecutionBudget{Fraction: cfg.GroupBudgetFraction}
-		m.gateOn = true
 	default:
-		return m, errValue("executionBudget", cfg.ExecutionBudget, "none|execution-budget")
+		return m, errValue("executionBudget", cfg.ExecutionBudget, "none")
 	}
 	return m, nil
 }

@@ -119,38 +119,6 @@ type groupMetrics struct {
 	// costs in waiting).
 	coldValveHeld *prometheus.CounterVec
 
-	// ---- the DISPATCH gate (the execution budget) ----
-	//
-	// runningBlocks is the running set's SIZE (the dedup-exact union of the engine's
-	// in-flight requests' chain blocks) and executionBudgetBlocks what it is tested
-	// against (fraction x num_gpu_blocks; 0 = no gate wired). dispatchHolds counts the
-	// decision passes on which the gate held at least one turn back. On every arm whose
-	// selector is the default ("none") the gauge is the running set the gate WOULD see
-	// (nothing is maintained, so 0) and the budget is 0: the series exist so a scrape is
-	// never missing, and they are only interesting on the execution-budget arm.
-	runningBlocks *prometheus.GaugeVec
-	// reservedBlocks is the part of the used side that carries no keys: the provisional
-	// estimates of turns admitted in the Pick->PreRequest window plus the output growth
-	// each dispatched turn reserves from its own max_tokens. The gate tests
-	// running_blocks + reserved_blocks against execution_budget_blocks — a run that
-	// scrapes only running_blocks reads the engine as emptier than the gate does.
-	reservedBlocks *prometheus.GaugeVec
-	execBudget     *prometheus.GaugeVec
-	dispatchHolds  *prometheus.CounterVec
-	// dispatchHoldsLast is the per-engine cumulative count the DELTA is taken against.
-	// The counter is exported from the scheduler's OWN cumulative count (one source of
-	// truth) rather than from a hook, so a unit-mode run and a live one cannot disagree
-	// and no path can forget to fire it — exactly like queueViewUntrusted.
-	dispatchHoldsLast map[string]int64
-	// The INTERACTION (README §4g): how many turns the gate held and for how long
-	// (heldTurns / heldSeconds), how much of the cold-entry valve's blocking is
-	// attributable to a HELD turn's outstanding charge (valveHeldGated), and how long the
-	// oldest such charge has been holding the slot right now (chargeHold, a gauge).
-	heldTurns      *prometheus.CounterVec
-	heldSeconds    *prometheus.HistogramVec
-	valveHeldGated *prometheus.CounterVec
-	chargeHold     *prometheus.GaugeVec
-
 	// ---- the CPU-tier shadow (piece 1) and its VALIDATION (piece 3) ----
 	//
 	// shadowBlocks / shadowCapacity are the model's own state per engine: a shadow
@@ -175,8 +143,7 @@ const subsystem = "llm_d_epp_group"
 var engineLabels = []string{"engine"}
 
 func newGroupMetrics(sched *Scheduler) *groupMetrics {
-	return &groupMetrics{sched: sched, known: map[string]struct{}{},
-		dispatchHoldsLast: map[string]int64{}}
+	return &groupMetrics{sched: sched, known: map[string]struct{}{}}
 }
 
 func (g *groupMetrics) register(reg prometheus.Registerer) error {
@@ -256,22 +223,6 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "engines torn down by an endpoint delete"})
 	g.coldValveHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "cold_valve_held_total",
 		Help: "heads the cold-entry valve held back (the budget would have admitted them; they WAIT, nothing is evicted)"}, engineLabels)
-	g.runningBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "running_blocks",
-		Help: "the engine's RUNNING set in blocks: the dedup-exact union of its in-flight requests' chain blocks (0 when no dispatch gate is wired)"}, engineLabels)
-	g.reservedBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "execution_reserved_blocks",
-		Help: "the part of the execution budget's used side that carries no chain keys: provisional estimates of turns admitted in the Pick->PreRequest window + the output growth each dispatched turn reserves from its max_tokens (0 = no dispatch gate wired)"}, engineLabels)
-	g.execBudget = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "execution_budget_blocks",
-		Help: "the DISPATCH budget in blocks: groupBudgetFraction x num_gpu_blocks (0 = no dispatch gate wired)"}, engineLabels)
-	g.dispatchHolds = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "dispatch_holds_total",
-		Help: "decision passes on which the execution budget held at least one of this engine's turns back (the turn waits in the EPP's ordered queue)"}, engineLabels)
-	g.heldTurns = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "dispatch_held_turns_total",
-		Help: "TURNS the execution budget held for at least one decision pass (counted once, at the first denial)"}, engineLabels)
-	g.heldSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "dispatch_held_seconds",
-		Help: "how long a turn the execution budget held waited before it dispatched", Buckets: prometheus.ExponentialBuckets(0.25, 2, 14)}, engineLabels)
-	g.valveHeldGated = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "cold_valve_held_gated_total",
-		Help: "cold-entry valve holds whose outstanding charge belonged to a turn the EXECUTION BUDGET was holding (the two budgets' one intersection)"}, engineLabels)
-	g.chargeHold = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "gate_charge_hold_seconds",
-		Help: "age of the oldest cold-entry charge owned by a HELD turn on this engine (0 = no admission is blocked by the interaction; a value that only grows is an admission stall)"}, engineLabels)
 	g.shadowBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "tier_shadow_blocks",
 		Help: "blocks this engine's CPU-tier SHADOW believes are stored in the offload tier (0 = no tier configured)"}, engineLabels)
 	g.shadowCapacity = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "tier_shadow_capacity_blocks",
@@ -287,8 +238,6 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.safetyFired, g.safetyFires, g.safetyFiredSeconds, g.safetySkips, g.engineKV, g.engineWaiting,
 		g.poolScore, g.staleSamples, g.capacityHeterogeneous, g.filterDecisions, g.affinityViolations, g.rebinds, g.engineGone,
 		g.coldValveHeld, g.queueViewAge, g.queueViewUntrusted, g.eventRingDropped,
-		g.runningBlocks, g.reservedBlocks, g.execBudget, g.dispatchHolds,
-		g.heldTurns, g.heldSeconds, g.valveHeldGated, g.chargeHold,
 		g.shadowBlocks, g.shadowCapacity, g.shadowPairs} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second
@@ -341,25 +290,6 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 		g.served.WithLabelValues(label).Add(0)
 		g.fcfs.WithLabelValues("nocapacity").Add(0)
 		g.safetySkips.WithLabelValues(label).Add(0)
-		g.runningBlocks.WithLabelValues(label).Set(float64(es.RunningBlocks))
-		g.reservedBlocks.WithLabelValues(label).Set(float64(es.ReservedBlocks))
-		g.execBudget.WithLabelValues(label).Set(float64(es.ExecutionBudgetBlocks))
-		g.chargeHold.WithLabelValues(label).Set(es.ChargeHoldSeconds)
-		// THE PASS COUNT, exported by DELTA from the scheduler's own cumulative count. It
-		// used to be instantiated with Add(0) and nothing else — the series existed and
-		// could never move, so the execution budget's measured cost was invisible on every
-		// arm (the reviewer's finding: metrics.go's Add(0) had no increment path anywhere).
-		// A counter that restarted (a scheduler replaced in-process) re-bases instead of
-		// going backwards: a Counter must never observe a negative delta.
-		if last := g.dispatchHoldsLast[label]; es.DispatchHolds < last {
-			g.dispatchHoldsLast[label] = 0
-		}
-		if d := es.DispatchHolds - g.dispatchHoldsLast[label]; d > 0 {
-			g.dispatchHolds.WithLabelValues(label).Add(float64(d))
-		}
-		g.dispatchHoldsLast[label] = es.DispatchHolds
-		g.heldTurns.WithLabelValues(label).Add(0)
-		g.heldSeconds.WithLabelValues(label).Observe(0)
 		for _, reason := range []string{"quantum-complete", "idle", "exiting", "engine-idle", "ttl",
 			"exiting-drain", "budget-idle", "budget-noqueue", "budget-exiting", "engine-gone"} {
 			g.exits.WithLabelValues(label, reason).Add(0)
@@ -384,12 +314,9 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 			continue
 		}
 		delete(g.known, label)
-		delete(g.dispatchHoldsLast, label)
 		for _, vec := range []*prometheus.GaugeVec{g.seats, g.uniqueBlocks, g.neBlocks,
-			g.runningBlocks, g.reservedBlocks,
 			g.exitingMembers, g.exitingBlocks, g.exitingOldest,
 			g.budgetBlocks, g.capacity, g.waiters, g.coldInFlight, g.coldCap, g.safetyFired,
-			g.execBudget, g.chargeHold,
 			g.engineKV, g.engineWaiting, g.shadowBlocks, g.shadowCapacity} {
 			vec.DeleteLabelValues(label)
 		}
@@ -532,34 +459,6 @@ func (g *groupMetrics) ObserveColdValveHeld(engine string) {
 		return
 	}
 	g.coldValveHeld.WithLabelValues(engineLabel(engine)).Inc()
-}
-
-// ObserveDispatchHold counts ONE TURN the DISPATCH gate (the execution budget) held back
-// — booked at its first denial, so the count is turns and not decision passes (the pass
-// count is llm_d_epp_group_dispatch_holds_total).
-func (g *groupMetrics) ObserveDispatchHold(engine string) {
-	if g == nil || g.heldTurns == nil {
-		return
-	}
-	g.heldTurns.WithLabelValues(engineLabel(engine)).Inc()
-}
-
-// ObserveDispatchHeldTurn books how long a held turn waited before it dispatched: the
-// distribution the two-budget arm reports as "held-turn duration".
-func (g *groupMetrics) ObserveDispatchHeldTurn(engine string, heldSeconds float64) {
-	if g == nil || g.heldSeconds == nil {
-		return
-	}
-	g.heldSeconds.WithLabelValues(engineLabel(engine)).Observe(heldSeconds)
-}
-
-// ObserveColdValveHeldGated counts a cold-entry valve hold whose charge belonged to a turn
-// the execution budget was holding — the two budgets' one intersection.
-func (g *groupMetrics) ObserveColdValveHeldGated(engine string) {
-	if g == nil || g.valveHeldGated == nil {
-		return
-	}
-	g.valveHeldGated.WithLabelValues(engineLabel(engine)).Inc()
 }
 
 // ObserveShadowValidation books ONE shadow-validation pair: the predicted resident

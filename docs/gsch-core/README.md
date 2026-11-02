@@ -708,6 +708,12 @@ emitter needs no new key: `CORE_SIZING` is already rendered into `CORE_MODULE_BL
 
 ## 4g. THE EXECUTION BUDGET — `executionBudget: "execution-budget"` (2026-11-02)
 
+> **RETIRED (2026-11-02, the scheduler trim).** The execution-budget dispatch gate, the
+> per-engine running-set accounting it priced, and the `executionBudget` value are REMOVED;
+> the config accepts `none` only and the DispatchGate seam is documented as empty. The
+> measurements below stand as measured on the builds they name; upstream's #3065 lands the
+> same idea on the engine side.
+
 The DISPATCH module: the second of the TWO BUDGETS that §4f needed and did not have.
 
 ```
@@ -792,6 +798,9 @@ The emitter needs ONE new key in `CORE_MODULE_BLOCK` (§2's printf) and ONE new 
 `TestGroupSchedulerCoreChainStartsWithTheExecutionBudget`.
 
 ## 4h. EXEC v2 — THE PICK-RACE FIX (2026-11-02; DIFF STAGE ONLY, no digest, no runs)
+
+> **RETIRED with §4g** (the same trim): the Pick reservation and the output-growth term
+> were part of the execution budget's ledger and are gone with it.
 
 The execution budget of §4g overran its own budget on the steady state: at c128 **73.6 % of
 `running_blocks` samples were over `execution_budget_blocks`, max 1.71x**. The estimate's

@@ -198,12 +198,6 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	} else {
 		fmt.Printf("group-scheduler: CORE policy — safety: MEMORY-ONLY net per engine, fires at measured kv >= %v (the budget's own fraction; no queue term), holds that engine's own dispatches and new seats, never influences placement\n", cfg.GroupBudgetFraction)
 	}
-	// The DISPATCH gate is echoed ONLY when it is on: the values that are off by default
-	// must leave the comparator arms' logs byte-identical to the build before they existed
-	// (the arm-diff artifacts are compared verbatim).
-	if r.sched.mod.gateOn {
-		fmt.Printf("group-scheduler: CORE policy — dispatch: EXECUTION BUDGET per engine = %v x num_gpu_blocks, tested against the RUNNING set (the dedup-exact union of in-flight requests' chain blocks, this EPP's own accounting — no endpoint metrics); a turn that does not fit waits in the ordered queue, FIFO among the eligible, one turn always allowed on an idle engine. Seating is unchanged\n", cfg.GroupBudgetFraction)
-	}
 	// The CPU offload tier is a DEPLOYMENT FACT, so the echo states whether this arm has
 	// one at all: a run artifact then says what the deployment looked like.
 	if n := cfg.tierBlocks(); n > 0 {
@@ -232,17 +226,6 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	r.sched.onUnbind = func(member string) { r.pins.del(member) }
 	r.sched.onColdValveHeld = func(engine string) {
 		r.metrics.ObserveColdValveHeld(engineLabel(engine))
-	}
-	// The DISPATCH gate's holds (the execution budget): the counterpart of the cold valve's
-	// — the count, the DURATION of each held turn, and the one place the two budgets touch.
-	r.sched.onDispatchHold = func(engine string) {
-		r.metrics.ObserveDispatchHold(engineLabel(engine))
-	}
-	r.sched.onDispatchHeldTurn = func(engine string, heldSeconds float64) {
-		r.metrics.ObserveDispatchHeldTurn(engineLabel(engine), heldSeconds)
-	}
-	r.sched.onColdValveHeldGated = func(engine string) {
-		r.metrics.ObserveColdValveHeldGated(engineLabel(engine))
 	}
 	// The tier shadow's VALIDATION pairs: prediction at seat, measurement at the turn's
 	// settle (see the SHADOW-VALIDATION event for the joinable, per-id record).
@@ -915,7 +898,6 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 		}
 		member, source := "", ""
 		reqID, size, fid := "", int64(0), ""
-		var maxTokens int64
 		if req := h.OriginalRequest(); req != nil {
 			if ir := req.InferenceRequest(); ir != nil {
 				member, source = r.memberOf(ir)
@@ -925,13 +907,12 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 				if size <= 0 {
 					size = int64(req.ByteSize())
 				}
-				maxTokens = maxOutputTokensOf(ir)
 			}
 		}
 		queues = append(queues, q)
 		heads = append(heads, Head{Member: member, Source: source,
 			FairnessID: fid, ReqID: reqID, Arrival: h.EnqueueTime(), SizeBytes: size,
-			MaxTokens: maxTokens})
+		})
 		return true
 	})
 	if len(heads) == 0 {
@@ -988,26 +969,8 @@ func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.Inferen
 	// The engine here is AUTHORITATIVE (the pendingEngine idiom): Pick
 	// charged the seat to the member's homed engine, and the framework's
 	// actual choice moves that charge if it disagrees.
-	r.sched.DispatchedOnUsage(id, request.RequestID, engine, keys, size,
-		maxOutputTokensOf(request), time.Now())
+	r.sched.DispatchedOnUsage(id, request.RequestID, engine, keys, size, time.Now())
 	return nil
-}
-
-// maxOutputTokensOf is the request's own output cap (max_tokens / max_completion_tokens /
-// max_output_tokens, as the parser normalises them into Body.MaxOutputTokens), 0 when the
-// client declared none. It is the DISPATCH gate's GROWTH term: a dispatched turn allocates
-// ceil(cap / blockSizeTokens) blocks of KV while it decodes, and that count is EXACT under
-// the campaign harness's ignore_eos — every output grows to its cap. One reader at Pick
-// (the reservation) and one at PreRequest (the confirmation), so the two prices of the same
-// turn cannot come from two different numbers.
-func maxOutputTokensOf(request *fwksched.InferenceRequest) int64 {
-	if request == nil || request.Body == nil || request.Body.MaxOutputTokens == nil {
-		return 0
-	}
-	if v := *request.Body.MaxOutputTokens; v > 0 {
-		return v
-	}
-	return 0
 }
 
 // blockKeysFor derives the chained token-block keys (tier A).

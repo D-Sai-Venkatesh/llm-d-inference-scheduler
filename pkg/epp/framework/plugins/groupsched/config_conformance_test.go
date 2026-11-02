@@ -62,9 +62,7 @@ package groupsched
 //	  rotation: "quantum"
 //	  victim: "valve"
 //	  safety: "none"             # CORE_SAFETY: | "budget-fraction" (the memory-only net)
-//	  executionBudget: "none"    # CORE_EXECUTION_BUDGET: | "execution-budget" (the
-//	                              # dispatch budget: the CPU tier widens residency,
-//	                              # never how many requests may RUN at once)
+//	  executionBudget: "none"    # CORE_EXECUTION_BUDGET (one value: the seam is empty)
 //	flowControl:
 //	  saturationDetector:
 //	    pluginRef: group           # the SAME plugin instance answers the pool gate
@@ -165,23 +163,6 @@ rotation: "quantum"
 victim: "valve"
 safety: "none"
 executionBudget: "none"`,
-	},
-	{
-		// The EXECUTION-BUDGET arm's module block (docs/gsch-core/
-		// core-q4-offload-tierinclusive-execbudget.env): CORE_EXECUTION_BUDGET=execution-budget.
-		// One VALUE differs from the tier-inclusive arm's block, and it has to survive the same
-		// strict decode (the TYPE half) and buildModules (the ENUM half) — a CrashLoop on
-		// the one arm that carries the two budgets otherwise.
-		block: "CORE_MODULE_BLOCK (CORE_EXECUTION_BUDGET=execution-budget)",
-		owner: PluginType,
-		proto: Config{},
-		body: `sizing: "tier-inclusive"
-entryOrder: "newcomer-first"
-engineChoice: "most-free-budget"
-rotation: "quantum"
-victim: "valve"
-safety: "none"
-executionBudget: "execution-budget"`,
 	},
 	{
 		// The branch plugin every core arm carries (BRANCH_PLUGIN=1). Its bool fields are
@@ -436,7 +417,7 @@ func TestModuleValuesMatchTheEmitter(t *testing.T) {
 		{"Rotation", []string{"quantum"}},
 		{"Victim", []string{"valve"}},
 		{"Safety", []string{"none", "budget-fraction"}},
-		{"ExecutionBudget", []string{"none", "execution-budget"}},
+		{"ExecutionBudget", []string{"none"}},
 	}
 	for _, e := range emitted {
 		for _, v := range e.values {

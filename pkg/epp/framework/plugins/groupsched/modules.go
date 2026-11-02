@@ -71,37 +71,17 @@ type TenureCtx struct {
 	// IdleSeconds is S, the silence bound: a branch silent that long (and with no
 	// queued head — the C8 fix) is not going to use its seat.
 	IdleSeconds float64
-	// QueueView is when the queue-head snapshot behind this decision pass was taken,
-	// and QueueViewKnown whether there is one at all. A branch's "has a queued head"
-	// lives in `waitingSince`, which only a PASS OVER THE QUEUE can maintain
-	// (syncWaitersLocked). When the flow controller's gate is closed no Pick runs, so
-	// that flag goes STALE — and an eviction rule that trusted a stale "no head" took
-	// seats away from branches whose head was queued the whole time (the C8 race: heads
-	// arriving just before a Tick, victims' heads then waiting 4.7-25 min, cold).
-	QueueView    time.Time
-	QueueViewSet bool
 }
 
-// Headless reports "this branch has no queued head" as EVIDENCE rather than as a
-// guess: it is true only when the queue view is recent enough for the absence to mean
-// something (a view older than S cannot tell a busy branch from an idle one).
-func (c TenureCtx) Headless(m *branch) bool {
-	if !m.waitingSince.IsZero() {
-		return false
-	}
-	if !c.QueueViewSet || c.Now.Sub(c.QueueView) > time.Duration(c.IdleSeconds*float64(time.Second)) {
-		return false // no trustworthy view: silence is NOT evidence
-	}
-	return true
-}
+// Headless reports that this branch has no queued head. Decisions run INSIDE Pick, where
+// `waitingSince` was just synced from the live queue, so the absence is a fact of this
+// pass rather than a guess about an old snapshot (the C8 race is gone with the decision
+// that wandered out of Pick).
+func (c TenureCtx) Headless(m *branch) bool { return m.waitingSince.IsZero() }
 
-// Silent reports the idle test for a branch: headless (see Headless) and no activity
-// for S.
+// Silent reports the idle test for a branch: no queued head and no activity for S.
 func (c TenureCtx) Silent(m *branch) bool {
-	if !c.Headless(m) {
-		return false
-	}
-	return c.Now.Sub(m.lastActivity) > time.Duration(c.IdleSeconds*float64(time.Second))
+	return c.Headless(m) && c.Now.Sub(m.lastActivity) > time.Duration(c.IdleSeconds*float64(time.Second))
 }
 
 // RotationPolicy answers "may this resident be released now, and why?".
@@ -146,17 +126,9 @@ type PressureCtx struct {
 	RotationVictim func() (string, *branch)
 	// Silent is the same idle test the tenure policy uses.
 	Silent func(m *branch) bool
-	// Headless reports whether the branch has no queued head, as EVIDENCE (false when
-	// the queue view is stale — see TenureCtx.Headless).
+	// Headless reports whether the branch has no queued head (exact: enforcement runs
+	// inside Pick, on the view that pass just synced).
 	Headless func(m *branch) bool
-	// QueueViewTrusted reports whether the queue view is recent enough that "this
-	// branch has no queued head" means anything at all. When it is false, the classes
-	// that reason about HEAD PRESENCE (done and mid-quantum) are SKIPPED: the policy
-	// cannot tell an idle branch from a busy one, so it must not reclaim a seat on a
-	// guess — that guess is exactly the C8 race (heads arriving just before a Tick,
-	// victims' heads then waiting 4.7-25 minutes, cold). Memory enforcement then waits
-	// for the next pass, which is at most one tick away.
-	QueueViewTrusted bool
 }
 
 // VictimChooser answers "who leaves when the engine is over its budget?".
@@ -195,22 +167,6 @@ func (BudgetValve) Victim(branches []*branch, ctx PressureCtx) (string, *branch)
 	}
 	if best != nil {
 		return "budget-noqueue", best
-	}
-	if !ctx.QueueViewTrusted {
-		// no trustworthy view of who has a queued head: classes (2) and (3) are guesses.
-		// Only branches already on their way out can be named.
-		for _, m := range branches {
-			if !ctx.Exiting(m.id) {
-				continue
-			}
-			if best == nil || olderCompletion(m, best) {
-				best = m
-			}
-		}
-		if best != nil {
-			return "budget-exiting", best
-		}
-		return "", nil
 	}
 	// class (3): mid-quantum. THE ORDER MATTERS: a branch that has not served a turn
 	// in this residency, or that has a queued head right now, is the LAST choice —

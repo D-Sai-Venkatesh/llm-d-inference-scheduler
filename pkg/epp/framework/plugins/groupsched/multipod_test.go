@@ -113,7 +113,7 @@ func TestT3e4RegressionNoLockInOnQueueDepth(t *testing.T) {
 			m.lastActivity = fx.clock
 			fx.s.mu.Unlock()
 		}
-		fx.s.Tick(fx.clock)
+		fx.s.PickFromHeads(nil, fx.clock)
 		before := fx.s.Snapshot()
 		for i := 0; i < 6; i++ {
 			id := fmt.Sprintf("q%d", i)

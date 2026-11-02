@@ -138,7 +138,7 @@ func (fx *engineSet) allGroups() []*engineGroup { return fx.s.activeGroupsLocked
 // tick advances the fixture's virtual clock by d and runs the scheduler's ticker.
 func (fx *engineSet) tick(d time.Duration) {
 	fx.clock = fx.clock.Add(d)
-	fx.s.Tick(fx.clock)
+	fx.s.PickFromHeads(nil, fx.clock)
 }
 
 // pick runs one Pick over the given heads at the fixture's clock.
@@ -345,7 +345,7 @@ func TestBudgetValvePrefersTheDoneMember(t *testing.T) {
 			t.Fatalf("the branch's grown head must dispatch, got %d", i)
 		}
 		dispatch(t, fx.s, "busy", keys(200, 77), bytesFor(200)) // the growth lands
-		fx.s.Tick(fx.clock)                                     // and the valve enforces it
+		fx.s.PickFromHeads(nil, fx.clock)                       // an empty-queue Pick: enforcement runs there now
 		fx.s.mu.Lock()
 		_, doneSeated := fx.g().branches["done"]
 		_, busySeated := fx.g().branches["busy"]
@@ -375,7 +375,7 @@ func TestNoEvictionWhileInFlight(t *testing.T) {
 			t.Fatalf("the branch's second head must be served (in-flight cap), got %d", i)
 		}
 		dispatch(t, fx.s, "m", keys(700, 3), bytesFor(700))
-		fx.s.Tick(fx.clock)
+		fx.s.PickFromHeads(nil, fx.clock)
 		if !fx.s.Seated("m") {
 			t.Fatal("a branch in flight must never be evicted (marked exiting at most)")
 		}
@@ -451,7 +451,7 @@ func TestExitingVictimDoesNotSpinEnforcement(t *testing.T) {
 		fx.clock = fx.clock.Add(60 * time.Second)
 		done := make(chan struct{})
 		go func() {
-			fx.s.Tick(fx.clock)
+			fx.s.PickFromHeads(nil, fx.clock)
 			close(done)
 		}()
 		select {
@@ -664,7 +664,7 @@ func TestTTLForgetsSilentRecordsKeepsWaiters(t *testing.T) {
 		fx.clock = longAgo
 		fx.pick(head("waiter", 10*time.Second, bytesFor(100)))
 		fx.clock = longAgo.Add(time.Duration(3*defaultConfig().TTLSeconds) * time.Second)
-		fx.s.Tick(fx.clock)
+		fx.s.PickFromHeads(nil, fx.clock)
 		if fx.s.Sessions() == 0 {
 			t.Fatal("a waiter with a live head must never be forgotten (R2)")
 		}
@@ -807,7 +807,6 @@ func TestClass3VictimPrefersAServedMember(t *testing.T) {
 		var reason string
 		var victim *branch
 		fx.s.mu.Lock()
-		fx.s.queueViewAt = fx.clock // a trustworthy queue view (both have heads)
 		reason, victim = fx.s.budgetVictimLocked(fx.g(), fx.clock)
 		fx.s.mu.Unlock()
 		if victim == nil {

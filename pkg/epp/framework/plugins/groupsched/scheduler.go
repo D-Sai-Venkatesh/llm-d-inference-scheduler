@@ -511,15 +511,6 @@ type Scheduler struct {
 
 	// pickSeq synthesizes request ids for heads that lack one (M1).
 	pickSeq int64
-	// queueViewAt is when the queue-head snapshot was last reconciled
-	// (syncWaitersLocked) — the evidence clock behind "this branch has no queued
-	// head". A stale view must never justify an eviction (the C8 race).
-	queueViewAt time.Time
-	// headsObservedAt is when the head list was last OBSERVED — a Pick, which carries a
-	// candidate set. A Tick RE-APPLIES the last observation (so the waiting flags stay
-	// honest) and must NOT refresh this clock: this is the age of the EVIDENCE itself,
-	// i.e. the size of the window in which a head can be queued with nobody looking.
-	headsObservedAt time.Time
 	// now is the virtual clock of the CURRENT decision pass (set at the top of
 	// every public decision entry point). Nothing here calls time.Now: a golden
 	// replay has to be reproducible.
@@ -530,9 +521,6 @@ type Scheduler struct {
 	// multi-engine run reproducible.
 	homeSeq int64
 	events  []Event
-	// lastHeads is the most recent queue-head snapshot (Pick's view), kept so the
-	// ticker's admission pass can re-sync the same evidence instead of guessing.
-	lastHeads []Head
 
 	counters struct {
 		entryWaits   []float64
@@ -850,7 +838,6 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.now = now
-	s.headsObservedAt = now // a Pick is the only FRESH observation of the queue
 	s.reapInflightLocked(now)
 	s.drainExitingLocked(now)
 	s.syncWaitersLocked(heads, now)
@@ -963,8 +950,6 @@ func (s *Scheduler) FCFSServed() {
 // vanished leaves it, and every seated branch's waiting-since tracks its oldest
 // queued head (the victim preference's input).
 func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
-	s.queueViewAt = now
-	s.lastHeads = heads
 	present := map[string]time.Time{}
 	for _, h := range heads {
 		if h.Branch == "" {
@@ -1433,11 +1418,10 @@ func (s *Scheduler) eligibleLocked(m *branch, now time.Time) (string, bool) {
 	return s.mod.tenure.Eligible(m, s.tenureCtxLocked(now))
 }
 
-// tenureCtxLocked is the read-only view the TENURE module gets (with the queue view's
-// age, so "no queued head" is evidence rather than a guess).
+// tenureCtxLocked is the read-only view the TENURE module gets. There is no queue-view
+// age in it any more: every decision runs inside Pick, on the view that pass synced.
 func (s *Scheduler) tenureCtxLocked(now time.Time) TenureCtx {
-	return TenureCtx{Now: now, IdleSeconds: s.cfg.IdleSeconds,
-		QueueView: s.queueViewAt, QueueViewSet: !s.queueViewAt.IsZero()}
+	return TenureCtx{Now: now, IdleSeconds: s.cfg.IdleSeconds}
 }
 
 // pressureCtxLocked is the read-only view the PRESSURE module gets of ONE engine.
@@ -1449,8 +1433,6 @@ func (s *Scheduler) pressureCtxLocked(g *engineGroup, now time.Time) PressureCtx
 		RotationVictim: func() (string, *branch) { return s.rotationVictimLocked(g, now) },
 		Silent:         tctx.Silent,
 		Headless:       tctx.Headless,
-		QueueViewTrusted: !tctx.QueueView.IsZero() &&
-			now.Sub(tctx.QueueView) <= time.Duration(s.cfg.IdleSeconds*float64(time.Second)),
 	}
 }
 
@@ -1655,31 +1637,6 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 	return true
 }
 
-// queueViewTrustedLocked reports whether the queue-head snapshot behind this decision
-// pass is recent enough that "this branch has no queued head" means anything at all.
-func (s *Scheduler) queueViewTrustedLocked(now time.Time) bool {
-	return !s.queueViewAt.IsZero() &&
-		now.Sub(s.queueViewAt) <= time.Duration(s.cfg.IdleSeconds*float64(time.Second))
-}
-
-// queueEvidenceAgeSecondsLocked is how old the head list the queue view was built from
-// is, on the DECISION clock (-1 when no head list has been observed yet — the
-// absent-signal convention: a 0 would read as "fresh"). It grows whenever Picks stop
-// (a closed pool gate is the normal cause), which is exactly the window in which a head
-// can be queued while `waitingSince` says otherwise (the C8 race).
-func (s *Scheduler) queueEvidenceAgeSecondsLocked() float64 {
-	if s.headsObservedAt.IsZero() {
-		return -1
-	}
-	return s.now.Sub(s.headsObservedAt).Seconds()
-}
-
-// noteQueueViewUntrustedLocked books one enforcement pass that ran without trustworthy
-// head evidence. The value is CUMULATIVE and exported from the snapshot (one source of
-// truth: the metrics layer converts it to a Prometheus counter by delta, so a hook
-// nobody wired cannot leave the series at zero).
-func (s *Scheduler) noteQueueViewUntrustedLocked() { s.counters.queueViewUntrusted++ }
-
 // enforceBudgetLocked is MEMORY PRESSURE on the growth path: while the engine's
 // accounted footprint (NE + pending estimates) is over its budget, take victims in
 // the valve's order until it fits or nothing is evictable.
@@ -1711,17 +1668,7 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 	if g.budgetBlocks <= 0 {
 		return // no measured capacity yet for THIS engine: nothing to enforce
 	}
-	countedStale := false
 	for s.overBudgetLocked(g) > 0 {
-		if !countedStale && !s.queueViewTrustedLocked(now) {
-			// ONE per engine-pass: this pass will choose victims with a queue view too old
-			// to tell a busy branch from an idle one, so the C8 guard drops the
-			// head-presence classes. The gauge beside this counter is the clock itself;
-			// both are the evidence that the guard is doing something (or that the
-			// decision clock has run away from the queue syncs).
-			s.noteQueueViewUntrustedLocked()
-			countedStale = true
-		}
 		reason, victim := s.budgetVictimLocked(g, now)
 		if victim == nil {
 			return
@@ -1780,27 +1727,14 @@ func (s *Scheduler) Tick(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.now = now
-	s.deriveLocked() // derive-don't-accumulate, every decision point
+	// DECISIONS LIVE IN PICK (R5). A Tick only does what has no event to hang on:
+	// derive the aggregates from the records, and reap in-flight ids whose termination
+	// was never observed (a provisional id with no PreRequest, a confirmed one past the
+	// request timeout). Admission, enforcement and rotation run in the Pick pass, on the
+	// queue view that pass just synced.
+	s.deriveLocked()
 	s.reapInflightLocked(now)
 	s.drainExitingLocked(now)
-	// NO TIMER FREES A SEAT (R6). A silent seat that nobody is waiting for costs
-	// nothing and its blocks are the reason the branch's next turn is cheap; taking it
-	// back on a clock throws that away and frees room nobody asked for. Seats are
-	// released on DEMAND (enforcement, when a head needs the room) — where a silent
-	// branch is the FIRST victim (it has no queued turn).
-	for _, g := range s.activeGroupsLocked() {
-		s.enforceBudgetLocked(g, now)
-	}
-	// R2: NO TTL on waiters — a waiter exists because its head was present at the
-	// last sync; rotation waits are minutes. Headless, unseated records are GC'd by
-	// lastSeen (silence, not queue age).
-	s.gcSilentRecordsLocked(now)
-	// BUG 3 (the C8 race): Tick calls the admission loop WITHOUT a queue sync, so a
-	// head that arrived since the last Pick left its branch looking headless. Re-sync
-	// from the LAST head snapshot (a candidate set is what Pick sees; it is refreshed on
-	// every decision pass, and Tick's rotate uses it so the two paths agree), then seat.
-	s.syncWaitersLocked(s.lastHeads, now)
-	s.rotateLocked(now)
 }
 
 // gcSilentRecordsLocked forgets headless, unseated records whose last activity is
@@ -2072,11 +2006,9 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 	snap := Snapshot{Exits: map[string]int64{},
 		Served: s.counters.served, FCFSServed: s.counters.fcfsServed,
 		AffinityViolations: s.counters.affinityViolations, Rebinds: s.counters.rebinds,
-		EngineGone:          s.counters.engineGone,
-		QueueViewAgeSeconds: s.queueEvidenceAgeSecondsLocked(),
-		QueueViewUntrusted:  s.counters.queueViewUntrusted,
-		EventRingDropped:    s.counters.eventsDropped,
-		Engines:             map[string]EngineSnapshot{}, Bindings: map[string]int{}}
+		EngineGone:       s.counters.engineGone,
+		EventRingDropped: s.counters.eventsDropped,
+		Engines:          map[string]EngineSnapshot{}, Bindings: map[string]int{}}
 	if full {
 		snap.Config = s.cfg
 		snap.RecentEvents = append([]Event(nil), s.events...)

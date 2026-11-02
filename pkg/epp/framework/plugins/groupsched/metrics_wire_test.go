@@ -16,7 +16,8 @@ limitations under the License.
 
 package groupsched
 
-// THE METRIC SURFACE, AS SCRAPED. The trim keeps NINETEEN names; this file pins that
+// THE METRIC SURFACE, AS SCRAPED. The trim keeps EIGHTEEN names (nineteen minus
+// queue_view_untrusted_passes_total, which R5 deletes with the C8 guard); this file pins that
 // each one reaches Prometheus under its documented name and labels — and that the ones
 // the trim dropped are gone (a deleted series that still registers is a promise the
 // dashboard still believes).
@@ -38,14 +39,13 @@ var keptMetrics = []string{
 	"dispatches_total", "exits_total",
 	"entry_wait_seconds",
 	"engine_gone_total", "rebinds_total", "affinity_violations_total",
-	"queue_view_untrusted_passes_total",
 }
 
 // droppedMetrics must NOT be registered any more.
 var droppedMetrics = []string{
 	"unique_blocks", "num_gpu_blocks", "waiters", "residency_turns", "refill_share",
 	"fcfs_dispatches_total", "filter_decisions_total", "queue_view_age_seconds",
-	"event_ring_dropped_total", "capacity_heterogeneous",
+	"event_ring_dropped_total", "capacity_heterogeneous", "queue_view_untrusted_passes_total",
 	"engine_kv_usage", "engine_waiting_queue",
 	"safety_fired", "safety_fires_total", "safety_fired_seconds_total", "safety_skips_total",
 	"detector_pool_score", "detector_stale_samples_total",
@@ -82,7 +82,7 @@ func TestMetricSurfaceIsExactlyTheKeptSet(t *testing.T) {
 
 		fx.seatOne(t, "m", 100, 5*time.Second)
 		fx.s.Chunk("m")
-		fx.s.Tick(fx.clock)
+		fx.s.PickFromHeads(nil, fx.clock)
 		m.Refresh()
 
 		mfs, err := reg.Gather()

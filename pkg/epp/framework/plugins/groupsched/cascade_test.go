@@ -168,7 +168,7 @@ func TestExitingVictimDoesNotSpinEnforcementAfterTheCascadeFix(t *testing.T) {
 		fx.clock = fx.clock.Add(60 * time.Second)
 		done := make(chan struct{})
 		go func() {
-			fx.s.Tick(fx.clock)
+			fx.s.PickFromHeads(nil, fx.clock)
 			close(done)
 		}()
 		select {
@@ -311,8 +311,6 @@ func TestSharedBlockWithAStayingBranchIsNotExcused(t *testing.T) {
 		// and enforcement keeps the overage visible rather than declaring itself done: with
 		// a fresh queue view, a pass over this state does NOT leave |stay| over budget
 		fx.s.mu.Lock()
-		fx.s.queueViewAt = fx.clock
-		fx.s.headsObservedAt = fx.clock
 		staysOver := fx.s.overBudgetLocked(g) > 0
 		fx.s.mu.Unlock()
 		if !staysOver {

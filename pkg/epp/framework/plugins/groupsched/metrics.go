@@ -58,13 +58,7 @@ type groupMetrics struct {
 	// waitersShared is the SHARED waiter queue's size (one number, no engine label,
 	// because a waiter belongs to no engine until one seats it).
 	waitersShared prometheus.Gauge
-	// queueViewUntrusted counts the budget-enforcement passes that ran with a queue
-	// view too old to trust (the C8 guard skipped the head-presence classes in exactly
-	// those passes, so without it the guard's own input is invisible). It is exported
-	// as the DELTA of the scheduler's cumulative count: one source of truth.
-	queueViewUntrusted     prometheus.Counter
-	queueViewUntrustedLast int64
-	exits                  *prometheus.CounterVec
+	exits         *prometheus.CounterVec
 	// entryWait is ONE histogram for BOTH seat waits (newcomer and re-entry), split by
 	// `kind`: they answer the same question (how long did admission make this branch
 	// wait), and two names meant two bucket sets and two queries.
@@ -115,8 +109,6 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "DERIVED cold-entry stagger cap in tokens: floor((1-groupBudgetFraction) x this engine's num_gpu_blocks) x blockSizeTokens"}, engineLabels)
 	g.waitersShared = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "waiters_shared",
 		Help: "heads waiting in the ONE shared admission queue"})
-	g.queueViewUntrusted = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "queue_view_untrusted_passes_total",
-		Help: "budget-enforcement passes whose victim choice ran with a queue view older than idleSeconds (the C8 guard skipped the head-presence classes)"})
 	g.exits = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "exits_total",
 		Help: "branch exits by reason"}, []string{"engine", "reason"})
 	g.entryWait = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "entry_wait_seconds",
@@ -140,7 +132,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	for _, c := range []prometheus.Collector{g.seats, g.neBlocks, g.budgetBlocks,
 		g.exitingBranches, g.exitingBlocks, g.exitingOldest,
 		g.coldInFlight, g.coldCap, g.waitersShared,
-		g.queueViewUntrusted, g.exits, g.entryWait, g.served,
+		g.exits, g.entryWait, g.served,
 		g.capacityMissing, g.capacityLearned,
 		g.affinityViolations, g.rebinds, g.engineGone, g.coldValveHeld,
 	} {
@@ -204,10 +196,6 @@ func (g *groupMetrics) Refresh() {
 		}
 	}
 	g.waitersShared.Set(float64(snap.WaitersShared))
-	if d := snap.QueueViewUntrusted - g.queueViewUntrustedLast; d > 0 {
-		g.queueViewUntrusted.Add(float64(d))
-		g.queueViewUntrustedLast = snap.QueueViewUntrusted
-	}
 }
 
 // ObserveExit records a branch exit (the reason + engine).

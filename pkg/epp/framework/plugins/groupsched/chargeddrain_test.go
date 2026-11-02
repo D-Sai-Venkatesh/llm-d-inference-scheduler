@@ -240,7 +240,6 @@ func TestChargedDrainReapOfCancelledRequestReleases(t *testing.T) {
 	cfg.IdleSeconds = 1e5
 	chargedPath(t, cfg, "reap-cancelled", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-cancelled", true)
-		fx.s.lastHeads = nil      // no queued heads: the release must not be masked by a re-admission
 		fx.tick(61 * time.Second) // the confirmed-id reap bound
 		assertReleased(t, fx, g, "reap (cancel, no settle)")
 	})
@@ -262,7 +261,6 @@ func TestChargedDrainReapOfUnconfirmedRequestReleases(t *testing.T) {
 			t.Fatal("fixture: the entry's cold charge must still be outstanding (no chunk, no settle)")
 		}
 		fx.s.mu.Lock()
-		fx.s.lastHeads = nil
 		fx.s.mu.Unlock()
 		fx.tick(31 * time.Second) // the provisional reap bound
 		assertReleased(t, fx, g, "reap (error before first chunk)")
@@ -292,7 +290,6 @@ func TestChargedDrainHeadlessIdleReleases(t *testing.T) {
 		m.inflight = 0
 		m.lastActivity = fx.clock
 		m.waitingSince = time.Time{} // headless: nothing queued for it
-		fx.s.lastHeads = nil         // ... and the queue view agrees (no stale head snapshot)
 		fx.s.mu.Unlock()
 		fx.tick(31 * time.Second) // past the TTL
 		assertReleased(t, fx, g, "ttl")

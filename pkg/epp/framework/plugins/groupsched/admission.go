@@ -178,10 +178,6 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatChoice {
 			// lands (and alarms loudly if it never does).
 			continue
 		}
-		if s.safetyFiredLocked(g) {
-			g.counters.safetySkips++
-			continue
-		}
 		tokens := coldTokensForEngine(head, g, s.blockSize)
 		blocks := tokens / int64(s.blockSize)
 		free := s.freeBudgetLocked(g)
@@ -217,8 +213,8 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatChoice {
 func (s *Scheduler) coldValveHeldOn(head *waiter) (string, bool) {
 	best := EngineCandidate{Engine: ""}
 	for _, g := range s.activeGroupsLocked() {
-		if g.numBlocks <= 0 || s.safetyFiredLocked(g) {
-			continue // no measured capacity, or the engine is not taking seats at all
+		if g.numBlocks <= 0 {
+			continue // no measured capacity: the engine is not taking seats at all
 		}
 		tokens := coldTokensForEngine(head, g, s.blockSize)
 		if tokens/int64(s.blockSize) > s.freeBudgetLocked(g) {

@@ -58,7 +58,7 @@ package groupsched
 //	  engineChoice: "most-free-budget"
 //	  rotation: "quantum"
 //	  victim: "valve"
-//	  safety: "none"             # CORE_SAFETY: | "budget-fraction" (the memory-only net)
+//	  safety: "none"             # CORE_SAFETY (one value: the seat budget is the control)
 //	  executionBudget: "none"    # CORE_EXECUTION_BUDGET (one value: the seam is empty)
 //	flowControl:
 //	  saturationDetector:
@@ -374,7 +374,7 @@ func TestModuleValuesMatchTheEmitter(t *testing.T) {
 		{"EngineChoice", []string{"most-free-budget"}},
 		{"Rotation", []string{"quantum"}},
 		{"Victim", []string{"valve"}},
-		{"Safety", []string{"none", "budget-fraction"}},
+		{"Safety", []string{"none"}},
 		{"ExecutionBudget", []string{"none"}},
 	}
 	for _, e := range emitted {

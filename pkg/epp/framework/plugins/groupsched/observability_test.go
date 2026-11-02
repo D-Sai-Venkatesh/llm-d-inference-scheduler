@@ -166,7 +166,7 @@ func TestQueueViewAgeAndUntrustedPassesAreVisible(t *testing.T) {
 		}
 		// the pass that just ran OBSERVED the queue: the evidence is 0 s old, and no pass
 		// has needed the guard.
-		m.Refresh(0)
+		m.Refresh()
 		snap := fx.s.Snapshot()
 		if snap.QueueViewAgeSeconds != 0 {
 			t.Fatalf("a pass that just observed the queue reports age %v s, want 0", snap.QueueViewAgeSeconds)
@@ -199,7 +199,7 @@ func TestQueueViewAgeAndUntrustedPassesAreVisible(t *testing.T) {
 			t.Fatalf("evidence age = %v s after a %v s gap, want > S (%v): a Tick re-sync must not mask how stale the OBSERVATION is",
 				snap.QueueViewAgeSeconds, stale, defaultConfig().IdleSeconds)
 		}
-		m.Refresh(0)
+		m.Refresh()
 		if got, ok := gatherValue(t, reg, subsystem+"_queue_view_age_seconds", nil); !ok || got <= defaultConfig().IdleSeconds {
 			t.Fatalf("queue_view_age_seconds = %v (present=%v), want > S (%v)", got, ok, defaultConfig().IdleSeconds)
 		}
@@ -259,12 +259,12 @@ func TestEventRingWrapIsCounted(t *testing.T) {
 		if len(snap.RecentEvents) != eventRingSize {
 			t.Fatalf("RecentEvents holds %d events, want the ring bound %d", len(snap.RecentEvents), eventRingSize)
 		}
-		m.Refresh(0)
+		m.Refresh()
 		if got, ok := gatherValue(t, reg, subsystem+"_event_ring_dropped_total", nil); !ok || got != 16 {
 			t.Fatalf("event_ring_dropped_total = %v (present=%v), want 16", got, ok)
 		}
 		// the counter is monotone and never double-booked by a second Refresh
-		m.Refresh(0)
+		m.Refresh()
 		if got, _ := gatherValue(t, reg, subsystem+"_event_ring_dropped_total", nil); got != 16 {
 			t.Fatalf("event_ring_dropped_total = %v after a second Refresh, want 16 (delta pattern)", got)
 		}
@@ -280,7 +280,7 @@ func TestColdCapIsExportedPerEngine(t *testing.T) {
 		if err := m.register(reg); err != nil {
 			t.Fatalf("register: %v", err)
 		}
-		m.Refresh(0)
+		m.Refresh()
 		want := float64(200 * 64) // 5 % of 4,000 blocks x 64 tokens
 		for _, id := range fx.ids {
 			if got, ok := gatherValue(t, reg, subsystem+"_cold_cap_tokens", map[string]string{"engine": id}); !ok || got != want {
@@ -313,7 +313,7 @@ func TestExitingLedgerIsVisiblePerEngine(t *testing.T) {
 		if err := mtr.register(reg); err != nil {
 			t.Fatalf("register: %v", err)
 		}
-		mtr.Refresh(0)
+		mtr.Refresh()
 		if got, ok := gatherValue(t, reg, subsystem+"_exiting_members", map[string]string{"engine": engineLabel(g.id)}); !ok || got != 0 {
 			t.Fatalf("a settled engine reports %v exiting members (present=%v), want 0", got, ok)
 		}
@@ -327,7 +327,7 @@ func TestExitingLedgerIsVisiblePerEngine(t *testing.T) {
 		fx.s.mu.Unlock()
 
 		fx.tick(7 * time.Second) // the decision clock advances; the drain has not (one request in flight)
-		mtr.Refresh(0)
+		mtr.Refresh()
 		if got, ok := gatherValue(t, reg, subsystem+"_exiting_members", map[string]string{"engine": engineLabel(g.id)}); !ok || got != 1 {
 			t.Fatalf("exiting_members = %v (present=%v), want 1", got, ok)
 		}
@@ -344,7 +344,7 @@ func TestExitingLedgerIsVisiblePerEngine(t *testing.T) {
 
 		// the drain: the ledger empties
 		fx.s.SettleOnUsage("gone", "r-gone", g.id, 300, 0, 0, false, fx.clock)
-		mtr.Refresh(0)
+		mtr.Refresh()
 		for _, name := range []string{"_exiting_members", "_exiting_blocks", "_exiting_oldest_age_seconds"} {
 			if got, ok := gatherValue(t, reg, subsystem+name, map[string]string{"engine": engineLabel(g.id)}); !ok || got != 0 {
 				t.Fatalf("%s = %v (present=%v) after the drain, want 0", name, got, ok)

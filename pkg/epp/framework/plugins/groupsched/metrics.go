@@ -18,7 +18,6 @@ package groupsched
 
 import (
 	"fmt"
-	"math"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -87,20 +86,6 @@ type groupMetrics struct {
 	capacityMissing *prometheus.GaugeVec
 	capacityLearned *prometheus.CounterVec
 
-	// ---- the safety net (per engine) ----
-	safetyFired        *prometheus.GaugeVec
-	safetyFires        *prometheus.CounterVec
-	safetyFiredSeconds *prometheus.CounterVec
-	safetySkips        *prometheus.CounterVec
-	engineKV           *prometheus.GaugeVec
-	engineWaiting      *prometheus.GaugeVec
-
-	// poolScore is the pool saturation the plugin last handed the flow controller as
-	// the framework's detector (0 = not saturated, the default answer).
-	poolScore prometheus.Gauge
-	// staleFired counts per-engine samples the detector had to EXCLUDE because the
-	// metrics had not been refreshed (stale → open).
-	staleSamples *prometheus.CounterVec
 	// capacityHeterogeneous is 1 when a measured num_gpu_blocks deviates >1% from
 	// the first engine's: a heterogeneous pool must never silently inherit another
 	// engine's budget.
@@ -180,22 +165,6 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "1 while this engine's num_gpu_blocks is still unknown past capacityLivenessSeconds"}, engineLabels)
 	g.capacityLearned = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "capacity_learned_total",
 		Help: "how each engine's capacity was acquired"}, []string{"via", "engine"})
-	g.safetyFired = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "safety_fired",
-		Help: "1 while this engine's memory-only safety net is firing (measured kv >= groupBudgetFraction)"}, engineLabels)
-	g.safetyFires = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "safety_fires_total",
-		Help: "safety net fire EVENTS per engine"}, engineLabels)
-	g.safetyFiredSeconds = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "safety_fired_seconds_total",
-		Help: "seconds this engine's safety net has been firing"}, engineLabels)
-	g.safetySkips = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "safety_skips_total",
-		Help: "decisions the safety net held back (dispatch or seat attempts) on this engine"}, engineLabels)
-	g.engineKV = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "engine_kv_usage",
-		Help: "the engine's scraped kv_cache_usage (the safety net's input)"}, engineLabels)
-	g.engineWaiting = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "engine_waiting_queue",
-		Help: "the engine's scraped vLLM waiting queue depth (REPORTING only: not part of the net)"}, engineLabels)
-	g.poolScore = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "detector_pool_score",
-		Help: "the pool saturation this plugin handed the flow controller as the saturation detector (0 = not saturated)"})
-	g.staleSamples = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "detector_stale_samples_total",
-		Help: "per-engine samples the detector excluded because the metrics were not refreshed"}, engineLabels)
 	g.capacityHeterogeneous = prometheus.NewGauge(prometheus.GaugeOpts{Subsystem: subsystem, Name: "capacity_heterogeneous",
 		Help: "1 when an engine's num_gpu_blocks deviates >1% from the first measured engine"})
 	g.filterDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "filter_decisions_total",
@@ -213,8 +182,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.waiters, g.coldInFlight, g.coldCap, g.capacity, g.waitersShared,
 		g.exitingMembers, g.exitingBlocks, g.exitingOldest, g.exits, g.residency, g.entryWait,
 		g.reentryWait, g.refillShare, g.served, g.fcfs, g.capacityMissing, g.capacityLearned,
-		g.safetyFired, g.safetyFires, g.safetyFiredSeconds, g.safetySkips, g.engineKV, g.engineWaiting,
-		g.poolScore, g.staleSamples, g.capacityHeterogeneous, g.filterDecisions, g.affinityViolations, g.rebinds, g.engineGone,
+		g.capacityHeterogeneous, g.filterDecisions, g.affinityViolations, g.rebinds, g.engineGone,
 		g.coldValveHeld, g.queueViewAge, g.queueViewUntrusted, g.eventRingDropped,
 	} {
 		if err := reg.Register(c); err != nil {
@@ -234,15 +202,11 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 // Refresh pushes a scheduler snapshot into the gauges (the ticker calls it every
 // second; the counters and histograms are observed at their events by the
 // scheduler).
-func (g *groupMetrics) Refresh(poolScoreBits uint64) {
+func (g *groupMetrics) Refresh() {
 	if g == nil || g.seats == nil {
 		return
 	}
 	snap := g.sched.SnapshotLite()
-	loads := map[string]SafetyState{}
-	for _, st := range g.sched.SafetyStates() {
-		loads[engineLabel(st.Engine)] = st
-	}
 	// PRE-INSTANTIATE the per-engine counter series for every known engine. A
 	// *CounterVec has no series until its first observation, so before any dispatch a
 	// scrape would carry no llm_d_epp_group_dispatches_total at all — and the deploy
@@ -265,23 +229,9 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 		g.exitingOldest.WithLabelValues(label).Set(es.ExitingOldestAgeS)
 		g.served.WithLabelValues(label).Add(0)
 		g.fcfs.WithLabelValues("nocapacity").Add(0)
-		g.safetySkips.WithLabelValues(label).Add(0)
 		for _, reason := range []string{"quantum-complete", "idle", "exiting", "engine-idle", "ttl",
 			"exiting-drain", "budget-idle", "budget-noqueue", "budget-exiting", "engine-gone"} {
 			g.exits.WithLabelValues(label, reason).Add(0)
-		}
-		if st, ok := loads[label]; ok {
-			// ONE definition, TWO readers (D3): fired comes from the scheduler's own
-			// verdict, never from the thresholds re-typed here.
-			fired := 0.0
-			if st.Fired {
-				fired = 1
-			}
-			g.safetyFired.WithLabelValues(label).Set(fired)
-			g.safetyFires.WithLabelValues(label).Add(0)
-			g.safetyFiredSeconds.WithLabelValues(label).Add(0)
-			g.engineKV.WithLabelValues(label).Set(st.KV)
-			g.engineWaiting.WithLabelValues(label).Set(float64(st.Waiting))
 		}
 	}
 	// an engine that disappeared must not keep its last gauge value
@@ -292,8 +242,7 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 		delete(g.known, label)
 		for _, vec := range []*prometheus.GaugeVec{g.seats, g.uniqueBlocks, g.neBlocks,
 			g.exitingMembers, g.exitingBlocks, g.exitingOldest,
-			g.budgetBlocks, g.capacity, g.waiters, g.coldInFlight, g.coldCap, g.safetyFired,
-			g.engineKV, g.engineWaiting} {
+			g.budgetBlocks, g.capacity, g.waiters, g.coldInFlight, g.coldCap} {
 			vec.DeleteLabelValues(label)
 		}
 	}
@@ -307,29 +256,12 @@ func (g *groupMetrics) Refresh(poolScoreBits uint64) {
 		g.eventRingDropped.Add(float64(d))
 		g.eventRingDroppedLast = snap.EventRingDropped
 	}
-	g.poolScore.Set(math.Float64frombits(poolScoreBits))
 	g.refillShare.Set(snap.RefillShare)
 	if len(snap.HeterogeneousEngines) > 0 {
 		g.capacityHeterogeneous.Set(1)
 	} else {
 		g.capacityHeterogeneous.Set(0)
 	}
-}
-
-// observeSafety books a fire EVENT (a transition into firing) and the accumulated
-// fired time. Called from the scheduler's settle hook.
-func (g *groupMetrics) observeSafety(engine string, fires int64, firedSeconds float64, fired bool) {
-	if g == nil || g.safetyFires == nil {
-		return
-	}
-	label := engineLabel(engine)
-	f := 0.0
-	if fired {
-		f = 1
-	}
-	g.safetyFired.WithLabelValues(label).Set(f)
-	g.safetyFires.WithLabelValues(label).Add(float64(fires))
-	g.safetyFiredSeconds.WithLabelValues(label).Add(firedSeconds)
 }
 
 // ObserveExit records a member exit (residency turns + the reason + engine).
@@ -410,14 +342,6 @@ func (g *groupMetrics) SetCapacityMissing(engine string, missing bool) {
 		v = 1
 	}
 	g.capacityMissing.WithLabelValues(engine).Set(v)
-}
-
-// ObserveStaleSample books an engine sample the detector had to exclude.
-func (g *groupMetrics) ObserveStaleSample(engine string) {
-	if g == nil || g.staleSamples == nil {
-		return
-	}
-	g.staleSamples.WithLabelValues(engineLabel(engine)).Inc()
 }
 
 // ObserveFCFS records a pre-capacity FCFS dispatch (label "nocapacity": B2 — a

@@ -515,19 +515,16 @@ func (NoopDispatchGate) Allows(DispatchCtx) bool { return true }
 
 // ---- SAFETY ------------------------------------------------------------------
 
-// SafetyDetector is THE definition of the net. The DEFAULT is NoopSafety: the seat
-// budget alone governs dispatch and admission, which is the human's model and makes
-// the core's no-constant claim exact. BudgetFraction (the memory-only detector) is
-// the ALTERNATIVE, kept wired and tested but OFF: its input is vLLM's kv_cache_usage,
-// and whether that measures IN-USE work (blocks with ref_cnt > 0) or cache occupancy
-// is still being verified against the vLLM source — a metric gate that latches on a
-// wrongly-understood input is worse than no gate (the E-wave measured exactly that).
+// SafetyDetector is the SAFETY seam. The ONE wired value is NoopSafety: the seat
+// budget is the whole admission control ("safety: none").
 //
-// The run-level safety that replaces it: preemptions <= the FCFS arm's (a hard fail),
-// plus the wave's own liveness gates. One implementation is
-// used by two readers: the scheduler (per-engine dispatch/seat holds) and the
-// framework's detector plugin (the pool-level Saturation signal) — see
-// detector.go, which is the same value wired into the framework's detector slot.
+// The memory-only net (threshold = the budget's own fraction, live kv scrape) was the
+// parked alternative and is REMOVED with its readers: the per-engine holds that asked
+// it, the pool score the framework detector returned, and the live-sample staleness
+// rule. What remains of the seam is the type: a future net is one implementation of
+// this interface plus one config value, and it must bring its own evidence — the trim
+// also removed the verdict path (safetyFiredLocked) rather than leaving a hook nothing
+// can reach.
 type SafetyDetector interface {
 	Name() string
 	// Threshold is the utilisation at which the net fires (the budget's own
@@ -565,27 +562,6 @@ func (NoopSafety) Threshold() float64 { return 0 }
 func (NoopSafety) Fired(float64, bool) bool { return false }
 
 func (NoopSafety) Score(float64, bool) float64 { return 0 }
-
-// BudgetFraction is the ALTERNATIVE: the memory-only detector at the seat budget's own
-// fraction (stale/absent metrics are OPEN — the budget is the primary control).
-type BudgetFraction struct {
-	Fraction float64
-}
-
-func (BudgetFraction) Name() string { return "budget-fraction" }
-
-func (d BudgetFraction) Threshold() float64 { return d.Fraction }
-
-func (d BudgetFraction) Fired(kv float64, have bool) bool {
-	return have && kv >= d.Fraction
-}
-
-func (d BudgetFraction) Score(kv float64, have bool) float64 {
-	if !have {
-		return 0 // no evidence → open (the budget is the primary control)
-	}
-	return kv / d.Fraction
-}
 
 // ---- the bundle --------------------------------------------------------------
 
@@ -638,10 +614,8 @@ func buildModules(cfg Config) (modules, error) {
 	switch cfg.Safety {
 	case "", "none":
 		m.safety = NoopSafety{}
-	case "budget-fraction":
-		m.safety = BudgetFraction{Fraction: cfg.GroupBudgetFraction}
 	default:
-		return m, errValue("safety", cfg.Safety, "none|budget-fraction")
+		return m, errValue("safety", cfg.Safety, "none")
 	}
 	switch cfg.ExecutionBudget {
 	case "", "none":

@@ -428,10 +428,9 @@ func TestGoldenHashesPinned(t *testing.T) {
 // difference between the two builds is the safety module, and this comparison is
 // exact because of the module's DEFAULT: NoopSafety (the seat budget is the whole
 // admission control). f0p's plugin-side gate was OFF as well, so the two builds run
-// with the SAME gate state — open, always. (Run the core with safety=budget-fraction
-// and the trace MAY diverge wherever that net fires; that arm's divergence is the
-// measured effect of the net, not a golden violation, and the wave's matched anchor
-// arm measures it on the cluster.)
+// with the SAME gate state — open, always. (The memory-only
+// net was the one configuration that could diverge; it was removed with the trim, so
+// this comparison is unconditional.)
 //
 // What the trace proves: identical picks, identical seats, identical exits with
 // reasons, identical seated-set transitions, identical served/refill totals, over

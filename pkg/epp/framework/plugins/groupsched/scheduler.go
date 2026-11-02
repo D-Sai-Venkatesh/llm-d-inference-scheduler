@@ -103,8 +103,8 @@ type Config struct {
 	//	EngineChoice "most-free-budget" most free budget where the head fits, tie → id
 	//	Rotation     "quantum"          fixed Q busy periods (plus S of silence)
 	//	Victim       "valve"            f0p's memory-pressure order
-	//	Safety       "none"            no net (the seat budget IS the control) |
-	//	             "budget-fraction" memory-only net at the budget's own fraction
+	//	Safety       "none"            no net (the seat budget IS the control): the ONE
+	//	                               value
 	//	ExecutionBudget
 	//	             "none"            no dispatch gate (an admitted turn runs) — the ONE
 	//	                               value: the seam stays (modules.go DispatchGate) but
@@ -403,11 +403,6 @@ type engineGroup struct {
 	// estimate component).
 	pendingTotal int64
 
-	// safetyFiredOn is the net's LATCHED verdict as of the last settle, and
-	// safetySince the start of the current fire interval (safety.go).
-	safetyFiredOn bool
-	safetySince   time.Time
-
 	// estCache/estVersion cache waiter admission estimates keyed on the index's
 	// mutation version (M2: Picks run at ~1kHz; unchanged state must not recompute
 	// ~150 × ~1k-block history scans). Per engine because the versions are.
@@ -417,11 +412,6 @@ type engineGroup struct {
 	counters struct {
 		served     int64 // dispatches served on this engine
 		fcfsServed int64 // pre-capacity FCFS dispatches counted here
-		// safetySkips counts dispatches the SAFETY NET held back (safety.go).
-		safetySkips int64
-		// safetyFires / safetyFiredSeconds are the net's events and fired time.
-		safetyFires        int64
-		safetyFiredSeconds float64
 		// entryWaits / reentryWaits are THIS engine's seat-wait samples (the
 		// per-engine wait ladder the dump reports, B7).
 		entryWaits   []float64
@@ -534,10 +524,6 @@ type Scheduler struct {
 	// one admission system instead of N.
 	waiters map[string]*waiter
 
-	// load is the PER-ENGINE utilisation view the plugin pushes up from the
-	// endpoint metrics it already polls (safety.go).
-	load map[string]engineLoad
-
 	// pickSeq synthesizes request ids for heads that lack one (M1).
 	pickSeq int64
 	// queueViewAt is when the queue-head snapshot was last reconciled
@@ -616,8 +602,7 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 		everSeated: map[string]struct{}{},
 		lastSeen:   map[string]time.Time{},
 		bindings:   map[string]string{},
-		waiters:    map[string]*waiter{},
-		load:       map[string]engineLoad{}}
+		waiters:    map[string]*waiter{}}
 	s.counters.exits = map[string]int64{}
 	s.counters.memberSources = map[string]int64{}
 	return s, nil
@@ -913,15 +898,6 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 			continue
 		}
 		if m.inflight >= s.cfg.InFlightCap {
-			continue
-		}
-		if s.safetyFiredLocked(g) {
-			// THE SAFETY NET holds this engine's own DISPATCHES (not just its seats):
-			// the net exists to leave preemption headroom for RUNNING work, and a
-			// running request's KV keeps growing after it was admitted. First-fit, like
-			// the seat loop: the head stays queued, other engines carry on, and a fire
-			// that clears restores the engine to the ordinary path with no state to undo.
-			g.counters.safetySkips++
 			continue
 		}
 		perEngine[g.id] = append(perEngine[g.id], cand{i: i, h: h, engine: g.id})
@@ -1856,7 +1832,6 @@ func (s *Scheduler) Tick(now time.Time) {
 	s.reapInflightLocked(now)
 	s.drainExitingLocked(now)
 	for _, g := range s.activeGroupsLocked() {
-		s.settleNetLocked(g, now)
 		s.enforceBudgetLocked(g, now)
 		for id, m := range g.members {
 			if now.Sub(m.lastActivity) > time.Duration(s.cfg.TTLSeconds*float64(time.Second)) &&
@@ -1877,13 +1852,6 @@ func (s *Scheduler) Tick(now time.Time) {
 	// every decision pass, and Tick's rotate uses it so the two paths agree), then seat.
 	s.syncWaitersLocked(s.lastHeads, now)
 	s.rotateLocked(now)
-}
-
-// settleNetLocked re-evaluates the safety net against the pushed snapshot so the
-// fire COUNT and the fired TIME are booked on the decision clock (a net that opens
-// and closes between two Picks is still a fire event).
-func (s *Scheduler) settleNetLocked(g *engineGroup, now time.Time) {
-	s.settleSafetyLocked(g, s.safetyFiredLocked(g), now)
 }
 
 // gcSilentRecordsLocked forgets headless, unseated records whose last activity is
@@ -2138,8 +2106,6 @@ type EngineSnapshot struct {
 	// scraped inputs it reads (the queue depth is reported, never decisive).
 	SafetyFiring       bool    `json:"safetyFiring"`
 	SafetyFires        int64   `json:"safetyFires"`
-	SafetyFiredSeconds float64 `json:"safetyFiredSeconds"`
-	SafetySkips        int64   `json:"safetySkips"`
 	SafetyKV           float64 `json:"safetyKv"`
 	SafetyWaitingQueue int     `json:"safetyWaitingQueue"`
 	// EntryWaitP50 / ReentryWaitP50 are THIS engine's median seat waits (B7: the
@@ -2193,7 +2159,6 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 	for _, id := range s.groupOrder {
 		g := s.groups[id]
 		label := engineLabel(id)
-		st := s.safetyStateLocked(g, s.now)
 		exitingMembers, exitingOldest := 0, time.Duration(0)
 		for id, m := range g.members {
 			if !g.index.ExitingLocked(id) {
@@ -2211,13 +2176,10 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 			BudgetBlocks: g.budgetBlocks, NumBlocks: g.numBlocks,
 			CapacityOK: g.numBlocks > 0, PendingBlocks: g.pendingTotal,
 			ColdInFlight: g.coldInFlight, Served: g.counters.served,
-			ColdCapTokens: g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize),
-			FCFSServed:    g.counters.fcfsServed,
-			ForcedSeats:   g.counters.forcedSeats,
-			BoundMembers:  snap.Bindings[label],
-			SafetyFiring:  st.Fired, SafetyFires: st.Fires,
-			SafetyFiredSeconds: st.FiredSeconds, SafetySkips: g.counters.safetySkips,
-			SafetyKV: st.KV, SafetyWaitingQueue: st.Waiting,
+			ColdCapTokens:  g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize),
+			FCFSServed:     g.counters.fcfsServed,
+			ForcedSeats:    g.counters.forcedSeats,
+			BoundMembers:   snap.Bindings[label],
 			EntryWaitP50:   p50(g.counters.entryWaits),
 			ReentryWaitP50: p50(g.counters.reentryWaits),
 		}

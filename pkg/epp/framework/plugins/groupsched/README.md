@@ -19,7 +19,7 @@ Six questions, one module each, one config value selecting the implementation:
 | placement | `EngineChooser` | `MostFreeBudget` ("most-free-budget") | which engine takes the head |
 | tenure | `RotationPolicy` | `FixedQuantum` ("quantum") | when may a resident be released |
 | pressure | `VictimChooser` | `BudgetValve` ("valve") | who leaves when an engine is over budget |
-| safety | `SafetyDetector` | `NoopSafety` ("none") | is the engine's net firing (always no: the seat budget is the control) |
+| safety | `SafetyDetector` | `NoopSafety` ("none") | is the engine's net firing (always no: the seat budget is the control; the seam is empty) |
 | dispatch | `DispatchGate` | `NoopDispatchGate` ("none") | may this seated turn RUN now (the seam is empty: no gate is wired) |
 
 The policy in one paragraph: a member is **seated** on exactly one engine, and its seat
@@ -92,7 +92,9 @@ archive **+ fixes 0-7** (recipe §4, Layer C); their counts are lines differing 
 
 The safety module's default is `none`, and f0p's plugin-side gate was off as well, so
 the two builds run with the **same gate state** (always open). Running the core with
-`safety: "budget-fraction"` is the one configuration that may legitimately diverge, and
+(The memory-only `safety: "budget-fraction"` net was removed with the trim; the golden
+comparison is now unconditional.) Historically it was the one configuration that could
+legitimately diverge, and
 then the divergence IS the net's measured effect.
 
 ## 2a. Reading A vs Reading B, settled by one replay

@@ -116,7 +116,8 @@ export CORE_MODULE_BLOCK
 
 * `ENGINES>1` is fine (the core is per-engine) — the old "single mode refuses ENGINES>1"
   guard disappears with the pooled mode;
-* `CORE_SAFETY=budget-fraction` is refused unless the arm is explicitly a backstop arm
+* `CORE_SAFETY=budget-fraction` is RETIRED — the net is removed by the trim; the config
+  accepts `none` only. (Historically it was refused unless the arm was explicitly a backstop arm
   (it is not part of the wave);
 * `CORE_DETECTOR` must be `group` on a core arm and `utilization-detector` on FCFS;
 * `AFFINITY_FILTER=0` and `BRANCH_PLUGIN=1` are mandatory on a core arm.

@@ -28,11 +28,9 @@ import (
 )
 
 // T1: PLACEMENT IS MOST-FREE-BUDGET. Of two engines where the head fits on both,
-// the one with more free budget takes the seat; if that engine's safety net is
-// firing, the other one takes it.
+// the one with more free budget takes the seat.
 func TestT1SeatGoesToTheMostFreeBudget(t *testing.T) {
 	cfg := defaultConfig()
-	cfg.Safety = "budget-fraction" // T1's second half needs the net
 	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
 		if len(fx.ids) < 2 {
 			// N=1: the same code with one candidate — the head lands on it.
@@ -54,24 +52,6 @@ func TestT1SeatGoesToTheMostFreeBudget(t *testing.T) {
 		}
 		if e != fx.ids[1] {
 			t.Fatalf("T1: the seat must go to the engine with the MOST FREE BUDGET (%s), got %s", fx.ids[1], e)
-		}
-		// now fire engine-b's safety net: the next head must go to engine-a
-		fx.s.SetEngineLoad(fx.ids[1], 0.99, 0, fx.clock)
-		fx.s.Tick(fx.clock)
-		h2 := head("m2", time.Second, bytesFor(100))
-		e2, i2 := fx.pickEngine(h2)
-		if i2 != 0 {
-			t.Fatalf("the second head must still be seated, got %d", i2)
-		}
-		if e2 != fx.ids[0] {
-			t.Fatalf("T1: with %s's net firing the head must go to %s, got %s", fx.ids[1], fx.ids[0], e2)
-		}
-		// and once the fire clears, the placement is the plain key again (a net never
-		// influences placement beyond holding its own engine's seats)
-		fx.s.SetEngineLoad(fx.ids[1], 0.10, 0, fx.clock.Add(time.Second))
-		fx.s.Tick(fx.clock.Add(time.Second))
-		if snap := fx.s.Snapshot(); snap.Engines[engineLabel(fx.ids[1])].SafetyFiring {
-			t.Fatal("the net must clear when the measured kv drops")
 		}
 	})
 }
@@ -115,10 +95,12 @@ func TestT2ExitUnbindsAndReentryReseatsAfresh(t *testing.T) {
 
 // T3: THE e4 REGRESSION. Four seats, KV at 3 %, MANY queued/held heads: the engine
 // keeps taking seats and NOTHING closes. (The E-wave's defect closed its gate on five
-// waiting requests at 3 % KV — a raw count — and the engine then starved permanently.)
+// waiting requests at 3 % KV — a raw count — and the engine then starved permanently.
+// The queue term is gone (the net itself is gone with the trim), so the property this
+// pins is narrower and still worth pinning: a deep vLLM queue is not a reason to stop
+// seating.)
 func TestT3e4RegressionNoLockInOnQueueDepth(t *testing.T) {
 	cfg := defaultConfig()
-	cfg.Safety = "budget-fraction" // even with the net ON, 3 % KV must not fire it
 	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
 		// four seats, each with a queued follow-up head (the residents want to run)
 		for i := 0; i < 4; i++ {
@@ -130,10 +112,6 @@ func TestT3e4RegressionNoLockInOnQueueDepth(t *testing.T) {
 			m.waitingSince = fx.clock.Add(-time.Duration(5+i) * time.Second)
 			m.lastActivity = fx.clock
 			fx.s.mu.Unlock()
-		}
-		// every engine: measured KV 3 %, vLLM waiting queue FULL (100)
-		for _, e := range fx.ids {
-			fx.s.SetEngineLoad(e, 0.03, 100, fx.clock)
 		}
 		fx.s.Tick(fx.clock)
 		before := fx.s.Snapshot()
@@ -150,67 +128,6 @@ func TestT3e4RegressionNoLockInOnQueueDepth(t *testing.T) {
 		after := fx.s.Snapshot()
 		if after.Seats <= before.Seats {
 			t.Fatalf("T3: the policy must KEEP seating (%d -> %d seats)", before.Seats, after.Seats)
-		}
-		for _, es := range after.Engines {
-			if es.SafetyFiring {
-				t.Fatal("T3: 3 % KV and a deep waiting queue must not fire the safety net")
-			}
-		}
-	})
-}
-
-// T4: THE QUEUE TERM IS GONE. vLLM reporting waiting=100 at KV 0.5 does NOT close
-// the net; KV at or over the budget fraction DOES — and the threshold is the budget's
-// own fraction (no second constant).
-func TestT4SafetyIsMemoryOnly(t *testing.T) {
-	cfg := defaultConfig()
-	cfg.Safety = "budget-fraction"
-	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
-		eng := fx.ids[0]
-		// deep queue, half-full KV: OPEN
-		fx.s.SetEngineLoad(eng, 0.5, 100, fx.clock)
-		fx.s.Tick(fx.clock)
-		if fx.s.Snapshot().Engines[engineLabel(eng)].SafetyFiring {
-			t.Fatal("T4: a waiting queue of 100 at KV 0.5 must NOT close the net (no queue term)")
-		}
-		// KV exactly at the budget fraction: FIRING
-		fx.s.SetEngineLoad(eng, cfg.GroupBudgetFraction, 0, fx.clock)
-		fx.s.Tick(fx.clock)
-		st := fx.s.Snapshot().Engines[engineLabel(eng)]
-		if !st.SafetyFiring {
-			t.Fatalf("T4: KV at the budget's own fraction (%v) must fire the net", cfg.GroupBudgetFraction)
-		}
-		if st.SafetyFires != 1 {
-			t.Fatalf("T4: one fire EVENT must be booked, got %d", st.SafetyFires)
-		}
-		// a firing engine seats nothing new and holds its own dispatches
-		before := fx.s.Snapshot().Engines[engineLabel(eng)].Seats
-		h := head("n", time.Second, bytesFor(100))
-		if len(fx.ids) == 1 {
-			if _, i := fx.pickEngine(h); i >= 0 {
-				t.Fatal("T4: a firing engine must not seat a new head")
-			}
-			if fx.s.Snapshot().Engines[engineLabel(eng)].Seats != before {
-				t.Fatal("T4: the seat count must not move while fired")
-			}
-		}
-		// the fire time is booked (the wave's "fired <= 1 %" liveness line)
-		if st2 := fx.s.Snapshot().Engines[engineLabel(eng)]; st2.SafetyFiredSeconds < 0 {
-			t.Fatal("fired seconds must be countable")
-		}
-	})
-}
-
-// NOOP IS THE DEFAULT: with the default config the net never fires, whatever the
-// metrics say — the seat budget is the whole admission control.
-func TestSafetyIsNoopByDefault(t *testing.T) {
-	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-		eng := fx.ids[0]
-		fx.s.SetEngineLoad(eng, 1.0, 1000, fx.clock)
-		fx.s.Tick(fx.clock)
-		st := fx.s.Snapshot().Engines[engineLabel(eng)]
-		if st.SafetyFiring || st.SafetyFires != 0 {
-			t.Fatalf("the default safety module must be a NOOP, got firing=%v fires=%d", st.SafetyFiring, st.SafetyFires)
 		}
 	})
 }

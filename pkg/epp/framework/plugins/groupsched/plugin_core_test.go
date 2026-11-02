@@ -117,85 +117,12 @@ func TestDetectorDefaultsToNotSaturated(t *testing.T) {
 		if got := p.Saturation(context.Background(), livePods(eps...)); got != 0 {
 			t.Fatalf("N=%d: the default detector must answer 0 (not saturated), got %v", n, got)
 		}
-		// it still SAMPLES what it read on the ticker (the instrumentation has to exist
-		// even when nothing is gated: a run states what would have happened)
+		// the live candidate set is still remembered on the ticker: it is the capacity
+		// retry's input (a remembered endpoint clone could never see the geometry arrive)
 		p.pushEngineLoad(time.Now())
-		if got := len(p.liveSamples()); got != n {
-			t.Fatalf("N=%d: the detector must publish one sample per engine, got %d", n, got)
+		if got := p.sampleCandidates(time.Now()); len(got) != n {
+			t.Fatalf("N=%d: the ticker must sample one reading per engine, got %d", n, len(got))
 		}
-	}
-}
-
-// The memory-only ALTERNATIVE: pool score = MIN over engines of kv/threshold; stale or
-// missing metrics are OPEN (excluded); the threshold is the budget's own fraction.
-func TestDetectorMemoryOnlyAlternative(t *testing.T) {
-	cfg := defaultConfig()
-	cfg.Safety = "budget-fraction"
-	p := newTestPlugin(t, cfg, 2, 1000)
-	now := time.Now()
-	// one engine at half the threshold, one at the threshold: MIN is the half one
-	got := p.Saturation(context.Background(), livePods(
-		liveEndpoint("a", cfg.GroupBudgetFraction/2, 0, 64, 1000, now),
-		liveEndpoint("b", cfg.GroupBudgetFraction, 900, 64, 1000, now)))
-	want := 0.5
-	if got < want-1e-9 || got > want+1e-9 {
-		t.Fatalf("the pool score must be the MIN over engines (%v), got %v", want, got)
-	}
-	// a STALE sample is excluded: the fresh half-filled engine decides, and a fully
-	// stale pool reads 0 (OPEN)
-	stale := now.Add(-time.Hour)
-	if got := p.Saturation(context.Background(), livePods(
-		liveEndpoint("a", cfg.GroupBudgetFraction/2, 0, 64, 1000, now),
-		liveEndpoint("b", 1.0, 900, 64, 1000, stale))); got < want-1e-9 || got > want+1e-9 {
-		t.Fatalf("a stale engine must be excluded (OPEN), got %v", got)
-	}
-	if got := p.Saturation(context.Background(), livePods(
-		liveEndpoint("a", 1.0, 0, 64, 1000, stale))); got != 0 {
-		t.Fatalf("an all-stale pool must read 0 (open), got %v", got)
-	}
-}
-
-// THE CLONE REGRESSION (the latch class): the policy's engine-state input must change
-// with NO dispatch. The detector reads the LIVE endpoint objects the framework passes
-// in, so a metric that moves between two Saturation calls is seen — even though the
-// endpoint object a plugin could have remembered at construction carries a frozen
-// clone.
-func TestLiveMetricsUpdateWithoutADispatch(t *testing.T) {
-	cfg := defaultConfig()
-	cfg.Safety = "budget-fraction"
-	p := newTestPlugin(t, cfg, 1, 1000)
-	now := time.Now()
-
-	// the FROZEN case, for contrast: the clone NewEndpoint took never moves
-	frozen := &fwkdl.Metrics{KVCacheUsagePercent: 0.10, CacheBlockSize: 64, CacheNumBlocks: 1000, UpdateTime: now}
-	frozenEp := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{Name: "a",
-		ID: types.NamespacedName{Namespace: "ns", Name: "a"}}, frozen, nil)
-	frozen.KVCacheUsagePercent = 0.99 // mutating the ORIGINAL does not move the clone
-	if got := frozenEp.GetMetrics().KVCacheUsagePercent; got != 0.10 {
-		t.Fatalf("the framework's endpoint clone is expected to be frozen; got %v (the core's live-read rule assumes it)", got)
-	}
-
-	// the LIVE case: the datastore hands fresh endpoint objects; the verdict follows
-	lo := p.Saturation(context.Background(), livePods(liveEndpoint("a", 0.10, 0, 64, 1000, time.Now())))
-	if lo >= 1 {
-		t.Fatalf("kv 0.10 must not saturate, got %v", lo)
-	}
-	hi := p.Saturation(context.Background(), livePods(liveEndpoint("a", 0.99, 0, 64, 1000, time.Now())))
-	if hi < 1 {
-		t.Fatalf("kv 0.99 at a 0.95 budget fraction MUST saturate, got %v", hi)
-	}
-	// ... and the sample the ticker pushes carries that change, with no Pick, no
-	// dispatch and no settle in between
-	p.pushEngineLoad(time.Now())
-	st := p.sched.Snapshot().Engines[engineLabel(engineID(0))]
-	if !st.SafetyFiring {
-		t.Fatalf("the pushed sample must fire the net with no dispatch in between (kv=%v fires=%d)", st.SafetyKV, st.SafetyFires)
-	}
-	// ... and the fire CLEARS the same way, live
-	p.Saturation(context.Background(), livePods(liveEndpoint("a", 0.20, 0, 64, 1000, time.Now())))
-	p.pushEngineLoad(time.Now())
-	if p.sched.Snapshot().Engines[engineLabel(engineID(0))].SafetyFiring {
-		t.Fatal("the fire must clear from a live sample, again with no dispatch")
 	}
 }
 
@@ -251,28 +178,5 @@ func BenchmarkSaturationNoop(b *testing.B) {
 		if got := p.Saturation(context.Background(), eps); got != 0 {
 			b.Fatalf("noop detector must answer 0, got %v", got)
 		}
-	}
-}
-
-// The ALTERNATIVE path is rate-limited: at ~1 kHz only one recompute per refresh
-// interval happens, so its cost is amortised to ~nothing per call.
-func BenchmarkSaturationMemoryOnly(b *testing.B) {
-	cfg := defaultConfig()
-	cfg.Safety = "budget-fraction"
-	s, err := NewScheduler(cfg)
-	if err != nil {
-		b.Fatal(err)
-	}
-	p := &GroupScheduler{cfg: cfg, sched: s, metrics: newGroupMetrics(s), pins: newPinTable(),
-		endpoints: map[string]*endpointState{}, hetero: map[string]struct{}{}}
-	now := time.Now()
-	eps := make([]fwkdl.Endpoint, 0, 2)
-	for i := 0; i < 2; i++ {
-		eps = append(eps, liveEndpoint(engineID(i), 0.5, 10, 64, 1000, now))
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		p.Saturation(context.Background(), eps)
 	}
 }

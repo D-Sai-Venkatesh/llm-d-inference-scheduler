@@ -1244,6 +1244,12 @@ func (s *Scheduler) seatObservedLocked(g *engineGroup, id string, chains []Chain
 	m := &branch{id: id, engine: g.id, seatTime: now, lastActivity: now, exitingSince: now}
 	g.branches[id] = m
 	s.bindings[id] = g.id
+	// THE INVARIANT: never seated AND waiting. The branch may still have a head in the SHARED
+	// queue — its seat was released while its request was on the way, so no admission pass
+	// ever seated it, and an exit re-queued the head it had — and a seat now exists. Leaving
+	// the waiter behind would let the admission loop seat an id that is already seated, i.e.
+	// charge one branch's blocks twice.
+	delete(s.waiters, id)
 	g.counters.forcedSeats++
 	// the observed seat is a MARK too (it leaves at the drain): one departure, one booking,
 	// and it is booked when it actually leaves, not here

@@ -385,6 +385,38 @@ func TestReleasedWindowVictimIsAccountedAtPreRequest(t *testing.T) {
 	})
 }
 
+// NEVER SEATED AND WAITING, pinned directly: a branch whose turn is waiting in the shared
+// queue can still reach a pod (its seat was released while the request was on the way), and
+// the observation then seats it. The waiter must go with the seat — a seated branch left in
+// the queue is an id the admission loop may seat a second time, which charges one branch's
+// blocks twice.
+func TestObservedSeatClearsTheBranchesWaiter(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		engine := fx.ids[0]
+		// the engine's budget is 950: a holds 900 and is IN FLIGHT, so nothing fits and
+		// nothing is evictable — the shape in which a head genuinely waits
+		fx.seatOne(t, "a", 900, 5*time.Second)
+		fx.closeEnginesExcept(t, engine, 950)
+
+		h := headWithChain("b", time.Second, chainOf("b", 100))
+		if i := fx.pick(h); i >= 0 {
+			t.Fatalf("b cannot fit and nothing is evictable: the head must wait, got %d", i)
+		}
+		if got := fx.s.Snapshot().WaitersShared; got != 1 {
+			t.Fatalf("b must be waiting in the shared queue, waiters=%d", got)
+		}
+
+		// the request reaches the pod anyway: the observed endpoint wins and seats it
+		fx.s.DispatchedOn("b", "r-b", engine, chainOf("b", 100), fx.clock)
+		if !fx.s.Seated("b") {
+			t.Fatal("the observation must seat the branch its request landed on")
+		}
+		if got := fx.s.Snapshot().WaitersShared; got != 0 {
+			t.Fatalf("a SEATED branch must not stay in the shared queue: %d still waiting", got)
+		}
+	})
+}
+
 // ---- THE THREE PROBES, as regressions ----
 //
 // The window is the COMMON case, not a corner: every dispatch passes through it and Pick

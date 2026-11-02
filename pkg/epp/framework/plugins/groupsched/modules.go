@@ -126,8 +126,10 @@ type PressureCtx struct {
 	RotationVictim func() (string, *branch)
 	// Silent is the same idle test the tenure policy uses.
 	Silent func(m *branch) bool
-	// Headless reports whether the branch has no queued head (exact: enforcement runs
-	// inside Pick, on the view that pass just synced).
+	// Headless reports whether the branch has no turn wanting to run: no queued head AND no
+	// request released and on its way to a pod. A window counts here (it is a turn on its
+	// way, so a branch that has one is never "done"), and it does NOT count for the tenure
+	// rule's silence test — liveness must never be barred by a window.
 	Headless func(m *branch) bool
 }
 
@@ -277,6 +279,10 @@ type EngineCandidate struct {
 	// HasVictim is LAZY (it costs a scan): may the engine evict an eligible
 	// incumbent right now?
 	HasVictim func() bool
+	// HasValveHolder is LAZY: may the engine evict the branch HOLDING its cold-entry
+	// charge right now (tenure permitting)? That is the ONE eviction a valve-held head may
+	// take, because it frees the valve rather than the budget.
+	HasValveHolder func() bool
 }
 
 // EngineChooser answers "which engine takes this head?".
@@ -287,7 +293,13 @@ type EngineChooser interface {
 }
 
 // MostFreeBudget is the default: among the engines where the head FITS (budget AND the
-// cold valve), the one with the MOST FREE BUDGET; ties → lowest engine id.
+// cold valve), the one with the MOST FREE BUDGET AFTER the seat — free minus this head's
+// cost on it; ties → lowest engine id.
+//
+// "After" rather than "before" is the same principle evaluated on the state the decision
+// produces, and it is dedup-aware for free: a fork whose parent's prefix is already
+// resident on A costs almost nothing there, so it lands on A unless B is genuinely
+// emptier — no separate affinity rule, and nothing to tune.
 //
 //   - If NOTHING fits but some engine fits BY BUDGET (i.e. the cold-entry valve is
 //     holding the head), the answer is "wait": the valve opens by itself when that
@@ -305,18 +317,31 @@ func (MostFreeBudget) Choose(cands []EngineCandidate) int {
 		if !cands[i].Fits {
 			continue
 		}
-		if best < 0 || betterEngine(cands[i], cands[best]) {
+		if best < 0 || betterFit(cands[i], cands[best]) {
 			best = i
 		}
 	}
 	if best >= 0 {
 		return best
 	}
-	// the cold valve is holding this head somewhere: WAIT, never evict (see Fits)
+	// The cold valve is holding this head somewhere: WAIT — never evict — because evicting
+	// frees budget and never the valve. The one exception is the branch HOLDING the charge
+	// on that engine: evicting IT releases the charge and opens the valve, and it is only
+	// ever a branch the tenure rule already releases (see valveHolderVictimLocked).
 	for i := range cands {
-		if cands[i].BudgetFits {
-			return -1
+		if !cands[i].BudgetFits {
+			continue
 		}
+		if cands[i].HasValveHolder != nil && cands[i].HasValveHolder() {
+			if best < 0 || betterEngine(cands[i], cands[best]) {
+				best = i
+			}
+			continue
+		}
+		return -1 // the valve holds it and nothing may be evicted for it
+	}
+	if best >= 0 {
+		return best
 	}
 	for i := range cands {
 		if cands[i].HasVictim == nil || !cands[i].HasVictim() {
@@ -329,7 +354,17 @@ func (MostFreeBudget) Choose(cands []EngineCandidate) int {
 	return best
 }
 
-// betterEngine is the placement total order: most free budget, then engine id.
+// betterFit is the placement total order among engines the head FITS: the most free budget
+// left AFTER the seat, then the engine id.
+func betterFit(c, best EngineCandidate) bool {
+	if c.FreeBudget-c.CostBlocks != best.FreeBudget-best.CostBlocks {
+		return c.FreeBudget-c.CostBlocks > best.FreeBudget-best.CostBlocks
+	}
+	return c.Engine < best.Engine
+}
+
+// betterEngine is the placement total order for the engines that cannot take the head (and
+// for naming the engine a valve-held head waits for): most free budget, then engine id.
 func betterEngine(c, best EngineCandidate) bool {
 	if c.FreeBudget != best.FreeBudget {
 		return c.FreeBudget > best.FreeBudget

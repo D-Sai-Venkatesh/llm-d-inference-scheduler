@@ -849,6 +849,26 @@ func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccess
 // NewState satisfies the FairnessPolicy contract.
 func (r *GroupScheduler) NewState(_ context.Context) any { return nil }
 
+// Produce is the DataProducer half of the RELEASE path, and it produces nothing. Being in
+// the director's producer list is what makes this plugin a recipient of RequestAbandoned —
+// the one event that covers a request the flow controller released but that never reached
+// PreRequest (the pinned engine vanished, a screener or an admitter refused it, scheduling
+// failed). It is a no-op by construction: the scheduler reads the request, it produces no
+// data for anyone.
+func (r *GroupScheduler) Produce(context.Context, *fwksched.InferenceRequest, []fwksched.Endpoint) error {
+	return nil
+}
+
+// RequestAbandoned closes the released window for a request that left the request path
+// without reaching PreRequest. It is safe when no window exists, and it only ever clears the
+// window that names this request.
+func (r *GroupScheduler) RequestAbandoned(_ context.Context, request *fwksched.InferenceRequest) {
+	if request == nil {
+		return
+	}
+	r.sched.Abandon(r.branchOf(request), request.RequestID)
+}
+
 // PreRequest runs after the request leaves the queue (dispatch). It records the in-flight
 // request and reconciles the engine the framework ACTUALLY picked with the one the seat
 // assumed; nothing is charged here, because the seat charged the exact chains.

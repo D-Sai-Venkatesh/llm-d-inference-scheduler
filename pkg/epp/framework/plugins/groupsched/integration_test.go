@@ -141,6 +141,21 @@ func newIntegrationHarness(t *testing.T, plugin fwkplugin.Plugin) (*controller.F
 	return fc, reg
 }
 
+// enqueueAndDispatch is EnqueueAndWait plus the dispatch-side hook the director runs the
+// moment a request leaves the queue: PreRequest. The flow controller alone is only the
+// RELEASE half of the path — without PreRequest the scheduler correctly sees a request that
+// is neither queued nor in flight.
+func enqueueAndDispatch(t *testing.T, fc *controller.FlowController, gs *GroupScheduler, req *intRequest) (fcTypes.QueueOutcome, error) {
+	t.Helper()
+	outcome, err := fc.EnqueueAndWait(context.Background(), req)
+	if outcome == fcTypes.QueueOutcomeDispatched {
+		if perr := gs.PreRequest(context.Background(), req.InferenceRequest(), nil); perr != nil {
+			return outcome, perr
+		}
+	}
+	return outcome, err
+}
+
 // fcfsFactory builds the FCFS ordering policy (the band default).
 func fcfsFactory() (flowcontrol.OrderingPolicy, error) {
 	handle := testutils.NewTestHandle(context.Background())
@@ -178,7 +193,7 @@ func TestIntegrationDispatchThroughRealController(t *testing.T) {
 	// dispatch is fast — wait on the RESULT, not the queue depth.
 	go func() {
 		req := newIntRequest("m", "m-1", uint64(400))
-		outcome, err := fc.EnqueueAndWait(context.Background(), req)
+		outcome, err := enqueueAndDispatch(t, fc, gs, req)
 		results <- dispatchResult{id: "m-1", outcome: outcome, err: err}
 	}()
 	select {
@@ -193,7 +208,7 @@ func TestIntegrationDispatchThroughRealController(t *testing.T) {
 	// w enqueues behind the budget (400 + 600 > 950): it stays queued.
 	go func() {
 		req := newIntRequest("w", "w-1", uint64(600))
-		outcome, err := fc.EnqueueAndWait(context.Background(), req)
+		outcome, err := enqueueAndDispatch(t, fc, gs, req)
 		results <- dispatchResult{id: "w-1", outcome: outcome, err: err}
 	}()
 	queuedOrDone := func() bool {
@@ -239,7 +254,7 @@ func TestIntegrationNewcomerEntry(t *testing.T) {
 	results := make(chan dispatchResult, 1)
 	go func() {
 		req := newIntRequest("new", "new-1", uint64(100))
-		outcome, err := fc.EnqueueAndWait(context.Background(), req)
+		outcome, err := enqueueAndDispatch(t, fc, gs, req)
 		results <- dispatchResult{id: "new-1", outcome: outcome, err: err}
 	}()
 	select {

@@ -155,8 +155,10 @@ func TestPerEngineBudgetFromOwnCapacity(t *testing.T) {
 	}
 }
 
-// PER-ENGINE DEDUP: the same block keys on two engines are two footprints (a block on
-// A is worthless to B), and one engine's eviction does not touch the other's NE.
+// PER-ENGINE DEDUP, and (R9) the shared prefix that pulls a branch to the engine which
+// already holds it: the same block keys on two engines are two footprints (a block on A is
+// worthless to B), and a branch whose prompt is already resident somewhere costs nothing
+// there — so it lands THERE, not on the emptier engine.
 func TestPerEngineDedupAndIndependence(t *testing.T) {
 	cfg := defaultConfig()
 	s, err := NewScheduler(cfg)
@@ -177,19 +179,109 @@ func TestPerEngineDedupAndIndependence(t *testing.T) {
 			t.Fatalf("%s must seat", id)
 		}
 		s.Dispatched(id, "r-"+id, now)
+		s.Chunk(id) // its prefill lands: the cold charge is released, the valve reopens
 	}
+	// R9: m2 costs 0 on the engine that already holds its blocks and 200 on the other, so
+	// both branches are on ONE engine and its 200 blocks are counted ONCE (dedup within an
+	// engine) — the empty engine holds nothing.
 	snap := s.Snapshot()
 	if len(snap.Engines) != 2 {
 		t.Fatalf("both engines must be tracked, got %d", len(snap.Engines))
 	}
-	// each engine holds 200 NE blocks; the same hashes dedup WITHIN an engine only
-	for id, es := range snap.Engines {
-		if es.NEBlocks != 200 {
-			t.Fatalf("engine %s: NE must be 200 (dedup is per engine), got %d", id, es.NEBlocks)
+	if snap.Engines["a"].NEBlocks != 200 || snap.Engines["b"].NEBlocks != 0 {
+		t.Fatalf("a shared prefix must pull the second branch to the first engine: a=%d b=%d, want 200/0",
+			snap.Engines["a"].NEBlocks, snap.Engines["b"].NEBlocks)
+	}
+	if snap.Engines["a"].Seats != 2 {
+		t.Fatalf("both branches must be seated on a, got %d", snap.Engines["a"].Seats)
+	}
+	if snap.NEBlocks != 200 {
+		t.Fatalf("the whole-policy NE counts the shared chain once (200), got %d", snap.NEBlocks)
+	}
+	// DEDUP IS PER ENGINE: fill engine a, and the same chain must seat on b and count
+	// AGAIN there — the same block keys on two engines are two footprints.
+	// the filler continues the shared chain (200 + 750 of its own), so it costs 750 on the
+	// engine that holds the prefix and 950 on the empty one: it fills a
+	filler := headWithChain("filler", time.Second, []Chain{{
+		Keys: append(append([]Hash{}, shared...), keys(750, 55)...), Tokens: 950 * 64}})
+	if i := s.PickFromHeads([]Head{filler}, now); i != 0 {
+		t.Fatal("the filler must seat")
+	}
+	s.Dispatched("filler", "r-filler", now)
+	s.Chunk("filler")
+	s.mu.Lock()
+	fillerEngine := s.bindings["filler"]
+	s.mu.Unlock()
+	if fillerEngine != "a" {
+		t.Fatalf("the filler must take a (it continues a's chain), it took %q", fillerEngine)
+	}
+	m3 := headWithChain("m3", time.Second, []Chain{{Keys: shared, Tokens: 200 * 64}})
+	if i := s.PickFromHeads([]Head{m3}, now); i != 0 {
+		t.Fatal("the third copy must seat on b (a is full)")
+	}
+	s.Dispatched("m3", "r-m3", now)
+	snap = s.Snapshot()
+	if snap.Engines["b"].NEBlocks != 200 {
+		t.Fatalf("the same chain on the second engine counts again: b=%d want 200", snap.Engines["b"].NEBlocks)
+	}
+	if snap.NEBlocks != 1150 { // a: 200 + 750 filler, b: 200
+		t.Fatalf("the whole-policy NE must sum the per-engine footprints, got %d want 1150", snap.NEBlocks)
+	}
+}
+
+// R9: PLACEMENT IS DECIDED ON THE FREE BUDGET AFTER THE SEAT, so a fork follows its
+// parent's prefix even when the other engine is emptier BEFORE the seat — no affinity
+// rule, nothing to tune, because the cost of a shared prefix is already zero.
+func TestPlacementIsDedupAware(t *testing.T) {
+	cfg := defaultConfig()
+	s, err := NewScheduler(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []string{"a", "b"} {
+		if err := s.SetNumBlocksFor(e, 64, 1000); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if snap.NEBlocks != 400 {
-		t.Fatalf("the whole-policy NE is the sum (400), got %d", snap.NEBlocks)
+	now := time.Unix(1793000000, 0).UTC()
+	seat := func(id string, chains []Chain) string {
+		t.Helper()
+		h := headWithChain(id, time.Second, chains)
+		if i := s.PickFromHeads([]Head{h}, now); i != 0 {
+			t.Fatalf("%s must seat", id)
+		}
+		s.Dispatched(id, "r-"+id, now)
+		s.Chunk(id) // its prefill lands: the cold charge goes, the valve reopens
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.bindings[id]
+	}
+	parent := keys(300, 77)
+	if got := seat("parent", []Chain{{Keys: parent, Tokens: 300 * 64}}); got != "a" {
+		t.Fatalf("the parent must seat on a (the id tie), it took %q", got)
+	}
+	// b gets 350 blocks of its own: a 650 free, b 600
+	if got := seat("fillb", chainOf("fillb", 350)); got != "b" {
+		t.Fatalf("fillb must seat on b, it took %q", got)
+	}
+	// a continues its own chain (300 + 100): 100 of cost there, 400 elsewhere
+	if got := seat("filla", []Chain{{
+		Keys: append(append([]Hash{}, parent...), keys(100, 88)...), Tokens: 400 * 64}}); got != "a" {
+		t.Fatalf("filla must seat on a, it took %q", got)
+	}
+	// now: a 550 free, b 600 free. The fork is the parent's 300 plus 100 of its own, so it
+	// costs 100 on a and 400 on b: a keeps 450, b keeps 200. BEFORE the seat b is emptier
+	// (600 > 550) and the old key would have chosen it.
+	s.mu.Lock()
+	freeA := s.freeBudgetLocked(s.groups["a"])
+	freeB := s.freeBudgetLocked(s.groups["b"])
+	s.mu.Unlock()
+	if freeB <= freeA {
+		t.Fatalf("premise: b must be the emptier engine before the seat (a=%d b=%d)", freeA, freeB)
+	}
+	forkKeys := append(append([]Hash{}, parent...), keys(100, 99)...)
+	if got := seat("fork", []Chain{{Keys: forkKeys, Tokens: 400 * 64}}); got != "a" {
+		t.Fatalf("the fork must land where its prefix is resident (a), it took %q — placement is not dedup-aware", got)
 	}
 }
 

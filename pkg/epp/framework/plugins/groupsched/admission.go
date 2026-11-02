@@ -115,6 +115,9 @@ type seatChoice struct {
 	freeBudget int64
 	// fits: the head's cost was inside the free budget.
 	fits bool
+	// valveHeld: the budget would take the head and only the cold-entry valve refuses it,
+	// so the ONLY victim that may be taken is the branch holding the charge.
+	valveHeld bool
 }
 
 // seatEngineLocked is THE seat-time engine choice: the scheduler gathers the FACTS
@@ -149,6 +152,10 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatChoice {
 			// eligible branch on the engine and left the seats cold-empty).
 			Fits:      budgetFits && s.coldAllowsTokens(g, tokens),
 			HasVictim: func() bool { return s.hasRotationVictimLocked(gg, now) },
+			HasValveHolder: func() bool {
+				_, holder := s.valveHolderVictimLocked(gg, now)
+				return holder != nil
+			},
 		})
 		owners = append(owners, gg)
 	}
@@ -158,7 +165,9 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatChoice {
 	}
 	return &seatChoice{g: owners[idx], costTokens: cands[idx].CostTokens,
 		costBlocks: cands[idx].CostBlocks, freeBudget: cands[idx].FreeBudget,
-		fits: cands[idx].Fits}
+		fits: cands[idx].Fits,
+		// not fitting while the BUDGET would take it = the valve is the blocker
+		valveHeld: !cands[idx].Fits && cands[idx].BudgetFits}
 }
 
 // coldValveHeldOn reports WHICH engine's cold-entry valve is the only thing keeping
@@ -194,6 +203,42 @@ func (s *Scheduler) coldValveHeldOn(head *waiter) (string, bool) {
 func (s *Scheduler) hasRotationVictimLocked(g *engineGroup, now time.Time) bool {
 	_, v := s.rotationVictimLocked(g, now)
 	return v != nil
+}
+
+// valveHolderVictimLocked answers the ONE case in which a valve-held head may evict.
+//
+// I2 says a valve-held head waits and never evicts, because evicting frees budget and never
+// frees the valve. That premise is false for exactly one member: the branch HOLDING the
+// cold charge. Evicting it releases the charge, which opens the valve — and it is only ever
+// done on demand, by the head that is waiting, for ONE holder, and only one the TENURE rule
+// already releases (nothing in flight, and Q complete or silent past S). BUG1 — the defect
+// that evicted every eligible member and left the seats cold-empty — cannot come back: this
+// evicts exactly the holder, never "every eligible member".
+//
+// The silence bound is what protects a LIVE window: a release a few milliseconds old
+// belongs to a branch whose S has not elapsed, so its charge stays.
+func (s *Scheduler) valveHolderVictimLocked(g *engineGroup, now time.Time) (string, *branch) {
+	var best *branch
+	var bestReason string
+	bestWaiting := false
+	for _, m := range g.branches {
+		if m.coldEntry <= 0 || g.index.ExitingLocked(m.id) {
+			continue
+		}
+		reason, ok := s.eligibleLocked(m, now)
+		if !ok {
+			continue
+		}
+		waiting := !m.waitingSince.IsZero()
+		better := best == nil ||
+			(waiting && !bestWaiting) ||
+			(waiting == bestWaiting && m.seatTime.Before(best.seatTime)) ||
+			(waiting == bestWaiting && m.seatTime.Equal(best.seatTime) && m.id < best.id)
+		if better {
+			best, bestReason, bestWaiting = m, reason, waiting
+		}
+	}
+	return bestReason, best
 }
 
 // entryHeadLocked is D1: the QUEUE module picks the head of the ONE shared queue. The
@@ -246,11 +291,14 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 			s.seatLocked(cand.g, head, cand.costTokens, now)
 			continue
 		}
-		// Nothing fits BY BUDGET on the chosen engine (a valve-held head never reaches
-		// here — the chooser answers "wait" for it): eviction is the only way a
-		// budget-blocked head ever runs, and it is demand-driven (a head is waiting
-		// right now).
+		// Nothing fits BY BUDGET on the chosen engine: eviction is the only way a
+		// budget-blocked head ever runs, and it is demand-driven (a head is waiting right
+		// now). A VALVE-held head reaches here only when the engine's charge holder is
+		// itself releasable — then that holder is the victim, and nothing else is touched.
 		reason, victim := s.rotationVictimLocked(cand.g, now)
+		if cand.valveHeld {
+			reason, victim = s.valveHolderVictimLocked(cand.g, now)
+		}
 		if victim == nil {
 			dbgNoVictim++
 			return // this engine can free nothing; another pass will re-evaluate

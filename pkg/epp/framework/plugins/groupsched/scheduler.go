@@ -310,8 +310,11 @@ type branch struct {
 	fairnessID string
 }
 
-// busy reports whether the branch has a request running or on its way to a pod.
-func (m *branch) busy() bool { return m.inflight > 0 || m.released != "" }
+// prefilling reports whether the branch can still be prefilling something: a request in
+// flight, or one released and not yet at a pod. It is the cold-charge derivation's input
+// and the victim CLASSIFICATION's ("a turn on its way"), and nothing else: a window must
+// never BAR the liveness rules, or a request that dies in it would freeze its engine.
+func (m *branch) prefilling() bool { return m.inflight > 0 || m.released != "" }
 
 // inflightRec is one in-flight request's reconciliation record.
 type inflightRec struct {
@@ -1044,14 +1047,8 @@ func (s *Scheduler) DispatchedOnUsage(id, reqID, engine string, now time.Time) {
 	}
 	if m, ok := g.branches[id]; ok {
 		m.lastActivity = now
-		// THE WINDOW CLOSES: the request is at the pod. A settle whose id matches the
-		// released one closes it too, and so does the legacy form (no id = "whatever this
-		// branch has"): a request that died between the release and PreRequest gets a
-		// terminal ResponseBody from the handler, and THAT is what arrives here — without
-		// this a lost request would leave its branch looking busy forever.
-		if reqID == "" || m.released == reqID {
-			m.released = ""
-		}
+		// THE WINDOW CLOSES: the request is at the pod.
+		s.closeReleasedLocked(m, reqID)
 		if m.inflightIDs == nil {
 			m.inflightIDs = map[string]inflightRec{}
 		}
@@ -1060,6 +1057,46 @@ func (s *Scheduler) DispatchedOnUsage(id, reqID, engine string, now time.Time) {
 		// this reads 0 in a run).
 		m.inflightIDs[reqID] = inflightRec{since: now, confirmed: true}
 		m.inflight = len(m.inflightIDs)
+	}
+}
+
+// closeReleasedLocked closes a branch's released window when an event proves the request
+// is no longer only "on its way". Every caller matches the request id: an id-less callback
+// (the legacy form) can only mean the released request when the branch has nothing in
+// flight to name instead.
+func (s *Scheduler) closeReleasedLocked(m *branch, reqID string) {
+	if m == nil || m.released == "" {
+		return
+	}
+	if reqID == "" && len(m.inflightIDs) > 0 {
+		return // ambiguous: two requests, one unnamed
+	}
+	if reqID != "" && m.released != reqID {
+		return // a different request: never clear a live window
+	}
+	m.released = ""
+}
+
+// closeReleasedByEngine closes every window on an engine (its teardown).
+func (s *Scheduler) closeReleasedByEngine(g *engineGroup) {
+	for _, m := range g.branches {
+		m.released = ""
+	}
+}
+
+// Abandon closes a released window from OUTSIDE the decision path: the request is gone, so
+// the branch is not waiting on anything any more. Nothing else changes — a seat is not a
+// per-request resource, and an idle seat is evicted on demand.
+func (s *Scheduler) Abandon(id, reqID string) {
+	if id == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if g := s.groupOfLocked(id); g != nil {
+		if m, ok := g.branches[id]; ok {
+			s.closeReleasedLocked(m, reqID)
+		}
 	}
 }
 
@@ -1162,13 +1199,11 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 		if removed {
 			m.inflight = len(m.inflightIDs)
 		}
-		// THE TERMINAL CALLBACK CLOSES THE RELEASED WINDOW. A request that died between
-		// its release and PreRequest has no in-flight record, so this is the only place
-		// that can say it is gone — and the handler forces this call whenever a pod was
+		// THE TERMINAL CALLBACK CLOSES THE WINDOW TOO: a request that died between its
+		// release and PreRequest has no in-flight record, so this is the only event that
+		// can say it is gone — and the handler forces this call whenever a pod was
 		// scheduled.
-		if reqID == "" || m.released == reqID {
-			m.released = ""
-		}
+		s.closeReleasedLocked(m, reqID)
 		m.lastActivity = now
 		s.releaseColdLocked(g, id) // S0-2: any termination releases the charge
 		// THE BUSY PERIOD (F4): the branch's in-flight count reaching zero — one branch
@@ -1271,7 +1306,7 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 func (s *Scheduler) deriveColdChargesLocked() {
 	for _, g := range s.activeGroupsLocked() {
 		for _, m := range g.branches {
-			if m.coldEntry == 0 || m.busy() || !m.waitingSince.IsZero() {
+			if m.coldEntry == 0 || m.prefilling() || !m.waitingSince.IsZero() {
 				continue
 			}
 			s.releaseColdLocked(g, m.id)
@@ -1344,7 +1379,8 @@ func (s *Scheduler) pressureCtxLocked(g *engineGroup, now time.Time) PressureCtx
 		Exiting:        g.index.ExitingLocked,
 		RotationVictim: func() (string, *branch) { return s.rotationVictimLocked(g, now) },
 		Silent:         tctx.Silent,
-		Headless:       tctx.Headless,
+		// the classification's view: a released window is a turn on its way
+		Headless: func(m *branch) bool { return m.waitingSince.IsZero() && m.released == "" },
 	}
 }
 
@@ -1385,7 +1421,7 @@ func (s *Scheduler) rotationVictimLocked(g *engineGroup, now time.Time) (string,
 	// livelock guard) while a waiter is blocked
 	idle := true
 	for _, m := range g.branches {
-		if m.busy() || !m.waitingSince.IsZero() {
+		if m.inflight > 0 || !m.waitingSince.IsZero() {
 			idle = false
 			break
 		}
@@ -1578,7 +1614,7 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 		if victim == nil {
 			return
 		}
-		if victim.busy() {
+		if victim.prefilling() {
 			if g.index.ExitingLocked(victim.id) {
 				// Already on its way out. Its blocks stay charged until it drains, so
 				// marking it again frees nothing: this pass is DONE (continuing would
@@ -1664,6 +1700,7 @@ func (s *Scheduler) RemoveEngine(engine string, now time.Time) int {
 	}
 	sort.Strings(ids)
 	n := 0
+	s.closeReleasedByEngine(g)
 	for _, id := range ids {
 		if m, ok := g.branches[id]; ok {
 			s.exitLocked(g, m, "engine-gone", now)

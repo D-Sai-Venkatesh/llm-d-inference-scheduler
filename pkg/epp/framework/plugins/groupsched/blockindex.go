@@ -225,14 +225,29 @@ func (b *BlockIndex) GrowLocked(id string, chains []Chain) {
 	b.applyDeltaLocked(s, old)
 }
 
-// sameChains reports whether two chain sets are the same length for every prompt — the
-// O(1) check that a branch's set did not change (the common case at a 1 kHz Pick).
+// sameChains reports whether two chain sets are the SAME CHAINS, not merely the same shape.
+//
+// It compares the last key of each chain as well as its length and token count, and that is
+// exact rather than a sample: a key is a CHAINED hash, so it commits to every block before
+// it — equal length, equal tokens and an equal tip is the same token sequence, block for
+// block. The cost is O(prompts) (one comparison per prompt, no scan of the keys), which is
+// the common case at a 1 kHz Pick and cheap enough that an equal SHAPE with different
+// content must not slip through: branch identity's tolerance lets a continuation differ in
+// its last full block plus the partial block, and a shape-only test would keep the OLD keys
+// charged (under-costing the next arrival, over-costing a fork of the new chain).
 func sameChains(a, c []Chain) bool {
 	if len(a) != len(c) {
 		return false
 	}
 	for i := range a {
 		if len(a[i].Keys) != len(c[i].Keys) || a[i].Tokens != c[i].Tokens {
+			return false
+		}
+		// both empty: one prompt with no blocks, nothing to compare
+		if len(a[i].Keys) == 0 {
+			continue
+		}
+		if a[i].Keys[len(a[i].Keys)-1] != c[i].Keys[len(c[i].Keys)-1] {
 			return false
 		}
 	}

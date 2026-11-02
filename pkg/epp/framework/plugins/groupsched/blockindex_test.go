@@ -419,3 +419,39 @@ func chainsClone(c []Chain) []Chain {
 	}
 	return out
 }
+
+// THE GROWTH'S SAME-SHAPE TRAP, pinned: a successor chain of the SAME length and token
+// count but DIFFERENT content is a different chain, and the index must charge it. Branch
+// identity's tolerance allows exactly this (a continuation may differ in its last full
+// block plus the partial block), so a shape-only check kept the OLD keys charged — the next
+// arrival extending the old chain was costed 0 extra (over-admission) and a fork of the new
+// one was costed fully cold (under-utilisation).
+func TestGrowChargesAnEqualShapeChainWithDifferentContent(t *testing.T) {
+	idx := newIdx(t)
+	old := []Chain{{Keys: []Hash{1, 2}, Tokens: 128}}
+	mustSeat(t, idx, "b", old, 1000)
+	if !idx.HasNELocked(2) {
+		t.Fatal("fixture: the seated chain's second block must be charged")
+	}
+	// same length, same token count, different tip: the branch's newest chain
+	grown := []Chain{{Keys: []Hash{1, 99}, Tokens: 128}}
+	idx.GrowLocked("b", grown)
+	if idx.HasNELocked(2) {
+		t.Fatal("the replaced tail block is still charged: an equal-shape chain was skipped")
+	}
+	if !idx.HasNELocked(99) {
+		t.Fatal("the new tail block is not charged: the index keeps modelling the OLD chain")
+	}
+	if !idx.HasNELocked(1) {
+		t.Fatal("the shared prefix block was released by a growth that kept it")
+	}
+	if got, want := idx.UniqueBlocksLocked(), 2; got != want {
+		t.Fatalf("used side %d, want %d (one shared prefix + the new tail)", got, want)
+	}
+	// and the SAME chain again is still a no-op (the 1 kHz Pick's common case)
+	before := idx.UniqueBlocksLocked()
+	idx.GrowLocked("b", grown)
+	if got := idx.UniqueBlocksLocked(); got != before {
+		t.Fatalf("re-growing the same chain moved the used side: %d -> %d", before, got)
+	}
+}

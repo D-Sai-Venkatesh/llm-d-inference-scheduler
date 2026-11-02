@@ -44,10 +44,8 @@ import (
 // caps) and the per-engine saturation gate with its 0.80/5 constants.
 type Config struct {
 	// GroupBudgetFraction sizes each engine's SEAT BUDGET from that engine's own
-	// measured KV capacity: budgetBlocks = fraction × num_gpu_blocks (with sizing
-	// "tier-inclusive": fraction × max(num_gpu_blocks, that engine's CPU tier
-	// blocks) — the tier is INCLUSIVE, so it adds no capacity beyond HBM's). It is
-	// ONE number with TWO uses, and that is deliberate:
+	// measured KV capacity: budgetBlocks = fraction × num_gpu_blocks. It is ONE
+	// number with TWO uses, and that is deliberate:
 	//
 	//	(1) SIZING — the budget a seat's footprint is admitted against;
 	//	(2) SAFETY  — the memory-only net's threshold (safety.go): the net fires
@@ -112,16 +110,9 @@ type Config struct {
 	// value here; nothing else in the config moves). Validated by buildModules. ----
 	//
 	//	Sizing       "index"            footprint from the engine's own BlockIndex,
-	//	                                budget = fraction x num_gpu_blocks |
-	//	             "tier-inclusive"   the same footprint and the same GPU-only cost,
-	//	                                with the budget sized from the engine's UNIQUE
-	//	                                capacity: fraction x max(num_gpu_blocks, the CPU
-	//	                                tier's blocks) — vLLM's native offload is
-	//	                                write-through, so the tier COVERS HBM and the two
-	//	                                do not add. The cold-entry valve's cap stays the
-	//	                                GPU headroom, so only the number of seats moves
-	//	                                (needs cpuTierBytes/kvBlockBytes; 0/0 makes it
-	//	                                "index" arithmetically)
+	//	                                budget = fraction x num_gpu_blocks (the ONE
+	//	                                implementation: the CPU offload tier is a
+	//	                                DEPLOYMENT fact and adds no seat)
 	//	EntryOrder   "newcomer-first"   newcomers, then oldest, then id |
 	//	             "hrrn-bounded"     bounded HRRN: wait ÷ min(cold tokens, the median
 	//	                                waiter's cold tokens), newcomers as the outer
@@ -440,8 +431,8 @@ type engineGroup struct {
 
 	index *BlockIndex // attached at creation (block size from config)
 	// budgetBlocks is what this engine may seat, in blocks: the SIZING module's answer
-	// for THIS engine's measured capacity (and, at sizing tier-inclusive, the tier's
-	// blocks when they exceed it). 0 until THIS engine's num_gpu_blocks arrives.
+	// for THIS engine's measured capacity. 0 until THIS engine's num_gpu_blocks
+	// arrives.
 	budgetBlocks int
 	numBlocks    int
 	// blockSizeMismatch is the loud per-engine wiring failure (a measured
@@ -511,10 +502,8 @@ type engineGroup struct {
 // blocks and 64-token blocks the cap is 2009 blocks = 128,576 tokens (the constant it
 // replaces was 131,072 in a unit the budget never used).
 //
-// IT READS num_gpu_blocks AND NOTHING ELSE, at every sizing value: the valve staggers
-// GPU allocation bursts, and a CPU tier cannot absorb one (a cold prefill allocates HBM
-// whatever the tier holds). So sizing tier-inclusive can grow the budget — and still leaves
-// this cap exactly where it is (TestTierInclusiveValveCapStaysGPUHeadroom).
+// IT READS num_gpu_blocks AND NOTHING ELSE: the valve staggers GPU allocation bursts, and
+// a CPU tier cannot absorb one (a cold prefill allocates HBM whatever the tier holds).
 //
 // 0 means "no measured capacity yet", and the places that call this are already
 // behind the capacity check (an engine without capacity takes no seats).
@@ -802,7 +791,7 @@ func (s *Scheduler) SetNumBlocksFor(engine string, blockSizeTokens, numBlocks in
 	// the tier's capacity comes from THIS engine's own shadow (0 when the deployment
 	// configures no tier), so both sizing values read one source for it and the
 	// GPU-only one ignores it.
-	g.budgetBlocks = s.mod.sizer.BudgetBlocks(numBlocks, g.tier.Capacity())
+	g.budgetBlocks = s.mod.sizer.BudgetBlocks(numBlocks)
 	return nil
 }
 

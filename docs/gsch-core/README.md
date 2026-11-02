@@ -641,6 +641,11 @@ pinned to `groupsched-e78152da`, the tier-inclusive build (§4a6, the one re-pin
 
 ## 4f. The tier-inclusive seat budget — `sizing: "tier-inclusive"` (2026-11-02)
 
+> **RETIRED as an arm, kept as a record (2026-11-02, the scheduler trim).** The
+> tier-inclusive sizer is REMOVED: `sizing` accepts `index` only, its env files are deleted
+> from the tree (last at b5c016a3) and its tests went with the module. The measurements
+> below stand as measured on the builds they name.
+
 The SIZING module's SECOND value, and the one that prices the offload deployment's real
 capacity:
 

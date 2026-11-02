@@ -56,7 +56,6 @@ package groupsched
 //	  cpuTierBytes: 0               # the CPU offload tier's BYTES (0 = no tier)
 //	  kvBlockBytes: 0               # one KV block's bytes (needed iff cpuTierBytes>0)
 //	  sizing: "index"               # CORE_MODULE_BLOCK (one selector per module);
-//	                                # "tier-inclusive" sizes the budget from max(GPU, tier)
 //	  entryOrder: "newcomer-first"  # CORE_ENTRY_ORDER (one value: the trim keeps one impl)
 //	  engineChoice: "most-free-budget"
 //	  rotation: "quantum"
@@ -147,22 +146,6 @@ capacityLivenessSeconds: 120
 inflightReapSeconds: 3700
 cpuTierBytes: 549755813888
 kvBlockBytes: 6291456`,
-	},
-	{
-		// The SIZING arm's module block: CORE_SIZING=tier-inclusive (docs/gsch-core/
-		// core-q4-offload-tierinclusive.env). One VALUE differs from CORE_MODULE_BLOCK: the
-		// emitter renders it verbatim, so the value has to survive the same strict decode
-		// as any other (the TYPE half) and buildModules has to accept it (the ENUM half).
-		block: "CORE_MODULE_BLOCK (CORE_SIZING=tier-inclusive)",
-		owner: PluginType,
-		proto: Config{},
-		body: `sizing: "tier-inclusive"
-entryOrder: "newcomer-first"
-engineChoice: "most-free-budget"
-rotation: "quantum"
-victim: "valve"
-safety: "none"
-executionBudget: "none"`,
 	},
 	{
 		// The branch plugin every core arm carries (BRANCH_PLUGIN=1). Its bool fields are
@@ -411,7 +394,7 @@ func TestModuleValuesMatchTheEmitter(t *testing.T) {
 		knob   string
 		values []string
 	}{
-		{"Sizing", []string{"index", "tier-inclusive"}},
+		{"Sizing", []string{"index"}},
 		{"EntryOrder", []string{"newcomer-first"}},
 		{"EngineChoice", []string{"most-free-budget"}},
 		{"Rotation", []string{"quantum"}},

@@ -186,11 +186,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// The policy has no MODES left, so the echo states the six things it does in
 	// words — a run's artifacts then say what ran without decoding knob names.
 	fmt.Printf("group-scheduler: CORE policy — identity: derived branch (member = queue key; nothing is written into the session slot)\n")
-	if r.sched.mod.sizer.Name() == "tier-inclusive" {
-		fmt.Printf("group-scheduler: CORE policy — sizing: per-engine seat budget = %v x that engine's UNIQUE KV capacity, max(measured num_gpu_blocks, its CPU tier's blocks) — the tier is INCLUSIVE (native offload is write-through, it copies HBM), so the two do not add; footprint from the engine's own block index (dedup + cold-token estimate), GPU-only, and the cold-entry valve's cap stays the GPU headroom\n", cfg.GroupBudgetFraction)
-	} else {
-		fmt.Printf("group-scheduler: CORE policy — sizing: per-engine seat budget = %v x that engine's measured num_gpu_blocks; footprint from the engine's own block index (dedup + cold-token estimate)\n", cfg.GroupBudgetFraction)
-	}
+	fmt.Printf("group-scheduler: CORE policy — sizing: per-engine seat budget = %v x that engine's measured num_gpu_blocks; footprint from the engine's own block index (dedup + cold-token estimate)\n", cfg.GroupBudgetFraction)
 	fmt.Printf("group-scheduler: CORE policy — admission: ONE shared waiter queue, newcomer-first then oldest; the head goes to the engine with the MOST FREE BUDGET where it fits (tie -> lowest engine id); the binding lasts only while seated\n")
 	fmt.Printf("group-scheduler: CORE policy — rotation: fixed quantum Q=%d completed busy periods (plus silence > %vs); memory pressure: the budget valve\n", cfg.quantum(), cfg.IdleSeconds)
 	if cfg.Safety == "none" {
@@ -201,11 +197,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// The CPU offload tier is a DEPLOYMENT FACT, so the echo states whether this arm has
 	// one at all: a run artifact then says what the deployment looked like.
 	if n := cfg.tierBlocks(); n > 0 {
-		seats := "the tier adds no seats (the budget and the valve stay GPU-only)"
-		if r.sched.mod.sizer.Name() == "tier-inclusive" {
-			seats = "sizing=tier-inclusive sizes the seat budget from the tier's blocks where they exceed the GPU's (the tier is inclusive, not additive); the cold-entry valve stays GPU-only"
-		}
-		fmt.Printf("group-scheduler: CORE policy — offload: CPU tier shadow ON, %d blocks per engine (cpuTierBytes %d / kvBlockBytes %d) — restorable tokens count as cached for entryOrder=%s; %s\n", n, cfg.CpuTierBytes, cfg.KvBlockBytes, cfg.EntryOrder, seats)
+		fmt.Printf("group-scheduler: CORE policy — offload: CPU tier shadow ON, %d blocks per engine (cpuTierBytes %d / kvBlockBytes %d) — the tier adds no seats (the budget and the cold valve stay GPU-only)\n", n, cfg.CpuTierBytes, cfg.KvBlockBytes)
 	} else {
 		fmt.Printf("group-scheduler: CORE policy — offload: NO CPU tier configured (cpuTierBytes 0) — no tier shadow\n")
 	}

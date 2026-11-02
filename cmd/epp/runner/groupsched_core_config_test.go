@@ -95,10 +95,8 @@ flowControl:
 // in THIS test binary. The plugins register their series into the plugin handle's
 // registry, which is process-global, so a second full start in one process fails on a
 // duplicate collector — a property of the harness (one EPP per process), not of a config.
-// The offload arm's loader gate (below) therefore SKIPS when another test already started
-// a runner, and is run on its own:
-//
-//	go test ./cmd/epp/runner/ -run TestGroupSchedulerCoreChainStartsWithTierInclusiveSizing
+// A loader gate that needs its own start therefore SKIPS when another test already started
+// a runner.
 var runnerStartedInProcess atomic.Bool
 
 // TestGroupSchedulerDualReferenceStarts is the config-level DAG gate: one
@@ -188,35 +186,4 @@ func TestGroupSchedulerCoreChainStarts(t *testing.T) {
 		}
 	}
 	require.Equal(t, 1, occurrences, "the group scheduler must appear once in the execution order, got %v", order)
-}
-
-// TestGroupSchedulerCoreChainStartsWithTierInclusiveSizing is the TIER-SIZED budget arm's
-// loader gate (docs/gsch-core/core-q4-offload-tierinclusive.env): the same chain with
-// `sizing: "tier-inclusive"` and the two tier facts it sizes the budget from. buildModules
-// fails closed on an unknown module value, so a value the emitter can render and the plugin
-// rejects is a CrashLoop on that arm only — the contract test (config_conformance_test.go)
-// mirrors this path, and this runs it.
-func TestGroupSchedulerCoreChainStartsWithTierInclusiveSizing(t *testing.T) {
-	if runnerStartedInProcess.Load() {
-		t.Skip("a runner has already been instantiated in this process (plugin metrics are process-global): run this gate on its own with -run TestGroupSchedulerCoreChainStartsWithTierInclusiveSizing")
-	}
-	tierCfg := strings.Replace(corePluginConfig, `sizing: "index"`, `sizing: "tier-inclusive"`, 1)
-	tierCfg = strings.Replace(tierCfg, "    inflightReapSeconds: 3700\n",
-		"    inflightReapSeconds: 3700\n    cpuTierBytes: 549755813888\n    kvBlockBytes: 6291456\n", 1)
-	require.Contains(t, tierCfg, `sizing: "tier-inclusive"`, "the fixture must carry the sizing selector")
-	require.Contains(t, tierCfg, "kvBlockBytes: 6291456", "the fixture must carry the tier facts the budget is sized from")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	opts := runserver.NewOptions()
-	opts.ConfigText = tierCfg
-	opts.PoolName = "core-tierinclusive"
-	opts.AllowExperimentalPlugins = true
-	r := NewRunner()
-	rawConfig, err := r.parseConfigurationPhaseOne(ctx, opts)
-	require.NoError(t, err)
-	ds := datastore.NewDatastore(ctx, r.setupMetricsCollection(opts))
-	_, err = r.parseConfigurationPhaseTwo(ctx, rawConfig, ds, opts.RefreshMetricsInterval)
-	require.NoError(t, err, "the tier-sized budget arm's config must parse, decode and pass the plugin-DAG/layer-order validation")
-	runnerStartedInProcess.Store(true)
 }

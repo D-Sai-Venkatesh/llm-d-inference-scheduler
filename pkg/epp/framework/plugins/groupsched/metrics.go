@@ -26,7 +26,7 @@ import (
 )
 
 // groupMetrics exports the MINIMAL set an operator needs to see liveness and fairness
-// or to diagnose a known failure class — eighteen names, and nothing else. The test for
+// or to diagnose a known failure class — nineteen names, and nothing else. The test for
 // every one of them: would its absence cost an operator a decision or a diagnosis?
 //
 //	admission state   seats · ne_blocks · budget_blocks · waiters_shared
@@ -36,6 +36,7 @@ import (
 //	decisions         dispatches_total · exits_total{reason}
 //	fairness          entry_wait_seconds{kind=new|reentry}   (ONE histogram)
 //	lifecycle         engine_gone_total · rebinds_total · affinity_violations_total
+//	integrity         anomalies_total{kind}   (every kind should be 0)
 //
 // EVERY per-engine series carries an `engine` label, whose value is the endpoint id:
 // `sum(llm_d_epp_group_seats)` is the whole-policy seat count with one engine and with N.
@@ -71,6 +72,11 @@ type groupMetrics struct {
 	affinityViolations *prometheus.CounterVec
 	rebinds            prometheus.Counter
 	engineGone         prometheus.Counter
+	// anomalies is the ONE kept counter for the events the policy cannot act on, by kind
+	// (anomalyKinds). Every kind is SHOULD-BE-ZERO: a lost render, an unnameable request, a
+	// settle for a request nothing tracks. One counter, one question: "is the accounting
+	// intact?"
+	anomalies *prometheus.CounterVec
 	// coldValveHeld counts heads the cold-entry VALVE held back: the budget would have
 	// admitted the head, the valve refused it, so the head WAITED for the engine's
 	// prefill slot. Nothing is evicted for it (the sizing signal: what the stagger
@@ -125,6 +131,8 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "seat moves repaired by the observed endpoint winning"})
 	g.engineGone = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "engine_gone_total",
 		Help: "engines torn down by an endpoint delete"})
+	g.anomalies = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "anomalies_total",
+		Help: "should-be-zero events the policy could not act on, by kind: no_tokens_head = a Pick pass saw a branch head with no rendered tokens (a lost render; it is served last, unseated); no_request_id = a Pick released a request with no id (nothing can name it); stray_settle = a settle named a request nothing tracks (a late reap, a duplicate terminal callback, a branch that left). All three read 0 on a healthy stack"}, []string{"kind"})
 	g.coldValveHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "cold_valve_held_total",
 		Help: "Pick passes in which the queue head was held by this engine's cold-entry valve (the budget would have admitted it; it WAITS, nothing is evicted). A PASS count, not a head count: Pick runs at ~1 kHz, so a head held for a second counts about a thousand times"}, engineLabels)
 
@@ -133,7 +141,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.coldInFlight, g.coldCap, g.waitersShared,
 		g.exits, g.entryWait, g.served,
 		g.capacityMissing, g.capacityLearned,
-		g.affinityViolations, g.rebinds, g.engineGone, g.coldValveHeld,
+		g.affinityViolations, g.rebinds, g.engineGone, g.coldValveHeld, g.anomalies,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second
@@ -200,6 +208,11 @@ func (g *groupMetrics) Refresh() {
 		}
 	}
 	g.waitersShared.Set(float64(snap.WaitersShared))
+	// ONE zero series per anomaly kind: a zero is a fact, an absent series is a question (and
+	// a should-be-zero count with no series is the shape of a bug nobody notices).
+	for _, kind := range anomalyKinds {
+		g.anomalies.WithLabelValues(kind).Add(0)
+	}
 }
 
 // ObserveExit records a branch exit (the reason + engine).
@@ -274,6 +287,14 @@ func (g *groupMetrics) SetCapacityMissing(engine string, missing bool) {
 		v = 1
 	}
 	g.capacityMissing.WithLabelValues(engine).Set(v)
+}
+
+// ObserveAnomaly counts ONE should-be-zero event by kind (anomalyKinds).
+func (g *groupMetrics) ObserveAnomaly(kind string) {
+	if g == nil || g.anomalies == nil {
+		return
+	}
+	g.anomalies.WithLabelValues(kind).Inc()
 }
 
 // ObserveColdValveHeld counts a head the cold-entry valve held back.

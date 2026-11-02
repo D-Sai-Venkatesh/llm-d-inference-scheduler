@@ -60,6 +60,7 @@ func newMetricFixture(t *testing.T, engines ...string) *metricFixture {
 	s.onEngineGone = func(engine string, n int) { m.ObserveEngineGone() }
 	s.onRehome = func(branch, from, to string) { m.ObserveAffinityViolation(from, to); m.ObserveRebind() }
 	s.onAffinityViolation = func(branch, charged, settled string) { m.ObserveAffinityViolation(charged, settled) }
+	s.onAnomaly = m.ObserveAnomaly
 	for _, e := range engines {
 		if err := s.SetNumBlocksFor(e, 64, 1000); err != nil {
 			t.Fatal(err)
@@ -260,4 +261,48 @@ func TestCounterCapacityLearnedMovesOnItsEvent(t *testing.T) {
 		t.Fatalf("capacity_learned_total{via=event}: %v, want 1", got)
 	}
 	_ = fwkdl.Metrics{}
+}
+
+// anomalies_total is ONE counter for the events the policy cannot act on, and every kind is
+// SHOULD-BE-ZERO. Each kind is driven by its own event here, and the neighbouring kinds are
+// checked not to move — the point of the fold is that a growing kind names its cause.
+func TestCounterAnomaliesMoveOnTheirEvent(t *testing.T) {
+	now := time.Unix(1793000000, 0).UTC()
+
+	t.Run("no_tokens_head", func(t *testing.T) {
+		f := newMetricFixture(t, "e0")
+		// a branch head the render produced no tokens for: it cannot be seated or charged
+		f.s.PickFromHeads([]Head{{Branch: "m", ReqID: "r-m", Arrival: now}}, now)
+		if got := f.value(t, "anomalies_total", map[string]string{"kind": anomalyNoTokens}); got != 1 {
+			t.Fatalf("anomalies_total{no_tokens_head}: %v, want 1", got)
+		}
+		if got := f.value(t, "anomalies_total", map[string]string{"kind": anomalyStraySettle}); got != 0 {
+			t.Fatalf("an unrelated kind moved: %v", got)
+		}
+	})
+
+	t.Run("no_request_id", func(t *testing.T) {
+		f := newMetricFixture(t, "e0")
+		h := head("m", time.Second, 100)
+		h.ReqID = "" // nothing can name this turn
+		if i := f.s.PickFromHeads([]Head{h}, now); i < 0 {
+			t.Fatal("the head must still be served (an unnameable turn is not refused)")
+		}
+		if got := f.value(t, "anomalies_total", map[string]string{"kind": anomalyNoRequestID}); got != 1 {
+			t.Fatalf("anomalies_total{no_request_id}: %v, want 1", got)
+		}
+	})
+
+	t.Run("stray_settle", func(t *testing.T) {
+		f := newMetricFixture(t, "e0")
+		// a settle for a request nothing tracks: a late reap, a duplicate callback, or a
+		// branch that has left — it must change state and be counted
+		f.s.SettleOnUsage("", "never-released", "", 100, 0, 0, true, now)
+		if got := f.value(t, "anomalies_total", map[string]string{"kind": anomalyStraySettle}); got != 1 {
+			t.Fatalf("anomalies_total{stray_settle}: %v, want 1", got)
+		}
+		if got := f.s.Snapshot().Anomalies[anomalyStraySettle]; got != 1 {
+			t.Fatalf("the dump must carry the same ledger, got %v", got)
+		}
+	})
 }

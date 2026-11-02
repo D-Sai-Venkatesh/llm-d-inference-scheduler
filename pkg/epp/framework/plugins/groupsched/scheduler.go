@@ -487,6 +487,9 @@ type Scheduler struct {
 	// counter: the settle-side one is the only signal when the placement path silently
 	// ignored the pin, and the metric's whole claim is that it must be 0.
 	onAffinityViolation func(branch, charged, settled string)
+	// onAnomaly fires for every should-be-zero event the policy cannot act on (anomalyKinds),
+	// so the ONE counter that carries them reaches Prometheus.
+	onAnomaly func(kind string)
 	// onBind / onUnbind are the PLACEMENT-PIN hooks: they fire when a branch's
 	// seat (and therefore its engine binding) is created or dropped, so the
 	// plugin's lock-light Filter table can follow the seats without ever touching
@@ -539,14 +542,14 @@ type Scheduler struct {
 	counters struct {
 		entryWaits   []float64
 		reentryWaits []float64
-		// emptyReqIDs / straySettles count events the policy cannot act on: a request with
-		// no id (nothing can name it) and a settle for an id that was never in flight.
-		// Both read 0 with the gateway, which sends a real id end to end.
-		emptyReqIDs  int64
-		straySettles int64
-		// noCost counts heads that arrived without tokens, so could not be seated (the
-		// render failed; branch identity counts that too). They are served FCFS, last.
-		noCost int64
+		// anomalies counts the EVENTS THE POLICY CANNOT ACT ON, by kind (anomalyKinds).
+		// Every one of them is SHOULD-BE-ZERO on a healthy stack: a head with no rendered
+		// tokens is a lost render, a request with no id is an id nothing can name, and a
+		// settle for an untracked request means the accounting lost a record. They are one
+		// counter because they answer one question ("is the accounting intact?"), and it is
+		// EXPORTED — a should-be-zero count nobody can read is worse than absent, because it
+		// looks like coverage.
+		anomalies map[string]int64
 		// affinityViolations counts requests that LANDED on an engine other than
 		// the one they were seated on (CORRECTNESS: the observed endpoint wins, so
 		// each violation is repaired by moving the seat; a nonzero steady rate
@@ -587,6 +590,7 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 		reqs:     map[string]*reqRec{},
 		waiters:  map[string]*waiter{}}
 	s.counters.exits = map[string]int64{}
+	s.counters.anomalies = map[string]int64{}
 	return s, nil
 }
 
@@ -902,9 +906,9 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 		}
 		if len(h.Chains) == 0 {
 			// no tokens, no cost: the request cannot be seated or charged, so it is served
-			// like anonymous traffic (FCFS, last) and never enters the shared queue. It is
-			// counted, because a run that starts seeing these is losing its render.
-			s.counters.noCost++
+			// like anonymous traffic (pass-through, last) and never enters the shared queue.
+			// It is an anomaly, because a run that starts seeing these is losing its render.
+			s.noteAnomalyLocked(anomalyNoTokens)
 			continue
 		}
 		present[h.Branch] = h.Arrival
@@ -1022,9 +1026,9 @@ func (s *Scheduler) releaseLocked(m *branch, reqID string, chains []Chain, now t
 	}
 	if reqID == "" {
 		// An id-less request cannot be tracked: nothing names it, so no window opens and
-		// the branch is not held busy by it. It is counted, because a run that starts
+		// the branch is not held busy by it. It is an anomaly, because a run that starts
 		// seeing these has lost the id the accounting joins on.
-		s.counters.emptyReqIDs++
+		s.noteAnomalyLocked(anomalyNoRequestID)
 		return
 	}
 	if _, tracked := s.reqs[reqID]; tracked {
@@ -1397,7 +1401,7 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 	if id == "" {
 		id = s.branchOfRequestLocked(reqID)
 		if id == "" {
-			s.counters.straySettles++
+			s.noteAnomalyLocked(anomalyStraySettle)
 			return
 		}
 	}
@@ -1436,7 +1440,7 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 				s.dropRequestLocked(reqID, now)
 				removed = true
 			} else {
-				s.counters.straySettles++
+				s.noteAnomalyLocked(anomalyStraySettle)
 			}
 		} else if oldest := s.oldestAtPodLocked(id); oldest != "" {
 			s.dropRequestLocked(oldest, now)
@@ -1779,6 +1783,38 @@ func fairnessOrNone(id string) string {
 	return id
 }
 
+// The anomaly KINDS. Each names an EVENT, not a code path — the help text and the dump both
+// use these strings, so a reducer that skips one is visibly skipping a kind.
+const (
+	// anomalyNoTokens: a Pick pass saw a branch head with no rendered tokens, so it cannot be
+	// seated or charged (the render failed; branch identity counts that too). Served last,
+	// like anonymous traffic.
+	anomalyNoTokens = "no_tokens_head"
+	// anomalyNoRequestID: a Pick released a turn for a request with no id. Nothing can name
+	// it, so no record opens and its branch is not held busy by it.
+	anomalyNoRequestID = "no_request_id"
+	// anomalyStraySettle: a settle named a request nothing tracks (a late reap, a duplicate
+	// terminal callback, or a branch that has left). Inventing a branch for it would charge an
+	// engine twice, so it changes nothing — and it is counted, because it means the map and
+	// the hooks disagree.
+	anomalyStraySettle = "stray_settle"
+)
+
+// anomalyKinds is every kind, in a fixed order (the metric pre-instantiates one zero series
+// per kind: a zero is a fact, an absent series is a question).
+var anomalyKinds = []string{anomalyNoTokens, anomalyNoRequestID, anomalyStraySettle}
+
+// noteAnomalyLocked books one anomaly and tells the observer.
+func (s *Scheduler) noteAnomalyLocked(kind string) {
+	if s.counters.anomalies == nil {
+		s.counters.anomalies = map[string]int64{}
+	}
+	s.counters.anomalies[kind]++
+	if s.onAnomaly != nil {
+		s.onAnomaly(kind)
+	}
+}
+
 // countExitLocked books ONE departure on the engine AND in the global tally (Snapshot.Exits
 // stays the whole-policy view). Marks are states, never departures: a mid-flight branch is
 // marked exiting (exitingBranches/exitingBlocks/exitingOldest) and booked here exactly once, at
@@ -2074,6 +2110,9 @@ type Snapshot struct {
 	AffinityViolations int64 `json:"affinityViolations"`
 	Rebinds            int64 `json:"rebinds"`
 	EngineGone         int64 `json:"enginesGone"`
+	// Anomalies is the should-be-zero ledger, by kind (anomalyKinds): every entry is an event
+	// the policy could not act on. A steady run reads all zeros; a growing one names its cause.
+	Anomalies map[string]int64 `json:"anomalies,omitempty"`
 	// Bindings is the number of LIVE seat bindings per engine (a branch is bound
 	// exactly while it is seated, so this equals that engine's seats; a binding to
 	// an engine that holds no such branch must be 0).
@@ -2150,6 +2189,12 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 	}
 	for k, v := range s.counters.exits {
 		snap.Exits[k] = v
+	}
+	if len(s.counters.anomalies) > 0 {
+		snap.Anomalies = map[string]int64{}
+		for k, v := range s.counters.anomalies {
+			snap.Anomalies[k] = v
+		}
 	}
 	for _, engine := range s.bindings {
 		snap.Bindings[engineLabel(engine)]++

@@ -39,6 +39,7 @@ var keptMetrics = []string{
 	"dispatches_total", "exits_total",
 	"entry_wait_seconds",
 	"engine_gone_total", "rebinds_total", "affinity_violations_total",
+	"anomalies_total",
 }
 
 // droppedMetrics must NOT be registered any more.
@@ -72,6 +73,7 @@ func TestMetricSurfaceIsExactlyTheKeptSet(t *testing.T) {
 		fx.s.onColdValveHeld = func(engine string) { m.ObserveColdValveHeld(engine) }
 		fx.s.onRehome = func(branch, from, to string) { m.ObserveAffinityViolation(from, to) }
 		fx.s.onEngineGone = func(string, int) { m.ObserveEngineGone() }
+		fx.s.onAnomaly = m.ObserveAnomaly
 		m.ObserveCapacityLearned("endpoint-event", engineLabel(fx.ids[0]))
 		m.SetCapacityMissing(engineLabel(fx.ids[1%len(fx.ids)]), true)
 

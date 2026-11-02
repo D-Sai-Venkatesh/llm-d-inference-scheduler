@@ -224,6 +224,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// branch by request id alone.
 	r.sched.onRelease = func(branch, reqID string) { r.pins.setRequest(reqID, branch) }
 	r.sched.onForget = func(reqID string) { r.pins.delRequest(reqID) }
+	r.sched.onAnomaly = r.metrics.ObserveAnomaly
 	r.sched.onColdValveHeld = func(engine string) {
 		r.metrics.ObserveColdValveHeld(engineLabel(engine))
 	}

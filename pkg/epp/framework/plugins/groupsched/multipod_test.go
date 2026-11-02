@@ -314,7 +314,7 @@ func TestMultiEngineGoldenProperties(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		trace := runGoldenScenarioOn(t, s)
+		trace := runScenarioOn(t, s)
 		return trace, s.Snapshot()
 	}
 	oneA, snapOne := run(1, 1000)

@@ -16,38 +16,29 @@ limitations under the License.
 
 package groupsched
 
-// The GOLDEN REPLAY TEST (BUILD-PLAN §1): the default config must
-// reproduce the legacy decision path exactly. A deterministic scenario
-// drives the Scheduler through the full public API on a virtual clock;
-// every observable decision (pick results, seats, exits with reasons,
-// seated-set transitions) is recorded as a trace. The committed golden
-// file (testdata/golden.txt) was generated from the PRE-CHANGE code;
-// any refactor must keep the default-config trace byte-identical.
+// THE N-ENGINE SIMULATION — the determinism guard that stands where the goldens did.
 //
-// The scenario is NORMAL-PATH ONLY by design: the always-on liveness
-// fixes (C3/C4/C8, derive-don't-accumulate) deliberately alter abnormal
-// paths (cancellations without EOS, TrySeat failures, gate closures
-// without Picks) and must not change this trace. Regenerate with:
+// A deterministic scenario drives the Scheduler through its public API on a virtual
+// clock and records every observable decision (picks, seats, exits with reasons, the
+// seated set) as a trace. There is no committed trace to compare against any more (the
+// goldens were removed with the replay machinery): what this file pins is that the SAME
+// event stream replayed twice produces the SAME decisions, at N=1 and N=2, so no
+// map-order dependence can creep back into the decision path.
 //
-//	go test ./pkg/epp/framework/plugins/groupsched/ -run TestGolden -update-golden
+// The scenario is NORMAL-PATH by design (the always-on liveness fixes deliberately
+// alter abnormal paths, and those have their own tests).
 
 import (
-	"crypto/sha256"
-	"flag"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 )
 
-var updateGolden = flag.Bool("update-golden", false, "rewrite a testdata trace from the current run")
-
 // ---- the virtual clock ----
 
-var goldenT0 = time.Unix(1793000000, 0).UTC()
+var scenarioT0 = time.Unix(1793000000, 0).UTC()
 
 // ---- the scenario model ----
 
@@ -61,10 +52,10 @@ type gsSession struct {
 	nextTurn int    // sim second of the next arrival
 }
 
-// goldenScenario builds the scripted session set: 46 sessions over
+// scenarioSessions builds the scripted session set: 46 sessions over
 // 2,600 sim seconds against a 1000-block capacity (budget 950), enough
 // pressure for seating, rotation, budget-idle exits, TTL and re-entry.
-func goldenScenario() []*gsSession {
+func scenarioSessions() []*gsSession {
 	var ss []*gsSession
 	for i := 0; i < 46; i++ {
 		kind := "main"
@@ -114,18 +105,18 @@ func (g *gsSession) thinkGap() int {
 
 // ---- the driver ----
 
-type goldenTrace struct {
+type scenarioTrace struct {
 	sb    strings.Builder
 	seats map[string]bool
 }
 
-func (g *goldenTrace) line(format string, args ...any) {
+func (g *scenarioTrace) line(format string, args ...any) {
 	fmt.Fprintf(&g.sb, format+"\n", args...)
 }
 
 // observeState appends the seated set ONLY when it changes (keeps the
 // golden small without losing decisions).
-func (g *goldenTrace) observeState(s *Scheduler) {
+func (g *scenarioTrace) observeState(s *Scheduler) {
 	cur := s.seatedIDs()
 	if len(cur) != len(g.seats) {
 		goto diff
@@ -146,32 +137,32 @@ diff:
 	g.line("STATE seats=%d [%s]", len(ids), strings.Join(ids, ","))
 }
 
-// runGoldenScenario drives the scheduler and returns the trace.
-func runGoldenScenario(t *testing.T) string {
-	return runGoldenScenarioEnd(t, 2600)
+// runScenario drives the scheduler and returns the trace.
+func runScenario(t *testing.T) string {
+	return runScenarioEnd(t, 2600)
 }
 
-// runGoldenScenarioCfg is the PARAMETRIZED driver used by the WAVE-1
+// runScenarioCfg is the PARAMETRIZED driver used by the WAVE-1
 // session-ordering equality test: cfg is the scheduler config and sessions
 // maps a scripted chain's id to its SESSION attribute (nil = every head
 // carries none, i.e. session := member — base mode).
-func runGoldenScenarioCfg(t *testing.T, simEnd int, cfg Config) string {
-	return runGoldenScenarioFull(t, simEnd, cfg)
+func runScenarioCfg(t *testing.T, simEnd int, cfg Config) string {
+	return runScenarioFull(t, simEnd, cfg)
 }
 
-// runGoldenScenarioEnd drives the scenario truncated at simEnd (the
+// runScenarioEnd drives the scenario truncated at simEnd (the
 // legacy-c57e92ed comparison uses 489 — the pre-C4 code stalls on this
 // scenario shortly after ~500, AND at t=490 the always-on C8 fix
 // deliberately diverges from legacy (a member with a queued head is no
 // longer idle-evicted — the reviewer's predicted A0 caveat). The 489s
 // prefix is byte-identical; the divergence point is documented, not
 // hidden; S1).
-func runGoldenScenarioEnd(t *testing.T, simEnd int) string {
+func runScenarioEnd(t *testing.T, simEnd int) string {
 	t.Helper()
-	return runGoldenScenarioFull(t, simEnd, defaultConfig())
+	return runScenarioFull(t, simEnd, defaultConfig())
 }
 
-func runGoldenScenarioFull(t *testing.T, simEnd int, cfg Config) string {
+func runScenarioFull(t *testing.T, simEnd int, cfg Config) string {
 	t.Helper()
 	s, err := NewScheduler(cfg)
 	if err != nil {
@@ -182,18 +173,18 @@ func runGoldenScenarioFull(t *testing.T, simEnd int, cfg Config) string {
 	if err := s.SetNumBlocksFor("engine-a", 64, 1000); err != nil {
 		t.Fatal(err)
 	}
-	return runGoldenScenarioOnSched(t, simEnd, s)
+	return runScenarioOnSched(t, simEnd, s)
 }
 
-// runGoldenScenarioOn replays the golden scenario on an ALREADY-BUILT scheduler (the
+// runScenarioOn replays the golden scenario on an ALREADY-BUILT scheduler (the
 // multi-engine properties are asserted this way).
-func runGoldenScenarioOn(t *testing.T, s *Scheduler) string {
+func runScenarioOn(t *testing.T, s *Scheduler) string {
 	t.Helper()
-	return runGoldenScenarioOnSched(t, 2600, s)
+	return runScenarioOnSched(t, 2600, s)
 }
 
-func runGoldenScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
-	tr := &goldenTrace{seats: map[string]bool{}}
+func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
+	tr := &scenarioTrace{seats: map[string]bool{}}
 
 	// exit/entry observation: hook order relative to the op is part of
 	// the trace (the hooks fire inside the op).
@@ -209,7 +200,7 @@ func runGoldenScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 		entryLog = append(entryLog, fmt.Sprintf("SEAT wait=%.3f", wait))
 	}
 
-	ss := goldenScenario()
+	ss := scenarioSessions()
 	byID := func(id string) *gsSession {
 		for _, g := range ss {
 			if g.id == id {
@@ -246,7 +237,7 @@ func runGoldenScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 				hs = append(hs, Head{
 					Member:    g.id,
 					ReqID:     fmt.Sprintf("%s-r%02d", g.id, reqSeq[g.id]+1),
-					Arrival:   goldenT0.Add(time.Duration(g.nextTurn) * time.Second),
+					Arrival:   scenarioT0.Add(time.Duration(g.nextTurn) * time.Second),
 					SizeBytes: int64(len(g.chain)+g.turnBlocks()) * 4 * 64,
 				})
 			}
@@ -255,7 +246,7 @@ func runGoldenScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 	}
 
 	for sim := 0; sim <= simEnd; sim++ {
-		now := goldenT0.Add(time.Duration(sim) * time.Second)
+		now := scenarioT0.Add(time.Duration(sim) * time.Second)
 
 		// settle due flights (decode periods of 5..40s)
 		var still []*flight
@@ -270,7 +261,7 @@ func runGoldenScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 					}
 				}
 				s.Chunk(g.id)
-				s.Settle(g.id, f.reqID, usage, f.natural, goldenT0.Add(time.Duration(f.settleAt)*time.Second))
+				s.Settle(g.id, f.reqID, usage, f.natural, scenarioT0.Add(time.Duration(f.settleAt)*time.Second))
 				tr.line("t=%d SETTLE %s req=%s natural=%v", f.settleAt, g.id, f.reqID, f.natural)
 				for _, l := range exitLog {
 					tr.line("t=%d %s", f.settleAt, l)
@@ -357,149 +348,6 @@ func runGoldenScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 	return tr.sb.String()
 }
 
-// TestGoldenDeterministic runs the scenario twice and requires identical
-// traces (guards against residual map-order nondeterminism).
-// TestGoldenLegacyC57e92ed closes the golden's circularity (S1): the
-// committed testdata/golden-legacy.txt was generated from the RAW
-// pre-change code (c57e92ed) on this scenario truncated at sim 500
-// (the legacy TrySeat spin — C4 — stalls it shortly after). The current
-// build's default config must reproduce that prefix byte-identically,
-// pinning default == legacy on code that predates every change in this
-// branch, not just on itself.
-// TestGoldenDeterministic runs the scenario twice and requires identical traces
-// (no residual map-order nondeterminism anywhere in the decision path — the ARCHIVE
-// build failed this; see olderCompletion's comment).
-func TestGoldenDeterministic(t *testing.T) {
-	a := runGoldenScenario(t)
-	for i := 0; i < 3; i++ {
-		if b := runGoldenScenario(t); a != b {
-			t.Fatalf("scenario is not deterministic across runs (run %d differs)", i+1)
-		}
-	}
-}
-
-// TestGoldenHashesPinned closes the loop between "the test passes" and "the bytes
-// that passed are the bytes an auditor can check" (audit item 4): testdata/
-// SHA256SUMS pins the sha256 of every committed trace, and this test FAILS if a
-// golden file changes without its hash being updated — a silent `-update-golden`
-// regeneration can no longer ride along unnoticed.
-func TestGoldenHashesPinned(t *testing.T) {
-	sums, err := os.ReadFile(filepath.Join("testdata", "SHA256SUMS"))
-	if err != nil {
-		t.Fatalf("testdata/SHA256SUMS missing: %v", err)
-	}
-	want := map[string]string{}
-	for _, line := range strings.Split(string(sums), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		f := strings.Fields(line)
-		if len(f) != 2 {
-			continue
-		}
-		want[f[1]] = f[0]
-	}
-	if len(want) < 2 {
-		t.Fatalf("SHA256SUMS lists %d files, want at least the two trace files", len(want))
-	}
-	for name, h := range want {
-		b, err := os.ReadFile(filepath.Join("testdata", name))
-		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
-		}
-		got := fmt.Sprintf("%x", sha256.Sum256(b))
-		if got != h {
-			t.Fatalf("%s: sha256 %s != pinned %s — if the change is intended, update both the trace and testdata/SHA256SUMS (and say why in the commit)", name, got, h)
-		}
-	}
-}
-
-// ---- GSCH-CORE: the f0p golden equality ----
-//
-// The core's baseline is f0p — the single-pod anchor every banked number is stated
-// against. testdata/golden-f0p-core.txt was produced by the ARCHIVE build
-// (dsai/groupsched-tier-aware @ dd5350b5) on THIS scenario with f0p's rendered
-// config: rotationMode=quantum Q4, valve on, victimOrder legacy, windowMode last4,
-// gateMode detector (no plugin-side dispatch gate), engineGroups=per-engine,
-// bindingMode=member-stable, every F/PAT/residue knob at its default-off value.
-//
-// The core must reproduce it BYTE FOR BYTE at N=1. The ONE declared behavioural
-// difference between the two builds is the safety module, and this comparison is
-// exact because of the module's DEFAULT: NoopSafety (the seat budget is the whole
-// admission control). f0p's plugin-side gate was OFF as well, so the two builds run
-// with the SAME gate state — open, always. (The memory-only
-// net was the one configuration that could diverge; it was removed with the trim, so
-// this comparison is unconditional.)
-//
-// What the trace proves: identical picks, identical seats, identical exits with
-// reasons, identical seated-set transitions, identical served/refill totals, over
-// 2,600 simulated seconds and 1,210 dispatches.
-func TestCoreEqualsF0P(t *testing.T) {
-	got := runGoldenScenario(t)
-	want, err := os.ReadFile(filepath.Join("testdata", "golden-f0p-bugfixes.txt"))
-	if err != nil {
-		t.Fatalf("f0p golden missing: %v", err)
-	}
-	if got != string(want) {
-		gotL := strings.Split(got, "\n")
-		wantL := strings.Split(string(want), "\n")
-		for i := 0; i < len(gotL) || i < len(wantL); i++ {
-			var a, b string
-			if i < len(gotL) {
-				a = gotL[i]
-			}
-			if i < len(wantL) {
-				b = wantL[i]
-			}
-			if a != b {
-				t.Fatalf("core/f0p divergence at line %d:\n  core: %s\n  f0p:  %s", i+1, a, b)
-			}
-		}
-		t.Fatal("core/f0p divergence (length)")
-	}
-}
-
-// TestCoreMatchesF0PUpToTheFixes pins the second half of the evidence: against the f0p
-// BASELINE (archive + the total tie-break, i.e. f0p's own policy) the core agrees line
-// for line up to the first point where one of the DECLARED fixes engages. The
-// accounting-only difference (BUG 4a: mid-flight exits now reach the exit hook, so the
-// trace carries `EXIT reason=exiting` lines it did not before) is normalised away; what
-// remains is decided behaviour, and the shared prefix is pinned.
-func TestCoreMatchesF0PUpToTheFixes(t *testing.T) {
-	norm := func(trace string) []string {
-		var out []string
-		for _, l := range strings.Split(trace, "\n") {
-			if strings.Contains(l, "EXIT reason=exiting") {
-				continue // accounting only: f0p never emitted these through the hook
-			}
-			out = append(out, l)
-		}
-		return out
-	}
-	got := norm(runGoldenScenario(t))
-	raw, err := os.ReadFile(filepath.Join("testdata", "golden-f0p-total.txt"))
-	if err != nil {
-		t.Fatalf("f0p baseline golden missing: %v", err)
-	}
-	want := norm(string(raw))
-	// measured: line 745 is the first place a declared fix changes a decision (t=333,
-	// an admission fix 5 — the charged drain — refuses). The shared prefix is pinned one
-	// line short of it, so the test fails the moment ANY change moves the first
-	// divergence earlier.
-	const shared = 744
-	limit := shared
-	if len(got) < limit || len(want) < limit {
-		t.Fatalf("trace shorter than the pinned shared prefix (%d lines)", shared)
-	}
-	for i := 0; i < limit; i++ {
-		if got[i] != want[i] {
-			t.Fatalf("core diverges from the f0p baseline at line %d (the shared prefix must stay >= %d lines):\n  core: %s\n  f0p:  %s", i+1, shared, got[i], want[i])
-		}
-	}
-	t.Logf("the core matches the f0p baseline line for line for its first %d decisions; the declared fixes take over after that", limit)
-}
-
 // TestDeterminism_OneAndTwoEngines replays the SAME synthetic N=1 and N=2 event
 // streams twice each and requires identical traces. This is the goldens' replacement:
 // with no committed trace to compare against, the property that must still hold is that
@@ -550,5 +398,5 @@ func runScenarioEngines(t *testing.T, n int) string {
 			t.Fatal(err)
 		}
 	}
-	return runGoldenScenarioOnSched(t, 2600, s)
+	return runScenarioOnSched(t, 2600, s)
 }

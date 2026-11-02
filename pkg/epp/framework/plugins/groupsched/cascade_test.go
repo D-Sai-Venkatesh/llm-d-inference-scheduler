@@ -220,7 +220,7 @@ func TestExitCompositionIsNotACascade(t *testing.T) {
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			trace := runGoldenScenarioCfg(t, 2600, tc.cfg)
+			trace := runScenarioCfg(t, 2600, tc.cfg)
 			exits := map[string]int{}
 			total, dispatches := 0, 0
 			for _, line := range strings.Split(trace, "\n") {

@@ -18,10 +18,10 @@ package groupsched
 
 // THE ENFORCEMENT CASCADE, and the TWO VIEWS that end it.
 //
-// The charged drain (iii) put an exiting member's blocks on the budget's used side until
+// The charged drain (iii) put an exiting branch's blocks on the budget's used side until
 // it drains — correct, because the engine pins them. What it also did, silently, was make
 // MARKING FREE: a pass that marked a mid-flight victim saw the same over-budget number
-// afterwards, so enforceBudgetLocked marked the next in-flight member, and the next, on
+// afterwards, so enforceBudgetLocked marked the next in-flight branch, and the next, on
 // every pass — and passes are every Pick. Behind those marks a perfectly healthy engine
 // churned its whole membership out from under one turn each.
 //
@@ -51,19 +51,19 @@ import (
 	"time"
 )
 
-// ---- ENFORCEMENT: one exiting member covering the overage ends the pass ----
+// ---- ENFORCEMENT: one exiting branch covering the overage ends the pass ----
 
-// The engine is over budget by (member's blocks), and that member is ALREADY exiting:
+// The engine is over budget by (branch's blocks), and that branch is ALREADY exiting:
 // enforcement must mark NOBODY else. This is the cascade's first domino.
 func TestEnforcementDoesNotMarkAnotherWhileOneIsLeaving(t *testing.T) {
 	chargedPath(t, defaultConfig(), "no-cascade", func(t *testing.T, fx *engineSet, g *engineGroup) {
-		// three members in flight on one engine; the engine's budget is exactly full
+		// three branches in flight on one engine; the engine's budget is exactly full
 		fx.s.Chunk("gone") // its prefill completed: the cold valve is free for the third seat
 		fx.seatOne(t, "m2", 250, 5*time.Second)
-		markExitingInflight(t, fx, g, "r-gone", true) // the 300-block member leaves
+		markExitingInflight(t, fx, g, "r-gone", true) // the 300-block branch leaves
 		fx.s.mu.Lock()
 		for _, id := range []string{"m2"} { // give the sibling a request too (mid-flight)
-			m := g.members[id]
+			m := g.branches[id]
 			m.inflightIDs = map[string]inflightRec{"r-" + id: {since: fx.clock, confirmed: true}}
 			m.inflight = 1
 		}
@@ -77,10 +77,10 @@ func TestEnforcementDoesNotMarkAnotherWhileOneIsLeaving(t *testing.T) {
 		m2Exiting := g.index.ExitingLocked("m2")
 		fx.s.mu.Unlock()
 		if m2Exiting {
-			t.Fatal("an exiting member already covers the overage: enforcement marked ANOTHER in-flight member (the cascade)")
+			t.Fatal("an exiting branch already covers the overage: enforcement marked ANOTHER in-flight branch (the cascade)")
 		}
 		if !g.index.Exiting("gone") {
-			t.Fatal("the member on its way out must still be the one leaving")
+			t.Fatal("the branch on its way out must still be the one leaving")
 		}
 	})
 }
@@ -93,8 +93,8 @@ func TestEnforcementTakesOneMoreWhenTheOverageExceedsTheRetirees(t *testing.T) {
 		fx.seatOne(t, "m2", 250, 5*time.Second)
 		markExitingInflight(t, fx, g, "r-gone", true)
 		fx.s.mu.Lock()
-		g.members["m2"].inflightIDs = map[string]inflightRec{"r-m2": {since: fx.clock, confirmed: true}}
-		g.members["m2"].inflight = 1
+		g.branches["m2"].inflightIDs = map[string]inflightRec{"r-m2": {since: fx.clock, confirmed: true}}
+		g.branches["m2"].inflight = 1
 		// NE 950, budget 300: over by 650; "gone" excuses 300, so 350 is still over —
 		// more than m2's 250, so exactly ONE further mark can be justified... and after
 		// that (250 excused, 100 left) the pass must stop: nobody else may be marked
@@ -105,22 +105,22 @@ func TestEnforcementTakesOneMoreWhenTheOverageExceedsTheRetirees(t *testing.T) {
 		fx.s.mu.Lock()
 		fx.s.enforceBudgetLocked(g, fx.clock)
 		marked := 0
-		for id := range g.members {
+		for id := range g.branches {
 			if g.index.ExitingLocked(id) {
 				marked++
 			}
 		}
 		fx.s.mu.Unlock()
 		if marked != 2 {
-			t.Fatalf("%d members are exiting, want exactly 2 (one retiree + the one mark the overage justifies)", marked)
+			t.Fatalf("%d branches are exiting, want exactly 2 (one retiree + the one mark the overage justifies)", marked)
 		}
 	})
 }
 
 // ---- ADMISSION: the same blocks are still OCCUPIED for a new seat ----
 
-// The heart of the two views: a head that would fit only if the exiting member's blocks
-// were free must WAIT — and then be admitted the moment that member actually drains.
+// The heart of the two views: a head that would fit only if the exiting branch's blocks
+// were free must WAIT — and then be admitted the moment that branch actually drains.
 func TestAdmissionRefusesWhatOnlyTheRetireesBlocksWouldMakeRoomFor(t *testing.T) {
 	chargedPath(t, defaultConfig(), "admission-refuses", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-gone", true) // NE = 700 of a 950 budget
@@ -135,7 +135,7 @@ func TestAdmissionRefusesWhatOnlyTheRetireesBlocksWouldMakeRoomFor(t *testing.T)
 		}
 		fx.pick(h)
 		if fx.s.Seated("newcomer") {
-			t.Fatal("a newcomer was seated on room that only exists if the exiting member's blocks are free")
+			t.Fatal("a newcomer was seated on room that only exists if the exiting branch's blocks are free")
 		}
 		// the drain: now the room is real, and the same head is admitted
 		fx.s.SettleOnUsage("gone", "r-gone", g.id, 300, 0, 0, false, fx.clock)
@@ -151,13 +151,13 @@ func TestAdmissionRefusesWhatOnlyTheRetireesBlocksWouldMakeRoomFor(t *testing.T)
 
 // ---- the livelock guard that (iii) added must still work ----
 
-// An engine whose ONLY member is exiting and in flight, with a queue view too old to
+// An engine whose ONLY branch is exiting and in flight, with a queue view too old to
 // trust: the pass must return instead of re-picking the same victim forever (the guard
 // the accounting fix added — the cascade fix must not remove the reason for it).
 func TestExitingVictimDoesNotSpinEnforcementAfterTheCascadeFix(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 900, 2*time.Second)
-		m, g := fx.member(t, "m")
+		m, g := fx.branch(t, "m")
 		fx.s.mu.Lock()
 		m.inflightIDs = map[string]inflightRec{"r-m": {since: fx.clock, confirmed: true}}
 		m.inflight = 1
@@ -176,7 +176,7 @@ func TestExitingVictimDoesNotSpinEnforcementAfterTheCascadeFix(t *testing.T) {
 			t.Fatal("Tick spun: an exiting in-flight victim was re-picked forever")
 		}
 		if !fx.s.Seated("m") {
-			t.Fatal("the exiting member must still be seated (it drains, it is not evicted)")
+			t.Fatal("the exiting branch must still be seated (it drains, it is not evicted)")
 		}
 	})
 }
@@ -240,7 +240,7 @@ func TestExitCompositionIsNotACascade(t *testing.T) {
 			t.Logf("%d exits (%.1f %% exiting-drain), %d dispatches, marks/dispatch %.1f %%",
 				total, 100*float64(marks)/float64(total), dispatches, 100*perDispatch)
 			if perDispatch > 0.05 {
-				t.Fatalf("%d mid-flight marks for %d dispatches (%.1f %%): enforcement is marking members in bulk "+
+				t.Fatalf("%d mid-flight marks for %d dispatches (%.1f %%): enforcement is marking branches in bulk "+
 					"(the cascade measured 81 %% live and 10 %% in this replay; the fixed arm runs 3 %%)",
 					marks, dispatches, 100*perDispatch)
 			}

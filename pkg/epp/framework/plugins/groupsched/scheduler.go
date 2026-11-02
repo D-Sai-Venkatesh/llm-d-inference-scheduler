@@ -39,7 +39,7 @@ import (
 // evidence): entry orders (HRRN / hrrn-bounded), every F-arm
 // (rotateWhenFree, dyn-size quantum, quantum ceilings, MLFQ-2), PAT, the
 // residue model and its reconcile, the victim-order variants, the ledger
-// rotation model (rho/nMax), member-stable binding, the pooled
+// rotation model (rho/nMax), branch-stable binding, the pooled
 // engineGroups=single mode, the session layer (sessionOrder / LSF / session
 // caps) and the per-engine saturation gate with its 0.80/5 constants.
 type Config struct {
@@ -68,7 +68,7 @@ type Config struct {
 	// seat budget's own headroom — floor((1 - groupBudgetFraction) x
 	// num_gpu_blocks) blocks x blockSizeTokens — so the valve can only ever spend
 	// the margin the budget reserved for it. See engineGroup.coldCapTokens.)
-	// InFlightCap bounds one member's concurrent requests.
+	// InFlightCap bounds one branch's concurrent requests.
 	InFlightCap int `json:"inFlightCap"`
 	// BlockSizeTokens is the engine's KV block size in tokens (the token
 	// processor's value; 64 on the campaign stacks). It is a WIRING FACT, not a
@@ -238,45 +238,45 @@ func (c Config) reapSeconds() float64 {
 // identity — the fairness unit AND the queue key), the request id, the enqueue
 // time, and the wire size (the conservative-cost input).
 type Head struct {
-	// Member is the group policy's unit: the derived branch id, or "" for
+	// Branch is the group policy's unit: the derived branch id, or "" for
 	// anonymous traffic (never tracked, never seated, R9).
-	Member    string
+	Branch    string
 	ReqID     string
 	Arrival   time.Time
 	SizeBytes int64
-	// Source names the attribute the member id came from ("branch" |
+	// Source names the attribute the branch id came from ("branch" |
 	// "session" | ""). Counted per dispatch (the run is auditable from the
 	// artifacts without re-deriving it from the config).
 	Source string
 	// FairnessID is the request's flow-control identity — the id the GATEWAY and
 	// the harness record on the wire (x_correlation_id / the client's thread id).
-	// The member id is a DERIVED branch id and joins to nothing in the request
+	// The branch id is a DERIVED branch id and joins to nothing in the request
 	// records (measured 0/768 matches), so every SEAT/EXIT event must carry this
 	// too or a run's seat membership cannot be joined to its own requests.
 	FairnessID string
 }
 
-// ---- per-member scheduling state ----
+// ---- per-branch scheduling state ----
 
-// member is one seated residency: a record that exists exactly as long as the
-// member holds a seat on ONE engine (the seat IS the binding — there is no
+// branch is one seated residency: a record that exists exactly as long as the
+// branch holds a seat on ONE engine (the seat IS the binding — there is no
 // pre-seat homing and no post-exit placement claim).
-type member struct {
+type branch struct {
 	id string
-	// engine is the engineGroup id this member is SEATED on — the same value as
+	// engine is the engineGroup id this branch is SEATED on — the same value as
 	// the identity-level binding, kept on the record so a dump shows the seat
 	// without a second lookup.
 	engine string
 	// seatTime orders exits: earliest-seated leaves first.
 	seatTime time.Time
-	// resTurns counts settled turns in this residency (the residency histogram's
+	// seatTurns counts settled turns in this residency (the residency histogram's
 	// unit).
-	resTurns int
+	seatTurns int
 	// inflight is DERIVED each decision point from inflightIDs
 	// (derive-don't-accumulate): a leaked increment cannot persist past a
 	// reconciliation.
 	inflight int
-	// inflightIDs tracks the member's in-flight request ids with their
+	// inflightIDs tracks the branch's in-flight request ids with their
 	// confirmation state (C3): provisional (chosen at Pick, not yet at
 	// PreRequest) ids are reaped after 30s; confirmed ids after
 	// InflightReapSeconds. m.inflight = len(inflightIDs).
@@ -293,7 +293,7 @@ type member struct {
 	lastCompletion time.Time
 	// lastActivity is the last arrival, dispatch or completion.
 	lastActivity time.Time
-	// coldEntry is this member's outstanding cold-entry charge in TOKENS against
+	// coldEntry is this branch's outstanding cold-entry charge in TOKENS against
 	// the stagger cap; released EXACTLY once (S0-2) at the first of: prefill
 	// complete, any termination, unseat.
 	coldEntry int64
@@ -306,15 +306,15 @@ type member struct {
 	// releases at exit. Without it a newcomer seats at index-cost 0 and the budget
 	// understates until the exact keys land.
 	pendingBlocks int64
-	// waitingSince is the member's oldest queued head (B5: kept oldest).
+	// waitingSince is the branch's oldest queued head (B5: kept oldest).
 	waitingSince time.Time
-	// exitingSince is when this member was marked exiting (the mid-flight class): the
+	// exitingSince is when this branch was marked exiting (the mid-flight class): the
 	// age of a retiree is the time between "nothing more will be admitted for it" and
 	// "its blocks are off the budget", i.e. how long the engine pays for a seat it has
-	// already written off. Zero on a member that is not exiting (a fresh residency is a
+	// already written off. Zero on a branch that is not exiting (a fresh residency is a
 	// fresh struct, so the flag never has to be cleared).
 	exitingSince time.Time
-	// fairnessID is the last fairness id (queue key) this member was seen with —
+	// fairnessID is the last fairness id (queue key) this branch was seen with —
 	// the join key for its SEAT/EXIT events (see Head.FairnessID).
 	fairnessID string
 }
@@ -323,7 +323,7 @@ type member struct {
 type inflightRec struct {
 	since     time.Time // Pick time (provisional) / PreRequest time (confirmed)
 	confirmed bool
-	main      bool // landed on the member's main chain (V1)
+	main      bool // landed on the branch's main chain (V1)
 	// keys are the exact tier-A chain blocks recorded at PreRequest. They are kept
 	// because SETTLE is where a request's blocks enter the CPU tier (a model of vLLM
 	// storing them) and settle otherwise carries no hash list — re-deriving the set
@@ -354,11 +354,11 @@ type waiter struct {
 	coldTokens int64
 	// coldTokensByEngine is the per-engine admission cost, FROZEN at sync time for
 	// this decision pass (reviewer R2). Each entry comes from that engine's own
-	// index, so an engine that does not hold the member's blocks is costed as cold
+	// index, so an engine that does not hold the branch's blocks is costed as cold
 	// — which is the truth about that engine — instead of inheriting the best case.
 	coldTokensByEngine map[string]int64
 	// fairnessID rides with the head (see Head.FairnessID) so a SEAT event can name
-	// the wire-level identity even before the member has a record.
+	// the wire-level identity even before the branch has a record.
 	fairnessID string
 }
 
@@ -371,9 +371,9 @@ type waiter struct {
 // same functions and the same decisions; there is no pooled group and no
 // single-engine special case.
 //
-// What is NOT here (identity, because a member's identity is a property of the
+// What is NOT here (identity, because a branch's identity is a property of the
 // client, not of the seat): everSeated (the newcomer test), lastSeen (the silence
-// GC), the member→engine bindings, and the SHARED waiter queue.
+// GC), the branch→engine bindings, and the SHARED waiter queue.
 type engineGroup struct {
 	// id is the endpoint id the EPP discovered.
 	id string
@@ -388,13 +388,13 @@ type engineGroup struct {
 	// CacheBlockSize that differs from the config's BlockSizeTokens).
 	blockSizeMismatch error
 
-	members map[string]*member
+	branches map[string]*branch
 	// coldInFlight is this engine's outstanding cold-entry charge: the stagger
 	// cap is PER ENGINE (N engines ⇒ N concurrent cold prefills; R11's "one cold
 	// entry is always allowed" proves liveness inside one engine's cap, and it
 	// holds independently for each engine).
 	coldInFlight int64
-	// pendingTotal is the sum of seated members' pendingBlocks (the budget's
+	// pendingTotal is the sum of seated branches' pendingBlocks (the budget's
 	// estimate component).
 	pendingTotal int64
 
@@ -445,7 +445,7 @@ func newEngineGroup(id string, blockSizeTokens int) (*engineGroup, error) {
 		return nil, err
 	}
 	g := &engineGroup{id: id, index: idx,
-		members: map[string]*member{}, estCache: map[string]estEntry{}}
+		branches: map[string]*branch{}, estCache: map[string]estEntry{}}
 	g.counters.exits = map[string]int64{}
 	return g, nil
 }
@@ -472,19 +472,19 @@ type Scheduler struct {
 	// comes from.
 	mod modules
 	// observers are the optional metric hooks (nil in tests).
-	onExit         func(engine, reason string, resTurns int)
+	onExit         func(engine, reason string, seatTurns int)
 	onEntry        func(engine, kind string, waitSeconds float64)
 	onServe        func(engine string)
 	onEvent        func(Event)
-	onRehome       func(member, from, to string)
-	onEngineGone   func(engine string, members int)
+	onRehome       func(branch, from, to string)
+	onEngineGone   func(engine string, branches int)
 	onMemberSource func(source string)
-	// onBind / onUnbind are the PLACEMENT-PIN hooks: they fire when a member's
+	// onBind / onUnbind are the PLACEMENT-PIN hooks: they fire when a branch's
 	// seat (and therefore its engine binding) is created or dropped, so the
 	// plugin's lock-light Filter table can follow the seats without ever touching
 	// s.mu. nil in tests.
-	onBind   func(member, engine string)
-	onUnbind func(member string)
+	onBind   func(branch, engine string)
+	onUnbind func(branch string)
 	// onColdValveHeld fires when the cold-entry valve HOLDS a head that would fit an
 	// engine's budget. The head WAITS (the valve opens when that engine's cold prefill
 	// produces its first token); nothing is evicted for it. This is the sizing signal:
@@ -500,19 +500,19 @@ type Scheduler struct {
 
 	blockSize int
 
-	// everSeated is the NEWCOMER test: a member that has never been seated queues
-	// ahead of the members that have (D1's newcomer-first order).
+	// everSeated is the NEWCOMER test: a branch that has never been seated queues
+	// ahead of the branches that have (D1's newcomer-first order).
 	everSeated map[string]struct{}
 	// lastSeen is the per-record activity time for the silence GC (R2): updated at
 	// Dispatched and Settle; a headless, unseated record older than TTL is
 	// forgotten.
 	lastSeen map[string]time.Time
-	// bindings is the member→engine association. It IS the seat: created when the
-	// member is seated, dropped the moment it exits. An unseated member has no
+	// bindings is the branch→engine association. It IS the seat: created when the
+	// branch is seated, dropped the moment it exits. An unseated branch has no
 	// placement opinion at all.
 	bindings map[string]string
 
-	// waiters is THE SHARED WAITER QUEUE: one entry per member with a queued head
+	// waiters is THE SHARED WAITER QUEUE: one entry per branch with a queued head
 	// and no seat. Whichever engine frees a seat (or has room) takes the head from
 	// here — the queue is where waiting is pooled, which is what makes N engines
 	// one admission system instead of N.
@@ -521,7 +521,7 @@ type Scheduler struct {
 	// pickSeq synthesizes request ids for heads that lack one (M1).
 	pickSeq int64
 	// queueViewAt is when the queue-head snapshot was last reconciled
-	// (syncWaitersLocked) — the evidence clock behind "this member has no queued
+	// (syncWaitersLocked) — the evidence clock behind "this branch has no queued
 	// head". A stale view must never justify an eviction (the C8 race).
 	queueViewAt time.Time
 	// headsObservedAt is when the head list was last OBSERVED — a Pick, which carries a
@@ -558,7 +558,7 @@ type Scheduler struct {
 		rebinds            int64
 		engineGone         int64
 		exits              map[string]int64
-		resTurns           []int
+		seatTurns          []int
 		refillShare        float64
 		uncachedTok        int64
 		totalTok           int64
@@ -573,8 +573,8 @@ type Scheduler struct {
 		// means "the dump's RecentEvents does not cover the window", which must be
 		// visible instead of inferred.
 		eventsDropped int64
-		// memberSources counts dispatches by the attribute the member id came from
-		// (the run's effective-member-source echo).
+		// memberSources counts dispatches by the attribute the branch id came from
+		// (the run's effective-branch-source echo).
 		memberSources map[string]int64
 	}
 }
@@ -639,9 +639,9 @@ func (s *Scheduler) eng() *engineGroup { return s.groups[""] }
 // (a settle for an already-torn-down engine must not resurrect the group).
 func (s *Scheduler) existingGroupLocked(id string) *engineGroup { return s.groups[id] }
 
-// groupOfLocked is the member's SEAT engine (nil when the member is unseated).
-func (s *Scheduler) groupOfLocked(member string) *engineGroup {
-	id, ok := s.bindings[member]
+// groupOfLocked is the branch's SEAT engine (nil when the branch is unseated).
+func (s *Scheduler) groupOfLocked(branch string) *engineGroup {
+	id, ok := s.bindings[branch]
 	if !ok {
 		return nil
 	}
@@ -854,7 +854,7 @@ func (s *Scheduler) PickFromHeads(heads []Head, now time.Time) int {
 // The pass is written for N engines as THE code and for one engine as its N=1
 // case: nothing below is conditioned on how many engines exist.
 //
-// Within an engine the member heads go OLDEST FIRST (a resident whose turn is due
+// Within an engine the branch heads go OLDEST FIRST (a resident whose turn is due
 // dispatches before its own later turns). ACROSS engines the order is the engine
 // whose own residents are waiting most per seat — a dispatch-order tie-break, not
 // a placement key — then the head's arrival, then the engine id, so the decision is
@@ -880,15 +880,15 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 	}
 	perEngine := make(map[string][]cand, len(groups))
 	for i, h := range heads {
-		if h.Member == "" {
+		if h.Branch == "" {
 			continue // anonymous traffic is not tracked (passes through last)
 		}
-		g := s.groupOfLocked(h.Member)
+		g := s.groupOfLocked(h.Branch)
 		if g == nil {
 			continue // unseated: its head is ADMISSION, handled by rotateLocked
 		}
-		m, seated := g.members[h.Member]
-		if !seated || g.index.ExitingLocked(h.Member) {
+		m, seated := g.branches[h.Branch]
+		if !seated || g.index.ExitingLocked(h.Branch) {
 			continue
 		}
 		if m.inflight >= s.cfg.InFlightCap {
@@ -918,7 +918,7 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 	}
 	if winner != nil {
 		g := s.groups[winner.c.engine]
-		m := g.members[winner.c.h.Member]
+		m := g.branches[winner.c.h.Branch]
 		s.observeMemberSourceLocked(winner.c.h.Source)
 		// M1: a dispatch is NEVER counted without an id — synthesize one when the
 		// head lacks ReqID (the counter follows the map).
@@ -941,11 +941,11 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 		}
 		return g.id, winner.c.i
 	}
-	// R9: no member head is dispatchable — serve the oldest ANONYMOUS head (FCFS
+	// R9: no branch head is dispatchable — serve the oldest ANONYMOUS head (FCFS
 	// pass-through, the siblings' behaviour; anonymous traffic is never tracked,
 	// never seated, never starved).
 	for i, h := range heads {
-		if h.Member == "" {
+		if h.Branch == "" {
 			return "", i
 		}
 	}
@@ -973,20 +973,20 @@ func (s *Scheduler) FCFSServed() {
 }
 
 // syncWaitersLocked reconciles the SHARED waiter queue with the queue-head
-// snapshot: a member with a queued head and no seat joins it, a member whose head
-// vanished leaves it, and every seated member's waiting-since tracks its oldest
+// snapshot: a branch with a queued head and no seat joins it, a branch whose head
+// vanished leaves it, and every seated branch's waiting-since tracks its oldest
 // queued head (the victim preference's input).
 func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 	s.queueViewAt = now
 	s.lastHeads = heads
 	present := map[string]time.Time{}
 	for _, h := range heads {
-		if h.Member == "" {
+		if h.Branch == "" {
 			continue
 		}
-		present[h.Member] = h.Arrival
-		if g := s.groupOfLocked(h.Member); g != nil {
-			if m, seated := g.members[h.Member]; seated {
+		present[h.Branch] = h.Arrival
+		if g := s.groupOfLocked(h.Branch); g != nil {
+			if m, seated := g.branches[h.Branch]; seated {
 				if h.FairnessID != "" && m.fairnessID != h.FairnessID {
 					m.fairnessID = h.FairnessID
 				}
@@ -998,10 +998,10 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 			}
 		}
 		// unseated: its demand is ADMISSION, so it waits in the one shared queue
-		w, ok := s.waiters[h.Member]
+		w, ok := s.waiters[h.Branch]
 		if !ok {
-			w = &waiter{id: h.Member, newcomer: s.isNewcomerLocked(h.Member)}
-			s.waiters[h.Member] = w
+			w = &waiter{id: h.Branch, newcomer: s.isNewcomerLocked(h.Branch)}
+			s.waiters[h.Branch] = w
 		}
 		w.fairnessID = h.FairnessID
 		// B5: keep the OLDEST arrival across fan-out re-arrivals
@@ -1011,9 +1011,9 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 		w.sizeBytes = h.SizeBytes
 		s.setWaiterCostsLocked(w) // per-engine admission costs, frozen for this pass
 	}
-	// vanished: members clear their waiting marker; waiters leave
+	// vanished: branches clear their waiting marker; waiters leave
 	for _, g := range s.activeGroupsLocked() {
-		for id, m := range g.members {
+		for id, m := range g.branches {
 			if _, ok := present[id]; !ok {
 				m.waitingSince = time.Time{}
 			}
@@ -1027,8 +1027,8 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 }
 
 // reconcileEngineLocked is the pendingEngine idiom's second half: the OBSERVED
-// endpoint wins. A seated member whose request lands on another engine is MOVED
-// to it (one member's correction instead of unbounded accounting drift — the index
+// endpoint wins. A seated branch whose request lands on another engine is MOVED
+// to it (one branch's correction instead of unbounded accounting drift — the index
 // is an optimistic model of where blocks ARE, and a stale binding drifts
 // permanently and silently).
 func (s *Scheduler) reconcileEngineLocked(id, observed string, now time.Time) *engineGroup {
@@ -1040,7 +1040,7 @@ func (s *Scheduler) reconcileEngineLocked(id, observed string, now time.Time) *e
 	if err != nil || to == nil {
 		return from
 	}
-	m := from.members[id]
+	m := from.branches[id]
 	if m == nil {
 		s.bindings[id] = to.id
 		return to
@@ -1050,16 +1050,16 @@ func (s *Scheduler) reconcileEngineLocked(id, observed string, now time.Time) *e
 	from.coldInFlight = max(from.coldInFlight-m.coldEntry, 0)
 	from.pendingTotal -= m.pendingBlocks
 	from.index.UnseatLocked(id) // the blocks are NOT on this engine (observation wins)
-	delete(from.members, id)
-	to.members[id] = m
+	delete(from.branches, id)
+	to.branches[id] = m
 	m.engine = to.id
 	s.bindings[id] = to.id
 	to.pendingTotal += m.pendingBlocks
 	to.coldInFlight += m.coldEntry
 	if ok, _ := to.index.TrySeatLocked(id, to.budgetBlocks); !ok {
-		// the engine is over its budget for this member: seat it anyway — it
+		// the engine is over its budget for this branch: seat it anyway — it
 		// demonstrably holds the blocks — and let enforcement evict (an over-budget
-		// counter is recoverable; a member absent from the engine that is serving it
+		// counter is recoverable; a branch absent from the engine that is serving it
 		// is not).
 		to.index.SeatForceLocked(id)
 		to.counters.forcedSeats++
@@ -1106,7 +1106,7 @@ func (s *Scheduler) estimateCostLocked(g *engineGroup, id string, sizeBytes int6
 // ---- PreRequest (post-dispatch): the exact tier-A correction ----
 
 // Dispatched records a released request at PreRequest without an observed endpoint
-// (the legacy/single-engine form): the member's seat decides the engine.
+// (the legacy/single-engine form): the branch's seat decides the engine.
 func (s *Scheduler) Dispatched(id, reqID string, keys []Hash, sizeBytes int64, now time.Time) {
 	s.DispatchedOn(id, reqID, "", keys, sizeBytes, now)
 }
@@ -1121,11 +1121,11 @@ func (s *Scheduler) DispatchedOn(id, reqID, engine string, keys []Hash, sizeByte
 // error at the next enforcement), in-flight and the cold charge are taken, and the
 // size baseline moves.
 //
-// engine=="" means "the member's SEAT" (no observation).
+// engine=="" means "the branch's SEAT" (no observation).
 //
-// B1 (the phantom binding): a member with NO seat is UNTRACKED. The old code fell
+// B1 (the phantom binding): a branch with NO seat is UNTRACKED. The old code fell
 // back to the pooled "" group and wrote a binding to it, so under per-engine groups
-// a member could be bound to an engine that no decision ever visits — permanently
+// a branch could be bound to an engine that no decision ever visits — permanently
 // unseated while the pool size and the dump counted it. There is no pooled group
 // here to fall back to: no seat, no charge, no binding.
 func (s *Scheduler) DispatchedOnUsage(id, reqID, engine string, keys []Hash, sizeBytes int64, now time.Time) {
@@ -1140,8 +1140,8 @@ func (s *Scheduler) DispatchedOnUsage(id, reqID, engine string, keys []Hash, siz
 		if err != nil || gg == nil {
 			return
 		}
-		if _, seated := gg.members[id]; !seated {
-			return // an engine we do not seat this member on: untracked, no binding
+		if _, seated := gg.branches[id]; !seated {
+			return // an engine we do not seat this branch on: untracked, no binding
 		}
 		g = gg
 	case engine != "" && engine != g.id:
@@ -1153,7 +1153,7 @@ func (s *Scheduler) DispatchedOnUsage(id, reqID, engine string, keys []Hash, siz
 	}
 	g.index.SetSizeLocked(id, sizeBytes) // the estimate baseline
 	onMain := g.index.SettleDispatchedAtLocked(id, reqID, keys, now)
-	if m, ok := g.members[id]; ok {
+	if m, ok := g.branches[id]; ok {
 		m.lastActivity = now
 		m.lastSizeBytes = sizeBytes
 		// C3/M1/R1: reconcile the in-flight id. A non-empty reqID confirms-or-adds.
@@ -1227,7 +1227,7 @@ func (s *Scheduler) ChunkAt(id string, now time.Time) {
 }
 
 func (s *Scheduler) releaseColdLocked(g *engineGroup, id string) {
-	m, ok := g.members[id]
+	m, ok := g.branches[id]
 	if !ok || m.coldDone || m.coldEntry <= 0 {
 		return
 	}
@@ -1249,7 +1249,7 @@ func (s *Scheduler) Settle(id, reqID string, usage struct{ Prompt, Cached int },
 // turn (A8), and the busy period on a main-chain drain.
 //
 // An engine mismatch here means the request landed on an engine other than the
-// member's seat AFTER PreRequest reconciled — a CORRECTNESS violation (it corrupts
+// branch's seat AFTER PreRequest reconciled — a CORRECTNESS violation (it corrupts
 // the charged engine's record). It is counted, never silently folded: the
 // accounting stays with the seat the PreRequest committed, and the counter is the
 // run-level alarm.
@@ -1273,7 +1273,7 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 		s.counters.affinityViolations++
 		s.recordEvent("AFFINITY-VIOLATION", id, fmt.Sprintf("bound=%s settled_on=%s", engineLabel(g.id), engineLabel(engine)), now)
 	}
-	m, seated := g.members[id]
+	m, seated := g.branches[id]
 	if seated {
 		// C3/M1: remove the in-flight record; the counter follows the map
 		// (derive-don't-accumulate). A missing reqID removes the OLDEST record
@@ -1283,7 +1283,7 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 		if reqID != "" {
 			// R2: a known id removes itself; an UNKNOWN non-empty id removes NOTHING
 			// (the oldest-fallback would delete a different live request's record
-			// after a late reap or a duplicate settle — the member would undercount
+			// after a late reap or a duplicate settle — the branch would undercount
 			// and evict mid-flight). Counted as a stray.
 			if rec, had := m.inflightIDs[reqID]; had {
 				delete(m.inflightIDs, reqID)
@@ -1325,12 +1325,12 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 	if !seated {
 		return
 	}
-	m.resTurns++ // A8: every settled turn counts
+	m.seatTurns++ // A8: every settled turn counts
 	// the settled request was the tracked queued head: clear the marker (the next
 	// Pick re-establishes it if more heads remain — the TTL path cannot see stale
 	// queue presence)
 	m.waitingSince = time.Time{}
-	// §6.3: an exiting member leaves when its in-flight requests drain
+	// §6.3: an exiting branch leaves when its in-flight requests drain
 	if g.index.ExitingLocked(id) && m.inflight == 0 {
 		s.exitLocked(g, m, "exiting-drain", now)
 		return
@@ -1342,7 +1342,7 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 	if uncached < 0 {
 		uncached = 0
 	}
-	s.counters.resTurns = append(s.counters.resTurns, m.resTurns)
+	s.counters.seatTurns = append(s.counters.seatTurns, m.seatTurns)
 	s.counters.uncachedTok += uncached
 	s.counters.totalTok += int64(promptTokens)
 	if s.counters.totalTok > 0 {
@@ -1353,21 +1353,21 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 // ---- rotation (§7): WHO leaves, and when ----
 
 // silentLocked is the idle test with the C8 fix: silent means no activity AND no
-// queued head (a waiting member wants to run).
-func (s *Scheduler) silentLocked(m *member, now time.Time) bool {
+// queued head (a waiting branch wants to run).
+func (s *Scheduler) silentLocked(m *branch, now time.Time) bool {
 	if !m.waitingSince.IsZero() {
 		return false
 	}
 	return now.Sub(m.lastActivity) > time.Duration(s.cfg.IdleSeconds*float64(time.Second))
 }
 
-// deriveLocked recomputes the derived aggregates from member records
+// deriveLocked recomputes the derived aggregates from branch records
 // (derive-don't-accumulate): a leaked or missed increment anywhere cannot persist
 // past the next decision point. Per engine.
 func (s *Scheduler) deriveLocked() {
 	for _, g := range s.groups {
 		var cold, pend int64
-		for _, m := range g.members {
+		for _, m := range g.branches {
 			cold += m.coldEntry
 			pend += m.pendingBlocks
 		}
@@ -1382,7 +1382,7 @@ func (s *Scheduler) deriveLocked() {
 // anything older is a leak).
 func (s *Scheduler) reapInflightLocked(now time.Time) {
 	for _, g := range s.groups {
-		for _, m := range g.members {
+		for _, m := range g.branches {
 			if len(m.inflightIDs) == 0 {
 				continue
 			}
@@ -1407,7 +1407,7 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 				}
 				if m.inflight == 0 {
 					m.lastCompletion = now
-					// M3(a): the member's requests are all dead — release its cold
+					// M3(a): the branch's requests are all dead — release its cold
 					// charge or the valve freezes the queue until the reap bound.
 					s.releaseColdLocked(g, m.id)
 				}
@@ -1416,20 +1416,20 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 	}
 }
 
-// drainExitingLocked is the RELEASE POINT's reconciliation: every member that is on its
+// drainExitingLocked is the RELEASE POINT's reconciliation: every branch that is on its
 // way out AND has nothing in flight is unseated here, at a decision point, instead of
 // only on the settle that happened to take its in-flight count to zero.
 //
-// (iii) left an exiting member's blocks charged to the budget until Unseat/Forget, which
+// (iii) left an exiting branch's blocks charged to the budget until Unseat/Forget, which
 // is correct (the engine pins them) and unforgiving: the release must not depend on WHICH
 // path brought the count down. Settle is not the only one. reapInflightLocked drops an id
 // whose termination was never observed (a client cancel the framework's forced
 // EndOfStream never reached the plugin for, an error before the first chunk), and the
-// member can also reach zero with a queued head still in the queue view — and then
-// NOTHING releases it: rotation refuses an exiting member (it is already leaving), the
+// branch can also reach zero with a queued head still in the queue view — and then
+// NOTHING releases it: rotation refuses an exiting branch (it is already leaving), the
 // pressure valve refuses it, and the TTL's idle test needs "no queued turn", which is
 // exactly what an oversubscribed engine never gives it (measured: 97-112 heads waiting in
-// the shared queue at c128). The member would sit there, undispatchable and charged,
+// the shared queue at c128). The branch would sit there, undispatchable and charged,
 // forever: the engine looks permanently full, TrySeat refuses every seat, marking frees
 // nothing — that engine stops serving, silently.
 //
@@ -1439,7 +1439,7 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 func (s *Scheduler) drainExitingLocked(now time.Time) {
 	for _, g := range s.activeGroupsLocked() {
 		var ids []string
-		for id, m := range g.members {
+		for id, m := range g.branches {
 			if m.inflight == 0 && g.index.ExitingLocked(id) {
 				ids = append(ids, id)
 			}
@@ -1451,7 +1451,7 @@ func (s *Scheduler) drainExitingLocked(now time.Time) {
 		// to be reproducible in the artifacts
 		sort.Strings(ids)
 		for _, id := range ids {
-			if m, ok := g.members[id]; ok {
+			if m, ok := g.branches[id]; ok {
 				s.exitLocked(g, m, "exiting-drain", now)
 			}
 		}
@@ -1462,8 +1462,8 @@ func (s *Scheduler) drainExitingLocked(now time.Time) {
 // one rotation value — in COMPLETED BUSY PERIODS, or S of silence.
 //
 // Q is a number, not a mode. Q4 and Q8 are the same code with Config.Quantum 4 and 8;
-// there is no ceiling, no per-member scaling and no pool split.
-func (s *Scheduler) eligibleLocked(m *member, now time.Time) (string, bool) {
+// there is no ceiling, no per-branch scaling and no pool split.
+func (s *Scheduler) eligibleLocked(m *branch, now time.Time) (string, bool) {
 	return s.mod.tenure.Eligible(m, s.tenureCtxLocked(now))
 }
 
@@ -1480,7 +1480,7 @@ func (s *Scheduler) pressureCtxLocked(g *engineGroup, now time.Time) PressureCtx
 	return PressureCtx{
 		Now:            now,
 		Exiting:        g.index.ExitingLocked,
-		RotationVictim: func() (string, *member) { return s.rotationVictimLocked(g, now) },
+		RotationVictim: func() (string, *branch) { return s.rotationVictimLocked(g, now) },
 		Silent:         tctx.Silent,
 		Headless:       tctx.Headless,
 		QueueViewTrusted: !tctx.QueueView.IsZero() &&
@@ -1488,20 +1488,20 @@ func (s *Scheduler) pressureCtxLocked(g *engineGroup, now time.Time) PressureCtx
 	}
 }
 
-// rotationVictimLocked (§7 demand-driven exit) over ONE engine's members, in the
-// order f0p ran: among the ELIGIBLE, prefer a member WITH a queued turn (it will
+// rotationVictimLocked (§7 demand-driven exit) over ONE engine's branches, in the
+// order f0p ran: among the ELIGIBLE, prefer a branch WITH a queued turn (it will
 // use the seat again the moment it gets it), then earliest-seated, then id.
 //
 // The engine-idle rule is the liveness fallback below it: an engine with nothing in
 // flight and nothing dispatchable, while a waiter is blocked, must free a seat or
 // the queue stalls — and that rule scans ONLY THIS ENGINE, because an engine whose
-// members are all in flight must not borrow another engine's idleness to justify an
+// branches are all in flight must not borrow another engine's idleness to justify an
 // eviction.
-func (s *Scheduler) rotationVictimLocked(g *engineGroup, now time.Time) (string, *member) {
-	var best *member
+func (s *Scheduler) rotationVictimLocked(g *engineGroup, now time.Time) (string, *branch) {
+	var best *branch
 	var bestReason string
 	bestHasWaiting := false
-	for _, m := range g.members {
+	for _, m := range g.branches {
 		if g.index.ExitingLocked(m.id) {
 			continue
 		}
@@ -1521,17 +1521,17 @@ func (s *Scheduler) rotationVictimLocked(g *engineGroup, now time.Time) (string,
 	if best != nil {
 		return bestReason, best
 	}
-	// engine-idle rule: no member in flight AND no member dispatchable (A1's
+	// engine-idle rule: no branch in flight AND no branch dispatchable (A1's
 	// livelock guard) while a waiter is blocked
 	idle := true
-	for _, m := range g.members {
+	for _, m := range g.branches {
 		if m.inflight > 0 || !m.waitingSince.IsZero() {
 			idle = false
 			break
 		}
 	}
 	if idle {
-		for _, m := range g.members {
+		for _, m := range g.branches {
 			if g.index.ExitingLocked(m.id) {
 				continue
 			}
@@ -1548,57 +1548,57 @@ func (s *Scheduler) rotationVictimLocked(g *engineGroup, now time.Time) (string,
 // completion beats "never completed", then oldest completion first, then the id.
 //
 // The last clause is a CORRECTNESS fix, not a taste: f0p's version returned false
-// for a member that had never completed a busy period, so among the (common) set of
-// members that have not completed one yet the "first one in map iteration order" won
+// for a branch that had never completed a busy period, so among the (common) set of
+// branches that have not completed one yet the "first one in map iteration order" won
 // — and Go randomises that. The archive build therefore produces DIFFERENT traces on
 // the same scenario and config (measured: 3 divergences in 4 replays of the 2,600 s
 // golden scenario with f0p's own config). Every victim rule below iterates a slice
-// built from the member map, so a total order is what makes a replay reproducible at
+// built from the branch map, so a total order is what makes a replay reproducible at
 // all; testdata/golden-f0p-total.txt is the archive build with EXACTLY this tie-break
 // added, and the core reproduces it byte for byte.
-func olderCompletion(a, b *member) bool {
+func olderCompletion(a, b *branch) bool {
 	az, bz := a.lastCompletion.IsZero(), b.lastCompletion.IsZero()
 	if az != bz {
 		return bz // a real completion is the cheaper victim
 	}
 	if az {
-		return a.id < b.id // TOTAL tie-break among members that never completed
+		return a.id < b.id // TOTAL tie-break among branches that never completed
 	}
 	return a.lastCompletion.Before(b.lastCompletion) ||
 		(a.lastCompletion.Equal(b.lastCompletion) && a.id < b.id)
 }
 
 // budgetVictimLocked is MEMORY PRESSURE (§6 growth): the PRESSURE module picks the
-// victim among ONE engine's members, in f0p's order (the budget valve, unchanged).
+// victim among ONE engine's branches, in f0p's order (the budget valve, unchanged).
 // Only memory pressure gets past the tenure rule's class (1): rotation itself never
-// evicts a member that is not eligible.
-func (s *Scheduler) budgetVictimLocked(g *engineGroup, now time.Time) (string, *member) {
-	members := make([]*member, 0, len(g.members))
-	for _, m := range g.members {
-		members = append(members, m)
+// evicts a branch that is not eligible.
+func (s *Scheduler) budgetVictimLocked(g *engineGroup, now time.Time) (string, *branch) {
+	branches := make([]*branch, 0, len(g.branches))
+	for _, m := range g.branches {
+		branches = append(branches, m)
 	}
-	return s.mod.pressure.Victim(members, s.pressureCtxLocked(g, now))
+	return s.mod.pressure.Victim(branches, s.pressureCtxLocked(g, now))
 }
 
-// exitLocked unseats one member. The BINDING IS DROPPED HERE — the seat is the
-// binding, so an exiting member keeps no placement claim: its next seat is chosen
+// exitLocked unseats one branch. The BINDING IS DROPPED HERE — the seat is the
+// binding, so an exiting branch keeps no placement claim: its next seat is chosen
 // fresh, by the fit/most-free-budget rule, and may land on a different engine.
-func (s *Scheduler) exitLocked(g *engineGroup, m *member, reason string, now time.Time) {
+func (s *Scheduler) exitLocked(g *engineGroup, m *branch, reason string, now time.Time) {
 	s.releaseColdLocked(g, m.id) // S0-2: unseat releases the charge
 	g.pendingTotal -= m.pendingBlocks
 	m.pendingBlocks = 0
 	g.index.UnseatLocked(m.id)
-	delete(g.members, m.id)
+	delete(g.branches, m.id)
 	s.countExitLocked(g, reason)
-	s.recordEvent("EXIT", m.id, fmt.Sprintf("reason=%s turns=%d fairness_id=%s", reason, m.resTurns, fairnessOrNone(m.fairnessID)), now)
+	s.recordEvent("EXIT", m.id, fmt.Sprintf("reason=%s turns=%d fairness_id=%s", reason, m.seatTurns, fairnessOrNone(m.fairnessID)), now)
 	if s.onExit != nil {
-		s.onExit(engineLabel(g.id), reason, m.resTurns)
+		s.onExit(engineLabel(g.id), reason, m.seatTurns)
 	}
 	delete(s.bindings, m.id)
 	if s.onUnbind != nil {
 		s.onUnbind(m.id)
 	}
-	// A7: a member with a queued head re-enters at its ORIGINAL waiting-since (FIFO
+	// A7: a branch with a queued head re-enters at its ORIGINAL waiting-since (FIFO
 	// survives the exit) — back in the SHARED queue, with no engine attached.
 	if !m.waitingSince.IsZero() {
 		w := &waiter{id: m.id, since: m.waitingSince, sizeBytes: m.lastSizeBytes}
@@ -1640,7 +1640,7 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 		s.onBind(w.id, g.id) // the placement pin's mirror (filter.go)
 	}
 	delete(s.waiters, w.id)
-	m := &member{
+	m := &branch{
 		id:           w.id,
 		engine:       g.id,
 		seatTime:     now,
@@ -1651,7 +1651,7 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 		lastSizeBytes: g.index.LastSizeBytesLocked(w.id),
 		// the head that triggered this seating is still queued (the serve happens
 		// after the seat): inherit its presence so the engine-idle rule cannot evict
-		// a member that is about to dispatch (A1's livelock class).
+		// a branch that is about to dispatch (A1's livelock class).
 		waitingSince: w.since,
 		fairnessID:   w.fairnessID,
 	}
@@ -1685,12 +1685,12 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, now time.Time) bool {
 		s.onEntry(engineLabel(g.id), waitKind, now.Sub(w.since).Seconds())
 	}
 	s.recordEvent("SEAT", w.id, fmt.Sprintf("kind=%s wait=%.3f fairness_id=%s", eventKind, now.Sub(w.since).Seconds(), fairnessOrNone(w.fairnessID)), now)
-	g.members[w.id] = m
+	g.branches[w.id] = m
 	return true
 }
 
 // queueViewTrustedLocked reports whether the queue-head snapshot behind this decision
-// pass is recent enough that "this member has no queued head" means anything at all.
+// pass is recent enough that "this branch has no queued head" means anything at all.
 func (s *Scheduler) queueViewTrustedLocked(now time.Time) bool {
 	return !s.queueViewAt.IsZero() &&
 		now.Sub(s.queueViewAt) <= time.Duration(s.cfg.IdleSeconds*float64(time.Second))
@@ -1719,23 +1719,23 @@ func (s *Scheduler) noteQueueViewUntrustedLocked() { s.counters.queueViewUntrust
 // the valve's order until it fits or nothing is evictable.
 //
 // TWO VIEWS OF ONE ACCOUNTING, and the difference between them is the whole of this
-// function. Both ask about the same footprint — every seated member's blocks, exiting
-// members included, because the engine pins them until the request drains (iii):
+// function. Both ask about the same footprint — every seated branch's blocks, exiting
+// branches included, because the engine pins them until the request drains (iii):
 //
 //	ADMISSION (freeBudgetLocked, TrySeat): the exiting blocks are OCCUPIED. A head
 //	  that would only fit if the retirees' blocks were free waits — that is what makes
 //	  (iii) correct instead of optimistic.
 //	ENFORCEMENT (here): the exiting blocks are NOT A REASON TO EVICT MORE. They are
-//	  already leaving, at their own drain; marking another member neither frees them
+//	  already leaving, at their own drain; marking another branch neither frees them
 //	  sooner nor frees anything now. So a pass measures
 //	  over = NE + pending − (exiting blocks + their pending estimates) and stops as
-//	  soon as the overage is entirely made of members already on their way out.
+//	  soon as the overage is entirely made of branches already on their way out.
 //
 // WITHOUT THE SECOND VIEW the two are the same number, and marking becomes free of
 // consequences for the loop: it marks a victim, the footprint does not move, it marks
-// the next in-flight member, and the next — on EVERY pass, and passes are every Pick.
+// the next in-flight branch, and the next — on EVERY pass, and passes are every Pick.
 // Measured on the live batch-1 anchor (99a47617 vs 88e74f85, c128, identical config):
-// 2,520 mid-flight marks against 87 (29x), bursts of up to 46 members marked in one
+// 2,520 mid-flight marks against 87 (29x), bursts of up to 46 branches marked in one
 // second, residency turns per seat 2.26 → 0.59, the rotating exits it displaced
 // (quantum-complete 532 → 44, idle 298 → 14), re-entry waits up to a 220 s p50 and
 // the cache destruction behind them (refill share 31.7 % → 44.5 %): −23 % of the
@@ -1749,7 +1749,7 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 	for s.overBudgetLocked(g) > 0 {
 		if !countedStale && !s.queueViewTrustedLocked(now) {
 			// ONE per engine-pass: this pass will choose victims with a queue view too old
-			// to tell a busy member from an idle one, so the C8 guard drops the
+			// to tell a busy branch from an idle one, so the C8 guard drops the
 			// head-presence classes. The gauge beside this counter is the clock itself;
 			// both are the evidence that the guard is doing something (or that the
 			// decision clock has run away from the queue syncs).
@@ -1764,17 +1764,17 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 			if g.index.ExitingLocked(victim.id) {
 				// Already on its way out. Its blocks stay charged until it drains, so
 				// marking it again frees nothing: this pass is DONE (continuing would
-				// re-pick the same member and spin under the scheduler's mutex).
+				// re-pick the same branch and spin under the scheduler's mutex).
 				return
 			}
 			g.index.MarkExitingLocked(victim.id)
 			victim.exitingSince = now
 			s.countExitLocked(g, "exiting")
-			// the series has to see it: the member is on its way out NOW (it drains, then
+			// the series has to see it: the branch is on its way out NOW (it drains, then
 			// exits as "exiting-drain"), and counting it only in the snapshot left
 			// llm_d_epp_group_exits_total{reason="exiting"} permanently at zero.
 			if s.onExit != nil {
-				s.onExit(engineLabel(g.id), "exiting", victim.resTurns)
+				s.onExit(engineLabel(g.id), "exiting", victim.seatTurns)
 			}
 			continue
 		}
@@ -1784,9 +1784,9 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 
 // overBudgetLocked is enforcement's view of the overage, in blocks: how much of the
 // engine's accounted footprint is NOT already on its way out. >= 0; 0 means this pass
-// has nothing left to do (everything over the budget is a member that is draining).
+// has nothing left to do (everything over the budget is a branch that is draining).
 //
-// The exiting member's PENDING estimate is excused too: a member can be marked between
+// The exiting branch's PENDING estimate is excused too: a branch can be marked between
 // its seat and its PreRequest, and its blocks are then in pendingTotal rather than in
 // NE. Excusing one and not the other would leave the pass churning on an estimate that
 // is already leaving.
@@ -1796,7 +1796,7 @@ func (s *Scheduler) overBudgetLocked(g *engineGroup) int64 {
 		return 0
 	}
 	excused := int64(g.index.ExitingBlocksLocked())
-	for id, m := range g.members {
+	for id, m := range g.branches {
 		if m.pendingBlocks != 0 && g.index.ExitingLocked(id) {
 			excused += m.pendingBlocks
 		}
@@ -1818,7 +1818,7 @@ func (s *Scheduler) Tick(now time.Time) {
 	s.drainExitingLocked(now)
 	for _, g := range s.activeGroupsLocked() {
 		s.enforceBudgetLocked(g, now)
-		for id, m := range g.members {
+		for id, m := range g.branches {
 			if now.Sub(m.lastActivity) > time.Duration(s.cfg.TTLSeconds*float64(time.Second)) &&
 				m.inflight == 0 && m.waitingSince.IsZero() {
 				s.exitLocked(g, m, "ttl", now)
@@ -1832,7 +1832,7 @@ func (s *Scheduler) Tick(now time.Time) {
 	// lastSeen (silence, not queue age).
 	s.gcSilentRecordsLocked(now)
 	// BUG 3 (the C8 race): Tick calls the admission loop WITHOUT a queue sync, so a
-	// head that arrived since the last Pick left its member looking headless. Re-sync
+	// head that arrived since the last Pick left its branch looking headless. Re-sync
 	// from the LAST head snapshot (a candidate set is what Pick sees; it is refreshed on
 	// every decision pass, and Tick's rotate uses it so the two paths agree), then seat.
 	s.syncWaitersLocked(s.lastHeads, now)
@@ -1842,7 +1842,7 @@ func (s *Scheduler) Tick(now time.Time) {
 // gcSilentRecordsLocked forgets headless, unseated records whose last activity is
 // older than the TTL (R2: silence, not queue age — a waiter with a live head is
 // NEVER forgotten, however long it waits). A forgotten record loses its
-// "ever seated" mark with it, so a member that has been gone long enough arrives as
+// "ever seated" mark with it, so a branch that has been gone long enough arrives as
 // a NEWCOMER again (which is what it is: nothing about its cache survived).
 func (s *Scheduler) gcSilentRecordsLocked(now time.Time) {
 	ttl := time.Duration(s.cfg.TTLSeconds * float64(time.Second))
@@ -1865,7 +1865,7 @@ func (s *Scheduler) gcSilentRecordsLocked(now time.Time) {
 
 func (s *Scheduler) seatedAnywhereLocked(id string) bool {
 	for _, g := range s.groups {
-		if _, ok := g.members[id]; ok {
+		if _, ok := g.branches[id]; ok {
 			return true
 		}
 	}
@@ -1885,8 +1885,8 @@ func (s *Scheduler) isNewcomerLocked(id string) bool {
 // forgetEverSeatedLocked drops a record's "was served" mark.
 func (s *Scheduler) forgetEverSeatedLocked(id string) { delete(s.everSeated, id) }
 
-// observeMemberSourceLocked counts a dispatch by its member-key source and fires
-// the once-per-source hook (the run's effective-member-source echo).
+// observeMemberSourceLocked counts a dispatch by its branch-key source and fires
+// the once-per-source hook (the run's effective-branch-source echo).
 func (s *Scheduler) observeMemberSourceLocked(source string) {
 	if source == "" {
 		source = "none"
@@ -1902,7 +1902,7 @@ func (s *Scheduler) observeMemberSourceLocked(source string) {
 
 // RemoveEngine tears one engine's group down when the EPP reports the
 // endpoint gone (EventDelete — node rotation exercises this every wave).
-// Its members are exited (reason "engine-gone") — their seats die with it and
+// Its branches are exited (reason "engine-gone") — their seats die with it and
 // their heads go back to the SHARED queue — and the group's budget/index/seats
 // disappear with it. Leaving charges on a dead engine is how a scale-down
 // silently poisons every later budget decision.
@@ -1913,25 +1913,25 @@ func (s *Scheduler) RemoveEngine(engine string, now time.Time) int {
 	if !ok {
 		return 0
 	}
-	// deterministic order: the teardown writes one EXIT event per member and
+	// deterministic order: the teardown writes one EXIT event per branch and
 	// a torn-down group's event order must be reproducible in the artifacts
-	ids := make([]string, 0, len(g.members))
-	for id := range g.members {
+	ids := make([]string, 0, len(g.branches))
+	for id := range g.branches {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 	n := 0
 	for _, id := range ids {
-		if m, ok := g.members[id]; ok {
+		if m, ok := g.branches[id]; ok {
 			s.exitLocked(g, m, "engine-gone", now)
 			n++
 		}
 	}
 	// The waiter QUEUE is shared and survives a teardown: those heads can seat on
 	// a survivor, which is the whole point of pooling the waits.
-	for member, id := range s.bindings {
+	for branch, id := range s.bindings {
 		if id == engine {
-			delete(s.bindings, member)
+			delete(s.bindings, branch)
 		}
 	}
 	delete(s.groups, engine)
@@ -1962,10 +1962,10 @@ type Event struct {
 	ID     string    `json:"id"`     // the session id
 	Engine string    `json:"engine"` // the engine label ("" single-mode group -> "single")
 	Detail string    `json:"detail"` // reason=... turns=... / kind=... wait=... / pred=... measured=... fairness_id=...
-	// Member is the fairness unit the event's id resolves to at emit time
-	// (the affinity-violation join needs member→engine-at-seat reconstructable
+	// Branch is the fairness unit the event's id resolves to at emit time
+	// (the affinity-violation join needs branch→engine-at-seat reconstructable
 	// from the artifacts alone).
-	Member string `json:"member,omitempty"`
+	Branch string `json:"branch,omitempty"`
 }
 
 const eventRingSize = 2048
@@ -1974,13 +1974,13 @@ func (s *Scheduler) recordEvent(kind, id, detail string, now time.Time) {
 	ev := Event{T: now, Kind: kind, ID: id, Detail: detail}
 	if g := s.groupOfLocked(id); g != nil {
 		ev.Engine = engineLabel(g.id)
-		ev.Member = id
+		ev.Branch = id
 	}
 	s.recordEventOn(ev)
 }
 
 // recordEventOn appends an already-attributed event (the caller knows the
-// engine: a torn-down group's events are emitted after its members are
+// engine: a torn-down group's events are emitted after its branches are
 // gone).
 func (s *Scheduler) recordEventOn(ev Event) {
 	s.events = append(s.events, ev)
@@ -2024,19 +2024,19 @@ type Snapshot struct {
 	Config Config
 	// RecentEvents is the tail of the seat/exit ring.
 	RecentEvents []Event
-	// MemberSources counts dispatches by the member-key source that resolved them
-	// ("branch" | "none") — the effective-member echo.
+	// MemberSources counts dispatches by the branch-key source that resolved them
+	// ("branch" | "none") — the effective-branch echo.
 	MemberSources map[string]int64
 	// Engines is the PER-ENGINE section. The top-level fields above remain the
 	// whole-policy sums, so a single-engine dump is unchanged and a multi-engine
 	// dump is scoreable.
 	Engines map[string]EngineSnapshot `json:"engines,omitempty"`
 	// AffinityViolations / Rebinds are the CORRECTNESS counters (a request landing
-	// off its member's seat engine).
+	// off its branch's seat engine).
 	AffinityViolations int64 `json:"affinityViolations"`
 	Rebinds            int64 `json:"rebinds"`
 	EngineGone         int64 `json:"enginesGone"`
-	// Bindings is the number of LIVE seat bindings per engine (a member is bound
+	// Bindings is the number of LIVE seat bindings per engine (a branch is bound
 	// exactly while it is seated, so this equals that engine's seats; a binding to
 	// an unknown engine — the B1 phantom — must be 0).
 	Bindings map[string]int `json:"bindings,omitempty"`
@@ -2075,7 +2075,7 @@ type EngineSnapshot struct {
 	// headroom, in tokens). A scored run divides coldInFlightTokens by THIS, not by
 	// a constant from the arm's config: the cap moves with the engine.
 	ColdCapTokens int64 `json:"coldCapTokens"`
-	// The EXITING ledger (the enforcement view's own inputs, per engine): members on
+	// The EXITING ledger (the enforcement view's own inputs, per engine): branches on
 	// their way out, the blocks of the used side they still hold, and how long the
 	// oldest one has been leaving. Read together they say whether an engine is busy or
 	// stuck: exiting_blocks inside ne_blocks is a drain in progress, and an oldest age
@@ -2145,7 +2145,7 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 		g := s.groups[id]
 		label := engineLabel(id)
 		exitingMembers, exitingOldest := 0, time.Duration(0)
-		for id, m := range g.members {
+		for id, m := range g.branches {
 			if !g.index.ExitingLocked(id) {
 				continue
 			}
@@ -2154,7 +2154,7 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 				exitingOldest = age
 			}
 		}
-		es := EngineSnapshot{ID: label, Seats: len(g.members),
+		es := EngineSnapshot{ID: label, Seats: len(g.branches),
 			ExitingMembers: exitingMembers, ExitingBlocks: g.index.ExitingBlocksLocked(),
 			ExitingOldestAgeS: exitingOldest.Seconds(),
 			UniqueBlocks:      g.index.UniqueBlocks(), NEBlocks: g.index.UniqueBlocksNE(),
@@ -2188,9 +2188,9 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 	// Waiters above are 0 by construction; the whole-policy number is the queue.
 	snap.WaitersShared = len(s.waiters)
 	snap.Waiters = snap.WaitersShared
-	if n := len(s.counters.resTurns); n > 0 {
+	if n := len(s.counters.seatTurns); n > 0 {
 		sum := 0
-		for _, t := range s.counters.resTurns {
+		for _, t := range s.counters.seatTurns {
 			sum += t
 		}
 		snap.MeanResTurns = float64(sum) / float64(n)
@@ -2226,7 +2226,7 @@ func p50(w []float64) float64 {
 	return cp[len(cp)/2]
 }
 
-// Sessions returns the tracked-member-record count (the record-leak test).
+// Sessions returns the tracked-branch-record count (the record-leak test).
 func (s *Scheduler) Sessions() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2237,14 +2237,14 @@ func (s *Scheduler) Sessions() int {
 	return n
 }
 
-// seatedIDs is the union of every engine's seated member ids. Used by the dumps,
+// seatedIDs is the union of every engine's seated branch ids. Used by the dumps,
 // the golden trace and the equivalence tests.
 func (s *Scheduler) seatedIDs() map[string]bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := map[string]bool{}
 	for _, g := range s.groups {
-		for id := range g.members {
+		for id := range g.branches {
 			out[id] = true
 		}
 	}

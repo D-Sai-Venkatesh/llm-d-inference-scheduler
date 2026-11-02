@@ -56,16 +56,16 @@ func TestT1SeatGoesToTheMostFreeBudget(t *testing.T) {
 	})
 }
 
-// T2: THE BINDING LASTS ONLY WHILE SEATED. A member that exits is unbound; when it
+// T2: THE BINDING LASTS ONLY WHILE SEATED. A branch that exits is unbound; when it
 // re-enters it is seated wherever there is room, which may be the OTHER engine.
 func TestT2ExitUnbindsAndReentryReseatsAfresh(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 300, 3*time.Second)
 		first := fx.s.bindings["m"]
 		if first == "" {
-			t.Fatal("a seated member must be bound")
+			t.Fatal("a seated branch must be bound")
 		}
-		m, g := fx.member(t, "m")
+		m, g := fx.branch(t, "m")
 		fx.s.mu.Lock()
 		fx.s.exitLocked(g, m, "test", fx.clock)
 		_, bound := fx.s.bindings["m"]
@@ -85,7 +85,7 @@ func TestT2ExitUnbindsAndReentryReseatsAfresh(t *testing.T) {
 		h := head("m", 900*time.Second, bytesFor(300))
 		e, i := fx.pickEngine(h)
 		if i < 0 {
-			t.Fatal("the re-entering member must be seated somewhere")
+			t.Fatal("the re-entering branch must be seated somewhere")
 		}
 		if e == first {
 			t.Fatalf("T2: the re-entry must be re-placed where there is room (%s), got the old engine %s", other, e)
@@ -107,7 +107,7 @@ func TestT3e4RegressionNoLockInOnQueueDepth(t *testing.T) {
 			id := fmt.Sprintf("s%d", i)
 			fx.seatOne(t, id, 100, time.Duration(10+i)*time.Second)
 			fx.s.Chunk(id) // each resident's prefill has landed: its cold slot is free
-			m, _ := fx.member(t, id)
+			m, _ := fx.branch(t, id)
 			fx.s.mu.Lock()
 			m.waitingSince = fx.clock.Add(-time.Duration(5+i) * time.Second)
 			m.lastActivity = fx.clock
@@ -191,7 +191,7 @@ func TestPerEngineDedupAndIndependence(t *testing.T) {
 	}
 }
 
-// ENGINE GONE: the engine's members are exited ("engine-gone") and their heads go
+// ENGINE GONE: the engine's branches are exited ("engine-gone") and their heads go
 // back to the SHARED queue, where a survivor seats them.
 func TestEngineGoneReleasesMembersToTheSharedQueue(t *testing.T) {
 	cfg := defaultConfig()
@@ -215,7 +215,7 @@ func TestEngineGoneReleasesMembersToTheSharedQueue(t *testing.T) {
 	}
 	gone := s.bindings["m1"]
 	if n := s.RemoveEngine(gone, now); n == 0 {
-		t.Fatal("the teardown must exit the engine's members")
+		t.Fatal("the teardown must exit the engine's branches")
 	}
 	if snap := s.Snapshot(); snap.EngineGone != 1 {
 		t.Fatalf("the engine-gone counter must be 1, got %d", snap.EngineGone)
@@ -223,14 +223,14 @@ func TestEngineGoneReleasesMembersToTheSharedQueue(t *testing.T) {
 	if _, ok := s.groups[gone]; ok {
 		t.Fatal("the group must be gone")
 	}
-	// a member of the dead engine re-enters and must be seated on the survivor
+	// a branch of the dead engine re-enters and must be seated on the survivor
 	survivor := "a"
 	if gone == "a" {
 		survivor = "b"
 	}
 	e, i := s.PickFromHeadsEngine([]Head{head("m1", 30*time.Second, bytesFor(300))}, now)
 	if i < 0 {
-		t.Fatal("the released member must be seatable on the survivor")
+		t.Fatal("the released branch must be seatable on the survivor")
 	}
 	if e != survivor {
 		t.Fatalf("the re-entry must land on the survivor %s, got %s", survivor, e)
@@ -238,14 +238,14 @@ func TestEngineGoneReleasesMembersToTheSharedQueue(t *testing.T) {
 }
 
 // THE FILTER PINS DISPATCH TO THE SEAT ENGINE: one candidate, never empty, and a
-// pass-through for unseated or anonymous members.
+// pass-through for unseated or anonymous branches.
 func TestFilterPinsTheSeatEngine(t *testing.T) {
 	cfg := defaultConfig()
 	plugin := newTestPlugin(t, cfg, 2, 1000)
 	s := plugin.sched
 	now := time.Unix(1793000000, 0).UTC()
 	if i := s.PickFromHeads([]Head{head("m", time.Second, bytesFor(200))}, now); i != 0 {
-		t.Fatal("the member must seat")
+		t.Fatal("the branch must seat")
 	}
 	seat := s.bindings["m"]
 	pods := podsOf(schedulerEndpoint("a"), schedulerEndpoint("b"))
@@ -257,9 +257,9 @@ func TestFilterPinsTheSeatEngine(t *testing.T) {
 	if got := plugin.Filter(t.Context(), requestFor(""), pods); len(got) != 2 {
 		t.Fatalf("anonymous traffic must pass through, got %d", len(got))
 	}
-	// unseated member: pass through (no placement opinion yet)
+	// unseated branch: pass through (no placement opinion yet)
 	if got := plugin.Filter(t.Context(), requestFor("stranger"), pods); len(got) != 2 {
-		t.Fatalf("an unseated member must pass through, got %d", len(got))
+		t.Fatalf("an unseated branch must pass through, got %d", len(got))
 	}
 	// the seat engine is not among the candidates: NEVER empty — pass all through and
 	// let the observed endpoint win
@@ -272,11 +272,11 @@ func TestFilterPinsTheSeatEngine(t *testing.T) {
 		t.Fatalf("a single candidate must pass through, got %d", len(got))
 	}
 	// an exit drops the pin
-	m, g := func() (*member, *engineGroup) {
+	m, g := func() (*branch, *engineGroup) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		for _, gg := range s.groups {
-			if mm, ok := gg.members["m"]; ok {
+			if mm, ok := gg.branches["m"]; ok {
 				return mm, gg
 			}
 		}
@@ -356,7 +356,7 @@ func TestMultiEngineGoldenProperties(t *testing.T) {
 
 // THE COLD VALVE NEVER EVICTS (the defect the core fixes): a head that fits an
 // engine's BUDGET but is held by the cold-entry valve WAITS for the prefill slot.
-// Evicting members frees budget, never the valve, so every eviction taken on such a
+// Evicting branches frees budget, never the valve, so every eviction taken on such a
 // pass was wasted — and the engine's seats sat cold-empty until the prefill finished.
 //
 // The cap is derived per engine (5 % of 10,000 blocks = 500 blocks = 32,000 tokens),
@@ -376,7 +376,7 @@ func TestColdValveHeldHeadNeverEvicts(t *testing.T) {
 		// each resident has a queued turn (so nobody is a rotation victim) and a big
 		// cold head waits behind them — one that FITS the budget easily
 		for i := range fx.ids {
-			m, _ := fx.member(t, fmt.Sprintf("res%d", i))
+			m, _ := fx.branch(t, fmt.Sprintf("res%d", i))
 			fx.s.mu.Lock()
 			m.waitingSince = fx.clock.Add(-time.Second)
 			m.lastActivity = fx.clock

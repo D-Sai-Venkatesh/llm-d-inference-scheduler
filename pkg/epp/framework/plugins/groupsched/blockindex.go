@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package groupsched implements the group scheduler (ALGORITHM-group.md):
 // a working set of sessions whose unique prefix blocks fit a budget of the
-// GPU cache, members dispatched immediately, rotation by payback.
+// GPU cache, branches dispatched immediately, rotation by payback.
 //
 // This file is the block accounting (decision D4, tier B — the reviewed
 // build, applying all six fixes from the adversarial review of the first
@@ -35,10 +35,10 @@ limitations under the License.
 //     (40,183 × 64 = 2.57M) — a hardcoded default silently admitting 4×
 //     the cache was the first draft's S0-3.
 //   - PER-SESSION EXITING STATE: the budget counter is the union over
-//     seated members, EXITING ONES INCLUDED, maintained as an invariant,
-//     not approximated by refcount tricks. An exiting member is still
+//     seated branches, EXITING ONES INCLUDED, maintained as an invariant,
+//     not approximated by refcount tricks. An exiting branch is still
 //     holding its blocks — the engine pins them until the request drains —
-//     so charging the budget only for "non-exiting" members meant the
+//     so charging the budget only for "non-exiting" branches meant the
 //     budget forgot 14-18 % of the pool while the pool was still paying
 //     for it (measured on the multi-pod wave; preempt-rootcause §7.3).
 //     MarkExiting is idempotent and changes no counter: it marks "do not
@@ -96,8 +96,8 @@ const minChunkBytes = 64
 type Hash uint64
 
 // BlockIndex is the group-level unique-block accounting: a reference
-// counter over the blocks of seated members, plus the budget counter over
-// the same set (a draining member's blocks stay charged until it is
+// counter over the blocks of seated branches, plus the budget counter over
+// the same set (a draining branch's blocks stay charged until it is
 // unseated, because the engine still holds them).
 //
 // Session records persist across residencies (Unseat keeps the record so
@@ -115,9 +115,9 @@ type BlockIndex struct {
 	// key — M2: Picks run at ~1kHz; unchanged state must not recompute).
 	version uint64
 
-	blocks   map[Hash]int // refcount over seated members' sets
-	blocksNE map[Hash]int // refcount over seated members (exiting included: the budget's used side)
-	// blocksExit is the refcount over the SEATED, EXITING members' sets — the part of
+	blocks   map[Hash]int // refcount over seated branches' sets
+	blocksNE map[Hash]int // refcount over seated branches (exiting included: the budget's used side)
+	// blocksExit is the refcount over the SEATED, EXITING branches' sets — the part of
 	// the budget's used side that is already on its way out. It exists because the two
 	// questions the accounting answers need two views of one truth (see
 	// Scheduler.enforceBudgetLocked): ADMISSION asks "is there room for a new seat?"
@@ -130,7 +130,7 @@ type BlockIndex struct {
 	seated     map[string]struct{}
 }
 
-// sessionBlocks is one member's rolling block set: the union of its waiting
+// sessionBlocks is one branch's rolling block set: the union of its waiting
 // requests and its last-window dispatched requests (the fixed 4-request window:
 // one entry per live prefix chain, expiring after S, was tried and retired), plus
 // the seating state.
@@ -295,7 +295,7 @@ func (b *BlockIndex) TrySeat(id string, budgetBlocks int) (bool, int) {
 		s = b.TrackLocked(id, 0)
 	}
 	if _, isSeated := b.seated[id]; isSeated {
-		return true, 0 // already a member
+		return true, 0 // already a branch
 	}
 	cost := 0
 	for h := range s.set() {
@@ -334,7 +334,7 @@ func (b *BlockIndex) TrackLocked(id string, window int) *sessionBlocks {
 }
 
 // Unseat removes a session from the group (its record persists; its
-// blocks are released from both counters — an exiting member's too, since
+// blocks are released from both counters — an exiting branch's too, since
 // this is the moment it actually drains).
 func (b *BlockIndex) Unseat(id string) {
 	b.mu.Lock()
@@ -376,7 +376,7 @@ func (b *BlockIndex) dec(m map[Hash]int, h Hash) {
 	}
 }
 
-// MarkExiting marks a member "on its way out": it is not dispatched and not
+// MarkExiting marks a branch "on its way out": it is not dispatched and not
 // re-seated, and it leaves at its next drain. Its blocks STAY on the budget's
 // used side until it is unseated — the engine pins them until the running request
 // finishes, so releasing them at the mark undercounts the pool for exactly the
@@ -384,10 +384,10 @@ func (b *BlockIndex) dec(m map[Hash]int, h Hash) {
 //
 // The write DOES move one counter: blocksExit, the subset of the used side that is
 // already leaving. That is what lets enforcement tell "the engine is full" from "the
-// engine is full for another moment, by members I have already sent away" — without
-// it a pass that marks one member sees the same over-budget number and marks the
+// engine is full for another moment, by branches I have already sent away" — without
+// it a pass that marks one branch sees the same over-budget number and marks the
 // next, and the next (the cascade measured on the live batch-1 anchor: 2,520
-// mid-flight marks for 3,104 dispatches, members draining after p50 = 1 turn).
+// mid-flight marks for 3,104 dispatches, branches draining after p50 = 1 turn).
 func (b *BlockIndex) MarkExiting(id string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -487,7 +487,7 @@ func (b *BlockIndex) Cancel(id, reqID string) error {
 // applyDeltaLocked applies the counter diff between the session's
 // previous set and its current set: increments for new blocks, decrements
 // for gone blocks. Both counters follow a SEATED session, exiting or not
-// (an exiting member's new turn is pinned by the engine like any other).
+// (an exiting branch's new turn is pinned by the engine like any other).
 func (b *BlockIndex) applyDeltaLocked(s *sessionBlocks, old map[Hash]struct{}) {
 	b.version++ // R4: bumps even when unseated (SetBlocks feeds estimates)
 	_, isSeated := b.seated[s.id]
@@ -559,14 +559,14 @@ func (b *BlockIndex) FitBlocks(hashes []Hash) int {
 	return n
 }
 
-// UniqueBlocks is the group's size in unique blocks (all seated members).
+// UniqueBlocks is the group's size in unique blocks (all seated branches).
 func (b *BlockIndex) UniqueBlocks() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return len(b.blocks)
 }
 
-// UniqueBlocksNE is the same over seated members, exiting ones included —
+// UniqueBlocksNE is the same over seated branches, exiting ones included —
 // the budget's enforcement counter (D6/D13).
 func (b *BlockIndex) UniqueBlocksNE() int {
 	b.mu.Lock()
@@ -574,7 +574,7 @@ func (b *BlockIndex) UniqueBlocksNE() int {
 	return len(b.blocksNE)
 }
 
-// Seated reports whether the session is currently a group member.
+// Seated reports whether the session is currently a group branch.
 func (b *BlockIndex) Seated(id string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -582,7 +582,7 @@ func (b *BlockIndex) Seated(id string) bool {
 	return ok
 }
 
-// Exiting reports the member's exiting state.
+// Exiting reports the branch's exiting state.
 func (b *BlockIndex) Exiting(id string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -606,7 +606,7 @@ func (b *BlockIndex) checkInvariantLocked() {
 		s := b.sessions[id]
 		for h := range s.set() {
 			want[h]++
-			wantNE[h]++ // exiting members are charged until they drain
+			wantNE[h]++ // exiting branches are charged until they drain
 			if s.exiting {
 				wantExit[h]++ // ... and are the part of it that is already leaving
 			}
@@ -817,7 +817,7 @@ func (b *BlockIndex) TrySeatLocked(id string, budgetBlocks int) (bool, int) {
 // is taken as present on this engine (an affinity reconciliation observed
 // it there — the engine, not our estimate, is authoritative about what it
 // holds). The next enforce pass evicts to fit; an over-budget counter is
-// recoverable, a member absent from the engine serving it is not.
+// recoverable, a branch absent from the engine serving it is not.
 func (b *BlockIndex) SeatForceLocked(id string) {
 	s := b.TrackLocked(id, 0)
 	if _, isSeated := b.seated[id]; isSeated {
@@ -847,7 +847,7 @@ func (b *BlockIndex) FitBlocksLocked(hashes []Hash) int {
 func (b *BlockIndex) UniqueBlocksNELocked() int { return len(b.blocksNE) }
 
 // ExitingBlocksLocked is how many distinct blocks of the budget's used side belong to
-// members that are ALREADY on their way out: the part of the overage that enforcement
+// branches that are ALREADY on their way out: the part of the overage that enforcement
 // must not evict again (it is leaving) and that admission must still refuse (it is
 // pinned until the drain).
 func (b *BlockIndex) ExitingBlocksLocked() int { return len(b.blocksExit) }
@@ -860,7 +860,7 @@ func (b *BlockIndex) ExitingBlocks() int {
 }
 
 // UniqueBlocksLocked is UniqueBlocks under an already-held lock (ALL
-// seated members, including exiting — their blocks stay pinned until
+// seated branches, including exiting — their blocks stay pinned until
 // they drain; the size-aware gate's usage term, M4).
 func (b *BlockIndex) UniqueBlocksLocked() int { return len(b.blocks) }
 

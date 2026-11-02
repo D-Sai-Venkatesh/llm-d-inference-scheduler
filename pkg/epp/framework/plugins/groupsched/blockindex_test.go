@@ -159,8 +159,8 @@ func TestExitingUnseatDoesNotStealNE(t *testing.T) {
 	}
 }
 
-// An exiting member's blocks STAY on the used side until it drains: mark the
-// member, and the budget still pays for its blocks (the engine pins them until the
+// An exiting branch's blocks STAY on the used side until it drains: mark the
+// branch, and the budget still pays for its blocks (the engine pins them until the
 // running request finishes). Releasing them at the mark was the accounting bug the
 // multi-pod wave measured at 14-18 % of the pool.
 func TestExitingMemberStaysChargedUntilUnseat(t *testing.T) {
@@ -195,7 +195,7 @@ func TestMarkExitingIdempotent(t *testing.T) {
 	idx.checkInvariantLocked()
 }
 
-// An exiting member's growth is pinned by the engine like anyone else's, so it is
+// An exiting branch's growth is pinned by the engine like anyone else's, so it is
 // charged: the retiree's next turn is real KV, and the budget must see it.
 func TestExitingMemberGrowthStaysCharged(t *testing.T) {
 	idx := newIdx(t)
@@ -211,7 +211,7 @@ func TestExitingMemberGrowthStaysCharged(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := idx.UniqueBlocksNE(); got != idx.UniqueBlocks() || got <= before-2 {
-		t.Fatalf("R3: NE after exiting member growth: %d (union %d) want the exiting member fully charged", got, idx.UniqueBlocks())
+		t.Fatalf("R3: NE after exiting branch growth: %d (union %d) want the exiting branch fully charged", got, idx.UniqueBlocks())
 	}
 	idx.checkInvariantLocked()
 }

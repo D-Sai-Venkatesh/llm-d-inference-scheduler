@@ -68,10 +68,10 @@ func podsOf(eps ...fwksched.Endpoint) []fwksched.Endpoint { return eps }
 
 // requestFor builds an InferenceRequest carrying the derived-branch attribute (the
 // core's identity input) — "" means anonymous.
-func requestFor(member string) *fwksched.InferenceRequest {
-	ir := &fwksched.InferenceRequest{RequestID: "req-" + member, RequestSizeBytes: 4096}
-	if member != "" {
-		ir.PutAttribute(branchidentity.BranchIdentityKey, member)
+func requestFor(branch string) *fwksched.InferenceRequest {
+	ir := &fwksched.InferenceRequest{RequestID: "req-" + branch, RequestSizeBytes: 4096}
+	if branch != "" {
+		ir.PutAttribute(branchidentity.BranchIdentityKey, branch)
 	}
 	return ir
 }
@@ -93,8 +93,8 @@ func newTestPlugin(t *testing.T, cfg Config, n, blocks int) *GroupScheduler {
 		cfg: cfg, sched: s, metrics: newGroupMetrics(s), pins: newPinTable(),
 		endpoints: map[string]*endpointState{}, hetero: map[string]struct{}{}}
 	// the pin table follows the seats, exactly as Factory wires it
-	s.onBind = func(member, engine string) { p.pins.set(member, engine) }
-	s.onUnbind = func(member string) { p.pins.del(member) }
+	s.onBind = func(branch, engine string) { p.pins.set(branch, engine) }
+	s.onUnbind = func(branch string) { p.pins.del(branch) }
 	return p
 }
 

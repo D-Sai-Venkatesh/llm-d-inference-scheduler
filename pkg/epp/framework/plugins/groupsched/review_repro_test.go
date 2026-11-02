@@ -61,8 +61,8 @@ func reproAligned(s string) []byte {
 	return b
 }
 
-// R1: MarkExiting then Unseat must not steal the OTHER member's non-exiting
-// refcount on shared blocks. Before the unseat the EXITING member is still charged
+// R1: MarkExiting then Unseat must not steal the OTHER branch's non-exiting
+// refcount on shared blocks. Before the unseat the EXITING branch is still charged
 // (it holds its blocks); the unseat is what releases them, and only its own.
 func TestReproNEStealOnUnseat(t *testing.T) {
 	sys := reproAligned(strings.Repeat("common ", 300)) // 3 shared chunks
@@ -73,11 +73,11 @@ func TestReproNEStealOnUnseat(t *testing.T) {
 	reproSeat(t, idx, "b", hb)
 	idx.MarkExiting("a")
 	if ne := idx.UniqueBlocksNE(); ne != 5 { // 3 shared + a's 1 + b's 1
-		t.Fatalf("NE before unseat: %d want 5 (the exiting member is still charged)", ne)
+		t.Fatalf("NE before unseat: %d want 5 (the exiting branch is still charged)", ne)
 	}
 	idx.Unseat("a")
 	if got := idx.UniqueBlocksNE(); got != 4 { // b alone: 3 shared + 1 private
-		t.Errorf("R1: unseating an exiting member removed b's shared blocks from NE: %d want 4", got)
+		t.Errorf("R1: unseating an exiting branch removed b's shared blocks from NE: %d want 4", got)
 	}
 }
 
@@ -97,18 +97,18 @@ func TestReproMarkExitingTwice(t *testing.T) {
 	}
 }
 
-// R3: an exiting member's new blocks ARE charged — the engine pins them for the
-// running request whatever the bookkeeping calls the member.
+// R3: an exiting branch's new blocks ARE charged — the engine pins them for the
+// running request whatever the bookkeeping calls the branch.
 func TestReproExitingGrowsNE(t *testing.T) {
 	idx := reproIdx(t)
-	body := append(reproAligned("member a turn 1"), privChunks(3, 1024, 'Q')...)
-	reproSeat(t, idx, "a", reproAligned("member a turn 1"))
+	body := append(reproAligned("branch a turn 1"), privChunks(3, 1024, 'Q')...)
+	reproSeat(t, idx, "a", reproAligned("branch a turn 1"))
 	idx.MarkExiting("a")
 	if err := idx.UpdateWaiting("a", "r", body); err != nil {
 		t.Fatal(err)
 	}
 	if got := idx.UniqueBlocksNE(); got != 4 {
-		t.Errorf("R3: exiting member's grown set is not fully charged: NE=%d want 4", got)
+		t.Errorf("R3: exiting branch's grown set is not fully charged: NE=%d want 4", got)
 	}
 }
 

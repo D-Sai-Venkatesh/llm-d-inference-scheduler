@@ -70,7 +70,7 @@ func TestMetricSurfaceIsExactlyTheKeptSet(t *testing.T) {
 		fx.s.onEntry = m.ObserveEntry
 		fx.s.onServe = m.ObserveServed
 		fx.s.onColdValveHeld = func(engine string) { m.ObserveColdValveHeld(engine) }
-		fx.s.onRehome = func(member, from, to string) { m.ObserveAffinityViolation(from, to) }
+		fx.s.onRehome = func(branch, from, to string) { m.ObserveAffinityViolation(from, to) }
 		fx.s.onEngineGone = func(string, int) { m.ObserveEngineGone() }
 		m.ObserveCapacityLearned("endpoint-event", engineLabel(fx.ids[0]))
 		m.SetCapacityMissing(engineLabel(fx.ids[1%len(fx.ids)]), true)

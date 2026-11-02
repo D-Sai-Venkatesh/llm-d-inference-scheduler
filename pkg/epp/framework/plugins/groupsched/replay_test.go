@@ -145,7 +145,7 @@ func runScenario(t *testing.T) string {
 // runScenarioCfg is the PARAMETRIZED driver used by the WAVE-1
 // session-ordering equality test: cfg is the scheduler config and sessions
 // maps a scripted chain's id to its SESSION attribute (nil = every head
-// carries none, i.e. session := member — base mode).
+// carries none, i.e. session := branch — base mode).
 func runScenarioCfg(t *testing.T, simEnd int, cfg Config) string {
 	return runScenarioFull(t, simEnd, cfg)
 }
@@ -153,7 +153,7 @@ func runScenarioCfg(t *testing.T, simEnd int, cfg Config) string {
 // runScenarioEnd drives the scenario truncated at simEnd (the
 // legacy-c57e92ed comparison uses 489 — the pre-C4 code stalls on this
 // scenario shortly after ~500, AND at t=490 the always-on C8 fix
-// deliberately diverges from legacy (a member with a queued head is no
+// deliberately diverges from legacy (a branch with a queued head is no
 // longer idle-evicted — the reviewer's predicted A0 caveat). The 489s
 // prefix is byte-identical; the divergence point is documented, not
 // hidden; S1).
@@ -193,8 +193,8 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 	// is unchanged, so a per-engine replay of this scenario compares against
 	// the same golden file line for line (PREREG-multipod-offload directive
 	// 1: the unit-equivalence gate).
-	s.onExit = func(_ string, reason string, resTurns int) {
-		exitLog = append(exitLog, fmt.Sprintf("EXIT reason=%s turns=%d", reason, resTurns))
+	s.onExit = func(_ string, reason string, seatTurns int) {
+		exitLog = append(exitLog, fmt.Sprintf("EXIT reason=%s turns=%d", reason, seatTurns))
 	}
 	s.onEntry = func(_ string, kind string, wait float64) {
 		entryLog = append(entryLog, fmt.Sprintf("SEAT kind=%s wait=%.3f", kind, wait))
@@ -235,7 +235,7 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 			if g.nextTurn <= sim {
 				// the head is queued since nextTurn
 				hs = append(hs, Head{
-					Member:    g.id,
+					Branch:    g.id,
 					ReqID:     fmt.Sprintf("%s-r%02d", g.id, reqSeq[g.id]+1),
 					Arrival:   scenarioT0.Add(time.Duration(g.nextTurn) * time.Second),
 					SizeBytes: int64(len(g.chain)+g.turnBlocks()) * 4 * 64,
@@ -289,7 +289,7 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 				break
 			}
 			h := hs[i]
-			g := byID(h.Member)
+			g := byID(h.Branch)
 			reqID := nextReqID(g.id)
 			// the dispatched request's context = chain + this turn's growth
 			g.turn++
@@ -353,7 +353,7 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 // with no committed trace to compare against, the property that must still hold is that
 // the decision path has NO map-order dependence — the archive build produced three
 // different traces in four replays of this scenario, and the total victim tie-break
-// (oldest completion, then member id) is what fixed it.
+// (oldest completion, then branch id) is what fixed it.
 //
 // The N=2 stream is the same arrivals against TWO engines, so the cross-engine pass
 // (per-engine dispatch order, the winner key, the engine id as the final tie-break) is

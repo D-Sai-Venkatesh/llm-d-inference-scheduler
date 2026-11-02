@@ -24,7 +24,7 @@ package groupsched
 // interface plus ONE value, never a new knob on five modules.
 //
 //	IDENTITY    the branch-identity plugin (separate plugin, unchanged): the
-//	            member id IS the queue key. This package only READS it.
+//	            branch id IS the queue key. This package only READS it.
 //	SIZING      FootprintSizer: what a head costs on one engine, in blocks, from
 //	            the engine's own BlockIndex (dedup + cold-token estimate), and the
 //	            engine's seat budget from its measured KV capacity — the ONE
@@ -45,7 +45,7 @@ package groupsched
 //	            detector (threshold = the seat budget's own fraction) is the
 //	            ALTERNATIVE implementation, OFF until its input is verified as
 //	            in-use work. Run-level safety is preemptions <= FCFS's.
-//	DISPATCH    DispatchGate: whether a seated member's turn may RUN on its engine now.
+//	DISPATCH    DispatchGate: whether a seated branch's turn may RUN on its engine now.
 //	            DEFAULT = NONE (an admitted turn runs). The ALTERNATIVE
 //	            execution-budget tests the engine's RUNNING set — the dedup-exact union
 //	            of its in-flight requests' chain blocks, from this package's own
@@ -68,24 +68,24 @@ type TenureCtx struct {
 	// Now is the decision pass's clock (never time.Now — a golden replay must be
 	// reproducible).
 	Now time.Time
-	// IdleSeconds is S, the silence bound: a member silent that long (and with no
+	// IdleSeconds is S, the silence bound: a branch silent that long (and with no
 	// queued head — the C8 fix) is not going to use its seat.
 	IdleSeconds float64
 	// QueueView is when the queue-head snapshot behind this decision pass was taken,
-	// and QueueViewKnown whether there is one at all. A member's "has a queued head"
+	// and QueueViewKnown whether there is one at all. A branch's "has a queued head"
 	// lives in `waitingSince`, which only a PASS OVER THE QUEUE can maintain
 	// (syncWaitersLocked). When the flow controller's gate is closed no Pick runs, so
 	// that flag goes STALE — and an eviction rule that trusted a stale "no head" took
-	// seats away from members whose head was queued the whole time (the C8 race: heads
+	// seats away from branches whose head was queued the whole time (the C8 race: heads
 	// arriving just before a Tick, victims' heads then waiting 4.7-25 min, cold).
 	QueueView    time.Time
 	QueueViewSet bool
 }
 
-// Headless reports "this member has no queued head" as EVIDENCE rather than as a
+// Headless reports "this branch has no queued head" as EVIDENCE rather than as a
 // guess: it is true only when the queue view is recent enough for the absence to mean
-// something (a view older than S cannot tell a busy member from an idle one).
-func (c TenureCtx) Headless(m *member) bool {
+// something (a view older than S cannot tell a busy branch from an idle one).
+func (c TenureCtx) Headless(m *branch) bool {
 	if !m.waitingSince.IsZero() {
 		return false
 	}
@@ -95,9 +95,9 @@ func (c TenureCtx) Headless(m *member) bool {
 	return true
 }
 
-// Silent reports the idle test for a member: headless (see Headless) and no activity
+// Silent reports the idle test for a branch: headless (see Headless) and no activity
 // for S.
-func (c TenureCtx) Silent(m *member) bool {
+func (c TenureCtx) Silent(m *branch) bool {
 	if !c.Headless(m) {
 		return false
 	}
@@ -108,9 +108,9 @@ func (c TenureCtx) Silent(m *member) bool {
 type RotationPolicy interface {
 	// Name is the config value that selects the policy.
 	Name() string
-	// Eligible reports the reason a member may be rotated ("" and false = it may
-	// not). A member with anything in flight is NEVER eligible.
-	Eligible(m *member, ctx TenureCtx) (string, bool)
+	// Eligible reports the reason a branch may be rotated ("" and false = it may
+	// not). A branch with anything in flight is NEVER eligible.
+	Eligible(m *branch, ctx TenureCtx) (string, bool)
 }
 
 // FixedQuantum is the ONE tenure rule: Q completed busy periods, or S of silence.
@@ -120,7 +120,7 @@ type FixedQuantum struct {
 
 func (FixedQuantum) Name() string { return "quantum" }
 
-func (p FixedQuantum) Eligible(m *member, ctx TenureCtx) (string, bool) {
+func (p FixedQuantum) Eligible(m *branch, ctx TenureCtx) (string, bool) {
 	if m.inflight > 0 {
 		return "", false
 	}
@@ -138,21 +138,21 @@ func (p FixedQuantum) Eligible(m *member, ctx TenureCtx) (string, bool) {
 // PressureCtx is what a victim chooser may consult about ONE engine.
 type PressureCtx struct {
 	Now time.Time
-	// Exiting reports that the member is already on its way out (it drains, then
+	// Exiting reports that the branch is already on its way out (it drains, then
 	// goes).
 	Exiting func(id string) bool
 	// RotationVictim is the TENURE module's demand-driven choice over this engine
-	// (nil when no member is release-eligible under it).
-	RotationVictim func() (string, *member)
+	// (nil when no branch is release-eligible under it).
+	RotationVictim func() (string, *branch)
 	// Silent is the same idle test the tenure policy uses.
-	Silent func(m *member) bool
-	// Headless reports whether the member has no queued head, as EVIDENCE (false when
+	Silent func(m *branch) bool
+	// Headless reports whether the branch has no queued head, as EVIDENCE (false when
 	// the queue view is stale — see TenureCtx.Headless).
-	Headless func(m *member) bool
+	Headless func(m *branch) bool
 	// QueueViewTrusted reports whether the queue view is recent enough that "this
-	// member has no queued head" means anything at all. When it is false, the classes
+	// branch has no queued head" means anything at all. When it is false, the classes
 	// that reason about HEAD PRESENCE (done and mid-quantum) are SKIPPED: the policy
-	// cannot tell an idle member from a busy one, so it must not reclaim a seat on a
+	// cannot tell an idle branch from a busy one, so it must not reclaim a seat on a
 	// guess — that guess is exactly the C8 race (heads arriving just before a Tick,
 	// victims' heads then waiting 4.7-25 minutes, cold). Memory enforcement then waits
 	// for the next pass, which is at most one tick away.
@@ -162,12 +162,12 @@ type PressureCtx struct {
 // VictimChooser answers "who leaves when the engine is over its budget?".
 type VictimChooser interface {
 	Name() string
-	Victim(members []*member, ctx PressureCtx) (string, *member)
+	Victim(branches []*branch, ctx PressureCtx) (string, *branch)
 }
 
 // BudgetValve is f0p's memory-pressure order, unchanged:
 //
-//	(1) a rotation victim (the tenure rule already releases this member);
+//	(1) a rotation victim (the tenure rule already releases this branch);
 //	(2) DONE or SILENT — no queued turn, or silent past S;
 //	(3) mid-quantum IDLE, oldest last completion first (the safety valve that only
 //	    genuine GROWTH pressure reaches: every admission was budget-checked);
@@ -176,14 +176,14 @@ type BudgetValve struct{}
 
 func (BudgetValve) Name() string { return "valve" }
 
-func (BudgetValve) Victim(members []*member, ctx PressureCtx) (string, *member) {
+func (BudgetValve) Victim(branches []*branch, ctx PressureCtx) (string, *branch) {
 	if ctx.RotationVictim != nil {
 		if reason, m := ctx.RotationVictim(); m != nil {
 			return reason, m
 		}
 	}
-	var best *member
-	for _, m := range members {
+	var best *branch
+	for _, m := range branches {
 		if ctx.Exiting(m.id) || m.inflight > 0 {
 			continue
 		}
@@ -198,8 +198,8 @@ func (BudgetValve) Victim(members []*member, ctx PressureCtx) (string, *member) 
 	}
 	if !ctx.QueueViewTrusted {
 		// no trustworthy view of who has a queued head: classes (2) and (3) are guesses.
-		// Only members already on their way out can be named.
-		for _, m := range members {
+		// Only branches already on their way out can be named.
+		for _, m := range branches {
 			if !ctx.Exiting(m.id) {
 				continue
 			}
@@ -212,12 +212,12 @@ func (BudgetValve) Victim(members []*member, ctx PressureCtx) (string, *member) 
 		}
 		return "", nil
 	}
-	// class (3): mid-quantum. THE ORDER MATTERS: a member that has not served a turn
+	// class (3): mid-quantum. THE ORDER MATTERS: a branch that has not served a turn
 	// in this residency, or that has a queued head right now, is the LAST choice —
 	// taking its seat back before its first turn makes it wait another admission cycle
 	// (measured on f0p's class-3 victims: 100 % had a queued head and 53/54 had served
 	// ZERO turns in the residency). Only then "oldest last completion", then id.
-	for _, m := range members {
+	for _, m := range branches {
 		if ctx.Exiting(m.id) || m.inflight > 0 {
 			continue
 		}
@@ -228,7 +228,7 @@ func (BudgetValve) Victim(members []*member, ctx PressureCtx) (string, *member) 
 	if best != nil {
 		return "budget-idle", best
 	}
-	for _, m := range members {
+	for _, m := range branches {
 		if ctx.Exiting(m.id) {
 			continue
 		}
@@ -257,7 +257,7 @@ type EntryCtx struct {
 
 // EntryOrder answers "which waiter is the head?" over the ONE shared queue.
 //
-// The comparison MUST be a TOTAL order ending in the member id. That is not a style
+// The comparison MUST be a TOTAL order ending in the branch id. That is not a style
 // preference: the archive build compared unset timestamps in map-iteration order and
 // produced three different traces in four replays of the same scenario.
 type EntryOrder interface {
@@ -266,7 +266,7 @@ type EntryOrder interface {
 	Head(waiters map[string]*waiter, ctx EntryCtx) *waiter
 }
 
-// NewcomerFirst is the default: newcomers before returning members, then the oldest
+// NewcomerFirst is the default: newcomers before returning branches, then the oldest
 // arrival, then the id (a total order, so map iteration cannot leak into a decision).
 type NewcomerFirst struct{}
 
@@ -312,8 +312,8 @@ type EngineCandidate struct {
 	// Fits reports BudgetFits AND that the COLD-ENTRY VALVE allows this head on this
 	// engine. Both halves matter, and keeping them apart is the fix for a real defect
 	// (inherited from f0p): a head that fits by budget but is held by the valve must
-	// WAIT, because evicting members frees budget and never frees the valve — the old
-	// loop therefore evicted every eligible member on the engine and left the seats
+	// WAIT, because evicting branches frees budget and never frees the valve — the old
+	// loop therefore evicted every eligible branch on the engine and left the seats
 	// empty until the cold prefill finished (measured on f0p's final-epp.prom:
 	// 913,162 valve-blocked passes, and every one that found a victim evicted for
 	// nothing).
@@ -395,13 +395,13 @@ type FootprintSizer interface {
 	BudgetBlocks(numBlocks int) int
 	// Cost is the conservative admission cost of a QUEUED request against one
 	// engine's index, in blocks.
-	Cost(idx *BlockIndex, member string, sizeBytes int64) int64
+	Cost(idx *BlockIndex, branch string, sizeBytes int64) int64
 	// Tokens converts a block count to tokens (R1: one unit everywhere).
 	Tokens(blocks int64) int64
 }
 
 // IndexSizer is the default: the engine's own BlockIndex (dedup against what the
-// engine already holds) plus the wire-size delta over the member's last dispatched
+// engine already holds) plus the wire-size delta over the branch's last dispatched
 // body, and a budget of fraction × num_gpu_blocks.
 type IndexSizer struct {
 	Fraction  float64
@@ -414,19 +414,19 @@ func (z IndexSizer) BudgetBlocks(numBlocks int) int {
 	return int(z.Fraction * float64(numBlocks))
 }
 
-func (z IndexSizer) Cost(idx *BlockIndex, member string, sizeBytes int64) int64 {
+func (z IndexSizer) Cost(idx *BlockIndex, branch string, sizeBytes int64) int64 {
 	var cold int64
-	for _, h := range idx.SetBlocks(member) { // persisted across residencies (CP1)
+	for _, h := range idx.SetBlocks(branch) { // persisted across residencies (CP1)
 		if idx.HasNELocked(h) {
 			// the engine can reach this block without recomputing it: it is in HBM.
 			continue
 		}
 		cold++
 	}
-	// the baseline is the member's last DISPATCHED body size (the index record,
+	// the baseline is the branch's last DISPATCHED body size (the index record,
 	// updated at PreRequest) — never the current head's size, or the second sight of
 	// the same head would estimate zero new blocks.
-	delta := sizeBytes - idx.LastSizeBytesLocked(member)
+	delta := sizeBytes - idx.LastSizeBytesLocked(branch)
 	if delta < 0 {
 		delta = 0
 	}
@@ -449,11 +449,11 @@ func (z IndexSizer) Tokens(blocks int64) int64 { return blocks * int64(z.BlockSi
 // check runs per candidate head on every decision pass, so it must neither allocate nor
 // reach into an engine.
 type DispatchCtx struct {
-	// Engine is the engine the head would run on (the member's seat — a head never
+	// Engine is the engine the head would run on (the branch's seat — a head never
 	// moves engines, so this is also the attribution of a hold).
 	Engine string
-	// Member is the head's member id (reporting only; the gate decides on blocks).
-	Member string
+	// Branch is the head's branch id (reporting only; the gate decides on blocks).
+	Branch string
 	// RunningBlocks is the engine's running set: the dedup-exact union of its in-flight
 	// requests' chain blocks, from the EPP's own accounting. It is NEVER an endpoint
 	// metric — that is what keeps a gate out of the old per-engine gate's failure class
@@ -475,7 +475,7 @@ type DispatchCtx struct {
 	Idle bool
 }
 
-// DispatchGate answers exactly one question: may this seated member's turn RUN on its
+// DispatchGate answers exactly one question: may this seated branch's turn RUN on its
 // engine now?
 //
 // THE SEAM IS EMPTY, DELIBERATELY. The seat budget is the whole admission control: an
@@ -539,14 +539,14 @@ type SafetyDetector interface {
 	Score(kv float64, have bool) float64
 }
 
-// class3Less is the mid-quantum (class 3) victim order: UNSTARTED or WANTING members
+// class3Less is the mid-quantum (class 3) victim order: UNSTARTED or WANTING branches
 // sort last (they have not had the seat long enough for it to be worth reclaiming),
 // then the oldest last completion, then the id.
-func class3Less(a, b *member) bool {
-	aRaw := a.resTurns == 0 || !a.waitingSince.IsZero()
-	bRaw := b.resTurns == 0 || !b.waitingSince.IsZero()
+func class3Less(a, b *branch) bool {
+	aRaw := a.seatTurns == 0 || !a.waitingSince.IsZero()
+	bRaw := b.seatTurns == 0 || !b.waitingSince.IsZero()
 	if aRaw != bRaw {
-		return !aRaw // a member that has used its seat goes first
+		return !aRaw // a branch that has used its seat goes first
 	}
 	return olderCompletion(a, b)
 }

@@ -18,25 +18,25 @@ package groupsched
 
 // THE CHARGED DRAIN'S RELEASE INVARIANT, ONE TEST PER EXIT PATH.
 //
-// (iii) made an exiting member's blocks stay on the budget's used side (blocksNE)
+// (iii) made an exiting branch's blocks stay on the budget's used side (blocksNE)
 // until it is unseated, because the engine pins them while the request drains. That is
-// sound ONLY if every path that takes a member out ends at the ONE release point
-// (Unseat/Forget). MarkExiting moves no counter any more, so a member that becomes
+// sound ONLY if every path that takes a branch out ends at the ONE release point
+// (Unseat/Forget). MarkExiting moves no counter any more, so a branch that becomes
 // exiting and never reaches Unseat/Forget keeps its blocks charged to the budget
 // FOREVER — the engine then looks permanently full, TrySeat refuses every seat, and
 // marking frees nothing, so that engine stops serving: the whole pool, silently.
 // Before (iii) the same lifecycle hole was invisible, because the mark itself dropped
 // the blocks out of NE "by definition".
 //
-// So the inventory has to be exhaustive. A member becomes EXITING at exactly one site
+// So the inventory has to be exhaustive. A branch becomes EXITING at exactly one site
 // (enforceBudgetLocked's mid-flight class); its in-flight count reaches zero at
 // exactly three (Settle, reapInflightLocked, and nowhere else). Every one of those must
 // end at the release. These tests drive each path for real and assert the same three
 // things every time:
 //
 //	1. the mark moved NO counter (it is a mark, not a release);
-//	2. when the path completes, the exiting member's charge is GONE — NE is exactly the
-//	   SURVIVING members' blocks, so the release was neither short nor taken out of
+//	2. when the path completes, the exiting branch's charge is GONE — NE is exactly the
+//	   SURVIVING branches' blocks, so the release was neither short nor taken out of
 //	   somebody else's charge (the asymmetry check);
 //	3. the index invariant still holds (blocks == blocksNE here, and nothing
 //	   underflowed — a double release panics).
@@ -67,11 +67,11 @@ func uniqueOn(fx *engineSet, g *engineGroup) int {
 }
 
 // chargedPath runs one path test at N=1 and N=2 with the fixture every path needs:
-// "keep" (a survivor whose charge must never be touched) and "gone" (the member that
+// "keep" (a survivor whose charge must never be touched) and "gone" (the branch that
 // becomes exiting), BOTH on the fixture's first engine.
 //
 // fx.tighten closes every other engine with a filler at its whole budget, so both
-// members land on e0 at N=1 AND at N=2 — the per-engine assertions then mean the same
+// branches land on e0 at N=1 AND at N=2 — the per-engine assertions then mean the same
 // thing at both counts, and the sibling's filler is the cross-engine check. "keep"'s
 // prefill completes (Chunk) so its cold charge is off the valve: otherwise the
 // stagger cap would hold "gone" at the door instead of seating it.
@@ -84,7 +84,7 @@ func chargedPath(t *testing.T, cfg Config, path string, fn func(t *testing.T, fx
 		fx.seatOne(t, "gone", 300, 5*time.Second)
 		g := fx.g()
 		for _, id := range []string{"keep", "gone"} {
-			if _, ok := g.members[id]; !ok {
+			if _, ok := g.branches[id]; !ok {
 				t.Fatalf("fixture: %q must be seated on %s", id, g.id)
 			}
 		}
@@ -95,13 +95,13 @@ func chargedPath(t *testing.T, cfg Config, path string, fn func(t *testing.T, fx
 	})
 }
 
-// markExitingInflight makes "gone" an exiting member with one in-flight request,
+// markExitingInflight makes "gone" an exiting branch with one in-flight request,
 // exactly as the pressure valve's mid-flight class does, and asserts the mark moved no
 // counter (the whole point of (iii): it is a mark, not a release).
 func markExitingInflight(t *testing.T, fx *engineSet, g *engineGroup, reqID string, confirmed bool) {
 	t.Helper()
 	fx.s.mu.Lock()
-	m := g.members["gone"]
+	m := g.branches["gone"]
 	before, beforeU := g.index.UniqueBlocksNELocked(), g.index.UniqueBlocksLocked()
 	m.inflightIDs = map[string]inflightRec{reqID: {since: fx.clock, confirmed: confirmed}}
 	m.inflight = 1
@@ -115,7 +115,7 @@ func markExitingInflight(t *testing.T, fx *engineSet, g *engineGroup, reqID stri
 		t.Fatalf("MarkExiting moved the all-seated counter: %d -> %d", beforeU, u)
 	}
 	if !fx.s.Seated("gone") {
-		t.Fatal("a marked member is still seated: it drains, it is not evicted")
+		t.Fatal("a marked branch is still seated: it drains, it is not evicted")
 	}
 }
 
@@ -125,7 +125,7 @@ func markExitingInflight(t *testing.T, fx *engineSet, g *engineGroup, reqID stri
 func assertReleased(t *testing.T, fx *engineSet, g *engineGroup, path string) {
 	t.Helper()
 	if fx.s.Seated("gone") {
-		t.Fatalf("%s: the exiting member is still seated — its blocks are still charged (LEAK)", path)
+		t.Fatalf("%s: the exiting branch is still seated — its blocks are still charged (LEAK)", path)
 	}
 	if got, want := neOn(fx, g), 400; got != want {
 		why := "over-released (somebody else's charge was taken)"
@@ -138,7 +138,7 @@ func assertReleased(t *testing.T, fx *engineSet, g *engineGroup, path string) {
 		t.Fatalf("%s: all-seated blocks = %d want %d", path, got, want)
 	}
 	if !fx.s.Seated("keep") {
-		t.Fatalf("%s: the release took the OTHER member's seat (asymmetry)", path)
+		t.Fatalf("%s: the release took the OTHER branch's seat (asymmetry)", path)
 	}
 	for _, id := range fx.ids[1:] {
 		if got, want := neOn(fx, fx.s.groups[id]), 950; got != want {
@@ -155,27 +155,27 @@ func assertReleased(t *testing.T, fx *engineSet, g *engineGroup, path string) {
 func TestChargedDrainSettleReleases(t *testing.T) {
 	chargedPath(t, defaultConfig(), "settle-drain", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-gone", true)
-		// the request terminates: the finalizer removes the record, sees the member
+		// the request terminates: the finalizer removes the record, sees the branch
 		// exiting and drained, and unseats it.
 		fx.s.SettleOnUsage("gone", "r-gone", g.id, 300, 0, 0, false, fx.clock)
 		assertReleased(t, fx, g, "settle-drain")
 	})
 }
 
-// A settle that does NOT drain the member (a second request still running) must not
+// A settle that does NOT drain the branch (a second request still running) must not
 // release: the blocks are still pinned. Release happens on the LAST drain, once.
 func TestChargedDrainWaitsForTheLastRequest(t *testing.T) {
 	chargedPath(t, defaultConfig(), "settle-drain-last", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r1", true)
 		fx.s.mu.Lock()
-		m := g.members["gone"]
+		m := g.branches["gone"]
 		m.inflightIDs["r2"] = inflightRec{since: fx.clock, confirmed: true}
 		m.inflight = 2
 		fx.s.mu.Unlock()
 
 		fx.s.SettleOnUsage("gone", "r1", g.id, 300, 0, 0, false, fx.clock)
 		if !fx.s.Seated("gone") {
-			t.Fatal("one of two in-flight requests settled: the member must stay charged")
+			t.Fatal("one of two in-flight requests settled: the branch must stay charged")
 		}
 		if got := neOn(fx, g); got != 700 {
 			t.Fatalf("NE = %d want 700 while one request still runs", got)
@@ -191,7 +191,7 @@ func TestChargedDrainStraySettleDoesNotRelease(t *testing.T) {
 	chargedPath(t, defaultConfig(), "stray-settle", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r1", true)
 		fx.s.mu.Lock()
-		m := g.members["gone"]
+		m := g.branches["gone"]
 		m.inflightIDs["r2"] = inflightRec{since: fx.clock, confirmed: true}
 		m.inflight = 2
 		fx.s.mu.Unlock()
@@ -206,13 +206,13 @@ func TestChargedDrainStraySettleDoesNotRelease(t *testing.T) {
 	})
 }
 
-// ---- path 2: engine-gone (the engine disappears under the member) ----
+// ---- path 2: engine-gone (the engine disappears under the branch) ----
 
 func TestChargedDrainEngineGoneReleases(t *testing.T) {
 	chargedPath(t, defaultConfig(), "engine-gone", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-gone", true)
 		if n := fx.s.RemoveEngine(g.id, fx.clock); n == 0 {
-			t.Fatal("the teardown must exit the members it tears down")
+			t.Fatal("the teardown must exit the branches it tears down")
 		}
 		if got, want := neOn(fx, g), 0; got != want {
 			t.Fatalf("engine-gone: NE = %d want %d — a dead engine's charge leaked", got, want)
@@ -227,7 +227,7 @@ func TestChargedDrainEngineGoneReleases(t *testing.T) {
 // never observed — a client cancel whose forced EndOfStream never reached the plugin,
 // or a request that errored before its first chunk. Dropping the LAST id IS a drain, so
 // it must finish the exit; the TTL is not a rescue (its idle test needs no queued turn,
-// and a member that still has a head is exactly the member that is waiting).
+// and a branch that still has a head is exactly the branch that is waiting).
 //
 // The TTL is pushed out of reach (1e5 s) so the test can only pass on the reap path.
 func TestChargedDrainReapOfCancelledRequestReleases(t *testing.T) {
@@ -253,7 +253,7 @@ func TestChargedDrainReapOfUnconfirmedRequestReleases(t *testing.T) {
 	chargedPath(t, cfg, "reap-provisional", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-provisional", false)
 		fx.s.mu.Lock()
-		charged := g.members["gone"].coldEntry
+		charged := g.branches["gone"].coldEntry
 		fx.s.mu.Unlock()
 		if charged == 0 {
 			t.Fatal("fixture: the entry's cold charge must still be outstanding (no chunk, no settle)")
@@ -271,20 +271,20 @@ func TestChargedDrainReapOfUnconfirmedRequestReleases(t *testing.T) {
 
 // ---- path 4: TTL, and the idle exit while already exiting ----
 //
-// A member that is exiting with nothing in flight is NOT a rotation victim: the victim
+// A branch that is exiting with nothing in flight is NOT a rotation victim: the victim
 // rules skip it (it is already leaving, and marking it again frees nothing). So the TTL
 // sweep is the only thing between it and a permanent charge — and the TTL sweep's own
-// test is "no queued turn". A member with a queued head keeps its waiting-since fresh
+// test is "no queued turn". A branch with a queued head keeps its waiting-since fresh
 // on every queue sync, which is the NORMAL state of an oversubscribed engine (measured:
 // 97-112 heads in the shared queue at c128). Hence: the release must not depend on the
-// TTL at all — it must happen the moment the member is exiting AND drained.
+// TTL at all — it must happen the moment the branch is exiting AND drained.
 func TestChargedDrainHeadlessIdleReleases(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.InflightReapSeconds = 60
 	chargedPath(t, cfg, "ttl", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-gone", true)
 		fx.s.mu.Lock()
-		m := g.members["gone"]
+		m := g.branches["gone"]
 		m.inflightIDs = map[string]inflightRec{}
 		m.inflight = 0
 		m.lastActivity = fx.clock
@@ -296,9 +296,9 @@ func TestChargedDrainHeadlessIdleReleases(t *testing.T) {
 	})
 }
 
-// The same member WITH a queued head still on the books (the common case at c128: it has
+// The same branch WITH a queued head still on the books (the common case at c128: it has
 // its next turn waiting). The TTL's idle test never fires for it and rotation and the
-// pressure valve both refuse an exiting member — so the decision point is the only thing
+// pressure valve both refuse an exiting branch — so the decision point is the only thing
 // between it and a permanent charge.
 func TestChargedDrainExitingWithQueuedHeadReleases(t *testing.T) {
 	cfg := defaultConfig()
@@ -306,7 +306,7 @@ func TestChargedDrainExitingWithQueuedHeadReleases(t *testing.T) {
 	chargedPath(t, cfg, "exiting-with-head", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-gone", true)
 		fx.s.mu.Lock()
-		m := g.members["gone"]
+		m := g.branches["gone"]
 		m.inflightIDs = map[string]inflightRec{}
 		m.inflight = 0
 		m.lastActivity = fx.clock
@@ -326,10 +326,10 @@ func TestChargedDrainExitingIsNeverDispatched(t *testing.T) {
 	chargedPath(t, defaultConfig(), "exiting-no-dispatch", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-gone", true)
 		if _, i := fx.pickEngine(head("gone", 10*time.Second, bytesFor(300))); i >= 0 {
-			t.Fatal("an exiting member must not be dispatched for its queued head")
+			t.Fatal("an exiting branch must not be dispatched for its queued head")
 		}
 		if got := neOn(fx, g); got != 700 {
-			t.Fatalf("the member is still draining: NE = %d want 700", got)
+			t.Fatalf("the branch is still draining: NE = %d want 700", got)
 		}
 	})
 }
@@ -337,7 +337,7 @@ func TestChargedDrainExitingIsNeverDispatched(t *testing.T) {
 // ---- path 5: Forget, and the double-release asymmetry ----
 
 // Forget is the OTHER half of the one release point (the TTL sweep and the silence GC
-// use it). On a SEATED member it must release both counters — the exiting member's
+// use it). On a SEATED branch it must release both counters — the exiting branch's
 // included — and a later Unseat must be a harmless no-op rather than a second release
 // (which would underflow and panic). Then a fresh residency must start non-exiting and
 // charge exactly once.
@@ -350,7 +350,7 @@ func TestChargedDrainForgetReleasesAndUnseatIsIdempotent(t *testing.T) {
 		g.index.checkInvariantLocked()
 		fx.s.mu.Unlock()
 		if got, want := neOn(fx, g), 400; got != want {
-			t.Fatalf("Forget on a seated exiting member: NE = %d want %d", got, want)
+			t.Fatalf("Forget on a seated exiting branch: NE = %d want %d", got, want)
 		}
 		// the double release: Unseat and a second Forget must both be no-ops
 		fx.s.mu.Lock()
@@ -375,9 +375,9 @@ func TestChargedDrainForgetReleasesAndUnseatIsIdempotent(t *testing.T) {
 	})
 }
 
-// ---- path 6: the other direction — a mark on a member that holds no charge ----
+// ---- path 6: the other direction — a mark on a branch that holds no charge ----
 
-// MarkExiting refuses an unseated session (a seated member is the only thing that can
+// MarkExiting refuses an unseated session (a seated branch is the only thing that can
 // be exiting), so no path can release a charge that was never taken. That symmetry is
 // what makes the unconditional release in exitLocked/Forget safe: the counters are
 // rebuilt from the seated sets, so an unseated record contributes nothing to release.

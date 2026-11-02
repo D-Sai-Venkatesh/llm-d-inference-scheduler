@@ -145,15 +145,15 @@ func TestColdValveHeldIsAttributedToTheEngine(t *testing.T) {
 //   - a fresh view (the pass that just synced) reports age 0 and books nothing;
 //   - a pass older than idleSeconds (S) reports age > S, books ONE untrusted pass for the
 //     engine it enforced on, and — the property the guard exists for — does NOT evict the
-//     member whose "no queued head" cannot be trusted;
+//     branch whose "no queued head" cannot be trusted;
 //   - the very next pass with a fresh view takes the eviction, so the guard DELAYS the
 //     decision by at most one tick instead of blocking it.
 func TestQueueViewAgeAndUntrustedPassesAreVisible(t *testing.T) {
-	// a small capacity so one member's growth puts its engine over budget
+	// a small capacity so one branch's growth puts its engine over budget
 	forEnginesCap(t, defaultConfig(), 400, func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "big", 300, 3*time.Second) // budget 380, footprint 300
 		// the head is CONSUMED (a Pick with nothing queued clears "has a queued head"),
-		// so the member is exactly the headless-but-over-budget case the C8 guard governs.
+		// so the branch is exactly the headless-but-over-budget case the C8 guard governs.
 		fx.pick()
 		// its next request brings 300 NEW blocks: the accounted footprint is 600 > 380,
 		// i.e. the engine is over budget and enforcement must choose a victim.
@@ -188,7 +188,7 @@ func TestQueueViewAgeAndUntrustedPassesAreVisible(t *testing.T) {
 			t.Fatalf("untrusted enforcement passes = %d, want 1 (one engine over budget, one stale-viewed pass)", snap.QueueViewUntrusted)
 		}
 		if !fx.s.Seated("big") {
-			t.Fatal("the member must SURVIVE the stale-viewed pass: \"no queued head\" is not evidence when the view is older than S (the C8 race)")
+			t.Fatal("the branch must SURVIVE the stale-viewed pass: \"no queued head\" is not evidence when the view is older than S (the C8 race)")
 		}
 		// Tick re-APPLIES the last head snapshot (so the waiting flags stay honest) but it
 		// does not OBSERVE the queue: the evidence age keeps measuring the window.
@@ -201,21 +201,21 @@ func TestQueueViewAgeAndUntrustedPassesAreVisible(t *testing.T) {
 			t.Fatalf("queue_view_untrusted_passes_total = %v (present=%v), want 1", got, ok)
 		}
 
-		// settle BOTH of the member's requests: a member with anything in flight is never
+		// settle BOTH of the branch's requests: a branch with anything in flight is never
 		// evictable by any class (a separate rule), so this leaves the stale-evidence guard
-		// as the only thing keeping the member seated.
+		// as the only thing keeping the branch seated.
 		usage := struct{ Prompt, Cached int }{Prompt: 600, Cached: 600}
 		fx.s.Settle("big", "r-big", usage, true, fx.clock)
 		fx.s.Settle("big", "r-second", usage, true, fx.clock)
 		if !fx.s.Seated("big") {
-			t.Fatal("settling must not evict: the guard is what kept this member seated, not the settle")
+			t.Fatal("settling must not evict: the guard is what kept this branch seated, not the settle")
 		}
 
 		// the next pass OBSERVES the queue, and then the SAME over-budget state does evict:
 		// the guard costs one tick, never a datapath stall.
 		fx.pick()
 		if fx.s.Seated("big") {
-			t.Fatal("with fresh evidence the over-budget member must be evicted (the guard must not be a permanent shield)")
+			t.Fatal("with fresh evidence the over-budget branch must be evicted (the guard must not be a permanent shield)")
 		}
 		snap = fx.s.Snapshot()
 		if snap.QueueViewUntrusted != 1 {
@@ -270,14 +270,14 @@ func TestColdCapIsExportedPerEngine(t *testing.T) {
 }
 
 // THE EXITING LEDGER ON THE WIRE (2026-11-01 late, the reviewer's ask: "this leak class
-// must be visible at T+5"). (iii) made the used side include members that are already
+// must be visible at T+5"). (iii) made the used side include branches that are already
 // leaving, so "how much of it is leaving, how many are leaving, and how long has the
 // oldest been leaving" are the three numbers that separate an engine that is BUSY from an
 // engine whose drains have stopped — a distinction the batch-1 anchor had to reconstruct
 // from the event log and the residency histogram because no gauge carried it.
 //
 // The gauges must be readable AT THE MOMENT OF THE MARK (before any drain), and must go
-// back to zero when the member leaves (a gauge that only ever rises is a counter wearing
+// back to zero when the branch leaves (a gauge that only ever rises is a counter wearing
 // the wrong name).
 func TestExitingLedgerIsVisiblePerEngine(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
@@ -285,7 +285,7 @@ func TestExitingLedgerIsVisiblePerEngine(t *testing.T) {
 		fx.seatOne(t, "keep", 400, 5*time.Second)
 		fx.s.Chunk("keep")
 		fx.seatOne(t, "gone", 300, 5*time.Second)
-		m, g := fx.member(t, "gone")
+		m, g := fx.branch(t, "gone")
 
 		reg := prometheus.NewRegistry()
 		mtr := newGroupMetrics(fx.s)
@@ -311,7 +311,7 @@ func TestExitingLedgerIsVisiblePerEngine(t *testing.T) {
 			t.Fatalf("exiting_branches = %v (present=%v), want 1", got, ok)
 		}
 		if got, ok := gatherValue(t, reg, subsystem+"_exiting_blocks", map[string]string{"engine": engineLabel(g.id)}); !ok || got != 300 {
-			t.Fatalf("exiting_blocks = %v (present=%v), want 300 (the member's own footprint)", got, ok)
+			t.Fatalf("exiting_blocks = %v (present=%v), want 300 (the branch's own footprint)", got, ok)
 		}
 		if got, ok := gatherValue(t, reg, subsystem+"_exiting_oldest_age_seconds", map[string]string{"engine": engineLabel(g.id)}); !ok || got < 7 {
 			t.Fatalf("exiting_oldest_age_seconds = %v (present=%v), want >= 7", got, ok)

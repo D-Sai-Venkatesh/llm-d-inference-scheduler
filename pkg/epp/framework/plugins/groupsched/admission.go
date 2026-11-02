@@ -23,7 +23,7 @@ package groupsched
 //  1. WAITING IS POOLED. There is exactly ONE waiter queue (s.waiters) for the
 //     whole policy. A waiter is not seated, so it belongs to no engine; "one
 //     queue" is what makes N engines one admission system instead of N queues
-//     whose depths drift apart. Nothing is pre-homed: an unseated member carries
+//     whose depths drift apart. Nothing is pre-homed: an unseated branch carries
 //     no placement opinion.
 //
 //  2. THE HEAD IS THE HEAD. Entry order is newcomer-first, then oldest arrival,
@@ -40,7 +40,7 @@ package groupsched
 //     engine that has an eligible victim.
 //
 //  4. THE BINDING LASTS ONLY WHILE SEATED. seatLocked creates it, exitLocked drops it,
-//     and nothing else touches it — so a member's next seat is chosen afresh, by the
+//     and nothing else touches it — so a branch's next seat is chosen afresh, by the
 //     state of the engines at that moment. There is no TTL and no pre-seat homing:
 //     there is nothing to keep warm between seats, because the blocks die during the
 //     unseated interval (measured, not assumed — the unseated interval IS a
@@ -55,7 +55,7 @@ import (
 
 // coldTokensForEngine is one waiter's admission cost against ONE engine, in
 // tokens: the per-engine estimate frozen at sync time (each engine is costed
-// against its OWN index — the member's blocks are warm or cold PER ENGINE), with
+// against its OWN index — the branch's blocks are warm or cold PER ENGINE), with
 // the pool's best-case scalar as the fallback for an engine that appeared after the
 // sync.
 func coldTokensForEngine(w *waiter, g *engineGroup, blockSize int) int64 {
@@ -91,17 +91,17 @@ func (s *Scheduler) setWaiterCostsLocked(w *waiter) {
 }
 
 // queuedPerSeatLocked is the engine's OWN queued demand per seat it holds: seated
-// members that have a head waiting right now, divided by its seats. It orders the
+// branches that have a head waiting right now, divided by its seats. It orders the
 // DISPATCH pass across engines (the engine whose own residents are waiting most per
 // seat releases first); it is never a placement key — placement is the fit +
 // most-free-budget rule alone.
 func (s *Scheduler) queuedPerSeatLocked(g *engineGroup) float64 {
-	seats := len(g.members)
+	seats := len(g.branches)
 	if seats <= 0 {
 		seats = 1
 	}
 	queued := 0
-	for _, m := range g.members {
+	for _, m := range g.branches {
 		if !m.waitingSince.IsZero() {
 			queued++
 		}
@@ -110,7 +110,7 @@ func (s *Scheduler) queuedPerSeatLocked(g *engineGroup) float64 {
 }
 
 // freeBudgetLocked is what the engine can still admit: its budget minus its
-// accounted footprint (NE blocks, EXITING members included — they still hold
+// accounted footprint (NE blocks, EXITING branches included — they still hold
 // them — plus the seat-time estimates not yet converted to exact keys). Negative
 // when the engine is over budget (enforcement is about to catch up).
 func (s *Scheduler) freeBudgetLocked(g *engineGroup) int64 {
@@ -126,7 +126,7 @@ func (s *Scheduler) freeBudgetLocked(g *engineGroup) int64 {
 // of that single rule:
 //
 //   - an EMPTY valve always admits one entry whatever its size (R11's liveness: a
-//     member bigger than the headroom still gets seated), because its capped charge
+//     branch bigger than the headroom still gets seated), because its capped charge
 //     is the headroom itself;
 //   - the charge can never exceed the cap, which it did in 20-30 % of the wave's
 //     samples when "one cold entry is always allowed" was an EXCEPTION to the cap
@@ -151,7 +151,7 @@ func (s *Scheduler) coldAllows(g *engineGroup, w *waiter) bool {
 type seatChoice struct {
 	g *engineGroup
 	// costTokens / costBlocks are the estimate the fit test used, so the chosen
-	// engine's own numbers become the member's cold charge and pending blocks
+	// engine's own numbers become the branch's cold charge and pending blocks
 	// (instead of the pool's best-case scalar).
 	costTokens int64
 	costBlocks int64
@@ -188,7 +188,7 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatChoice {
 			FreeBudget: free, BudgetFits: budgetFits,
 			// FITS = budget AND cold valve: a head the valve holds must wait for the
 			// valve, never evict for it (the defect this replaces evicted every
-			// eligible member on the engine and left the seats cold-empty).
+			// eligible branch on the engine and left the seats cold-empty).
 			Fits:      budgetFits && s.coldAllowsTokens(g, tokens),
 			HasVictim: func() bool { return s.hasRotationVictimLocked(gg, now) },
 		})
@@ -248,15 +248,15 @@ func (s *Scheduler) entryHeadLocked(now time.Time) *waiter {
 // rotateLocked is the admission loop: hand the shared queue's head to an engine
 // until nothing more can be seated.
 //
-// Bounded: every iteration either seats a head (the queue shrinks), evicts a member
-// (an engine's member count shrinks) or returns.
+// Bounded: every iteration either seats a head (the queue shrinks), evicts a branch
+// (an engine's branch count shrinks) or returns.
 func (s *Scheduler) rotateLocked(now time.Time) {
 	if len(s.waiters) == 0 {
 		return
 	}
 	budget := len(s.waiters)
 	for _, g := range s.activeGroupsLocked() {
-		budget += len(g.members)
+		budget += len(g.branches)
 	}
 	for ; budget > 0; budget-- {
 		head := s.entryHeadLocked(now)
@@ -302,8 +302,8 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 			return // this engine can free nothing; another pass will re-evaluate
 		}
 		// NOTE: a rotation victim is never in flight — the tenure rule refuses in-flight
-		// members — so there is no mid-flight exit to handle here (the mid-flight class
-		// lives in the PRESSURE module, which does reach running members).
+		// branches — so there is no mid-flight exit to handle here (the mid-flight class
+		// lives in the PRESSURE module, which does reach running branches).
 		s.exitLocked(cand.g, victim, reason, now)
 	}
 }

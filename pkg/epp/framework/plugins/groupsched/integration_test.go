@@ -143,8 +143,8 @@ type dispatchResult struct {
 }
 
 // TestIntegrationDispatchThroughRealController: two sessions with sizes
-// that only one fits (the budget); the member's request dispatches
-// through the REAL controller; after the member goes quiet, the blocked
+// that only one fits (the budget); the branch's request dispatches
+// through the REAL controller; after the branch goes quiet, the blocked
 // waiter is rotated in (the engine-idle path) and dispatches too.
 func TestIntegrationDispatchThroughRealController(t *testing.T) {
 	plugin, err := Factory("gs", nil, nil)
@@ -158,7 +158,7 @@ func TestIntegrationDispatchThroughRealController(t *testing.T) {
 	results := make(chan dispatchResult, 4)
 	// session "m": 400 blocks; session "w": 600 blocks (400+600 > 950:
 	// w cannot co-fit; it waits until m is rotated out)
-	// m enqueues and dispatches (a member; the queue is real). The
+	// m enqueues and dispatches (a branch; the queue is real). The
 	// dispatch is fast — wait on the RESULT, not the queue depth.
 	go func() {
 		req := newIntRequest("m", "m-1", uint64(bytesFor(400)))
@@ -172,7 +172,7 @@ func TestIntegrationDispatchThroughRealController(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("m never dispatched — the lifecycle deadlock (S0-1) is back")
 	}
-	require.True(t, gs.sched.Seated("m"), "m must be the seated member")
+	require.True(t, gs.sched.Seated("m"), "m must be the seated branch")
 
 	// w enqueues behind the budget (400 + 600 > 950): it stays queued.
 	go func() {

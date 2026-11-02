@@ -74,14 +74,14 @@ var (
 // FAIRNESS POLICY, the scheduling FILTER, and the SATURATION DETECTOR — one plugin,
 // one state, so the three answers cannot disagree.
 //
-//	policy    Pick: which queued request dispatches next (seated members only)
-//	filter    Filter: which engine may serve it (the member's seat)
+//	policy    Pick: which queued request dispatches next (seated branches only)
+//	filter    Filter: which engine may serve it (the branch's seat)
 //	detector  Saturation: is the POOL saturated (the flow controller's dispatch gate)
 //
 // The detector answers from an ATOMIC snapshot and never takes the scheduler's mutex
 // (the flow controller polls it about once per millisecond). Its DEFAULT answer is
 // "not saturated": the SEAT BUDGET is the admission control, and this policy only ever
-// releases requests of members it has seated, so a pool-level gate has nothing left to
+// releases requests of branches it has seated, so a pool-level gate has nothing left to
 // decide. The memory-only backstop (live datastore metrics, threshold = the budget
 // fraction, stale → open) is the alternative safety module and is OFF by default.
 type GroupScheduler struct {
@@ -124,7 +124,7 @@ type GroupScheduler struct {
 	// (fwksched.NewEndpoint → metrics.Clone()), so the capacity retry reads THIS set.
 	candidates atomic.Pointer[[]fwkdl.Endpoint]
 
-	// pins mirrors the scheduler's member→engine SEAT binding so the Filter can
+	// pins mirrors the scheduler's branch→engine SEAT binding so the Filter can
 	// read it WITHOUT taking s.mu (see filter.go's lock discipline). The
 	// scheduler pushes every seat/unseat/rebind through onBind/onUnbind; nothing
 	// here infers anything.
@@ -197,21 +197,21 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	r.sched.onExit = func(engine, reason string, _ int) { r.metrics.ObserveExit(engine, reason) }
 	r.sched.onEntry = r.metrics.ObserveEntry
 	r.sched.onServe = r.metrics.ObserveServed
-	r.sched.onRehome = func(member, from, to string) {
+	r.sched.onRehome = func(branch, from, to string) {
 		r.metrics.ObserveAffinityViolation(engineLabel(from), engineLabel(to))
 		r.logger.V(logutil.DEFAULT).Info("group-scheduler: AFFINITY VIOLATION — a request landed off its seat; rebound to the observed endpoint",
-			"member", member, "charged", engineLabel(from), "observed", engineLabel(to))
+			"branch", branch, "charged", engineLabel(from), "observed", engineLabel(to))
 	}
 	// The pin table follows the SEATS: one map write per seat, one delete per exit.
-	r.sched.onBind = func(member, engine string) { r.pins.set(member, engine) }
-	r.sched.onUnbind = func(member string) { r.pins.del(member) }
+	r.sched.onBind = func(branch, engine string) { r.pins.set(branch, engine) }
+	r.sched.onUnbind = func(branch string) { r.pins.del(branch) }
 	r.sched.onColdValveHeld = func(engine string) {
 		r.metrics.ObserveColdValveHeld(engineLabel(engine))
 	}
-	r.sched.onEngineGone = func(engine string, members int) {
+	r.sched.onEngineGone = func(engine string, branches int) {
 		r.metrics.ObserveEngineGone()
-		r.logger.V(logutil.DEFAULT).Info("group-scheduler: ENGINE GONE — members exited and the group dropped",
-			"engine", engineLabel(engine), "members", members)
+		r.logger.V(logutil.DEFAULT).Info("group-scheduler: ENGINE GONE — branches exited and the group dropped",
+			"engine", engineLabel(engine), "branches", branches)
 	}
 	if handle != nil {
 		// THE DETECTOR-IDENTITY GATE. The loader FABRICATES the stock utilization
@@ -234,7 +234,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 			}
 		}
 		r.sched.onMemberSource = func(source string) {
-			r.logger.V(logutil.DEBUG).Info("group-scheduler: member source in effect at dispatch", "source", source)
+			r.logger.V(logutil.DEBUG).Info("group-scheduler: branch source in effect at dispatch", "source", source)
 		}
 		// the per-id SEAT/EXIT event log (one debug line each; the
 		// campaign's spans could not see seat membership).
@@ -252,7 +252,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 			}
 			r.logger.V(logutil.DEBUG).Info("group-scheduler event",
 				"t", ev.T.UTC().Format(time.RFC3339Nano), "kind", ev.Kind, "id", ev.ID,
-				"detail", ev.Detail, "engine", ev.Engine, "member", ev.Member)
+				"detail", ev.Detail, "engine", ev.Engine, "branch", ev.Branch)
 		}
 		go r.runTicker(handle.Context())
 	}
@@ -276,14 +276,14 @@ func (r *GroupScheduler) runTicker(ctx context.Context) {
 	}
 }
 
-// memberKeyRule states the resolution rule of a memberKey value in words (the
+// branchKeyRule states the resolution rule of a branchKey value in words (the
 // startup echo).
-func memberKeyRule(memberKey string) string {
-	switch memberKey {
+func branchKeyRule(branchKey string) string {
+	switch branchKey {
 	case "branch":
-		return "base mode: the derived branch is member AND queue key"
+		return "base mode: the derived branch is branch AND queue key"
 	case "session":
-		return "the agent-identity session attribute is the member"
+		return "the agent-identity session attribute is the branch"
 	default:
 		return "branch when present, else the session, else anonymous (R9)"
 	}
@@ -317,10 +317,10 @@ func (r *GroupScheduler) TypedName() fwkplugin.TypedName { return r.typedName }
 //	before request control while the code comments assume the opposite order) —
 //	filed as a draft note for the human, never opened by an agent.
 //
-// Both identity keys are OPTIONAL at the data layer because which one is the member
+// Both identity keys are OPTIONAL at the data layer because which one is the branch
 // depends on Config.MemberKey (and on which identity plugin the arm deployed); the
 // fail-closed check is validateMemberProducer at startup, which requires the
-// producer of the configured member source to EXIST. Making the keys required
+// producer of the configured branch source to EXIST. Making the keys required
 // unconditionally would have made base mode (no session header, branch
 // identity only) a startup failure.
 //
@@ -375,7 +375,7 @@ func (r *GroupScheduler) otherDetectors() []string {
 	return out
 }
 
-// memberOf resolves the request's MEMBER id and the source that produced it:
+// branchOf resolves the request's MEMBER id and the source that produced it:
 //
 //	branch  -> the derived branch id (branch-identity; the BASE mode)
 //	session -> the agent-identity session attribute, when the branch plugin is not
@@ -384,7 +384,7 @@ func (r *GroupScheduler) otherDetectors() []string {
 //
 // It is a PURE READ: the branch id is never written into the agent-identity slot
 // (that slot keeps meaning "the client's session" for the rest of the stack).
-func (r *GroupScheduler) memberOf(request *fwksched.InferenceRequest) (member, source string) {
+func (r *GroupScheduler) branchOf(request *fwksched.InferenceRequest) (branch, source string) {
 	if request == nil {
 		return "", ""
 	}
@@ -426,7 +426,7 @@ func (r *GroupScheduler) validateTokenProducer() error {
 }
 
 // validateMemberProducer is the fail-closed MEMBER-SOURCE gate: the configured
-// memberKey needs its identity plugin in the same config. Without it every
+// branchKey needs its identity plugin in the same config. Without it every
 // request is anonymous and Pick degrades to R9 FCFS pass-through — the worst
 // arm of the campaign, and a failure that is silent in the outcome metrics
 // (Amendment 4 measured it twice), so it must fail at startup.
@@ -451,7 +451,7 @@ func (r *GroupScheduler) validateMemberProducer() error {
 			branchidentity.PluginType, agentidentity.PluginType)
 	}
 	if b && !s {
-		r.logger.V(logutil.DEFAULT).Info("group-scheduler: no session-identity plugin in the config — the derived branch is the member key on every request")
+		r.logger.V(logutil.DEFAULT).Info("group-scheduler: no session-identity plugin in the config — the derived branch is the branch key on every request")
 	}
 	return nil
 }
@@ -606,7 +606,7 @@ func (r *GroupScheduler) forgetEndpoint(ep metricsSource) {
 	delete(r.endpoints, key)
 	delete(r.hetero, key)
 	r.capMu.Unlock()
-	// tear the engine's group down: its members are exited, their homing
+	// tear the engine's group down: its branches are exited, their homing
 	// released, its budget/index dropped (leaving charges on a dead engine
 	// poisons every later budget decision on a scale-down).
 	r.sched.RemoveEngine(key, time.Now())
@@ -698,7 +698,7 @@ func (r *GroupScheduler) pollCapacity(now time.Time) {
 
 // Saturation answers the flow controller's pool gate: 0.0 (NOT saturated), always. The
 // seat budget is the admission control — this policy only ever releases requests of
-// members it has seated, so a pool-level gate has nothing left to decide.
+// branches it has seated, so a pool-level gate has nothing left to decide.
 //
 // It still stores the LIVE candidate set on the way (a no-op unless the set changed):
 // that set is the ticker's capacity-retry input, and this hook is the only place the
@@ -779,11 +779,11 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 		if h == nil {
 			return true
 		}
-		member, source := "", ""
+		branch, source := "", ""
 		reqID, size, fid := "", int64(0), ""
 		if req := h.OriginalRequest(); req != nil {
 			if ir := req.InferenceRequest(); ir != nil {
-				member, source = r.memberOf(ir)
+				branch, source = r.branchOf(ir)
 				reqID = ir.RequestID
 				fid = ir.FairnessID // the wire-level identity (the queue key)
 				size = int64(ir.RequestSizeBytes)
@@ -793,7 +793,7 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 			}
 		}
 		queues = append(queues, q)
-		heads = append(heads, Head{Member: member, Source: source,
+		heads = append(heads, Head{Branch: branch, Source: source,
 			FairnessID: fid, ReqID: reqID, Arrival: h.EnqueueTime(), SizeBytes: size,
 		})
 		return true
@@ -838,7 +838,7 @@ func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.Inferen
 			return err // the loud mismatch failure
 		}
 	}
-	id, _ := r.memberOf(request)
+	id, _ := r.branchOf(request)
 	if id == "" {
 		return nil
 	}
@@ -849,7 +849,7 @@ func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.Inferen
 	request.PutAttribute(requestKeysKey, keys)
 	size := int64(request.RequestSizeBytes)
 	// The engine here is AUTHORITATIVE (the pendingEngine idiom): Pick
-	// charged the seat to the member's homed engine, and the framework's
+	// charged the seat to the branch's homed engine, and the framework's
 	// actual choice moves that charge if it disagrees.
 	r.sched.DispatchedOnUsage(id, request.RequestID, engine, keys, size, time.Now())
 	return nil
@@ -878,7 +878,7 @@ func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.Infer
 	if request == nil || response == nil {
 		return
 	}
-	id, _ := r.memberOf(request)
+	id, _ := r.branchOf(request)
 	if id == "" {
 		return
 	}
@@ -948,7 +948,7 @@ func configEcho(cfg Config) string {
 func (r *GroupScheduler) logPolicy() {
 	cfg := r.cfg
 	r.logger.V(logutil.DEFAULT).Info("group-scheduler: policy",
-		"identity", "derived branch (the member is the queue key)",
+		"identity", "derived branch (the branch is the queue key)",
 		"sizing", "seat budget = groupBudgetFraction x num_gpu_blocks, footprint from the engine's own block index",
 		"admission", "one shared queue, newcomer-first then oldest; most free budget where the head fits, tie -> lowest engine id",
 		"rotation", fmt.Sprintf("fixed quantum Q=%d completed busy periods, or silence > %vs", cfg.quantum(), cfg.IdleSeconds),

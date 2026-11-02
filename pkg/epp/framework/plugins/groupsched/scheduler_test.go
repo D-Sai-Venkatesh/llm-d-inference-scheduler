@@ -47,7 +47,7 @@ func keys(n int, seed Hash) []Hash {
 // (the estimate path's convention).
 func bytesFor(blocks int) int64 { return int64(blocks) * 4 * 64 }
 
-// seedFor derives a DISTINCT block key set per (member, size) — two members must not
+// seedFor derives a DISTINCT block key set per (branch, size) — two branches must not
 // share blocks by accident, or the index's dedup would hide the second one's footprint.
 func seedFor(id string) Hash {
 	h := Hash(1469598103934665603)
@@ -57,9 +57,9 @@ func seedFor(id string) Hash {
 	return h
 }
 
-// head is one queue head for member id (ago = how long it has waited).
+// head is one queue head for branch id (ago = how long it has waited).
 func head(id string, ago time.Duration, sizeBytes int64) Head {
-	return Head{Member: id, ReqID: "r-" + id, Arrival: time.Now().Add(-ago), SizeBytes: sizeBytes}
+	return Head{Branch: id, ReqID: "r-" + id, Arrival: time.Now().Add(-ago), SizeBytes: sizeBytes}
 }
 
 // dispatch drives the released-request path: Pick chose the head, the producer
@@ -114,17 +114,17 @@ func forEnginesCap(t *testing.T, cfg Config, capacity int, fn func(t *testing.T,
 	}
 }
 
-// member finds a seated member and the engine it holds, on any engine.
-func (fx *engineSet) member(t *testing.T, id string) (*member, *engineGroup) {
+// branch finds a seated branch and the engine it holds, on any engine.
+func (fx *engineSet) branch(t *testing.T, id string) (*branch, *engineGroup) {
 	t.Helper()
 	fx.s.mu.Lock()
 	defer fx.s.mu.Unlock()
 	for _, g := range fx.allGroups() {
-		if m, ok := g.members[id]; ok {
+		if m, ok := g.branches[id]; ok {
 			return m, g
 		}
 	}
-	t.Fatalf("member %s is not seated on any engine", id)
+	t.Fatalf("branch %s is not seated on any engine", id)
 	return nil, nil
 }
 
@@ -151,18 +151,18 @@ func (fx *engineSet) pickEngine(hs ...Head) (string, int) {
 	return fx.s.PickFromHeadsEngine(hs, fx.clock)
 }
 
-// seatOn seats one member on a NAMED engine through the public path (the seat-time
+// seatOn seats one branch on a NAMED engine through the public path (the seat-time
 // choice must agree with the ask, or the test's premise is broken).
 func (fx *engineSet) seatOn(t *testing.T, engine, id string, blocks int, ago time.Duration) {
 	t.Helper()
 	fx.seatOne(t, id, blocks, ago)
 	if got := fx.s.bindings[id]; got != engine {
-		t.Fatalf("member %s seated on %s, wanted %s", id, got, engine)
+		t.Fatalf("branch %s seated on %s, wanted %s", id, got, engine)
 	}
 }
 
 // tighten makes room scarce on the FIRST engine and absent everywhere else: the
-// test seats its own members first, then every OTHER engine is filled to its budget
+// test seats its own branches first, then every OTHER engine is filled to its budget
 // with one 950-block filler (the most-free-budget rule puts each one there). A test
 // that asserts "only one seat fits" is then true at N=1 and at N=2 alike.
 func (fx *engineSet) tighten(t *testing.T) {
@@ -176,7 +176,7 @@ func (fx *engineSet) tighten(t *testing.T) {
 	}
 	fx.s.mu.Lock()
 	for _, g := range fx.allGroups() {
-		for _, m := range g.members {
+		for _, m := range g.branches {
 			m.lastActivity = fx.clock
 		}
 	}
@@ -196,38 +196,38 @@ func newSched(t *testing.T) *Scheduler {
 	return s
 }
 
-// seatOne seats one member on the fixture through the public path.
+// seatOne seats one branch on the fixture through the public path.
 func (fx *engineSet) seatOne(t *testing.T, id string, blocks int, ago time.Duration) {
 	t.Helper()
 	h := head(id, ago, bytesFor(blocks))
 	if i := fx.pick(h); i < 0 {
-		t.Fatalf("member %s must be seated", id)
+		t.Fatalf("branch %s must be seated", id)
 	}
 	dispatch(t, fx.s, id, keys(blocks, seedFor(id)), bytesFor(blocks))
 }
 
 // ---- the tests ----
 
-// A member with a queued head dispatches immediately once seated; an unknown member
-// is never seated by dispatching to it (non-members never run unseated).
+// A branch with a queued head dispatches immediately once seated; an unknown branch
+// is never seated by dispatching to it (non-branches never run unseated).
 func TestMemberServedAndUnknownNeverSeated(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 100, time.Second)
 		if i := fx.pick(head("m", time.Second, bytesFor(100))); i != 0 {
-			t.Fatalf("a seated member's head must dispatch, got %d", i)
+			t.Fatalf("a seated branch's head must dispatch, got %d", i)
 		}
 		if !fx.s.Seated("m") {
-			t.Fatal("the member must be seated")
+			t.Fatal("the branch must be seated")
 		}
 		settle(fx.s, "m", 100, 100)
 		if fx.s.Sessions() != 1 {
-			t.Fatalf("only the seated member has a record, got %d", fx.s.Sessions())
+			t.Fatalf("only the seated branch has a record, got %d", fx.s.Sessions())
 		}
 	})
 }
 
 // Newcomers go first among the WAITING heads (D1 as f0p ran it), and the seat goes
-// to the newcomer even though the returning member has waited longer.
+// to the newcomer even though the returning branch has waited longer.
 func TestNewcomerFirstThenOldest(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		// fill EVERY engine's budget so exactly ONE of the two queued heads can be
@@ -236,7 +236,7 @@ func TestNewcomerFirstThenOldest(t *testing.T) {
 		fx.seatOne(t, "filler", 800, 5*time.Second)
 		settle(fx.s, "filler", 800, 800)
 		fx.tighten(t)
-		// the returning member HAS been served before (non-newcomer); the other has not
+		// the returning branch HAS been served before (non-newcomer); the other has not
 		fx.s.mu.Lock()
 		fx.s.everSeated["ret"] = struct{}{}
 		fx.s.mu.Unlock()
@@ -246,7 +246,7 @@ func TestNewcomerFirstThenOldest(t *testing.T) {
 			t.Fatal("the newcomer must be seated first (D1 newcomer-first)")
 		}
 		if fx.s.Seated("ret") {
-			t.Fatal("only one seat fits: the returning member must wait behind the newcomer")
+			t.Fatal("only one seat fits: the returning branch must wait behind the newcomer")
 		}
 	})
 }
@@ -270,7 +270,7 @@ func TestOldestWaiterIsTheHead(t *testing.T) {
 	})
 }
 
-// The quantum Q is the tenure rule: a member that completed Q busy periods is
+// The quantum Q is the tenure rule: a branch that completed Q busy periods is
 // rotation-eligible, one mid-quantum is not. Q4 vs Q8 is a VALUE, same code.
 func TestQuantumIsTheTenureRule(t *testing.T) {
 	for _, q := range []int{4, 8} {
@@ -282,7 +282,7 @@ func TestQuantumIsTheTenureRule(t *testing.T) {
 				fx.seatOne(t, "m", 400, time.Second)
 				settle(fx.s, "m", 400, 400) // one busy period completes (main chain drains)
 				fx.s.mu.Lock()
-				m := fx.g().members["m"]
+				m := fx.g().branches["m"]
 				bp := m.busyPeriods
 				_, eligible := fx.s.eligibleLocked(m, fx.clock)
 				fx.s.mu.Unlock()
@@ -290,7 +290,7 @@ func TestQuantumIsTheTenureRule(t *testing.T) {
 					t.Fatalf("one drained main-chain request is one busy period, got %d", bp)
 				}
 				if eligible {
-					t.Fatalf("Q=%d: a member with 1 busy period must NOT be rotation-eligible", q)
+					t.Fatalf("Q=%d: a branch with 1 busy period must NOT be rotation-eligible", q)
 				}
 				for i := 1; i < q; i++ {
 					fx.s.mu.Lock()
@@ -308,29 +308,29 @@ func TestQuantumIsTheTenureRule(t *testing.T) {
 	}
 }
 
-// A member in flight is NEVER eligible: rotation must not evict running work.
+// A branch in flight is NEVER eligible: rotation must not evict running work.
 func TestInFlightNeverEligible(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 100, time.Second)
 		fx.s.mu.Lock()
-		m := fx.g().members["m"]
+		m := fx.g().branches["m"]
 		m.busyPeriods = 100 // way past any Q
 		m.inflight = 1
 		_, ok := fx.s.eligibleLocked(m, fx.clock)
 		fx.s.mu.Unlock()
 		if ok {
-			t.Fatal("a member with a request in flight must never be rotation-eligible")
+			t.Fatal("a branch with a request in flight must never be rotation-eligible")
 		}
 	})
 }
 
 // The budget valve (MEMORY PRESSURE): when an engine's footprint grows past its
-// budget, the victim is the DONE member (no queued turn) — never the member that is
+// budget, the victim is the DONE branch (no queued turn) — never the branch that is
 // waiting to run (f0p's order).
 func TestBudgetValvePrefersTheDoneMember(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-		// order matters: the first member lands on e0 (id tie), THEN the other
-		// engines are closed off, so the second member has to share e0
+		// order matters: the first branch lands on e0 (id tie), THEN the other
+		// engines are closed off, so the second branch has to share e0
 		fx.seatOne(t, "done", 450, 5*time.Second)
 		settle(fx.s, "done", 450, 450) // finished its turn: no queued head
 		fx.tighten(t)
@@ -338,23 +338,23 @@ func TestBudgetValvePrefersTheDoneMember(t *testing.T) {
 		// `busy` wants to run again (a queued head), and its request GROWS to 200
 		// blocks: 450 + 450 + 200 > 950 budget => the valve must fire
 		fx.s.mu.Lock()
-		fx.g().members["busy"].waitingSince = fx.clock.Add(-time.Second)
-		fx.g().members["busy"].lastActivity = fx.clock
+		fx.g().branches["busy"].waitingSince = fx.clock.Add(-time.Second)
+		fx.g().branches["busy"].lastActivity = fx.clock
 		fx.s.mu.Unlock()
 		if i := fx.pick(head("busy", time.Second, bytesFor(200))); i != 0 {
-			t.Fatalf("the member's grown head must dispatch, got %d", i)
+			t.Fatalf("the branch's grown head must dispatch, got %d", i)
 		}
 		dispatch(t, fx.s, "busy", keys(200, 77), bytesFor(200)) // the growth lands
 		fx.s.Tick(fx.clock)                                     // and the valve enforces it
 		fx.s.mu.Lock()
-		_, doneSeated := fx.g().members["done"]
-		_, busySeated := fx.g().members["busy"]
+		_, doneSeated := fx.g().branches["done"]
+		_, busySeated := fx.g().branches["busy"]
 		fx.s.mu.Unlock()
 		if doneSeated {
-			t.Fatal("the DONE member (no queued turn) must be the budget victim")
+			t.Fatal("the DONE branch (no queued turn) must be the budget victim")
 		}
 		if !busySeated {
-			t.Fatal("the member with a queued turn must survive (f0p's valve order)")
+			t.Fatal("the branch with a queued turn must survive (f0p's valve order)")
 		}
 		if snap := fx.s.Snapshot(); snap.Exits["budget-noqueue"] == 0 && snap.Exits["budget-idle"] == 0 {
 			t.Fatalf("the exit must be a budget-class exit, got %v", snap.Exits)
@@ -362,7 +362,7 @@ func TestBudgetValvePrefersTheDoneMember(t *testing.T) {
 	})
 }
 
-// No eviction while in flight: a member with a running request is marked exiting at
+// No eviction while in flight: a branch with a running request is marked exiting at
 // most, never removed, until the drain completes.
 func TestNoEvictionWhileInFlight(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
@@ -372,25 +372,25 @@ func TestNoEvictionWhileInFlight(t *testing.T) {
 		// m's first turn is still running when its second (grown) head is served
 		i := fx.pick(head("m", time.Millisecond, bytesFor(700)))
 		if i != 0 {
-			t.Fatalf("the member's second head must be served (in-flight cap), got %d", i)
+			t.Fatalf("the branch's second head must be served (in-flight cap), got %d", i)
 		}
 		dispatch(t, fx.s, "m", keys(700, 3), bytesFor(700))
 		fx.s.Tick(fx.clock)
 		if !fx.s.Seated("m") {
-			t.Fatal("a member in flight must never be evicted (marked exiting at most)")
+			t.Fatal("a branch in flight must never be evicted (marked exiting at most)")
 		}
 		settle(fx.s, "m", 400, 0)
 		settle(fx.s, "m", 700, 0)
 		if fx.s.Seated("m") {
-			t.Fatal("after the drain the exiting member must leave")
+			t.Fatal("after the drain the exiting branch must leave")
 		}
 
 	})
 }
 
 // AN EXITING MEMBER'S BLOCKS STAY ON THE USED SIDE UNTIL IT DRAINS. Marking a
-// member exiting says "do not dispatch, do not re-seat" — it says nothing about the
-// engine, which keeps the member's blocks pinned until the running request finishes.
+// branch exiting says "do not dispatch, do not re-seat" — it says nothing about the
+// engine, which keeps the branch's blocks pinned until the running request finishes.
 // Excluding them from the budget at the mark was a plain accounting bug: the budget
 // then believed it had 14-18 % of the pool free while the pool was still paying for
 // it (measured on the multi-pod wave).
@@ -399,7 +399,7 @@ func TestExitingMemberStaysOnTheUsedSideUntilDrain(t *testing.T) {
 		for i := range fx.ids {
 			fx.seatOne(t, fmt.Sprintf("m%d", i), 400, time.Duration(5+i)*time.Second)
 		}
-		min, g := fx.member(t, "m0")
+		min, g := fx.branch(t, "m0")
 		fx.s.mu.Lock()
 		// in flight and marked exiting (the mid-flight pressure class)
 		min.inflightIDs = map[string]inflightRec{"r-m0": {since: fx.clock, confirmed: true}}
@@ -411,7 +411,7 @@ func TestExitingMemberStaysOnTheUsedSideUntilDrain(t *testing.T) {
 		freeAfter := fx.s.freeBudgetLocked(g)
 		fx.s.mu.Unlock()
 		if neAfter != neBefore {
-			t.Fatalf("marking a member exiting released %d blocks from the used side (NE %d -> %d)",
+			t.Fatalf("marking a branch exiting released %d blocks from the used side (NE %d -> %d)",
 				neBefore-neAfter, neBefore, neAfter)
 		}
 		if freeAfter != freeBefore {
@@ -422,32 +422,32 @@ func TestExitingMemberStaysOnTheUsedSideUntilDrain(t *testing.T) {
 		settle(fx.s, "m0", 400, 400)
 		fx.s.mu.Lock()
 		defer fx.s.mu.Unlock()
-		if _, seated := g.members["m0"]; seated {
-			t.Fatal("a drained exiting member must leave")
+		if _, seated := g.branches["m0"]; seated {
+			t.Fatal("a drained exiting branch must leave")
 		}
 		if got := g.index.UniqueBlocksNELocked(); got >= neBefore {
-			t.Fatalf("the drain did not release the member's blocks: NE %d want < %d", got, neBefore)
+			t.Fatalf("the drain did not release the branch's blocks: NE %d want < %d", got, neBefore)
 		}
 	})
 }
 
-// An exiting member that cannot be freed must END the enforcement pass: marking is
+// An exiting branch that cannot be freed must END the enforcement pass: marking is
 // idempotent and its blocks stay charged, so re-picking it would spin the loop
 // forever under the scheduler's mutex.
 func TestExitingVictimDoesNotSpinEnforcement(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 900, 2*time.Second)
-		m, g := fx.member(t, "m")
+		m, g := fx.branch(t, "m")
 		fx.s.mu.Lock()
 		m.inflightIDs = map[string]inflightRec{"r-m": {since: fx.clock, confirmed: true}}
 		m.inflight = 1
 		g.index.MarkExitingLocked("m")
-		// way over budget with the only member already exiting
+		// way over budget with the only branch already exiting
 		g.budgetBlocks = 100
 		fx.s.mu.Unlock()
 		// The enforcement pass runs BEFORE Tick's queue re-sync, so a clock this far
 		// ahead leaves the queue view untrustworthy — the one path that names an
-		// already-exiting member as the victim.
+		// already-exiting branch as the victim.
 		fx.clock = fx.clock.Add(60 * time.Second)
 		done := make(chan struct{})
 		go func() {
@@ -460,7 +460,7 @@ func TestExitingVictimDoesNotSpinEnforcement(t *testing.T) {
 			t.Fatal("Tick spun: an exiting in-flight victim was re-picked forever")
 		}
 		if !fx.s.Seated("m") {
-			t.Fatal("the exiting member must still be seated (it drains, it is not evicted)")
+			t.Fatal("the exiting branch must still be seated (it drains, it is not evicted)")
 		}
 	})
 }
@@ -507,21 +507,21 @@ func TestColdEntryValveIsPerEngine(t *testing.T) {
 	})
 }
 
-// Anonymous traffic (R9) is served when no member head is dispatchable, is never
-// tracked, and never outranks a member's head.
+// Anonymous traffic (R9) is served when no branch head is dispatchable, is never
+// tracked, and never outranks a branch's head.
 func TestAnonymousPassThrough(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-		anon := Head{Member: "", ReqID: "anon-1", Arrival: fx.clock.Add(-time.Second), SizeBytes: 1000}
+		anon := Head{Branch: "", ReqID: "anon-1", Arrival: fx.clock.Add(-time.Second), SizeBytes: 1000}
 		if i := fx.pick(anon); i != 0 {
-			t.Fatalf("an anonymous head must be served when no member head is dispatchable, got %d", i)
+			t.Fatalf("an anonymous head must be served when no branch head is dispatchable, got %d", i)
 		}
 		if fx.s.Sessions() != 0 {
 			t.Fatal("anonymous traffic must not be tracked")
 		}
 		fx.seatOne(t, "m", 10, time.Second)
-		anonLater := Head{Member: "", ReqID: "anon-2", Arrival: fx.clock, SizeBytes: 1000}
+		anonLater := Head{Branch: "", ReqID: "anon-2", Arrival: fx.clock, SizeBytes: 1000}
 		if i := fx.pick(anonLater, head("m", time.Second, bytesFor(10))); i != 1 {
-			t.Fatalf("the member's head must outrank the anonymous one: got %d", i)
+			t.Fatalf("the branch's head must outrank the anonymous one: got %d", i)
 		}
 	})
 }
@@ -529,15 +529,15 @@ func TestAnonymousPassThrough(t *testing.T) {
 // Hold the line: a blocked head does not let a later, smaller head jump it.
 func TestHoldTheLine(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-		// both residents must live on ONE engine, so the tests' own members are seated
+		// both residents must live on ONE engine, so the tests' own branches are seated
 		// first (the first lands on e0 by the id tie) and THEN the other engines are
 		// closed off; a resident that still lands elsewhere makes the shape invalid
 		fx.seatOne(t, "m1", 450, 3*time.Second)
 		settle(fx.s, "m1", 450, 450)
 		fx.tighten(t)
 		fx.seatOne(t, "m2", 450, 2*time.Second)
-		m1, g1 := fx.member(t, "m1")
-		m2, g2 := fx.member(t, "m2")
+		m1, g1 := fx.branch(t, "m1")
+		m2, g2 := fx.branch(t, "m2")
 		if g1 != g2 {
 			t.Skip("residents landed on different engines; the hold-the-line shape needs them together")
 		}
@@ -558,9 +558,9 @@ func TestHoldTheLine(t *testing.T) {
 			if i == 2 {
 				t.Fatal("hold the line violated: small jumped the blocked big head")
 			}
-			if i >= 0 && hs[i].Member != "" {
-				dispatch(t, fx.s, hs[i].Member, keys(400, 9), bytesFor(400))
-				settle(fx.s, hs[i].Member, 400, 400)
+			if i >= 0 && hs[i].Branch != "" {
+				dispatch(t, fx.s, hs[i].Branch, keys(400, 9), bytesFor(400))
+				settle(fx.s, hs[i].Branch, 400, 400)
 			}
 		}
 	})
@@ -582,10 +582,10 @@ func TestNoStarvation(t *testing.T) {
 		gotSeat := map[string]bool{}
 		// The synthetic head list has to rotate: with the cold-entry cap derived from
 		// the engine (50 blocks here) a seam is only admitted while the engine's cold
-		// slot is free, and a slot is freed when the seated member's head RUNS. Two
-		// heads with the same synthetic arrival let one member win every Pick, so the
+		// slot is free, and a slot is freed when the seated branch's head RUNS. Two
+		// heads with the same synthetic arrival let one branch win every Pick, so the
 		// other stayed seated-but-never-dispatched and the test measured that artifact
-		// instead of starvation. The least-served member gets the oldest head.
+		// instead of starvation. The least-served branch gets the oldest head.
 		served := map[string]int{}
 		maxServed := func() int {
 			m := 0
@@ -632,7 +632,7 @@ func TestNoStarvation(t *testing.T) {
 				if i < 0 {
 					break
 				}
-				id := hs[i].Member
+				id := hs[i].Branch
 				if id != "" && fx.s.Seated(id) {
 					dispatch(t, fx.s, id, keys(300, Hash(uint64(id[len(id)-1]))), bytesFor(300))
 					settle(fx.s, id, 300, 300)
@@ -647,16 +647,16 @@ func TestNoStarvation(t *testing.T) {
 	})
 }
 
-// TTL: a silent, unseated record is forgotten; a member with a live head is not.
+// TTL: a silent, unseated record is forgotten; a branch with a live head is not.
 func TestTTLForgetsSilentRecordsKeepsWaiters(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "quiet", 100, time.Second)
 		settle(fx.s, "quiet", 100, 100)
-		// a second member seats, then leaves so it is a returning WAITER — its record
+		// a second branch seats, then leaves so it is a returning WAITER — its record
 		// must survive any TTL while it has a live head
 		fx.seatOne(t, "waiter", 100, time.Second)
 		settle(fx.s, "waiter", 100, 100)
-		m, g := fx.member(t, "waiter")
+		m, g := fx.branch(t, "waiter")
 		fx.s.mu.Lock()
 		fx.s.exitLocked(g, m, "test", fx.clock)
 		fx.s.mu.Unlock()
@@ -674,18 +674,18 @@ func TestTTLForgetsSilentRecordsKeepsWaiters(t *testing.T) {
 	})
 }
 
-// C8: a member with a queued head is not idle — gate closure (no Picks) must not
+// C8: a branch with a queued head is not idle — gate closure (no Picks) must not
 // manufacture idle exits.
 func TestWaitingMemberIsNotIdleEvicted(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 400, time.Second)
 		settle(fx.s, "m", 400, 400)
 		fx.s.mu.Lock()
-		fx.g().members["m"].waitingSince = fx.clock.Add(-time.Minute)
+		fx.g().branches["m"].waitingSince = fx.clock.Add(-time.Minute)
 		fx.s.mu.Unlock()
 		fx.tick(5 * time.Minute) // no Picks at all: the gate is "closed"
 		if !fx.s.Seated("m") {
-			t.Fatal("a member with a queued turn must not be idle-evicted while no Picks run (C8)")
+			t.Fatal("a branch with a queued turn must not be idle-evicted while no Picks run (C8)")
 		}
 	})
 }
@@ -701,7 +701,7 @@ func TestProvisionalInflightReaped(t *testing.T) {
 		h2.ReqID = "r-m-2"
 		fx.pick(h2)
 		fx.s.mu.Lock()
-		m := fx.g().members["m"]
+		m := fx.g().branches["m"]
 		before := m.inflight
 		fx.s.mu.Unlock()
 		if before != 2 {
@@ -709,7 +709,7 @@ func TestProvisionalInflightReaped(t *testing.T) {
 		}
 		fx.tick(31 * time.Second)
 		fx.s.mu.Lock()
-		after := fx.g().members["m"].inflight
+		after := fx.g().branches["m"].inflight
 		fx.s.mu.Unlock()
 		if after != 1 {
 			t.Fatalf("the provisional id must be reaped, %d in flight remain", after)
@@ -741,7 +741,7 @@ func TestSeatExitEventsCarryFairnessIDAndEngine(t *testing.T) {
 		h := head("m", time.Second, bytesFor(100))
 		h.FairnessID = "thread-7"
 		if i := fx.pick(h); i != 0 {
-			t.Fatal("the member must seat")
+			t.Fatal("the branch must seat")
 		}
 		dispatch(t, fx.s, "m", keys(100, 1), bytesFor(100))
 		evs := fx.s.Events()
@@ -762,7 +762,7 @@ func TestSeatExitEventsCarryFairnessIDAndEngine(t *testing.T) {
 			t.Fatalf("the SEAT event must carry the wire identity (%s), got %q", want, seat.Detail)
 		}
 		fx.s.mu.Lock()
-		m := fx.g().members["m"]
+		m := fx.g().branches["m"]
 		fx.s.exitLocked(fx.g(), m, "test", fx.clock)
 		fx.s.mu.Unlock()
 		evs = fx.s.Events()
@@ -786,8 +786,8 @@ func contains(s, sub string) bool {
 	return false
 }
 
-// BUG 2: the MID-QUANTUM victim order never takes a seat back from a member that has
-// not served a turn in this residency while a member that HAS served one is available.
+// BUG 2: the MID-QUANTUM victim order never takes a seat back from a branch that has
+// not served a turn in this residency while a branch that HAS served one is available.
 func TestClass3VictimPrefersAServedMember(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		// two residents, both with a queued head (so class 2 finds nothing), neither
@@ -796,7 +796,7 @@ func TestClass3VictimPrefersAServedMember(t *testing.T) {
 		settle(fx.s, "served", 200, 200) // served one turn
 		fx.seatOne(t, "fresh", 200, 8*time.Second)
 		for _, id := range []string{"served", "fresh"} {
-			m, _ := fx.member(t, id)
+			m, _ := fx.branch(t, id)
 			fx.s.mu.Lock()
 			m.waitingSince = fx.clock.Add(-time.Second)
 			m.lastActivity = fx.clock
@@ -805,7 +805,7 @@ func TestClass3VictimPrefersAServedMember(t *testing.T) {
 			fx.s.mu.Unlock()
 		}
 		var reason string
-		var victim *member
+		var victim *branch
 		fx.s.mu.Lock()
 		fx.s.queueViewAt = fx.clock // a trustworthy queue view (both have heads)
 		reason, victim = fx.s.budgetVictimLocked(fx.g(), fx.clock)
@@ -814,15 +814,15 @@ func TestClass3VictimPrefersAServedMember(t *testing.T) {
 			t.Fatal("a victim must exist")
 		}
 		if victim.id == "fresh" {
-			t.Fatalf("BUG 2: a member that has served ZERO turns must not be taken before one that has (reason=%s)", reason)
+			t.Fatalf("BUG 2: a branch that has served ZERO turns must not be taken before one that has (reason=%s)", reason)
 		}
 		if victim.id != "served" {
-			t.Fatalf("expected the served member, got %s", victim.id)
+			t.Fatalf("expected the served branch, got %s", victim.id)
 		}
 	})
 }
 
-// BUG 3 (the C8 race): a head that arrives just before a Tick protects its member, and
+// BUG 3 (the C8 race): a head that arrives just before a Tick protects its branch, and
 // a STALE queue view must never justify an idle eviction.
 func TestStaleQueueViewNeverIdleEvicts(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
@@ -832,12 +832,12 @@ func TestStaleQueueViewNeverIdleEvicts(t *testing.T) {
 		fx.pick(head("m", time.Second, bytesFor(200)))
 		fx.tick(25 * time.Second) // silence past S, but the head is queued
 		if !fx.s.Seated("m") {
-			t.Fatal("BUG 3: a head present at the last sync must protect its member from an idle eviction")
+			t.Fatal("BUG 3: a head present at the last sync must protect its branch from an idle eviction")
 		}
 		// (b) no Pick has run for longer than S (the flow controller's gate is closed):
 		// the queue view is stale, so silence is NOT evidence and nothing may be evicted
 		fx.s.mu.Lock()
-		m := fx.g().members["m"]
+		m := fx.g().branches["m"]
 		m.waitingSince = time.Time{} // the flag went stale exactly as in the race
 		m.lastActivity = fx.clock.Add(-time.Hour)
 		fx.s.mu.Unlock()
@@ -849,27 +849,27 @@ func TestStaleQueueViewNeverIdleEvicts(t *testing.T) {
 }
 
 // BUG 4(a): a mid-flight exit reaches the exit HOOK (the metric series), not only the
-// snapshot. BUG 4(b): a rotation victim is never a member with something in flight.
+// snapshot. BUG 4(b): a rotation victim is never a branch with something in flight.
 func TestExitingIsCountedAndRotationNeverPicksInflight(t *testing.T) {
 	cfg := defaultConfig()
 	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
 		var hooked []string
 		fx.s.onExit = func(engine, reason string, turns int) { hooked = append(hooked, reason) }
-		// a member filling most of the budget, in flight
+		// a branch filling most of the budget, in flight
 		fx.seatOne(t, "run", 800, 5*time.Second)
 		// over budget by growth: the pressure module takes the mid-flight class
 		fx.s.mu.Lock()
-		m := fx.g().members["run"]
+		m := fx.g().branches["run"]
 		m.waitingSince = time.Time{}
 		m.lastActivity = fx.clock.Add(-time.Hour) // silent, so class 2 has a victim...
 		fx.s.mu.Unlock()
-		// ...but the member is in flight, so class 2 skips it: force class 4 by making
-		// every member in flight and the engine over budget
+		// ...but the branch is in flight, so class 2 skips it: force class 4 by making
+		// every branch in flight and the engine over budget
 		fx.dispatchBig(t, "run", 400)
 		fx.s.mu.Lock()
 		fx.s.enforceBudgetLocked(fx.g(), fx.clock)
 		fx.s.mu.Unlock()
-		// (b) the rotation never returns an in-flight member
+		// (b) the rotation never returns an in-flight branch
 		fx.s.mu.Lock()
 		_, rv := fx.s.rotationVictimLocked(fx.g(), fx.clock)
 		fx.s.mu.Unlock()
@@ -889,14 +889,14 @@ func TestExitingIsCountedAndRotationNeverPicksInflight(t *testing.T) {
 	})
 }
 
-// dispatchBig grows a member's footprint with an extra request (the pressure path's
+// dispatchBig grows a branch's footprint with an extra request (the pressure path's
 // trigger), through the public API.
 func (fx *engineSet) dispatchBig(t *testing.T, id string, blocks int) {
 	t.Helper()
 	h := head(id, time.Second, bytesFor(blocks))
 	h.ReqID = "r-" + id + "-grow"
 	if i := fx.pick(h); i < 0 {
-		t.Fatalf("the member's growth head must dispatch, got %d", i)
+		t.Fatalf("the branch's growth head must dispatch, got %d", i)
 	}
 	fx.s.Dispatched(id, h.ReqID, keys(blocks, seedFor(id)+97), bytesFor(blocks), fx.clock)
 }

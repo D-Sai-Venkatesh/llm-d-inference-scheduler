@@ -47,7 +47,7 @@ type groupMetrics struct {
 	neBlocks     *prometheus.GaugeVec
 	budgetBlocks *prometheus.GaugeVec
 	// The EXITING ledger: the enforcement view's inputs, per engine. (iii) made the
-	// used side include members that are already leaving, so "how much of it is
+	// used side include branches that are already leaving, so "how much of it is
 	// leaving" is a first-class number: without these three, an engine that is busy
 	// and an engine whose drains have stopped look the same in every other series.
 	exitingBranches *prometheus.GaugeVec
@@ -74,7 +74,7 @@ type groupMetrics struct {
 	capacityMissing *prometheus.GaugeVec
 	capacityLearned *prometheus.CounterVec
 
-	// affinityViolations counts requests that landed off their member's seat engine.
+	// affinityViolations counts requests that landed off their branch's seat engine.
 	affinityViolations *prometheus.CounterVec
 	rebinds            prometheus.Counter
 	engineGone         prometheus.Counter
@@ -98,15 +98,15 @@ func newGroupMetrics(sched *Scheduler) *groupMetrics {
 
 func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.seats = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "seats",
-		Help: "seated members (residencies) on this engine"}, engineLabels)
+		Help: "seated branches (residencies) on this engine"}, engineLabels)
 	g.exitingBranches = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "exiting_branches",
 		Help: "branches on this engine that have been marked exiting and still hold their seat until their in-flight requests drain"}, engineLabels)
 	g.exitingBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "exiting_blocks",
-		Help: "distinct blocks of this engine's ne_blocks that belong to exiting members: the part of the used side that is already leaving (admission still refuses it, enforcement no longer evicts for it)"}, engineLabels)
+		Help: "distinct blocks of this engine's ne_blocks that belong to exiting branches: the part of the used side that is already leaving (admission still refuses it, enforcement no longer evicts for it)"}, engineLabels)
 	g.exitingOldest = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "exiting_oldest_age_seconds",
 		Help: "how long this engine's OLDEST exiting branch has been on its way out (a value that only grows is a drain that is not happening)"}, engineLabels)
 	g.neBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "ne_blocks",
-		Help: "distinct blocks charged to this engine's budget: every seated member's set, exiting members included until they drain"}, engineLabels)
+		Help: "distinct blocks charged to this engine's budget: every seated branch's set, exiting branches included until they drain"}, engineLabels)
 	g.budgetBlocks = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "budget_blocks",
 		Help: "seat budget in blocks (groupBudgetFraction x this engine's num_gpu_blocks)"}, engineLabels)
 	g.coldInFlight = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "cold_inflight_tokens",
@@ -118,7 +118,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.queueViewUntrusted = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "queue_view_untrusted_passes_total",
 		Help: "budget-enforcement passes whose victim choice ran with a queue view older than idleSeconds (the C8 guard skipped the head-presence classes)"})
 	g.exits = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "exits_total",
-		Help: "member exits by reason"}, []string{"engine", "reason"})
+		Help: "branch exits by reason"}, []string{"engine", "reason"})
 	g.entryWait = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "entry_wait_seconds",
 		Help:    "seat waits by kind (new = a branch's first turn, reentry = a returning branch): how long admission made it wait, TOP BUCKET 13,107 s so nothing lands only in +Inf",
 		Buckets: prometheus.ExponentialBuckets(0.1, 2, 18)}, []string{"engine", "kind"})
@@ -129,7 +129,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.capacityLearned = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "capacity_learned_total",
 		Help: "how each engine's capacity was acquired"}, []string{"via", "engine"})
 	g.affinityViolations = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "affinity_violations_total",
-		Help: "requests that landed on an engine other than the member's seat (an invariant: must be 0)"}, []string{"from", "to"})
+		Help: "requests that landed on an engine other than the branch's seat (an invariant: must be 0)"}, []string{"from", "to"})
 	g.rebinds = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "rebinds_total",
 		Help: "seat moves repaired by the observed endpoint winning"})
 	g.engineGone = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "engine_gone_total",
@@ -210,7 +210,7 @@ func (g *groupMetrics) Refresh() {
 	}
 }
 
-// ObserveExit records a member exit (the reason + engine).
+// ObserveExit records a branch exit (the reason + engine).
 func (g *groupMetrics) ObserveExit(engine, reason string) {
 	if g == nil || g.exits == nil {
 		return
@@ -236,7 +236,7 @@ func (g *groupMetrics) ObserveServed(engine string) {
 	g.served.WithLabelValues(engine).Inc()
 }
 
-// ObserveAffinityViolation records a request that landed off its member's seat
+// ObserveAffinityViolation records a request that landed off its branch's seat
 // engine (and the rebind that repaired it).
 func (g *groupMetrics) ObserveAffinityViolation(from, to string) {
 	if g == nil || g.affinityViolations == nil {

@@ -34,7 +34,7 @@ package groupsched
 // partial block), PreRequest lands them — and then reads back three numbers for the
 // same request:
 //
-//	blocks_in_index  what the member is CHARGED (its set in the engine's BlockIndex)
+//	blocks_in_index  what the branch is CHARGED (its set in the engine's BlockIndex)
 //	bytes/256        what a byte-derived counter would say
 //	entry estimate   what a QUEUED head is charged at admission (IndexSizer.Cost)
 //
@@ -115,16 +115,16 @@ func TestSeatIndexBlockCountReadings(t *testing.T) {
 	for i := 0; i < n; i++ {
 		tokens := promptSizeQuantiles[(i*7)%len(promptSizeQuantiles)]
 		sizeBytes := int64(float64(tokens)*readingABByteRatio + 0.5)
-		member := fmt.Sprintf("m%03d", i)
+		branch := fmt.Sprintf("m%03d", i)
 		reqID := fmt.Sprintf("r%03d", i)
 		now = now.Add(time.Millisecond)
 
 		// the ADMISSION estimate: what a queued head is charged before its exact keys
 		// exist (this is the only quantity available at Pick time).
-		estBlocks := sizer.Cost(g.index, member, sizeBytes)
+		estBlocks := sizer.Cost(g.index, branch, sizeBytes)
 
 		// Pick: the head is seated (the engine has room; prefill is acked below).
-		h := Head{Member: member, ReqID: reqID, Arrival: now.Add(-time.Second), SizeBytes: sizeBytes}
+		h := Head{Branch: branch, ReqID: reqID, Arrival: now.Add(-time.Second), SizeBytes: sizeBytes}
 		if got := s.PickFromHeads([]Head{h}, now); got != 0 {
 			t.Fatalf("request %d: head not seated (pick %d)", i, got)
 		}
@@ -134,9 +134,9 @@ func TestSeatIndexBlockCountReadings(t *testing.T) {
 			ids[j] = uint32(j % 50257)
 		}
 		keys := s.HashTokens(ids, "", 64)
-		s.DispatchedOn(member, reqID, engine, keys, sizeBytes, now)
+		s.DispatchedOn(branch, reqID, engine, keys, sizeBytes, now)
 
-		charged := int64(len(g.index.SetBlocks(member)))
+		charged := int64(len(g.index.SetBlocks(branch)))
 		trueBlocks := float64((tokens + 63) / 64) // the engine's own allocation (tail block included)
 		if charged != int64(trueBlocks) {
 			t.Fatalf("request %d: index charged %d blocks for %d tokens, want %d (token-exact)",
@@ -152,18 +152,18 @@ func TestSeatIndexBlockCountReadings(t *testing.T) {
 
 		// the request finishes: prefill acked, then it leaves (the replay measures
 		// per-request counts; the budget's own accumulation is the goldens' business).
-		s.ChunkAt(member, now)
-		s.Settle(member, reqID, struct{ Prompt, Cached int }{tokens, 0}, true, now)
+		s.ChunkAt(branch, now)
+		s.Settle(branch, reqID, struct{ Prompt, Cached int }{tokens, 0}, true, now)
 		s.mu.Lock()
-		g.index.MarkExitingLocked(member)
+		g.index.MarkExitingLocked(branch)
 		s.mu.Unlock()
-		s.Settle(member, "", struct{ Prompt, Cached int }{0, 0}, true, now.Add(time.Millisecond))
+		s.Settle(branch, "", struct{ Prompt, Cached int }{0, 0}, true, now.Add(time.Millisecond))
 	}
 	s.mu.Lock()
-	left := len(g.members)
+	left := len(g.branches)
 	s.mu.Unlock()
 	if left != 0 {
-		t.Fatalf("%d members still seated at the end of the replay", left)
+		t.Fatalf("%d branches still seated at the end of the replay", left)
 	}
 
 	t.Logf("READING A/B REPLAY — n=%d requests, %d with a partial tail block, engine %d blocks x 64 tokens, %.2f B/token",

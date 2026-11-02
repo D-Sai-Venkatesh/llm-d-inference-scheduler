@@ -532,3 +532,42 @@ func TestNoRotationExitInsideALiveWindow(t *testing.T) {
 		usedWithinBudget(t, fx.g())
 	})
 }
+
+// A LATE PreRequest closes only what was COUNTED. A window that outlived S stops counting as
+// in flight (the pass derives that), and its request may still turn up at a pod afterwards. If
+// that arrival decremented the branch unconditionally it would take the count away from
+// ANOTHER live window of the same branch, and the branch would read as idle — evictable
+// mid-flight — until the next pass re-derived the counts.
+func TestLatePreRequestDoesNotEatAnotherLiveWindow(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		fx.seatOne(t, "m", 100, 5*time.Second)
+		h1 := head("m", time.Second, 100)
+		h1.ReqID = "r-1"
+		if i := fx.pick(h1); i < 0 {
+			t.Fatal("m's first released turn must dispatch on its seat")
+		}
+		if got := fx.s.pendingForTest("m"); got != 1 {
+			t.Fatalf("one live window, pending=%d", got)
+		}
+		// r-1's window outlives S: the pass presumes it dead and stops counting it
+		fx.clock = fx.clock.Add(time.Duration(fx.s.cfg.IdleSeconds+1) * time.Second)
+		fx.pick()
+		if got := fx.s.pendingForTest("m"); got != 0 {
+			t.Fatalf("the dead window must stop counting, pending=%d", got)
+		}
+		// a SECOND turn is released now, so its window is live
+		h2 := head("m", time.Second, 100)
+		h2.ReqID = "r-2"
+		if i := fx.pick(h2); i < 0 {
+			t.Fatal("m's second released turn must dispatch")
+		}
+		if got := fx.s.pendingForTest("m"); got != 1 {
+			t.Fatalf("one live window again, pending=%d", got)
+		}
+		// the LATE PreRequest for r-1 arrives: it is in flight now, but r-2 is still on its way
+		fx.s.DispatchedOn("m", "r-1", "", chainOf("m", 100), fx.clock)
+		if got := fx.s.pendingForTest("m"); got != 1 {
+			t.Fatalf("the late arrival consumed another live window: pending=%d, want 1", got)
+		}
+	})
+}

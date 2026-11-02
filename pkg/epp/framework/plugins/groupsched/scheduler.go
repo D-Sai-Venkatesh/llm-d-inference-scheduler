@@ -1056,13 +1056,21 @@ func (s *Scheduler) windowLive(rec *reqRec, now time.Time) bool {
 
 // atPodLocked closes the released window: the request is running on an engine.
 func (s *Scheduler) atPodLocked(rec *reqRec, m *branch, engine string, now time.Time) {
-	rec.engine = engine
 	if !rec.pod.IsZero() {
+		rec.engine = engine
 		return // a repeated PreRequest: the record is already in flight
 	}
+	// LIVENESS IS READ BEFORE THE RECORD STOPS BEING PENDING: a window that already outlived S
+	// was never counted (reapRequestsLocked adds only live windows to m.pending), so a LATE
+	// PreRequest must not decrement the branch — it would take a count away from another live
+	// window of the same branch and read the branch as not busy until the next pass re-derives.
+	live := s.windowLive(rec, now)
+	rec.engine = engine
 	rec.pod = now
 	if m != nil && rec.branch == m.id {
-		m.pending = max(m.pending-1, 0)
+		if live {
+			m.pending = max(m.pending-1, 0)
+		}
 		m.inflight++
 	}
 }

@@ -370,15 +370,16 @@ func tokenRun(seed, n int) []uint32 {
 func bruteCost(idx *BlockIndex, chains []Chain) int {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	n := 0
+	seen := map[Hash]struct{}{}
 	for _, c := range chains {
 		for _, h := range c.Keys {
-			if _, held := idx.blocks[h]; !held {
-				n++
+			if _, held := idx.blocks[h]; held {
+				continue
 			}
+			seen[h] = struct{}{} // the union is DEDUPLICATED: cost == charge
 		}
 	}
-	return n
+	return len(seen)
 }
 
 // The index is called under the scheduler's lock, but its own methods are safe too: a
@@ -453,5 +454,25 @@ func TestGrowChargesAnEqualShapeChainWithDifferentContent(t *testing.T) {
 	idx.GrowLocked("b", grown)
 	if got := idx.UniqueBlocksLocked(); got != before {
 		t.Fatalf("re-growing the same chain moved the used side: %d -> %d", before, got)
+	}
+}
+
+// COST == CHARGE, the case that used to disagree: a multi-prompt request whose prompts are
+// byte-identical. The charge deduplicated the union; the cost summed per chain, so the fit
+// test saw two prompts' worth of blocks where the seat took one.
+func TestCostEqualsTheChargeForIdenticalPrompts(t *testing.T) {
+	idx := newIdx(t)
+	one := []Chain{{Keys: []Hash{7, 8}, Tokens: 128}}
+	two := []Chain{{Keys: []Hash{7, 8}, Tokens: 128}, {Keys: []Hash{7, 8}, Tokens: 128}}
+	if got, want := idx.CostLocked(two), idx.CostLocked(one); got != want {
+		t.Fatalf("two identical prompts cost %d blocks, one costs %d: the cost must be the deduplicated union", got, want)
+	}
+	cost := mustSeat(t, idx, "m", two, 1000)
+	if got := idx.UniqueBlocksLocked(); got != cost {
+		t.Fatalf("the seat charged %d blocks but the cost said %d: cost != charge (R1's claim)", got, cost)
+	}
+	// and a half-resident duplicate: one shared block, one new
+	if got := idx.CostLocked([]Chain{{Keys: []Hash{7}, Tokens: 64}, {Keys: []Hash{7}, Tokens: 64}}); got != 0 {
+		t.Fatalf("a fully resident prompt repeated is %d blocks, want 0", got)
 	}
 }

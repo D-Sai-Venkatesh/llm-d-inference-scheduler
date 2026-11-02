@@ -147,13 +147,23 @@ func (b *BlockIndex) residentPrefixLocked(keys []Hash) int {
 	return lo
 }
 
-// CostLocked is the exact admission cost of a branch on this engine, in blocks: what
-// the engine would have to compute, i.e. every block beyond its resident prefix, per
-// chain.
+// CostLocked is the exact admission cost of a branch on this engine, in blocks: how many
+// NEW blocks the seat would add to the engine's used side.
+//
+// It is COST == CHARGE BY CONSTRUCTION: the same deduplicated union the seat charges
+// (chargeSet), minus what the engine already holds. Summing per chain instead — the obvious
+// shape, and the wrong one — counted a multi-prompt request's byte-identical prompts twice,
+// so the fit test and the seat disagreed: TrySeat could refuse a seat that would have fitted
+// (conservative, but the "one number, one moment" claim stops being true).
+//
+// It costs one pass over the chains and their keys per engine per head at Pick. That is the
+// price of the identity above, and it is O(keys) with no binary search per chain.
 func (b *BlockIndex) CostLocked(chains []Chain) int {
 	n := 0
-	for _, c := range chains {
-		n += len(c.Keys) - b.residentPrefixLocked(c.Keys)
+	for h := range chargeSet(chains) {
+		if _, held := b.blocks[h]; !held {
+			n++
+		}
 	}
 	return n
 }

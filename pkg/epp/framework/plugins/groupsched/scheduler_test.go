@@ -90,7 +90,10 @@ func headWithChain(id string, ago time.Duration, chains []Chain) Head {
 func dispatch(t *testing.T, s *Scheduler, id string) {
 	t.Helper()
 	s.PickFromHeads(nil, s.now)
-	s.Dispatched(id, "r-"+id, time.Now())
+	// the pass clock, not time.Now(): the request reaches the pod inside the fixture's own
+	// timeline, which is what makes the released window's liveness (and every derived count)
+	// answerable in the same units the passes use.
+	s.Dispatched(id, "r-"+id, s.now)
 }
 
 // settleChunk is the first response chunk (prefill complete) + the natural settle.

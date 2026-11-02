@@ -120,7 +120,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help:    "seat waits by kind (new = a branch's first turn, reentry = a returning branch): how long admission made it wait, TOP BUCKET 13,107 s so nothing lands only in +Inf",
 		Buckets: prometheus.ExponentialBuckets(0.1, 2, 18)}, []string{"engine", "kind"})
 	g.served = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "dispatches_total",
-		Help: "dispatches served from this engine's seats"}, engineLabels)
+		Help: "dispatches served: per engine, by that engine's seats; under engine=\"nocapacity\", the pre-capacity pass-through (no engine had a measured num_gpu_blocks yet, so nothing was seated and the request was served unseated)"}, engineLabels)
 	g.capacityMissing = prometheus.NewGaugeVec(prometheus.GaugeOpts{Subsystem: subsystem, Name: "capacity_missing",
 		Help: "1 while this engine's num_gpu_blocks is still unknown past capacityLivenessSeconds"}, engineLabels)
 	g.capacityLearned = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "capacity_learned_total",
@@ -208,6 +208,9 @@ func (g *groupMetrics) Refresh() {
 		}
 	}
 	g.waitersShared.Set(float64(snap.WaitersShared))
+	// the pre-capacity bucket exists from the first scrape: a zero is a fact, and this is the
+	// series that says "no request was served before capacity arrived"
+	g.served.WithLabelValues(nocapacityEngine).Add(0)
 	// ONE zero series per anomaly kind: a zero is a fact, an absent series is a question (and
 	// a should-be-zero count with no series is the shape of a bug nobody notices).
 	for _, kind := range anomalyKinds {

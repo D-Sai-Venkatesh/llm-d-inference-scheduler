@@ -111,6 +111,12 @@ func TestMetricSurfaceIsExactlyTheKeptSet(t *testing.T) {
 				t.Fatalf("dropped metric %s is still exported", name)
 			}
 		}
+		// the PRE-CAPACITY bucket exists at zero (a zero is a fact), and it is not an engine id
+		if v, ok := gatherValue(t, reg, subsystem+"_dispatches_total",
+			map[string]string{"engine": nocapacityEngine}); !ok || v != 0 {
+			t.Fatalf("dispatches_total{engine=%q} must exist at 0 on a capacity-measured stack, got %v (present=%v)",
+				nocapacityEngine, v, ok)
+		}
 		// the engine label is the endpoint id the framework gave us
 		if _, ok := gatherValue(t, reg, subsystem+"_seats", map[string]string{"engine": engineLabel(fx.ids[0])}); !ok {
 			t.Fatalf("seats must carry engine=%s", engineLabel(fx.ids[0]))

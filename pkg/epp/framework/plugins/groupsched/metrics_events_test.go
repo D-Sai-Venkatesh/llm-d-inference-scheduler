@@ -28,6 +28,9 @@ import (
 	"testing"
 	"time"
 
+	fcTypes "github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/types"
+	fwkfc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
@@ -305,4 +308,52 @@ func TestCounterAnomaliesMoveOnTheirEvent(t *testing.T) {
 			t.Fatalf("the dump must carry the same ledger, got %v", got)
 		}
 	})
+}
+
+// THE PRE-CAPACITY WINDOW IS VISIBLE IN dispatches_total. Before an engine's num_gpu_blocks
+// arrives the policy seats nothing and serves every request unseated; that dispatch belongs to
+// no engine, so it is counted under engine="nocapacity". Without it the series reads 0 while
+// requests are served, and nothing distinguishes "serving unseated" from "serving nothing".
+func TestPreCapacityDispatchIsCountedOnTheNocapacitySeries(t *testing.T) {
+	ctx := t.Context()
+	plugin, err := Factory("gs", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gs := plugin.(*GroupScheduler)
+	reg := prometheus.NewRegistry()
+	if err := gs.metrics.register(reg); err != nil {
+		t.Fatal(err)
+	}
+	// NO SetNumBlocksFor: the policy is pre-capacity, so Pick passes every head through
+	fc, _ := newIntegrationHarness(t, gs)
+	req := bareRequest("s-1", 100, map[string]string{})
+	req.key = fwkfc.FlowKey{ID: "s-1", Priority: 0}
+	outcome, err := fc.EnqueueAndWait(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.String() != fcTypes.QueueOutcomeDispatched.String() {
+		t.Fatalf("a pre-capacity stack must still serve: outcome %v", outcome)
+	}
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := -1.0
+	for _, fam := range families {
+		if fam.GetName() != subsystem+"_dispatches_total" {
+			continue
+		}
+		for _, m := range fam.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "engine" && lp.GetValue() == nocapacityEngine {
+					got = m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	if got != 1 {
+		t.Fatalf("dispatches_total{engine=%q} = %v, want 1", nocapacityEngine, got)
+	}
 }

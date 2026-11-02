@@ -838,6 +838,11 @@ func (r *GroupScheduler) readSamples(candidates []fwkdl.Endpoint, now time.Time)
 	return out
 }
 
+// nocapacityEngine is the dispatches_total label for a pre-capacity pass-through dispatch. It
+// is deliberately NOT an engine id: no engine served the request, and a per-engine series
+// must never carry a value that is not one.
+const nocapacityEngine = "nocapacity"
+
 // Pick is the dispatch decision. The waiting set is the queue-head
 // snapshot; pre-capacity it degrades to FCFS pass-through.
 //
@@ -899,6 +904,11 @@ func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccess
 			r.logger.V(logutil.DEFAULT).Info("group-scheduler: num_gpu_blocks not yet measured; serving FCFS until the endpoint metrics arrive")
 		})
 		r.sched.FCFSServed()
+		// and COUNTED ON THE DISPATCH SERIES, under the one label value that belongs to no
+		// engine: without it the whole pre-capacity window is invisible in
+		// dispatches_total, which reads 0 while requests are being served — an operator then
+		// has capacity_missing alone to tell "serving unseated" from "serving nothing".
+		r.metrics.ObserveServed(nocapacityEngine)
 		if i := FCFSPick(heads); i >= 0 {
 			return queues[i], nil
 		}

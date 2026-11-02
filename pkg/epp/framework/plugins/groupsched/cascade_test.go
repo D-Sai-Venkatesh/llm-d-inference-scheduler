@@ -239,11 +239,83 @@ func TestExitCompositionIsNotACascade(t *testing.T) {
 			perDispatch := float64(marks) / float64(dispatches)
 			t.Logf("%d exits (%.1f %% exiting-drain), %d dispatches, marks/dispatch %.1f %%",
 				total, 100*float64(marks)/float64(total), dispatches, 100*perDispatch)
-			if perDispatch > 0.05 {
+			// THE BOUND IS 8 %, and R4 raised it from 5 % on purpose: enforcement now
+			// measures the overage on the STAY side, so a shared block held by an exiting
+			// branch is no longer excused wholesale and the saturated arm marks ~2 points
+			// more (5.8 % vs 3.5 %) — the fix evicts for what will NOT leave by itself.
+			// The cascade's signature is an order of magnitude away (10 % in this replay,
+			// 81 % live), so the gate still separates them.
+			if perDispatch > 0.08 {
 				t.Fatalf("%d mid-flight marks for %d dispatches (%.1f %%): enforcement is marking branches in bulk "+
-					"(the cascade measured 81 %% live and 10 %% in this replay; the fixed arm runs 3 %%)",
+					"(the cascade measured 81 %% live and 10 %% in this replay; a healthy arm runs ~4-6 %%)",
 					marks, dispatches, 100*perDispatch)
 			}
 		})
 	}
+}
+
+// ---- R4: THE STAY SIDE, with a SHARED block ----
+
+// TestSharedBlockWithAStayingBranchIsNotExcused is the defect R4 fixes. The old
+// arithmetic excused EVERY block an exiting branch held — `used − |exit|` — so a block
+// an exiting branch SHARES with a staying one was counted as leaving when it is not:
+// enforcement under-evicted by |stay ∩ exit| and the engine could overcommit. Here a
+// fork shares its parent's prefix with the parent that is exiting; the engine is over
+// budget by exactly the shared block, and the pass must evict on that (or mark) rather
+// than declare itself done.
+func TestSharedBlockWithAStayingBranchIsNotExcused(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		shared := keys(3, seedFor("fork-shared")) // 3 blocks the parent and the fork both hold
+		privateKeep := keys(2, seedFor("fork-private"))
+		privateGone := keys(2, seedFor("fork-private-gone"))
+
+		fx.s.mu.Lock()
+		g := fx.s.groups[fx.ids[0]]
+		// a staying branch holding shared+privateKeep, and an exiting one holding
+		// shared+privateGone: |used| = 5 + 5 - 3 (shared) = 7, |stay| = 5.
+		keep := append(append([]Hash{}, shared...), privateKeep...)
+		gone := append(append([]Hash{}, shared...), privateGone...)
+		g.index.TrackLocked("keep", 0)
+		g.index.UpdateWaitingLocked("keep", "r-keep", keep)
+		g.index.TrySeatLocked("keep", 1<<20)
+		g.branches["keep"] = &branch{id: "keep", engine: g.id, waitingSince: fx.clock}
+		g.index.TrackLocked("gone", 0)
+		g.index.UpdateWaitingLocked("gone", "r-gone", gone)
+		g.index.TrySeatLocked("gone", 1<<20)
+		g.branches["gone"] = &branch{id: "gone", engine: g.id, inflightIDs: map[string]inflightRec{"r-gone": {since: fx.clock, confirmed: true}}, inflight: 1}
+		g.index.MarkExitingLocked("gone")
+		used, stay := g.index.UniqueBlocksLocked(), g.index.StayBlocksLocked()
+		fx.s.mu.Unlock()
+
+		if used != 7 || stay != 5 {
+			t.Fatalf("premise: used = %d, stay = %d (want 7 and 5: 3 shared + 2 + 2)", used, stay)
+		}
+		// the budget leaves a 1-block overage on the STAY side, which the old arithmetic
+		// would have excused entirely (|exit| = 5 ≥ overage 1)
+		fx.s.mu.Lock()
+		g.budgetBlocks = 4
+		over := fx.s.overBudgetLocked(g)
+		fx.s.mu.Unlock()
+		if over != 1 {
+			t.Fatalf("enforcement's overage = %d, want 1 (stay 5 − budget 4): a shared block an exiting branch holds is NOT a reason to stop evicting", over)
+		}
+
+		// THE OLD FORMULA, for the record: it excused |exit| wholesale —
+		// used (7) − exit (5) = 2 ≤ budget (4) → "nothing to do", and the engine stayed
+		// overcommitted by the shared block. That is the under-eviction this pins.
+		exiting := 5
+		if old := int64(used - exiting - 4); old > 0 {
+			t.Fatalf("premise: the excuse-based formula must read <= 0 here, got %d", old)
+		}
+		// and enforcement keeps the overage visible rather than declaring itself done: with
+		// a fresh queue view, a pass over this state does NOT leave |stay| over budget
+		fx.s.mu.Lock()
+		fx.s.queueViewAt = fx.clock
+		fx.s.headsObservedAt = fx.clock
+		staysOver := fx.s.overBudgetLocked(g) > 0
+		fx.s.mu.Unlock()
+		if !staysOver {
+			t.Fatal("the pass must still see an overage: a shared block an exiting branch holds is not leaving")
+		}
+	})
 }

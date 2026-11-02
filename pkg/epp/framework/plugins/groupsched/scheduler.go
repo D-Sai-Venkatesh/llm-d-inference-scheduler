@@ -1782,29 +1782,30 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 	}
 }
 
-// overBudgetLocked is enforcement's view of the overage, in blocks: how much of the
-// engine's accounted footprint is NOT already on its way out. >= 0; 0 means this pass
-// has nothing left to do (everything over the budget is a branch that is draining).
-//
-// The exiting branch's PENDING estimate is excused too: a branch can be marked between
-// its seat and its PreRequest, and its blocks are then in pendingTotal rather than in
-// NE. Excusing one and not the other would leave the pass churning on an estimate that
-// is already leaving.
+// overBudgetLocked is enforcement's view of the overage, in blocks: the STAY side (the
+// seated branches that are not exiting) plus their pending estimates, over the budget.
+// An exiting branch's blocks are excused by construction — they are not on the stay side,
+// and if a staying branch shares them the shared blocks still count there, which is
+// exactly the under-eviction this replaces (used − |exit| excused them wholesale).
 func (s *Scheduler) overBudgetLocked(g *engineGroup) int64 {
-	over := int64(g.index.UniqueBlocksNELocked()) + g.pendingTotal - int64(g.budgetBlocks)
-	if over <= 0 {
+	over := int64(g.index.StayBlocksLocked()) + s.pendingStayBlocksLocked(g) - int64(g.budgetBlocks)
+	if over < 0 {
 		return 0
 	}
-	excused := int64(g.index.ExitingBlocksLocked())
+	return over
+}
+
+// pendingStayBlocksLocked is the pending admission estimate of the NON-exiting seated
+// branches: a branch can be marked between its seat and its PreRequest, and its blocks
+// are in the pending estimate rather than in the index.
+func (s *Scheduler) pendingStayBlocksLocked(g *engineGroup) int64 {
+	var pend int64
 	for id, m := range g.branches {
-		if m.pendingBlocks != 0 && g.index.ExitingLocked(id) {
-			excused += m.pendingBlocks
+		if m.pendingBlocks != 0 && !g.index.ExitingLocked(id) {
+			pend += m.pendingBlocks
 		}
 	}
-	if over-excused <= 0 {
-		return 0
-	}
-	return over - excused
+	return pend
 }
 
 // ---- lifecycle (§8): the ~1s ticker ----
@@ -2157,7 +2158,7 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 		es := EngineSnapshot{ID: label, Seats: len(g.branches),
 			ExitingMembers: exitingMembers, ExitingBlocks: g.index.ExitingBlocksLocked(),
 			ExitingOldestAgeS: exitingOldest.Seconds(),
-			UniqueBlocks:      g.index.UniqueBlocks(), NEBlocks: g.index.UniqueBlocksNE(),
+			UniqueBlocks:      g.index.UniqueBlocks(), NEBlocks: g.index.UniqueBlocksLocked(),
 			BudgetBlocks: g.budgetBlocks, NumBlocks: g.numBlocks,
 			CapacityOK: g.numBlocks > 0, PendingBlocks: g.pendingTotal,
 			ColdInFlight: g.coldInFlight, Served: g.counters.served,

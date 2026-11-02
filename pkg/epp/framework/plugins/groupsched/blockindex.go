@@ -115,17 +115,15 @@ type BlockIndex struct {
 	// key — M2: Picks run at ~1kHz; unchanged state must not recompute).
 	version uint64
 
-	blocks   map[Hash]int // refcount over seated branches' sets
-	blocksNE map[Hash]int // refcount over seated branches (exiting included: the budget's used side)
-	// blocksExit is the refcount over the SEATED, EXITING branches' sets — the part of
-	// the budget's used side that is already on its way out. It exists because the two
-	// questions the accounting answers need two views of one truth (see
-	// Scheduler.enforceBudgetLocked): ADMISSION asks "is there room for a new seat?"
-	// (no: those blocks are still pinned), ENFORCEMENT asks "must I evict MORE?" (no:
-	// they will leave by themselves at their next drain). It is a strict subset of
-	// blocksNE, maintained at exactly the same sites, and checkInvariantLocked proves
-	// it against the seated sets like the other two.
-	blocksExit map[Hash]int
+	// blocks is the refcount over every SEATED branch's set: the USED side, which is
+	// what admission asks about (an exiting branch's blocks are still pinned by the
+	// engine, so they are occupied).
+	blocks map[Hash]int
+	// blocksStay is the refcount over the seated branches that are NOT exiting: the
+	// STAY side, which is what enforcement asks about. A block an exiting branch shares
+	// with a staying one does not leave at the drain, so the overage must be measured on
+	// what actually stays.
+	blocksStay map[Hash]int
 	sessions   map[string]*sessionBlocks
 	seated     map[string]struct{}
 }
@@ -161,8 +159,7 @@ func NewBlockIndex(blockSizeTokens int) (*BlockIndex, error) {
 		blockSizeTokens: blockSizeTokens,
 		chunkBytes:      chunkBytesFor(blockSizeTokens),
 		blocks:          make(map[Hash]int),
-		blocksNE:        make(map[Hash]int),
-		blocksExit:      make(map[Hash]int),
+		blocksStay:      make(map[Hash]int),
 		sessions:        make(map[string]*sessionBlocks),
 		seated:          make(map[string]struct{}),
 	}, nil
@@ -299,20 +296,19 @@ func (b *BlockIndex) TrySeat(id string, budgetBlocks int) (bool, int) {
 	}
 	cost := 0
 	for h := range s.set() {
-		if _, held := b.blocksNE[h]; !held {
+		if _, held := b.blocks[h]; !held {
 			cost++
 		}
 	}
-	if len(b.blocksNE)+cost > budgetBlocks {
+	if len(b.blocks)+cost > budgetBlocks {
 		return false, cost
 	}
 	b.version++ // R4: the seated write
 	b.seated[id] = struct{}{}
 	s.exiting = false // a fresh residency is non-exiting
-	set := s.set()
-	for h := range set {
+	for h := range s.set() {
 		b.blocks[h]++
-		b.blocksNE[h]++
+		b.blocksStay[h]++
 	}
 	return true, cost
 }
@@ -357,9 +353,8 @@ func (b *BlockIndex) releaseLocked(s *sessionBlocks) {
 	b.version++ // R4: every mutation path bumps at its primitive
 	for h := range s.set() {
 		b.dec(b.blocks, h)
-		b.dec(b.blocksNE, h)
-		if s.exiting {
-			b.dec(b.blocksExit, h)
+		if !s.exiting {
+			b.dec(b.blocksStay, h) // an exiting branch left the STAY side at its mark
 		}
 	}
 }
@@ -402,10 +397,10 @@ func (b *BlockIndex) markExitingLocked(id string) {
 	if _, isSeated := b.seated[id]; !isSeated {
 		return // an unseated session is not exiting
 	}
-	b.version++ // R4: the exiting write (blocksExit moves)
+	b.version++
 	s.exiting = true
 	for h := range s.set() {
-		b.blocksExit[h]++
+		b.dec(b.blocksStay, h) // from here on its blocks are accounted as leaving
 	}
 }
 
@@ -498,18 +493,16 @@ func (b *BlockIndex) applyDeltaLocked(s *sessionBlocks, old map[Hash]struct{}) {
 	for h := range cur {
 		if _, had := old[h]; !had {
 			b.blocks[h]++
-			b.blocksNE[h]++
-			if s.exiting {
-				b.blocksExit[h]++
+			if !s.exiting {
+				b.blocksStay[h]++
 			}
 		}
 	}
 	for h := range old {
 		if _, has := cur[h]; !has {
 			b.dec(b.blocks, h)
-			b.dec(b.blocksNE, h)
-			if s.exiting {
-				b.dec(b.blocksExit, h)
+			if !s.exiting {
+				b.dec(b.blocksStay, h)
 			}
 		}
 	}
@@ -552,7 +545,7 @@ func (b *BlockIndex) FitBlocks(hashes []Hash) int {
 	defer b.mu.Unlock()
 	n := 0
 	for _, h := range hashes {
-		if _, held := b.blocksNE[h]; !held {
+		if _, held := b.blocks[h]; !held {
 			n++
 		}
 	}
@@ -564,14 +557,6 @@ func (b *BlockIndex) UniqueBlocks() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return len(b.blocks)
-}
-
-// UniqueBlocksNE is the same over seated branches, exiting ones included —
-// the budget's enforcement counter (D6/D13).
-func (b *BlockIndex) UniqueBlocksNE() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return len(b.blocksNE)
 }
 
 // Seated reports whether the session is currently a group branch.
@@ -600,26 +585,21 @@ func (b *BlockIndex) EstimateTokens(blocks int) int64 {
 // panics on divergence. Used by tests (the review's invariant checker).
 func (b *BlockIndex) checkInvariantLocked() {
 	want := make(map[Hash]int)
-	wantNE := make(map[Hash]int)
-	wantExit := make(map[Hash]int)
+	wantStay := make(map[Hash]int)
 	for id := range b.seated {
 		s := b.sessions[id]
 		for h := range s.set() {
 			want[h]++
-			wantNE[h]++ // exiting branches are charged until they drain
-			if s.exiting {
-				wantExit[h]++ // ... and are the part of it that is already leaving
+			if !s.exiting {
+				wantStay[h]++
 			}
 		}
 	}
 	if !sameCounts(want, b.blocks) {
 		panic(fmt.Sprintf("invariant: blocks %v != recomputed %v", b.blocks, want))
 	}
-	if !sameCounts(wantNE, b.blocksNE) {
-		panic(fmt.Sprintf("invariant: blocksNE %v != recomputed %v", b.blocksNE, wantNE))
-	}
-	if !sameCounts(wantExit, b.blocksExit) {
-		panic(fmt.Sprintf("invariant: blocksExit %v != recomputed %v", b.blocksExit, wantExit))
+	if !sameCounts(wantStay, b.blocksStay) {
+		panic(fmt.Sprintf("invariant: blocksStay %v != recomputed %v", b.blocksStay, wantStay))
 	}
 }
 
@@ -795,20 +775,19 @@ func (b *BlockIndex) TrySeatLocked(id string, budgetBlocks int) (bool, int) {
 	}
 	cost := 0
 	for h := range s.set() {
-		if _, held := b.blocksNE[h]; !held {
+		if _, held := b.blocks[h]; !held {
 			cost++
 		}
 	}
-	if len(b.blocksNE)+cost > budgetBlocks {
+	if len(b.blocks)+cost > budgetBlocks {
 		return false, cost
 	}
 	b.version++ // R4: the seated write
 	b.seated[id] = struct{}{}
 	s.exiting = false
-	set := s.set()
-	for h := range set {
+	for h := range s.set() {
 		b.blocks[h]++
-		b.blocksNE[h]++
+		b.blocksStay[h]++
 	}
 	return true, cost
 }
@@ -828,7 +807,7 @@ func (b *BlockIndex) SeatForceLocked(id string) {
 	s.exiting = false
 	for h := range s.set() {
 		b.blocks[h]++
-		b.blocksNE[h]++
+		b.blocksStay[h]++
 	}
 }
 
@@ -836,27 +815,34 @@ func (b *BlockIndex) SeatForceLocked(id string) {
 func (b *BlockIndex) FitBlocksLocked(hashes []Hash) int {
 	n := 0
 	for _, h := range hashes {
-		if _, held := b.blocksNE[h]; !held {
+		if _, held := b.blocks[h]; !held {
 			n++
 		}
 	}
 	return n
 }
 
-// UniqueBlocksNELocked is UniqueBlocksNE under an already-held lock.
-func (b *BlockIndex) UniqueBlocksNELocked() int { return len(b.blocksNE) }
+// StayBlocksLocked is the STAY side's size: seated branches that are not exiting.
+// Enforcement measures the overage against it.
+func (b *BlockIndex) StayBlocksLocked() int { return len(b.blocksStay) }
 
-// ExitingBlocksLocked is how many distinct blocks of the budget's used side belong to
-// branches that are ALREADY on their way out: the part of the overage that enforcement
-// must not evict again (it is leaving) and that admission must still refuse (it is
-// pinned until the drain).
-func (b *BlockIndex) ExitingBlocksLocked() int { return len(b.blocksExit) }
+// StayBlocks is StayBlocksLocked under the index's own lock.
+func (b *BlockIndex) StayBlocks() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.blocksStay)
+}
+
+// ExitingBlocksLocked is how many distinct blocks of the USED side belong only to
+// exiting branches (used − stay) — the part of the overage that enforcement must not
+// evict again, and that admission still refuses (it is pinned until the drain).
+func (b *BlockIndex) ExitingBlocksLocked() int { return len(b.blocks) - len(b.blocksStay) }
 
 // ExitingBlocks is ExitingBlocksLocked under the index's own lock.
 func (b *BlockIndex) ExitingBlocks() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return len(b.blocksExit)
+	return len(b.blocks) - len(b.blocksStay)
 }
 
 // UniqueBlocksLocked is UniqueBlocks under an already-held lock (ALL
@@ -900,10 +886,10 @@ func (b *BlockIndex) LastSizeBytesLocked(id string) int64 {
 	return s.lastSizeBytes
 }
 
-// HasNELocked reports whether a hash is held by the budget group
-// (the estimate path's membership test).
+// HasNELocked reports whether a hash is held by the budget group (the USED side):
+// the estimate path's membership test.
 func (b *BlockIndex) HasNELocked(h Hash) bool {
-	_, ok := b.blocksNE[h]
+	_, ok := b.blocks[h]
 	return ok
 }
 

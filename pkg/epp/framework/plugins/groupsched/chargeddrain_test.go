@@ -56,7 +56,7 @@ import (
 func neOn(fx *engineSet, g *engineGroup) int {
 	fx.s.mu.Lock()
 	defer fx.s.mu.Unlock()
-	return g.index.UniqueBlocksNELocked()
+	return g.index.UniqueBlocksLocked()
 }
 
 // uniqueOn is the all-seated block count (the other side of the same coin).
@@ -102,17 +102,20 @@ func markExitingInflight(t *testing.T, fx *engineSet, g *engineGroup, reqID stri
 	t.Helper()
 	fx.s.mu.Lock()
 	m := g.branches["gone"]
-	before, beforeU := g.index.UniqueBlocksNELocked(), g.index.UniqueBlocksLocked()
+	before, beforeU := g.index.UniqueBlocksLocked(), g.index.UniqueBlocksLocked()
 	m.inflightIDs = map[string]inflightRec{reqID: {since: fx.clock, confirmed: confirmed}}
 	m.inflight = 1
 	g.index.MarkExitingLocked("gone")
-	n, u := g.index.UniqueBlocksNELocked(), g.index.UniqueBlocksLocked()
+	n, u := g.index.UniqueBlocksLocked(), g.index.UniqueBlocksLocked()
 	fx.s.mu.Unlock()
 	if n != before {
 		t.Fatalf("MarkExiting moved the budget counter: NE %d -> %d (the mark must move nothing)", before, n)
 	}
 	if u != beforeU {
-		t.Fatalf("MarkExiting moved the all-seated counter: %d -> %d", beforeU, u)
+		t.Fatalf("MarkExiting moved the used counter: %d -> %d", beforeU, u)
+	}
+	if stay := g.index.StayBlocks(); stay == beforeU {
+		t.Fatalf("MarkExiting must move the STAY side (still %d): the branch's blocks are leaving", stay)
 	}
 	if !fx.s.Seated("gone") {
 		t.Fatal("a marked branch is still seated: it drains, it is not evicted")
@@ -358,7 +361,7 @@ func TestChargedDrainForgetReleasesAndUnseatIsIdempotent(t *testing.T) {
 		g.index.ForgetLocked("gone")
 		g.index.checkInvariantLocked()
 		ok, _ := g.index.TrySeatLocked("gone", 950)
-		n := g.index.UniqueBlocksNELocked()
+		n := g.index.UniqueBlocksLocked()
 		fx.s.mu.Unlock()
 		if !ok {
 			t.Fatal("the record must be re-seatable after the Forget")
@@ -387,7 +390,7 @@ func TestChargedDrainMarkOnUnseatedRecordIsANoOp(t *testing.T) {
 		g.index.MarkExitingLocked("never-seated")
 		g.index.MarkExitingLocked("keep-then-gone")
 		g.index.checkInvariantLocked()
-		n := g.index.UniqueBlocksNELocked()
+		n := g.index.UniqueBlocksLocked()
 		fx.s.mu.Unlock()
 		if got, want := n, 700; got != want {
 			t.Fatalf("marking an unseated id moved the budget counter: %d want %d", got, want)

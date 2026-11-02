@@ -114,7 +114,7 @@ func (s *Scheduler) queuedPerSeatLocked(g *engineGroup) float64 {
 // them — plus the seat-time estimates not yet converted to exact keys). Negative
 // when the engine is over budget (enforcement is about to catch up).
 func (s *Scheduler) freeBudgetLocked(g *engineGroup) int64 {
-	return int64(g.budgetBlocks) - (int64(g.index.UniqueBlocksNELocked()) + g.pendingTotal)
+	return int64(g.budgetBlocks) - (int64(g.index.UniqueBlocksLocked()) + g.pendingTotal)
 }
 
 // coldAllowsTokens is coldAllows against an EXPLICIT per-engine cost (the placement

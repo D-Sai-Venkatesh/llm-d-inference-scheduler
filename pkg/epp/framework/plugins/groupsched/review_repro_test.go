@@ -72,11 +72,11 @@ func TestReproNEStealOnUnseat(t *testing.T) {
 	reproSeat(t, idx, "a", ha)
 	reproSeat(t, idx, "b", hb)
 	idx.MarkExiting("a")
-	if ne := idx.UniqueBlocksNE(); ne != 5 { // 3 shared + a's 1 + b's 1
+	if ne := idx.UniqueBlocks(); ne != 5 { // 3 shared + a's 1 + b's 1
 		t.Fatalf("NE before unseat: %d want 5 (the exiting branch is still charged)", ne)
 	}
 	idx.Unseat("a")
-	if got := idx.UniqueBlocksNE(); got != 4 { // b alone: 3 shared + 1 private
+	if got := idx.UniqueBlocks(); got != 4 { // b alone: 3 shared + 1 private
 		t.Errorf("R1: unseating an exiting branch removed b's shared blocks from NE: %d want 4", got)
 	}
 }
@@ -92,7 +92,7 @@ func TestReproMarkExitingTwice(t *testing.T) {
 	reproSeat(t, idx, "b", hb)
 	idx.MarkExiting("a")
 	idx.MarkExiting("a")
-	if ne := idx.UniqueBlocksNE(); ne != 5 {
+	if ne := idx.UniqueBlocks(); ne != 5 {
 		t.Errorf("R2: second MarkExiting(a) moved the budget counter: NE=%d want 5", ne)
 	}
 }
@@ -107,7 +107,7 @@ func TestReproExitingGrowsNE(t *testing.T) {
 	if err := idx.UpdateWaiting("a", "r", body); err != nil {
 		t.Fatal(err)
 	}
-	if got := idx.UniqueBlocksNE(); got != 4 {
+	if got := idx.UniqueBlocks(); got != 4 {
 		t.Errorf("R3: exiting branch's grown set is not fully charged: NE=%d want 4", got)
 	}
 }

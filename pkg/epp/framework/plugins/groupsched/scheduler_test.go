@@ -405,9 +405,9 @@ func TestExitingMemberStaysOnTheUsedSideUntilDrain(t *testing.T) {
 		min.inflightIDs = map[string]inflightRec{"r-m0": {since: fx.clock, confirmed: true}}
 		min.inflight = 1
 		freeBefore := fx.s.freeBudgetLocked(g)
-		neBefore := g.index.UniqueBlocksNELocked()
+		neBefore := g.index.UniqueBlocksLocked()
 		g.index.MarkExitingLocked("m0")
-		neAfter := g.index.UniqueBlocksNELocked()
+		neAfter := g.index.UniqueBlocksLocked()
 		freeAfter := fx.s.freeBudgetLocked(g)
 		fx.s.mu.Unlock()
 		if neAfter != neBefore {
@@ -425,7 +425,7 @@ func TestExitingMemberStaysOnTheUsedSideUntilDrain(t *testing.T) {
 		if _, seated := g.branches["m0"]; seated {
 			t.Fatal("a drained exiting branch must leave")
 		}
-		if got := g.index.UniqueBlocksNELocked(); got >= neBefore {
+		if got := g.index.UniqueBlocksLocked(); got >= neBefore {
 			t.Fatalf("the drain did not release the branch's blocks: NE %d want < %d", got, neBefore)
 		}
 	})

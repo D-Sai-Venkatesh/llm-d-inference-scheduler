@@ -148,13 +148,13 @@ func TestExitingUnseatDoesNotStealNE(t *testing.T) {
 	idx := newIdx(t)
 	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
 	mustSeat(t, idx, "b", body(3, 2, 'N'), 1000)
-	neBoth := idx.UniqueBlocksNE() // 3 shared + 1 + 2 = 6
+	neBoth := idx.UniqueBlocks() // 3 shared + 1 + 2 = 6
 	if neBoth != 6 {
 		t.Fatalf("NE both: %d want 6", neBoth)
 	}
 	idx.MarkExiting("a")
 	idx.Unseat("a")
-	if got := idx.UniqueBlocksNE(); got != 5 { // 3 shared + 2 private to b
+	if got := idx.UniqueBlocks(); got != 5 { // 3 shared + 2 private to b
 		t.Fatalf("R1: NE after exiting-unseat: %d want 5 (stolen from b!)", got)
 	}
 }
@@ -166,13 +166,13 @@ func TestExitingUnseatDoesNotStealNE(t *testing.T) {
 func TestExitingMemberStaysChargedUntilUnseat(t *testing.T) {
 	idx := newIdx(t)
 	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
-	before := idx.UniqueBlocksNE()
+	before := idx.UniqueBlocks()
 	idx.MarkExiting("a")
-	if got := idx.UniqueBlocksNE(); got != before {
+	if got := idx.UniqueBlocks(); got != before {
 		t.Fatalf("NE after MarkExiting: %d want %d (the blocks are still held)", got, before)
 	}
 	idx.Unseat("a")
-	if got := idx.UniqueBlocksNE(); got != 0 {
+	if got := idx.UniqueBlocks(); got != 0 {
 		t.Fatalf("NE after the drain (Unseat): %d want 0", got)
 	}
 	idx.checkInvariantLocked()
@@ -182,11 +182,11 @@ func TestExitingMemberStaysChargedUntilUnseat(t *testing.T) {
 func TestMarkExitingIdempotent(t *testing.T) {
 	idx := newIdx(t)
 	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
-	ne := idx.UniqueBlocksNE()
+	ne := idx.UniqueBlocks()
 	idx.MarkExiting("a")
 	idx.MarkExiting("a")
 	idx.MarkExiting("a")
-	if got := idx.UniqueBlocksNE(); got != ne {
+	if got := idx.UniqueBlocks(); got != ne {
 		t.Fatalf("R2: NE after triple MarkExiting: %d want %d", got, ne)
 	}
 	if got := idx.UniqueBlocks(); got != 4 {
@@ -202,7 +202,7 @@ func TestExitingMemberGrowthStaysCharged(t *testing.T) {
 	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
 	mustSeat(t, idx, "b", body(3, 2, 'N'), 1000)
 	idx.MarkExiting("a")
-	before := idx.UniqueBlocksNE()
+	before := idx.UniqueBlocks()
 	// a grows while exiting: the new blocks enter both counters
 	if err := idx.UpdateWaiting("a", "r", body(0, 2, 'Q')); err != nil {
 		t.Fatal(err)
@@ -210,7 +210,7 @@ func TestExitingMemberGrowthStaysCharged(t *testing.T) {
 	if err := idx.SettleDispatched("a", "r", body(0, 2, 'Q')); err != nil {
 		t.Fatal(err)
 	}
-	if got := idx.UniqueBlocksNE(); got != idx.UniqueBlocks() || got <= before-2 {
+	if got := idx.UniqueBlocks(); got != idx.UniqueBlocks() || got <= before-2 {
 		t.Fatalf("R3: NE after exiting branch growth: %d (union %d) want the exiting branch fully charged", got, idx.UniqueBlocks())
 	}
 	idx.checkInvariantLocked()
@@ -325,12 +325,12 @@ func TestReplaceWaitingCancelAndMutation(t *testing.T) {
 	if !ok {
 		t.Fatal("seat")
 	}
-	before := idx.UniqueBlocksNE()
+	before := idx.UniqueBlocks()
 	// cancel: the waiting request's blocks leave the budget
 	if err := idx.Cancel("a", "r"); err != nil {
 		t.Fatal(err)
 	}
-	if got := idx.UniqueBlocksNE(); got != 0 {
+	if got := idx.UniqueBlocks(); got != 0 {
 		t.Fatalf("cancel: NE %d want 0 (was %d)", got, before)
 	}
 	// mutation: swap in a new body
@@ -341,7 +341,7 @@ func TestReplaceWaitingCancelAndMutation(t *testing.T) {
 	if err := idx.UpdateWaiting("a", "r", mutated); err != nil {
 		t.Fatal(err)
 	}
-	if got := idx.UniqueBlocksNE(); got != 5 {
+	if got := idx.UniqueBlocks(); got != 5 {
 		t.Fatalf("mutation: NE %d want 5", got)
 	}
 	// settling the MUTATED body works (no orphan waiting entry)
@@ -426,7 +426,7 @@ func TestConcurrentSharedPrefixes(t *testing.T) {
 				if i%5 == 0 {
 					idx.Unseat(id)
 				}
-				idx.UniqueBlocksNE()
+				idx.UniqueBlocks()
 			}
 		}(w)
 	}

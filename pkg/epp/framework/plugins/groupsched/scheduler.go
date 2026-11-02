@@ -274,11 +274,15 @@ type branch struct {
 	// (derive-don't-accumulate): a leaked increment cannot persist past a
 	// reconciliation.
 	inflight int
-	// inflightIDs tracks the branch's in-flight request ids with their
-	// confirmation state (C3): provisional (chosen at Pick, not yet at
-	// PreRequest) ids are reaped after 30s; confirmed ids after
-	// InflightReapSeconds. m.inflight = len(inflightIDs).
+	// inflightIDs tracks the branch's in-flight request ids (recorded at PreRequest,
+	// dropped at settle or by the reap). m.inflight = len(inflightIDs).
 	inflightIDs map[string]inflightRec
+	// released is the request this branch released at the last Pick that has not reached
+	// PreRequest yet — a "provisional dispatch". A request in that window is neither
+	// queued nor in flight, so this is the one fact that says the branch is still busy:
+	// without it a cold-charge derivation would free the charge of a prefill that is
+	// about to start, and rotation could evict the branch that is on its way to the pod.
+	released string
 	// busyPeriods counts completed MAIN-CHAIN busy periods (V1: the main chain
 	// draining to zero — under root identity a busy root with overlapping
 	// sub-agent threads never fully drains, which would make it de-facto Q=∞).
@@ -306,7 +310,10 @@ type branch struct {
 	fairnessID string
 }
 
-// inflightRec is one in-flight request's reconciliation record (C3).
+// busy reports whether the branch has a request running or on its way to a pod.
+func (m *branch) busy() bool { return m.inflight > 0 || m.released != "" }
+
+// inflightRec is one in-flight request's reconciliation record.
 type inflightRec struct {
 	since     time.Time // Pick time (provisional) / PreRequest time (confirmed)
 	confirmed bool
@@ -472,8 +479,6 @@ type Scheduler struct {
 	// one admission system instead of N.
 	waiters map[string]*waiter
 
-	// pickSeq synthesizes request ids for heads that lack one (M1).
-	pickSeq int64
 	// now is the virtual clock of the CURRENT decision pass (set at the top of
 	// every public decision entry point). Nothing here calls time.Now: a golden
 	// replay has to be reproducible.
@@ -769,6 +774,7 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 	s.reapInflightLocked(now)
 	s.drainExitingLocked(now)
 	s.syncWaitersLocked(heads, now)
+	s.deriveColdChargesLocked()
 	groups := s.activeGroupsLocked()
 	for _, g := range groups {
 		s.enforceBudgetLocked(g, now)
@@ -833,19 +839,16 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 		if len(winner.c.h.Chains) > 0 {
 			g.index.GrowLocked(m.id, winner.c.h.Chains)
 		}
-		// M1: a dispatch is NEVER counted without an id — synthesize one when the
-		// head lacks ReqID (the counter follows the map).
-		rid := winner.c.h.ReqID
-		if rid == "" {
-			s.pickSeq++
-			rid = fmt.Sprintf("synthetic-%d", s.pickSeq)
+		// The request is RELEASED: it is neither queued nor in flight until PreRequest
+		// records it. No synthetic id is minted and no provisional record is made — the
+		// branch carries `released` for the length of that window, and the handler forces
+		// a terminal ResponseBody whenever a pod was scheduled, so the window always ends.
+		m.released = winner.c.h.ReqID
+		if m.released == "" {
+			// an id-less request cannot be tracked; it is counted and the branch is still
+			// held busy for one window
+			s.counters.emptyReqIDs++
 		}
-		if m.inflightIDs == nil {
-			m.inflightIDs = map[string]inflightRec{}
-		}
-		// provisional (C3): confirmed at Dispatched.
-		m.inflightIDs[rid] = inflightRec{since: now}
-		m.inflight = len(m.inflightIDs)
 		m.lastActivity = now
 		g.counters.served++
 		s.counters.served++
@@ -1041,31 +1044,20 @@ func (s *Scheduler) DispatchedOnUsage(id, reqID, engine string, now time.Time) {
 	}
 	if m, ok := g.branches[id]; ok {
 		m.lastActivity = now
-		// C3/M1/R1: reconcile the in-flight id. A non-empty reqID confirms-or-adds.
-		// An EMPTY reqID must not mint a second id (Pick already recorded a
-		// provisional one — two records for one request leak past the reap): confirm
-		// the OLDEST PROVISIONAL record, and synthesize only when none exists.
-		if reqID == "" {
-			s.counters.emptyReqIDs++
-			oldestKey, oldestTime := "", time.Time{}
-			for rid, rec := range m.inflightIDs {
-				if rec.confirmed {
-					continue
-				}
-				if oldestKey == "" || rec.since.Before(oldestTime) {
-					oldestKey, oldestTime = rid, rec.since
-				}
-			}
-			if oldestKey != "" {
-				reqID = oldestKey
-			} else {
-				s.pickSeq++
-				reqID = fmt.Sprintf("synthetic-%d", s.pickSeq)
-			}
+		// THE WINDOW CLOSES: the request is at the pod. A settle whose id matches the
+		// released one closes it too, and so does the legacy form (no id = "whatever this
+		// branch has"): a request that died between the release and PreRequest gets a
+		// terminal ResponseBody from the handler, and THAT is what arrives here — without
+		// this a lost request would leave its branch looking busy forever.
+		if reqID == "" || m.released == reqID {
+			m.released = ""
 		}
 		if m.inflightIDs == nil {
 			m.inflightIDs = map[string]inflightRec{}
 		}
+		// The record is keyed by the request id. An id-less request keys as "" — there is
+		// at most one per branch, and it is counted (the gateway always sends an id, so
+		// this reads 0 in a run).
 		m.inflightIDs[reqID] = inflightRec{since: now, confirmed: true}
 		m.inflight = len(m.inflightIDs)
 	}
@@ -1170,6 +1162,13 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 		if removed {
 			m.inflight = len(m.inflightIDs)
 		}
+		// THE TERMINAL CALLBACK CLOSES THE RELEASED WINDOW. A request that died between
+		// its release and PreRequest has no in-flight record, so this is the only place
+		// that can say it is gone — and the handler forces this call whenever a pod was
+		// scheduled.
+		if reqID == "" || m.released == reqID {
+			m.released = ""
+		}
 		m.lastActivity = now
 		s.releaseColdLocked(g, id) // S0-2: any termination releases the charge
 		// THE BUSY PERIOD (F4): the branch's in-flight count reaching zero — one branch
@@ -1231,10 +1230,10 @@ func (s *Scheduler) deriveLocked() {
 	}
 }
 
-// reapInflightLocked drops in-flight ids whose termination was never observed
-// (C3): provisional ids (chosen at Pick, never reaching PreRequest) after 30s;
-// confirmed ids after InflightReapSeconds (the harness request timeout is 3600s —
-// anything older is a leak).
+// reapInflightLocked drops in-flight ids whose termination was never observed, past
+// InflightReapSeconds (the harness request timeout is 3600 s, so anything older is a
+// leak). The handler forces a terminal ResponseBody whenever a pod was scheduled, so this
+// should never fire: it is the belt to that braces, and it is counted.
 func (s *Scheduler) reapInflightLocked(now time.Time) {
 	for _, g := range s.groups {
 		for _, m := range g.branches {
@@ -1243,10 +1242,7 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 			}
 			reaped := false
 			for rid, rec := range m.inflightIDs {
-				limit := 30 * time.Second
-				if rec.confirmed {
-					limit = time.Duration(s.cfg.reapSeconds() * float64(time.Second))
-				}
+				limit := time.Duration(s.cfg.reapSeconds() * float64(time.Second))
 				if now.Sub(rec.since) > limit {
 					delete(m.inflightIDs, rid)
 					reaped = true
@@ -1261,6 +1257,24 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 					s.releaseColdLocked(g, m.id)
 				}
 			}
+		}
+	}
+}
+
+// deriveColdChargesLocked releases a cold charge whose owner can no longer be prefilling:
+// no queued head, no released-but-not-yet-dispatched request, and nothing in flight.
+//
+// A cold charge left behind CLOSES THE ENGINE'S VALVE for everyone — the valve, not the
+// budget, is what binds admission — so it is derived from the branch's own records at
+// every decision point instead of waiting for a timer. Nothing here evicts anything: a
+// charge that is still explained by a head or a request stays.
+func (s *Scheduler) deriveColdChargesLocked() {
+	for _, g := range s.activeGroupsLocked() {
+		for _, m := range g.branches {
+			if m.coldEntry == 0 || m.busy() || !m.waitingSince.IsZero() {
+				continue
+			}
+			s.releaseColdLocked(g, m.id)
 		}
 	}
 }
@@ -1371,7 +1385,7 @@ func (s *Scheduler) rotationVictimLocked(g *engineGroup, now time.Time) (string,
 	// livelock guard) while a waiter is blocked
 	idle := true
 	for _, m := range g.branches {
-		if m.inflight > 0 || !m.waitingSince.IsZero() {
+		if m.busy() || !m.waitingSince.IsZero() {
 			idle = false
 			break
 		}
@@ -1564,7 +1578,7 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 		if victim == nil {
 			return
 		}
-		if victim.inflight > 0 {
+		if victim.busy() {
 			if g.index.ExitingLocked(victim.id) {
 				// Already on its way out. Its blocks stay charged until it drains, so
 				// marking it again frees nothing: this pass is DONE (continuing would

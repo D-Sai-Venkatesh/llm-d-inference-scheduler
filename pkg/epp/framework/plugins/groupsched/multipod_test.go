@@ -381,16 +381,9 @@ func TestColdValveHeldHeadNeverEvicts(t *testing.T) {
 			fx.seatOne(t, id, 600, time.Duration(5+i)*time.Second)
 		}
 		before := fx.s.Snapshot()
-		// each resident has a queued turn (so nobody is a rotation victim) and a big
-		// cold head waits behind them — one that FITS the budget easily
-		for i := range fx.ids {
-			m, _ := fx.branch(t, fmt.Sprintf("res%d", i))
-			fx.s.mu.Lock()
-			m.waitingSince = fx.clock.Add(-time.Second)
-			m.lastActivity = fx.clock
-			m.inflight = 0
-			fx.s.mu.Unlock()
-		}
+		// the residents' prefills are RUNNING (in flight, no chunk), which is what keeps
+		// their cold charge live — and a running branch is never a rotation victim, so
+		// nothing can be evicted for the head that waits.
 		for attempt := 0; attempt < 4; attempt++ {
 			h := head(fmt.Sprintf("cold%d", attempt), time.Second, 900)
 			_, i := fx.pickEngine(h)

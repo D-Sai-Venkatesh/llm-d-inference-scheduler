@@ -244,26 +244,74 @@ func TestChargedDrainReapOfCancelledRequestReleases(t *testing.T) {
 	})
 }
 
-// The same for a PROVISIONAL id (picked, never confirmed at PreRequest — an error
-// before the first chunk): the 30 s provisional bound drops it. The cold charge is
-// still outstanding here (no chunk ever released it), so the exit must release that too.
-func TestChargedDrainReapOfUnconfirmedRequestReleases(t *testing.T) {
+// A request that died between the RELEASE and PreRequest (an error before the first
+// chunk). Nothing was ever recorded in flight, so there is nothing to drain: the branch is
+// exiting with a live cold charge and no live request, and the derivation at the next
+// decision point releases it — cold charge and all. No timer.
+func TestChargedDrainReleasedWindowReleases(t *testing.T) {
 	cfg := defaultConfig()
-	cfg.IdleSeconds = 1e5
-	chargedPath(t, cfg, "reap-provisional", func(t *testing.T, fx *engineSet, g *engineGroup) {
-		markExitingInflight(t, fx, g, "r-provisional", false)
+	cfg.IdleSeconds = 1e5 // no idle rescue: the derivation must do it
+	chargedPath(t, cfg, "released-window", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		fx.s.mu.Lock()
-		charged := g.branches["gone"].coldEntry
+		m := g.branches["gone"]
+		charged := m.coldEntry
+		m.inflightIDs = map[string]inflightRec{}
+		m.inflight = 0
+		m.released = "r-gone" // released at the last Pick, never reached a pod
+		g.index.MarkExitingLocked("gone")
 		fx.s.mu.Unlock()
 		if charged == 0 {
 			t.Fatal("fixture: the entry's cold charge must still be outstanding (no chunk, no settle)")
 		}
+		if i := fx.pick(); i != -1 {
+			t.Fatalf("no heads: nothing to dispatch, got %d", i)
+		}
+		assertReleased(t, fx, g, "released window (error before PreRequest)")
+		if got := g.coldInFlight; got != 0 {
+			t.Fatalf("the cold-entry charge leaked on the released-window path: %d want 0", got)
+		}
+	})
+}
+
+// A LEAKED cold charge is recovered by the derivation at the next decision point, and
+// nothing is evicted for it: the engine's valve is closed for everyone while the charge
+// stands, so a charge nobody can explain must go — but a charge a head or a live request
+// explains must stay.
+func TestLeakedColdChargeIsReleasedWithoutEvicting(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.IdleSeconds = 1e5
+	chargedPath(t, cfg, "leaked-charge", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		fx.s.mu.Lock()
+		// "keep" is innocent: it holds blocks and nothing else is wrong with it
+		keep := g.branches["keep"]
+		keepCold := keep.coldEntry
+		// "gone" leaked: it was charged at its seat, then its request vanished without a
+		// chunk, a settle or a PreRequest. Nothing explains its charge.
+		m := g.branches["gone"]
+		m.inflightIDs = map[string]inflightRec{}
+		m.inflight = 0
+		m.waitingSince = time.Time{}
+		leaked := m.coldEntry
 		fx.s.mu.Unlock()
-		fx.tick(31 * time.Second) // the provisional reap bound
-		assertReleased(t, fx, g, "reap (error before first chunk)")
-		if got := fx.s.groups[g.id].coldInFlight; got != 0 {
-			t.Fatalf("the cold-entry charge leaked on the reap path: %d want 0", got)
+		if leaked == 0 {
+			t.Fatal("fixture: the leaked charge must be outstanding")
+		}
+		if i := fx.pick(); i != -1 {
+			t.Fatalf("no heads: nothing to dispatch, got %d", i)
+		}
+		fx.s.mu.Lock()
+		after := g.branches["gone"].coldEntry
+		keepAfter := g.branches["keep"].coldEntry
+		seated := len(g.branches)
+		fx.s.mu.Unlock()
+		if after != 0 {
+			t.Fatalf("the leaked charge survived a Pick (still %d)", after)
+		}
+		if keepAfter != keepCold {
+			t.Fatalf("the innocent branch's charge moved: %d -> %d", keepCold, keepAfter)
+		}
+		if seated != 2 {
+			t.Fatalf("the derivation evicted a branch for a charge: %d seats, want 2", seated)
 		}
 	})
 }

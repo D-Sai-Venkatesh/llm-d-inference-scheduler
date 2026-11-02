@@ -721,29 +721,45 @@ func TestWaitingMemberIsNotIdleEvicted(t *testing.T) {
 	})
 }
 
-// C3: a provisional in-flight id (chosen at Pick, never reaching PreRequest) is
-// reaped; a confirmed one survives until InflightReapSeconds.
-func TestProvisionalInflightReaped(t *testing.T) {
+// NO RECORD BEFORE PreRequest (R7): a request that is picked and never reaches a pod
+// leaves no in-flight record at all — the branch carries the released window instead, and
+// the terminal callback the handler forces for every scheduled request closes it. Nothing
+// is invented: no provisional record, no synthetic id.
+func TestNoRecordBeforePreRequest(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 100, time.Second)
-		// one more head, picked but never dispatched => provisional (a NEW req id, or
-		// the record would simply overwrite the confirmed one)
+		fx.s.mu.Lock()
+		inFlight := fx.g().branches["m"].inflight
+		fx.s.mu.Unlock()
+		if inFlight != 1 {
+			t.Fatalf("after PreRequest the branch has %d requests in flight, want 1", inFlight)
+		}
+		// a second turn is picked but never dispatched
 		h2 := head("m", time.Second, 100)
 		h2.ReqID = "r-m-2"
-		fx.pick(h2)
+		if i := fx.pick(h2); i != 0 {
+			t.Fatalf("the seated branch's head must be picked, got %d", i)
+		}
 		fx.s.mu.Lock()
 		m := fx.g().branches["m"]
-		before := m.inflight
+		afterPick, released := m.inflight, m.released
 		fx.s.mu.Unlock()
-		if before != 2 {
-			t.Fatalf("expected one confirmed + one provisional in flight, got %d", before)
+		if afterPick != 1 {
+			t.Fatalf("a picked-but-not-dispatched request made an in-flight record: %d want 1", afterPick)
 		}
-		fx.tick(31 * time.Second)
+		if released != "r-m-2" {
+			t.Fatalf("the released window names %q, want r-m-2 (it is the fact that keeps the branch busy)", released)
+		}
+		if !fx.s.Seated("m") {
+			t.Fatal("the branch must stay seated while its request is on its way")
+		}
+		// the terminal callback closes the window, and the branch is free again
+		fx.s.Settle("m", "r-m-2", struct{ Prompt, Cached int }{100, 0}, false, fx.clock)
 		fx.s.mu.Lock()
-		after := fx.g().branches["m"].inflight
+		releasedAfter := fx.g().branches["m"].released
 		fx.s.mu.Unlock()
-		if after != 1 {
-			t.Fatalf("the provisional id must be reaped, %d in flight remain", after)
+		if releasedAfter != "" {
+			t.Fatalf("the terminal callback left the released window open (%q)", releasedAfter)
 		}
 	})
 }

@@ -53,6 +53,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/datalayer"
 	fcTypes "github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/types"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -60,6 +61,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 	epmetadata "github.com/llm-d/llm-d-router/pkg/epp/metadata"
 	eppmetrics "github.com/llm-d/llm-d-router/pkg/epp/metrics"
+	testutils "github.com/llm-d/llm-d-router/test/utils"
 )
 
 // Extension-point labels for the scope. They only label the violation counter and the log;
@@ -135,7 +137,9 @@ type scopedCase struct {
 
 // scopedCases are the shapes every arm must survive: branch identity (what the arms run), an
 // explicit client fairness header (the operator override), no identity at all (pass-through),
-// and agent identity as the ONLY source.
+// and branch identity with agent identity ALSO in the config (the branch must stay the
+// derived one). A config with agent identity and no branch identity is not a shape a run can
+// have: the startup gate refuses it (TestAgentIdentityOnlyConfigIsRefused).
 func scopedCases(t *testing.T) []scopedCase {
 	t.Helper()
 	bi := newBranchIdentity(t)
@@ -190,14 +194,17 @@ func scopedCases(t *testing.T) []scopedCase {
 			},
 		},
 		{
-			// AGENT IDENTITY ONLY: no branch identity in the config. The identity gate
-			// accepts it and the director derives the queue key from the agent id, so the
-			// policy's unit must be the agent id too — otherwise every request would be
-			// untracked while the startup gate reported a healthy wiring.
-			name: "agent-identity-only",
+			// AGENT IDENTITY ALSO CONFIGURED: an accepted config (branch identity is present),
+			// and the agent id must NOT become the branch. An agent (session) id is a
+			// multi-chain member — its parallel sub-agents are separate chains — while the
+			// index keeps ONE chain per tracked id, so seating by agent id would
+			// under-account the engine. The branch stays branch identity's. (A config with
+			// agent identity ALONE is refused at startup: TestAgentIdentityOnlyConfigIsRefused.)
+			name: "agent-identity-also-configured",
 			build: func(t *testing.T, id string) *intRequest {
 				req := bareRequest(id, 100, map[string]string{agentidentity.ClaudeCodeSessionHeader: scopedAgentSession})
 				require.NoError(t, agent.RequestHeader(context.Background(), req.InferenceRequest()))
+				require.NoError(t, bi.RequestHeader(context.Background(), req.InferenceRequest()))
 				return asIdentity(req)
 			},
 		},
@@ -235,9 +242,9 @@ func TestScopedHooksResolveTheBranchAndViolateNothing(t *testing.T) {
 					} else {
 						require.NotEmpty(t, branch, "Pick must resolve the branch from the unscoped queue item")
 					}
-					if tc.name == "agent-identity-only" {
-						require.Equal(t, scopedAgentSession, branch,
-							"with no branch identity, the agent identity is the branch (as the director's queue key)")
+					if tc.name == "agent-identity-also-configured" {
+						require.NotEqual(t, scopedAgentSession, branch,
+							"the agent (session) id must never become the branch: it is a multi-chain member")
 					}
 
 					// FILTER — ScopeInvocation, the framework's own call for a filter.
@@ -297,6 +304,52 @@ func TestScopedHooksResolveTheBranchAndViolateNothing(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAgentIdentityOnlyConfigIsRefused pins the startup gate's ONE rejected config: agent
+// identity without branch identity. It is refused, not degraded — an agent id is a
+// MULTI-CHAIN member (its parallel sub-agents are separate chains) while this policy's index
+// keeps ONE chain per tracked id, so seating by agent id would under-account the engine. The
+// alternative (seat by agent id anyway) is what an undeclared fallback did once, and it is
+// the mechanism R3 removed.
+func TestAgentIdentityOnlyConfigIsRefused(t *testing.T) {
+	build := func(t *testing.T) *GroupScheduler {
+		t.Helper()
+		p, err := Factory("gs", nil, testutils.NewTestHandle(t.Context()))
+		require.NoError(t, err)
+		return p.(*GroupScheduler)
+	}
+
+	t.Run("agent identity alone is refused", func(t *testing.T) {
+		gs := build(t)
+		gs.handle.AddPlugin("agent", &stubPlugin{tn: fwkplugin.TypedName{Type: agentidentity.PluginType, Name: "agent"}})
+		err := gs.validateBranchProducer()
+		require.Error(t, err, "an agent-identity-only config must refuse to start")
+		require.Contains(t, err.Error(), branchidentity.PluginType)
+		require.Contains(t, err.Error(), "multi-chain")
+	})
+	t.Run("no identity at all is refused", func(t *testing.T) {
+		gs := build(t)
+		err := gs.validateBranchProducer()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), branchidentity.PluginType)
+	})
+	t.Run("branch identity passes", func(t *testing.T) {
+		gs := build(t)
+		gs.handle.AddPlugin("bi", &stubPlugin{tn: fwkplugin.TypedName{Type: branchidentity.PluginType, Name: "bi"}})
+		require.NoError(t, gs.validateBranchProducer())
+	})
+	t.Run("branch identity beside agent identity passes", func(t *testing.T) {
+		gs := build(t)
+		gs.handle.AddPlugin("bi", &stubPlugin{tn: fwkplugin.TypedName{Type: branchidentity.PluginType, Name: "bi"}})
+		gs.handle.AddPlugin("agent", &stubPlugin{tn: fwkplugin.TypedName{Type: agentidentity.PluginType, Name: "agent"}})
+		require.NoError(t, gs.validateBranchProducer())
+	})
+	t.Run("nil handle skips the gate (unit/test mode)", func(t *testing.T) {
+		p, err := Factory("gs", nil, nil)
+		require.NoError(t, err)
+		require.NoError(t, p.(*GroupScheduler).validateBranchProducer())
+	})
 }
 
 // TestBranchIdentityIsScopeClean drives the OTHER identity plugin we added through the same

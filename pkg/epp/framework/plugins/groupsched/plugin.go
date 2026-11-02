@@ -278,34 +278,31 @@ func (r *GroupScheduler) runTicker(ctx context.Context) {
 
 func (r *GroupScheduler) TypedName() fwkplugin.TypedName { return r.typedName }
 
-// Consumes declares the ONE request attribute the policy reads under a scope: agent
-// identity, Optional, because a config may run without it.
+// Consumes declares NOTHING, and that is the honest declaration: no attribute this policy
+// reads is one the framework would let it read through a declared dependency.
 //
-// The BRANCH keys are deliberately NOT declared, and that is a startup constraint, not a
-// preference: the DAG's layer validator rejects a dependency whose PRODUCER sits in a later
-// layer than its consumer, and branch identity implements PreRequest (request-control layer)
-// while this policy is a FairnessPolicy (flow-control layer 0) — declaring its key makes the
-// EPP refuse to start with "invalid plugin layer execution order". The layer model is the
-// thing to fix upstream (a draft note in README §5; never opened by an agent).
+// The one attribute it reads at all is branch identity's branch id, at Pick — and it cannot
+// be declared, which is a startup constraint rather than a preference: the DAG's layer
+// validator rejects a dependency whose PRODUCER sits in a later layer than its consumer, and
+// branch identity implements PreRequest (request-control layer) while this policy is a
+// FairnessPolicy (flow-control layer 0), so declaring its key makes the EPP refuse to start
+// with "invalid plugin layer execution order". The layer model is the thing to fix upstream
+// (a draft note in README §5; never opened by an agent).
 //
-// AND THAT IS FINE, because this policy does not read the branch from a request: the only
-// hook that reads the arrival attributes is Pick, which receives the flow controller's own
-// queue item UNSCOPED (processor.go: fairnessP.Pick — the flow-control package applies no
-// request scope). Every other hook is handed a SCOPED request (ScopeInvocation in
-// scheduler_profile.go, ScopeRequest in requestcontrol/director.go) where an undeclared read
-// RESOLVES AS ABSENT, so a branch id read that way would silently be "" — an unseated,
-// unstarved, FCFS-pass-through scheduler that looks healthy in every outcome metric. Those
-// hooks resolve the branch from the scheduler's own record of the release instead
-// (Scheduler.branchOfRequestLocked), by request id.
+// AND THAT IS FINE, because this policy does not read the branch from a request outside
+// Pick: Pick receives the flow controller's own queue item UNSCOPED (processor.go:
+// fairnessP.Pick — the flow-control package applies no request scope), which is why it can
+// read the undeclared key at all. Every other hook is handed a SCOPED request
+// (ScopeInvocation in scheduler_profile.go, ScopeRequest in requestcontrol/director.go)
+// where an undeclared read RESOLVES AS ABSENT, so a branch id read that way would silently be
+// "" — an unseated, unstarved, pass-through scheduler that looks healthy in every outcome
+// metric. Those hooks resolve the branch from the scheduler's own record of the release
+// instead (Scheduler.branchOfRequestLocked), by request id.
 //
-// The key is optional at the data layer; validateBranchProducer is the fail-closed startup
-// check instead (an identity plugin must EXIST in the same config).
+// validateBranchProducer is the fail-closed startup check that replaces the declaration: the
+// branch-identity plugin must EXIST in the same config.
 func (r *GroupScheduler) Consumes() fwkplugin.DataDependencies {
-	return fwkplugin.DataDependencies{
-		Optional: map[fwkplugin.DataKey]any{
-			agentidentity.AgentIdentityKey: "",
-		},
-	}
+	return fwkplugin.DataDependencies{}
 }
 
 // Produces declares no request attribute, and that is now the whole truth: the plugin
@@ -398,10 +395,17 @@ func (r *GroupScheduler) otherDetectors() []string {
 	return out
 }
 
-// branchOf is the request's branch id — the queue key, read from branch identity (or, in a
-// config with no branch identity, from agent identity: see below). A request with neither is
-// ANONYMOUS: it is never seated and never starved (FCFS pass-through). The branch is the
-// identity, and a session header is an attribute, never a key: nothing here falls back to it.
+// branchOf is the request's branch id — the queue key, read from branch identity. A request
+// without one is ANONYMOUS: it is never seated and never starved (pass-through). The branch
+// is the identity, and a session header is an attribute, never a key: nothing here falls
+// back to it.
+//
+// NO AGENT-IDENTITY FALLBACK, deliberately. A fallback looks like a kindness and is a
+// correctness hole: an agent (a session) id is a MULTI-CHAIN member — its parallel sub-agents
+// are separate chains — while the redesigned index keeps ONE chain per tracked id (one
+// branch, one chain, R3). Seating by agent id would therefore charge the sub-agents' blocks
+// to one record and UNDER-ACCOUNT the engine. A config with no branch identity is refused at
+// startup instead (validateBranchProducer) — fail closed, not a degraded queue key.
 //
 // PICK ONLY. This is the one hook whose request is the flow controller's own queue item,
 // unscoped (processor.go: fairnessP.Pick(ctx, flowGroup) — the flow-control package applies
@@ -412,16 +416,7 @@ func (r *GroupScheduler) branchOf(request *fwksched.InferenceRequest) string {
 	if request == nil {
 		return ""
 	}
-	if id := readID(request, branchidentity.BranchIdentityKey); id != "" {
-		return id
-	}
-	// AGENT-IDENTITY-ONLY CONFIG: the other source the identity gate accepts. The director
-	// derives the flow queue key from the same order (branch → agent → default), so with no
-	// branch identity the agent id IS the queue key, and the policy's unit has to be the same
-	// or every request would be anonymous while validateBranchProducer reported a healthy
-	// wiring — the exact failure mode the gate exists to prevent. The key is declared
-	// Optional in Consumes(), so this read is inside the plugin's own contract.
-	return readID(request, agentidentity.AgentIdentityKey)
+	return readID(request, branchidentity.BranchIdentityKey)
 }
 
 // isReturner reports whether the request is NOT its branch's first turn — the
@@ -461,32 +456,42 @@ func (r *GroupScheduler) validateTokenProducer() error {
 		PluginType)
 }
 
-// validateBranchProducer is the fail-closed branch-source gate: the identity plugin that
-// produces the branch attribute must be in the same config. Without it every request is
-// anonymous and Pick degrades to FCFS pass-through — a failure that looks healthy in every
-// outcome metric, so it fails at startup instead.
+// validateBranchProducer is the fail-closed branch-source gate: the branch-identity plugin
+// must be in the same config, and it is the ONLY source accepted.
+//
+// Without it every request is anonymous and Pick degrades to pass-through — a failure that
+// looks healthy in every outcome metric, which is why it fails at startup instead. Agent
+// identity is NOT an accepted substitute: an agent (session) id is a multi-chain member — its
+// parallel sub-agents are separate chains — while this policy's index keeps ONE chain per
+// tracked id, so seating by agent id would under-account the engine (see branchOf). A config
+// that offers only agent identity therefore refuses to start, which is the honest answer:
+// this policy cannot be correct on it.
 func (r *GroupScheduler) validateBranchProducer() error {
 	if r.handle == nil {
 		return nil // unit/test mode
 	}
-	b, s := false, false
+	branch, agent := false, false
 	for _, p := range r.handle.GetAllPlugins() {
 		if p == nil {
 			continue
 		}
 		switch p.TypedName().Type {
 		case branchidentity.PluginType:
-			b = true
+			branch = true
 		case agentidentity.PluginType:
-			s = true
+			agent = true
 		}
 	}
-	if !b && !s {
-		return fmt.Errorf("the identity source needs at least one identity plugin ('%s' or '%s'); with neither, every request is anonymous and the group policy degrades to R9 FCFS",
-			branchidentity.PluginType, agentidentity.PluginType)
+	if !branch {
+		if agent {
+			return fmt.Errorf("the '%s' plugin requires the '%s' plugin: agent identity alone is refused, because an agent id is a multi-chain member (its parallel sub-agents are separate chains) and this policy keeps ONE chain per tracked id — add the '%s' plugin",
+				PluginType, branchidentity.PluginType, branchidentity.PluginType)
+		}
+		return fmt.Errorf("the '%s' plugin requires the '%s' plugin: with no branch identity every request is anonymous and Pick passes every head through unseated, which looks healthy in every outcome metric",
+			PluginType, branchidentity.PluginType)
 	}
-	if b && !s {
-		r.logger.V(logutil.DEFAULT).Info("group-scheduler: no session-identity plugin in the config — the derived branch is the branch key on every request")
+	if agent {
+		r.logger.V(logutil.DEBUG).Info("group-scheduler: agent identity is configured but unused — the branch is branch identity's derived branch on every request")
 	}
 	return nil
 }

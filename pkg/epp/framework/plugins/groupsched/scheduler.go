@@ -363,8 +363,7 @@ type engineGroup struct {
 	coldInFlight int64
 
 	counters struct {
-		served     int64 // dispatches served on this engine
-		fcfsServed int64 // pre-capacity FCFS dispatches counted here
+		served int64 // dispatches served on this engine
 		// entryWaits / reentryWaits are THIS engine's seat-wait samples (the
 		// per-engine wait ladder the dump reports, B7).
 		entryWaits   []float64
@@ -440,8 +439,6 @@ type Scheduler struct {
 	// produces its first token); nothing is evicted for it. This is the sizing signal:
 	// how often the stagger makes demand wait.
 	onColdValveHeld func(engine string)
-	// onSafetyFire fires when an engine's safety net OPENS (a fire event).
-	onSafetyFire func(engine string)
 	// groups holds one engineGroup per DISCOVERED engine, keyed by endpoint id.
 	groups map[string]*engineGroup
 	// groupOrder is the sorted key list (deterministic iteration: every
@@ -464,13 +461,8 @@ type Scheduler struct {
 	// now is the virtual clock of the CURRENT decision pass (set at the top of
 	// every public decision entry point). Nothing here calls time.Now: a golden
 	// replay has to be reproducible.
-	now time.Time
-	// homeSeq rotates the tie-break among equally-empty engines at SEAT time.
-	// Round-robin rather than random: same anti-burst property (a burst of
-	// newcomers splits instead of racing to one engine) and it keeps EVERY
-	// multi-engine run reproducible.
-	homeSeq int64
-	events  []Event
+	now    time.Time
+	events []Event
 
 	counters struct {
 		entryWaits   []float64
@@ -569,15 +561,6 @@ func (s *Scheduler) activeGroupsLocked() []*engineGroup {
 		out = append(out, s.groups[id])
 	}
 	return out
-}
-
-// SetNumBlocks attaches the measured capacity (num_gpu_blocks from the endpoint
-// metrics). A measured block size that differs from the config value fails loudly
-// (recorded; the engine is not usable until it matches).
-//
-// It is SetNumBlocksFor("") — the single-engine form the legacy tests use.
-func (s *Scheduler) SetNumBlocks(blockSizeTokens, numBlocks int) error {
-	return s.SetNumBlocksFor("", blockSizeTokens, numBlocks)
 }
 
 // SetNumBlocksFor attaches ONE engine's measured capacity. Capacity is per engine
@@ -1791,15 +1774,15 @@ type Snapshot struct {
 // EngineSnapshot is ONE engine's group state: seats, waiters (accounted), the
 // budget, the exit mix, the safety net and the per-engine wait ladder.
 type EngineSnapshot struct {
-	ID            string `json:"id"`
-	Seats         int    `json:"seats"`
-	Waiters       int    `json:"waiters"`
-	UniqueBlocks  int    `json:"uniqueBlocks"`
-	NEBlocks      int    `json:"neBlocks"`
-	BudgetBlocks  int    `json:"budgetBlocks"`
-	NumBlocks     int    `json:"numBlocks"`
-	CapacityOK    bool   `json:"capacityOk"`
-	ColdInFlight  int64  `json:"coldInFlightTokens"`
+	ID           string `json:"id"`
+	Seats        int    `json:"seats"`
+	Waiters      int    `json:"waiters"`
+	UniqueBlocks int    `json:"uniqueBlocks"`
+	NEBlocks     int    `json:"neBlocks"`
+	BudgetBlocks int    `json:"budgetBlocks"`
+	NumBlocks    int    `json:"numBlocks"`
+	CapacityOK   bool   `json:"capacityOk"`
+	ColdInFlight int64  `json:"coldInFlightTokens"`
 	// ColdCapTokens is the DERIVED cold-entry stagger cap (the budget's own
 	// headroom, in tokens). A scored run divides coldInFlightTokens by THIS, not by
 	// a constant from the arm's config: the cap moves with the engine.
@@ -1814,14 +1797,7 @@ type EngineSnapshot struct {
 	ExitingOldestAgeS float64 `json:"exitingOldestAgeSeconds"`
 	BoundMembers      int     `json:"boundMembers"`
 	Served            int64   `json:"served"`
-	FCFSServed        int64   `json:"fcfsServed"`
 	ForcedSeats       int64   `json:"forcedSeats"`
-	// Safety net: the live verdict, the fire EVENTS and the fired TIME, plus the
-	// scraped inputs it reads (the queue depth is reported, never decisive).
-	SafetyFiring       bool    `json:"safetyFiring"`
-	SafetyFires        int64   `json:"safetyFires"`
-	SafetyKV           float64 `json:"safetyKv"`
-	SafetyWaitingQueue int     `json:"safetyWaitingQueue"`
 	// EntryWaitP50 / ReentryWaitP50 are THIS engine's median seat waits, or -1 when nothing
 	// has waited yet (see `absent`). (B7: the
 	// Prometheus histograms were per engine while the dump was whole-policy only,
@@ -1886,7 +1862,6 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 			CapacityOK:   g.numBlocks > 0,
 			ColdInFlight: g.coldInFlight, Served: g.counters.served,
 			ColdCapTokens:  g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize),
-			FCFSServed:     g.counters.fcfsServed,
 			ForcedSeats:    g.counters.forcedSeats,
 			BoundMembers:   snap.Bindings[label],
 			EntryWaitP50:   p50(g.counters.entryWaits),

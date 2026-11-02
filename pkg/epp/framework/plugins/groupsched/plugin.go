@@ -278,7 +278,7 @@ func (r *GroupScheduler) TypedName() fwkplugin.TypedName { return r.typedName }
 // stays declared because its plugin implements only RequestHeader and is a harmless
 // declaration.
 //
-// The key is optional at the data layer; validateMemberProducer is the fail-closed startup
+// The key is optional at the data layer; validateBranchProducer is the fail-closed startup
 // check instead (the identity plugin must EXIST in the same config).
 func (r *GroupScheduler) Consumes() fwkplugin.DataDependencies {
 	return fwkplugin.DataDependencies{
@@ -407,11 +407,11 @@ func (r *GroupScheduler) validateTokenProducer() error {
 		PluginType)
 }
 
-// validateMemberProducer is the fail-closed branch-source gate: the identity plugin that
+// validateBranchProducer is the fail-closed branch-source gate: the identity plugin that
 // produces the branch attribute must be in the same config. Without it every request is
 // anonymous and Pick degrades to FCFS pass-through — a failure that looks healthy in every
 // outcome metric, so it fails at startup instead.
-func (r *GroupScheduler) validateMemberProducer() error {
+func (r *GroupScheduler) validateBranchProducer() error {
 	if r.handle == nil {
 		return nil // unit/test mode
 	}
@@ -448,7 +448,7 @@ func (r *GroupScheduler) RegisterDependencies(reg fwkdl.Registrar) error {
 	if err := r.validateTokenProducer(); err != nil {
 		return err
 	}
-	if err := r.validateMemberProducer(); err != nil {
+	if err := r.validateBranchProducer(); err != nil {
 		return err
 	}
 	return reg.Register(fwkdl.PendingRegistration{

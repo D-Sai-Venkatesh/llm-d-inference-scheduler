@@ -964,3 +964,9 @@ func TestPassThroughServesTheOldest(t *testing.T) {
 		}
 	})
 }
+
+// SetNumBlocks attaches the measured capacity for the fixture's ONE engine (the ""
+// engine id): the production path names engines, a single-engine test does not have to.
+func (s *Scheduler) SetNumBlocks(blockSizeTokens, numBlocks int) error {
+	return s.SetNumBlocksFor("", blockSizeTokens, numBlocks)
+}

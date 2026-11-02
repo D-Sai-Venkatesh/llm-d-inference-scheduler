@@ -101,10 +101,6 @@ type seatChoice struct {
 	// costTokens is the head's cold tokens ON THIS ENGINE: the fit test's input and the
 	// cold-entry charge the seat takes (capped by the engine's own valve).
 	costTokens int64
-	// costBlocks is the same cost in blocks (the budget's unit).
-	costBlocks int64
-	// freeBudget is what the engine could still admit when it was chosen.
-	freeBudget int64
 	// fits: the head's cost was inside the free budget.
 	fits bool
 	// valveHeld: the budget would take the head and only the cold-entry valve refuses it,
@@ -156,7 +152,6 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatChoice {
 		return nil
 	}
 	return &seatChoice{g: owners[idx], costTokens: cands[idx].CostTokens,
-		costBlocks: cands[idx].CostBlocks, freeBudget: cands[idx].FreeBudget,
 		fits: cands[idx].Fits,
 		// not fitting while the BUDGET would take it = the valve is the blocker
 		valveHeld: !cands[idx].Fits && cands[idx].BudgetFits}

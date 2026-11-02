@@ -123,7 +123,7 @@ func (r *GroupScheduler) Filter(_ context.Context, request *fwksched.InferenceRe
 	if len(pods) <= 1 {
 		return pods
 	}
-	branch, _ := r.branchOf(request)
+	branch := r.branchOf(request)
 	if branch == "" {
 		return pods
 	}

@@ -636,14 +636,9 @@ func (b *BlockIndex) UpdateWaitingLocked(id, reqID string, hashes []Hash) {
 	b.applyDeltaLocked(s, old)
 }
 
-// SettleDispatchedAtLocked is SettleDispatchedLocked with an explicit
-// time (the derived window's chain timestamps — deterministic tests).
-// Returns whether the dispatch landed on the session's MAIN chain —
-// the largest chain of the derived window (V1: the quantum counts busy
-// periods on the main chain; under root identity a busy root with
-// overlapping sub-agent threads never fully drains, which would make it
-// de-facto Q=∞). In the fixed-window mode every dispatch is main.
-func (b *BlockIndex) SettleDispatchedAtLocked(id, reqID string, hashes []Hash, now time.Time) bool {
+// SettleDispatchedAtLocked is SettleDispatchedLocked with an explicit time (the derived
+// window's chain timestamps — deterministic tests).
+func (b *BlockIndex) SettleDispatchedAtLocked(id, reqID string, hashes []Hash, now time.Time) {
 	s := b.TrackLocked(id, 0)
 	old := s.set()
 	if _, ok := s.waiting[reqID]; ok {
@@ -651,12 +646,10 @@ func (b *BlockIndex) SettleDispatchedAtLocked(id, reqID string, hashes []Hash, n
 		delete(s.waitSince, reqID)
 		s.rebuildWaitSet()
 	}
-	main := true
 	if hashes != nil {
 		s.pushDispatched(hashes)
 	}
 	b.applyDeltaLocked(s, old)
-	return main
 }
 
 // SettleDispatchedLocked is SettleDispatched under an already-held lock.

@@ -233,9 +233,6 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 				return nil, fmt.Errorf("failed to register metrics of the '%s' plugin: %w", PluginType, err)
 			}
 		}
-		r.sched.onMemberSource = func(source string) {
-			r.logger.V(logutil.DEBUG).Info("group-scheduler: branch source in effect at dispatch", "source", source)
-		}
 		// the per-id SEAT/EXIT event log (one debug line each; the
 		// campaign's spans could not see seat membership).
 		//
@@ -273,19 +270,6 @@ func (r *GroupScheduler) runTicker(ctx context.Context) {
 			r.sched.Tick(now)
 			r.metrics.Refresh()
 		}
-	}
-}
-
-// branchKeyRule states the resolution rule of a branchKey value in words (the
-// startup echo).
-func branchKeyRule(branchKey string) string {
-	switch branchKey {
-	case "branch":
-		return "base mode: the derived branch is branch AND queue key"
-	case "session":
-		return "the agent-identity session attribute is the branch"
-	default:
-		return "branch when present, else the session, else anonymous (R9)"
 	}
 }
 
@@ -384,20 +368,15 @@ func (r *GroupScheduler) otherDetectors() []string {
 //
 // It is a PURE READ: the branch id is never written into the agent-identity slot
 // (that slot keeps meaning "the client's session" for the rest of the stack).
-func (r *GroupScheduler) branchOf(request *fwksched.InferenceRequest) (branch, source string) {
+// branchOf is the request's branch id — the queue key, read from branch identity. A
+// request without one is ANONYMOUS: it is never seated and never starved (FCFS
+// pass-through). There is no session fallback any more: the branch is the identity, and a
+// session header is an attribute, never a key.
+func (r *GroupScheduler) branchOf(request *fwksched.InferenceRequest) string {
 	if request == nil {
-		return "", ""
+		return ""
 	}
-	// reads are lazy: the hot Pick path pays at most two attribute loads (the
-	// branch, and the session only when the branch is absent). Attribute loads are a
-	// sync.Map read.
-	if branch := readID(request, branchidentity.BranchIdentityKey); branch != "" {
-		return branch, "branch"
-	}
-	if session := r.sessionAttr(request); session != "" {
-		return session, "session"
-	}
-	return "", ""
+	return readID(request, branchidentity.BranchIdentityKey)
 }
 
 // sessionAttr is the request's SESSION attribute: the system's agent-identity
@@ -779,11 +758,11 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 		if h == nil {
 			return true
 		}
-		branch, source := "", ""
+		branch := ""
 		reqID, size, fid := "", int64(0), ""
 		if req := h.OriginalRequest(); req != nil {
 			if ir := req.InferenceRequest(); ir != nil {
-				branch, source = r.branchOf(ir)
+				branch = r.branchOf(ir)
 				reqID = ir.RequestID
 				fid = ir.FairnessID // the wire-level identity (the queue key)
 				size = int64(ir.RequestSizeBytes)
@@ -793,7 +772,7 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 			}
 		}
 		queues = append(queues, q)
-		heads = append(heads, Head{Branch: branch, Source: source,
+		heads = append(heads, Head{Branch: branch,
 			FairnessID: fid, ReqID: reqID, Arrival: h.EnqueueTime(), SizeBytes: size,
 		})
 		return true
@@ -838,7 +817,7 @@ func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.Inferen
 			return err // the loud mismatch failure
 		}
 	}
-	id, _ := r.branchOf(request)
+	id := r.branchOf(request)
 	if id == "" {
 		return nil
 	}
@@ -878,7 +857,7 @@ func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.Infer
 	if request == nil || response == nil {
 		return
 	}
-	id, _ := r.branchOf(request)
+	id := r.branchOf(request)
 	if id == "" {
 		return
 	}

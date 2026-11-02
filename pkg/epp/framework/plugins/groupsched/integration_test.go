@@ -38,6 +38,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/branchidentity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/bandselection"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/ordering/fcfs"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/usagelimits"
@@ -77,10 +78,13 @@ func (r *intRequest) TargetModelName() string                      { return "tes
 func (r *intRequest) InferenceRequest() *fwksched.InferenceRequest { return r.infReq }
 func (r *intRequest) ReceivedTimestamp() time.Time                 { return time.Now() }
 
-func newIntRequest(session, id string, size uint64) *intRequest {
-	ir := &fwksched.InferenceRequest{RequestID: id, RequestSizeBytes: int(size)}
-	ir.PutAttribute(agentidentity.AgentIdentityKey, session)
-	return &intRequest{id: id, key: flowcontrol.FlowKey{ID: session, Priority: 0}, size: size, infReq: ir}
+// newIntRequest builds a request the way the real stack does: branch identity has already
+// derived the BRANCH id (the queue key) and the client's session rides as an attribute.
+func newIntRequest(branch, id string, size uint64) *intRequest {
+	ir := &fwksched.InferenceRequest{RequestID: id, RequestSizeBytes: int(size), FairnessID: branch}
+	ir.PutAttribute(branchidentity.BranchIdentityKey, branch)
+	ir.PutAttribute(agentidentity.AgentIdentityKey, branch)
+	return &intRequest{id: id, key: flowcontrol.FlowKey{ID: branch, Priority: 0}, size: size, infReq: ir}
 }
 
 // newIntegrationHarness wires the real controller with the plugin as

@@ -244,10 +244,6 @@ type Head struct {
 	ReqID     string
 	Arrival   time.Time
 	SizeBytes int64
-	// Source names the attribute the branch id came from ("branch" |
-	// "session" | ""). Counted per dispatch (the run is auditable from the
-	// artifacts without re-deriving it from the config).
-	Source string
 	// FairnessID is the request's flow-control identity — the id the GATEWAY and
 	// the harness record on the wire (x_correlation_id / the client's thread id).
 	// The branch id is a DERIVED branch id and joins to nothing in the request
@@ -286,9 +282,6 @@ type branch struct {
 	// sub-agent threads never fully drains, which would make it de-facto Q=∞).
 	// It is the rotation quantum's unit.
 	busyPeriods int
-	// mainInflight is the in-flight count on the MAIN chain (the busy-period
-	// unit's input).
-	mainInflight int
 	// lastCompletion is the last time the main chain returned to zero.
 	lastCompletion time.Time
 	// lastActivity is the last arrival, dispatch or completion.
@@ -323,7 +316,6 @@ type branch struct {
 type inflightRec struct {
 	since     time.Time // Pick time (provisional) / PreRequest time (confirmed)
 	confirmed bool
-	main      bool // landed on the branch's main chain (V1)
 	// keys are the exact tier-A chain blocks recorded at PreRequest. They are kept
 	// because SETTLE is where a request's blocks enter the CPU tier (a model of vLLM
 	// storing them) and settle otherwise carries no hash list — re-deriving the set
@@ -472,13 +464,12 @@ type Scheduler struct {
 	// comes from.
 	mod modules
 	// observers are the optional metric hooks (nil in tests).
-	onExit         func(engine, reason string, seatTurns int)
-	onEntry        func(engine, kind string, waitSeconds float64)
-	onServe        func(engine string)
-	onEvent        func(Event)
-	onRehome       func(branch, from, to string)
-	onEngineGone   func(engine string, branches int)
-	onMemberSource func(source string)
+	onExit       func(engine, reason string, seatTurns int)
+	onEntry      func(engine, kind string, waitSeconds float64)
+	onServe      func(engine string)
+	onEvent      func(Event)
+	onRehome     func(branch, from, to string)
+	onEngineGone func(engine string, branches int)
 	// onBind / onUnbind are the PLACEMENT-PIN hooks: they fire when a branch's
 	// seat (and therefore its engine binding) is created or dropped, so the
 	// plugin's lock-light Filter table can follow the seats without ever touching
@@ -573,9 +564,6 @@ type Scheduler struct {
 		// means "the dump's RecentEvents does not cover the window", which must be
 		// visible instead of inferred.
 		eventsDropped int64
-		// memberSources counts dispatches by the attribute the branch id came from
-		// (the run's effective-branch-source echo).
-		memberSources map[string]int64
 	}
 }
 
@@ -598,7 +586,6 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 		bindings:   map[string]string{},
 		waiters:    map[string]*waiter{}}
 	s.counters.exits = map[string]int64{}
-	s.counters.memberSources = map[string]int64{}
 	return s, nil
 }
 
@@ -919,7 +906,6 @@ func (s *Scheduler) PickFromHeadsEngine(heads []Head, now time.Time) (string, in
 	if winner != nil {
 		g := s.groups[winner.c.engine]
 		m := g.branches[winner.c.h.Branch]
-		s.observeMemberSourceLocked(winner.c.h.Source)
 		// M1: a dispatch is NEVER counted without an id — synthesize one when the
 		// head lacks ReqID (the counter follows the map).
 		rid := winner.c.h.ReqID
@@ -1152,7 +1138,7 @@ func (s *Scheduler) DispatchedOnUsage(id, reqID, engine string, keys []Hash, siz
 		}
 	}
 	g.index.SetSizeLocked(id, sizeBytes) // the estimate baseline
-	onMain := g.index.SettleDispatchedAtLocked(id, reqID, keys, now)
+	g.index.SettleDispatchedAtLocked(id, reqID, keys, now)
 	if m, ok := g.branches[id]; ok {
 		m.lastActivity = now
 		m.lastSizeBytes = sizeBytes
@@ -1181,14 +1167,8 @@ func (s *Scheduler) DispatchedOnUsage(id, reqID, engine string, keys []Hash, siz
 		if m.inflightIDs == nil {
 			m.inflightIDs = map[string]inflightRec{}
 		}
-		m.inflightIDs[reqID] = inflightRec{since: now, confirmed: true, main: onMain, keys: keys}
+		m.inflightIDs[reqID] = inflightRec{since: now, confirmed: true, keys: keys}
 		m.inflight = len(m.inflightIDs)
-		m.mainInflight = 0
-		for _, rec := range m.inflightIDs {
-			if rec.main {
-				m.mainInflight++
-			}
-		}
 		if m.pendingBlocks > 0 {
 			g.pendingTotal -= m.pendingBlocks
 			m.pendingBlocks = 0 // the exact keys are in NE now (D13 reconciles)
@@ -1279,15 +1259,14 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 		// (derive-don't-accumulate). A missing reqID removes the OLDEST record
 		// (defensive legacy path — never blind).
 		removed := false
-		removedMain := false
 		if reqID != "" {
 			// R2: a known id removes itself; an UNKNOWN non-empty id removes NOTHING
 			// (the oldest-fallback would delete a different live request's record
 			// after a late reap or a duplicate settle — the branch would undercount
 			// and evict mid-flight). Counted as a stray.
-			if rec, had := m.inflightIDs[reqID]; had {
+			if _, had := m.inflightIDs[reqID]; had {
 				delete(m.inflightIDs, reqID)
-				removed, removedMain = true, rec.main
+				removed = true
 			} else {
 				s.counters.straySettles++
 			}
@@ -1298,26 +1277,19 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 					key, oldest = rid, rec.since
 				}
 			}
-			if rec, had := m.inflightIDs[key]; had {
+			if _, had := m.inflightIDs[key]; had {
 				delete(m.inflightIDs, key)
-				removed, removedMain = true, rec.main
+				removed = true
 			}
 		}
 		if removed {
 			m.inflight = len(m.inflightIDs)
-			m.mainInflight = 0
-			for _, rec := range m.inflightIDs {
-				if rec.main {
-					m.mainInflight++
-				}
-			}
 		}
 		m.lastActivity = now
 		s.releaseColdLocked(g, id) // S0-2: any termination releases the charge
-		// S4/V1/R3a: the busy period closes only when a MAIN-chain request was
-		// removed AND the main chain drained to zero — a sub-agent request settling
-		// while the main chain is idle must not burn a quantum unit.
-		if removed && removedMain && m.mainInflight == 0 {
+		// THE BUSY PERIOD (F4): the branch's in-flight count reaching zero — one branch
+		// is one chain, so "the main chain" is all of it.
+		if removed && m.inflight == 0 {
 			m.busyPeriods++
 			m.lastCompletion = now
 		}
@@ -1399,12 +1371,6 @@ func (s *Scheduler) reapInflightLocked(now time.Time) {
 			}
 			if reaped {
 				m.inflight = len(m.inflightIDs)
-				m.mainInflight = 0
-				for _, rec := range m.inflightIDs {
-					if rec.main {
-						m.mainInflight++
-					}
-				}
 				if m.inflight == 0 {
 					m.lastCompletion = now
 					// M3(a): the branch's requests are all dead — release its cold
@@ -1885,16 +1851,6 @@ func (s *Scheduler) forgetEverSeatedLocked(id string) { delete(s.everSeated, id)
 
 // observeMemberSourceLocked counts a dispatch by its branch-key source and fires
 // the once-per-source hook (the run's effective-branch-source echo).
-func (s *Scheduler) observeMemberSourceLocked(source string) {
-	if source == "" {
-		source = "none"
-	}
-	first := s.counters.memberSources[source] == 0
-	s.counters.memberSources[source]++
-	if first && s.onMemberSource != nil {
-		s.onMemberSource(source)
-	}
-}
 
 // ---- engine lifecycle (the DISCOVERED engine set) ----
 
@@ -2022,9 +1978,6 @@ type Snapshot struct {
 	Config Config
 	// RecentEvents is the tail of the seat/exit ring.
 	RecentEvents []Event
-	// MemberSources counts dispatches by the branch-key source that resolved them
-	// ("branch" | "none") — the effective-branch echo.
-	MemberSources map[string]int64
 	// Engines is the PER-ENGINE section. The top-level fields above remain the
 	// whole-policy sums, so a single-engine dump is unchanged and a multi-engine
 	// dump is scoreable.
@@ -2130,10 +2083,6 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 	}
 	for k, v := range s.counters.exits {
 		snap.Exits[k] = v
-	}
-	snap.MemberSources = map[string]int64{}
-	for k, v := range s.counters.memberSources {
-		snap.MemberSources[k] = v
 	}
 	for _, engine := range s.bindings {
 		snap.Bindings[engineLabel(engine)]++

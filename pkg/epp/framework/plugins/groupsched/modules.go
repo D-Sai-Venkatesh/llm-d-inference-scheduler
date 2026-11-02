@@ -25,32 +25,25 @@ package groupsched
 //
 //	IDENTITY    the branch-identity plugin (separate plugin, unchanged): the
 //	            branch id IS the queue key. This package only READS it.
-//	SIZING      FootprintSizer: what a head costs on one engine, in blocks, from
-//	            the engine's own BlockIndex (dedup + cold-token estimate), and the
-//	            engine's seat budget from its measured KV capacity — the ONE
-//	            implementation IndexSizer: budget = fraction x num_gpu_blocks. The
-//	            CPU offload tier is a DEPLOYMENT fact, not a sizing input: native
-//	            offload is write-through, so it adds no seat.
+//	SIZING      SeatBudget: one engine's seat budget, from its measured KV capacity — the
+//	            ONE implementation IndexSizer: budget = fraction x num_gpu_blocks. What a
+//	            head COSTS is not a module's answer any more: it is exact, from the
+//	            engine's own BlockIndex. The CPU offload tier is a DEPLOYMENT fact, not a
+//	            sizing input: native offload is write-through, so it adds no seat.
 //	QUEUE       EntryOrder: which waiter is the head — newcomer-first, then oldest
-//	            arrival, then id (a TOTAL order; the archive's map-order tie-break was
-//	            a real bug).
-//	PLACEMENT   EngineChooser: which engine takes the head. Default the most free
-//	            budget among the engines where it fits, tie → lowest engine id.
+//	            arrival, then id (a TOTAL order: a map-order tie-break is a real bug).
+//	PLACEMENT   EngineChooser: which engine takes the head. Default: the most free budget
+//	            left AFTER the seat, among the engines where it fits, tie → lowest id.
 //	TENURE      RotationPolicy: when a resident may be released. Default the fixed
 //	            quantum Q (one value, default 4; Q8 is the same code with 8).
-//	PRESSURE    VictimChooser: who leaves under MEMORY pressure. Default: the valve's
-//	            budget valve.
-//	SAFETY      SafetyDetector: the per-engine net. DEFAULT = NONE: the seat budget
-//	            is the whole admission control (the human's model). The memory-only
-//	            detector (threshold = the seat budget's own fraction) is the
-//	            ALTERNATIVE implementation, OFF until its input is verified as
-//	            in-use work. Run-level safety is preemptions <= FCFS's.
+//	PRESSURE    VictimChooser: who leaves under MEMORY pressure. Default: the budget valve.
+//	SAFETY      SafetyDetector: a seam with ONE wired value, NONE — the seat budget is the
+//	            whole admission control, so a net has nothing to add and no implementation
+//	            ships (a future one brings its own evidence and one config value).
 //	DISPATCH    DispatchGate: whether a seated branch's turn may RUN on its engine now.
-//	            DEFAULT = NONE (an admitted turn runs). The ALTERNATIVE
-//	            execution-budget tests the engine's RUNNING set — the dedup-exact union
-//	            of its in-flight requests' chain blocks, from this package's own
-//	            BlockIndex — against the same fraction of num_gpu_blocks: the CPU tier
-//	            widens RESIDENCY, never how many requests may run at once.
+//	            ONE wired value, NONE (an admitted turn runs). A gate that BINDS would need
+//	            the engine's running-set accounting, which the trim removed with its parked
+//	            implementation — it must be re-added with the gate that prices it.
 //	OBSERVABILITY the hooks + groupMetrics (metrics.go) + the event log.
 //
 // The modules never see *Scheduler: they receive the facts they are allowed to use
@@ -65,7 +58,7 @@ import (
 
 // TenureCtx is what a rotation policy may consult about one resident.
 type TenureCtx struct {
-	// Now is the decision pass's clock (never time.Now — a golden replay must be
+	// Now is the decision pass's clock (never time.Now — a replayed decision stream must be
 	// reproducible).
 	Now time.Time
 	// IdleSeconds is S, the silence bound: a branch silent that long (and with no
@@ -74,9 +67,8 @@ type TenureCtx struct {
 }
 
 // Headless reports that this branch has no queued head. Decisions run INSIDE Pick, where
-// `waitingSince` was just synced from the live queue, so the absence is a fact of this
-// pass rather than a guess about an old snapshot: every decision runs inside Pick, on the
-// queue view that pass just synced.
+// `waitingSince` was just synced from the live queue, so the absence is a fact of this pass
+// rather than a guess about an old snapshot.
 func (c TenureCtx) Headless(m *branch) bool { return m.waitingSince.IsZero() }
 
 // Silent reports the idle test for a branch: no queued head and no activity for S.
@@ -145,7 +137,8 @@ type VictimChooser interface {
 //	(2) DONE or SILENT — no queued turn, or silent past S;
 //	(3) mid-quantum IDLE, oldest last completion first (the safety valve that only
 //	    genuine GROWTH pressure reaches: every admission was budget-checked);
-//	(4) the EXITING class, mid-flight.
+//	(4) anything else — a branch with a request RUNNING. It is marked exiting and leaves at
+//	    its drain: the mark is progress, because its blocks leave the stay side immediately.
 type BudgetValve struct{}
 
 func (BudgetValve) Name() string { return "valve" }
@@ -207,17 +200,17 @@ func (BudgetValve) Victim(branches []*branch, ctx PressureCtx) (string, *branch)
 // scheduler hands it (never *Scheduler, never time.Now), so a replay is reproducible
 // and a policy cannot quietly read a clock its inputs never carried.
 type EntryCtx struct {
-	// Now is the decision pass's clock (never time.Now — a golden replay must be
-	// reproducible). "How long this head has waited" is derived from it and the
-	// waiter's own oldest arrival, never stored.
+	// Now is the decision pass's clock (never time.Now — a replayed decision stream must be
+	// reproducible). "How long this head has waited" is derived from it and the waiter's
+	// own oldest arrival, never stored.
 	Now time.Time
 }
 
 // EntryOrder answers "which waiter is the head?" over the ONE shared queue.
 //
 // The comparison MUST be a TOTAL order ending in the branch id. That is not a style
-// preference: the archive build compared unset timestamps in map-iteration order and
-// produced three different traces in four replays of the same scenario.
+// preference: a comparison that falls back to map iteration order produced three
+// different traces in four replays of one scenario.
 type EntryOrder interface {
 	Name() string
 	// Head returns the head of the waiter set, or nil when nothing is waiting.
@@ -416,12 +409,10 @@ type DispatchCtx struct {
 	// (a metrics clone that latched and locked an engine out).
 	RunningBlocks int64
 	// ReservedBlocks is the engine's used side OUTSIDE that key set: the charges its
-	// in-flight requests hold that carry no chain keys (a provisional estimate before
-	// PreRequest, and a dispatched turn's output growth).
+	// in-flight requests hold that carry no chain keys (an unborn dispatch's growth).
 	ReservedBlocks int64
-	// ChainBlocks is what THIS head would ADD to the running set: its whole estimated
-	// footprint MINUS the blocks the running set already holds (dedup), PLUS its own
-	// output growth.
+	// ChainBlocks is what THIS head would ADD to the running set: the cold part of its
+	// chain against that set (dedup), PLUS its own output growth.
 	ChainBlocks int64
 	// BudgetBlocks is this engine's dispatch budget in blocks (DispatchGate.BudgetBlocks).
 	BudgetBlocks int64

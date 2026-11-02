@@ -100,8 +100,8 @@ func (p *pinTable) size() int {
 // Contract, in order:
 //
 //  1. ≤1 candidate → pass through (nothing to narrow; still counted).
-//  2. ANONYMOUS request (no branch resolved) → pass through freely (R9: the policy
-//     never tracks, seats or constrains anonymous traffic).
+//  2. ANONYMOUS request (no branch resolved) → pass through freely (the policy never
+//     tracks, seats or constrains anonymous traffic).
 //  3. UNSEATED branch → pass through freely. This is the model's defining
 //     property: an unseated branch carries NO placement opinion, so its head is
 //     placed by the ordinary scorer and the engine it lands on becomes its seat

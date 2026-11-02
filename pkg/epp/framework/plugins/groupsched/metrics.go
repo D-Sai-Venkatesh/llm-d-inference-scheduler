@@ -26,7 +26,7 @@ import (
 )
 
 // groupMetrics exports the MINIMAL set an operator needs to see liveness and fairness
-// or to diagnose a known failure class — nineteen names, and nothing else. The test for
+// or to diagnose a known failure class — eighteen names, and nothing else. The test for
 // every one of them: would its absence cost an operator a decision or a diagnosis?
 //
 //	admission state   seats · ne_blocks · budget_blocks · waiters_shared
@@ -36,7 +36,6 @@ import (
 //	decisions         dispatches_total · exits_total{reason}
 //	fairness          entry_wait_seconds{kind=new|reentry}   (ONE histogram)
 //	lifecycle         engine_gone_total · rebinds_total · affinity_violations_total
-//	                  · queue_view_untrusted_passes_total
 //
 // EVERY per-engine series carries an `engine` label, whose value is the endpoint id:
 // `sum(llm_d_epp_group_seats)` is the whole-policy seat count with one engine and with N.
@@ -46,10 +45,10 @@ type groupMetrics struct {
 	seats        *prometheus.GaugeVec
 	neBlocks     *prometheus.GaugeVec
 	budgetBlocks *prometheus.GaugeVec
-	// The EXITING ledger: the enforcement view's inputs, per engine. (iii) made the
-	// used side include branches that are already leaving, so "how much of it is
-	// leaving" is a first-class number: without these three, an engine that is busy
-	// and an engine whose drains have stopped look the same in every other series.
+	// The EXITING ledger: the enforcement view's inputs, per engine. The used side includes
+	// branches that are already leaving, so "how much of it is leaving" is a first-class
+	// number: without these three, an engine that is busy and an engine whose drains have
+	// stopped look the same in every other series.
 	exitingBranches *prometheus.GaugeVec
 	exitingBlocks   *prometheus.GaugeVec
 	exitingOldest   *prometheus.GaugeVec
@@ -242,7 +241,7 @@ func (g *groupMetrics) ObserveEngineGone() {
 	g.engineGone.Inc()
 }
 
-// ObserveQuality learns how an engine's capacity arrived.
+// ObserveCapacityLearned records how an engine's capacity arrived (the acquisition path).
 func (g *groupMetrics) ObserveCapacityLearned(via, engine string) {
 	if g == nil || g.capacityLearned == nil {
 		return

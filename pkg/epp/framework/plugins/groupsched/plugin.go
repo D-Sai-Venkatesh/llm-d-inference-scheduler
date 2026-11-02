@@ -21,8 +21,8 @@ limitations under the License.
 // sees it as a queue head, with its tokens already rendered by branch identity at arrival →
 // the chosen queue is released → PreRequest (here) records the in-flight request and
 // reconciles the engine the framework actually picked → the engine → ResponseBody (here)
-// settles. So the waiting set and every cost come from the queues at Pick time, and nothing
-// is estimated.
+// settles. So the waiting set and every cost come from the queues at Pick time, and every
+// cost is the request's own exact prefill chain.
 package groupsched
 
 import (
@@ -75,12 +75,11 @@ var (
 //	filter    Filter: which engine may serve it (the branch's seat)
 //	detector  Saturation: is the POOL saturated (the flow controller's dispatch gate)
 //
-// The detector answers from an ATOMIC snapshot and never takes the scheduler's mutex
-// (the flow controller polls it about once per millisecond). Its DEFAULT answer is
-// "not saturated": the SEAT BUDGET is the admission control, and this policy only ever
+// The detector answers 0 (NOT saturated) from an atomic read and never takes the
+// scheduler's mutex (the flow controller polls it about once per millisecond). That is not
+// a placeholder: the SEAT BUDGET is the admission control, and this policy only ever
 // releases requests of branches it has seated, so a pool-level gate has nothing left to
-// decide. The memory-only backstop (live datastore metrics, threshold = the budget
-// fraction, stale → open) is the alternative safety module and is OFF by default.
+// decide.
 type GroupScheduler struct {
 	typedName fwkplugin.TypedName
 	cfg       Config
@@ -95,7 +94,7 @@ type GroupScheduler struct {
 
 	fcfsOnce sync.Once
 
-	// ---- capacity acquisition (WAVE-1 item 1: the capacity race) ----
+	// ---- capacity acquisition (the capacity race) ----
 	//
 	// num_gpu_blocks arrives on the endpoint's METRICS, and an endpoint's
 	// creation event fires BEFORE the first scrape has populated them, so
@@ -178,12 +177,10 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		handle: handle,
 	}
 	r.metrics = newGroupMetrics(r.sched)
-	// BUILD-PLAN §1(ii): echo EVERY knob at startup — each arm's config
-	// is verifiable afterwards from the run artifacts (also carried in
-	// DumpState/Snapshot.Config).
 	// The effective config is echoed at the DEFAULT level, always: a run's arm must be
-	// verifiable from its own log. It is rendered as sorted key=value pairs, NOT as JSON:
-	// a logger escapes quotes inside a message, which no tool can parse afterwards.
+	// verifiable from its own log (it is also carried in DumpState/Snapshot.Config). It is
+	// rendered as sorted key=value pairs, NOT as JSON: a logger escapes quotes inside a
+	// message, which no tool can parse afterwards.
 	r.logger.V(logutil.DEFAULT).Info("group-scheduler: effective config " + configEcho(cfg))
 	r.logPolicy()
 
@@ -327,7 +324,7 @@ func (r *GroupScheduler) chainsFor(ctx context.Context, request *fwksched.Infere
 	return chains
 }
 
-// readID is the non-empty string attribute at key ("" when absent).
+// readID is the string attribute at key ("" when it is absent).
 func readID(request *fwksched.InferenceRequest, key fwkplugin.DataKey) string {
 	if request == nil {
 		return ""
@@ -355,19 +352,10 @@ func (r *GroupScheduler) otherDetectors() []string {
 	return out
 }
 
-// branchOf resolves the request's MEMBER id and the source that produced it:
-//
-//	branch  -> the derived branch id (branch-identity; the BASE mode)
-//	session -> the agent-identity session attribute, when the branch plugin is not
-//	           in the config (the queue key is then the session, as it always was)
-//	(none)  -> nothing resolvable: anonymous traffic, R9 FCFS pass-through
-//
-// It is a PURE READ: the branch id is never written into the agent-identity slot
-// (that slot keeps meaning "the client's session" for the rest of the stack).
 // branchOf is the request's branch id — the queue key, read from branch identity. A
 // request without one is ANONYMOUS: it is never seated and never starved (FCFS
-// pass-through). There is no session fallback any more: the branch is the identity, and a
-// session header is an attribute, never a key.
+// pass-through). The branch is the identity, and a session header is an attribute, never a
+// key: nothing here falls back to it.
 func (r *GroupScheduler) branchOf(request *fwksched.InferenceRequest) string {
 	if request == nil {
 		return ""
@@ -464,15 +452,14 @@ func (r *GroupScheduler) RegisterDependencies(reg fwkdl.Registrar) error {
 
 // Extract learns num_gpu_blocks (and checks the block size matches the
 // config — a mismatch fails loudly) from the endpoint lifecycle EVENTS, and
-// remembers the endpoint HANDLE so the ticker can poll its metrics (the
-// event carries them before the first scrape has populated them — the
+// remembers the endpoint so the ticker can retry its capacity acquisition (the
+// event carries the metrics before the first scrape has populated them — the
 // capacity race).
 //
 // The engine SET is DISCOVERED here, never configured: an add-or-update
 // creates (or refreshes) that endpoint's engine group, and a delete tears it
-// down. The campaign's wave protocol rotates nodes every arm, so the
-// scale-down path is exercised constantly and must not leave charges on a
-// dead engine.
+// down. Node rotation exercises the scale-down path regularly, and it must not leave
+// charges on a dead engine.
 func (r *GroupScheduler) Extract(_ context.Context, event fwkdl.EndpointEvent) error {
 	if event.Endpoint == nil {
 		return nil
@@ -632,16 +619,14 @@ func (r *GroupScheduler) pushEngineLoad(now time.Time) {
 	_ = now
 }
 
-// pollCapacity is the STARTUP LIVENESS check (WAVE-1 item 1): once a decode endpoint
-// has been observed, its capacity must arrive within capacityLivenessSeconds, else
-// the FCFS pass-through (A5) is being served silently — log loudly and raise the
-// missing gauge.
+// pollCapacity is the STARTUP LIVENESS check: once a decode endpoint has been observed,
+// its capacity must arrive within capacityLivenessSeconds, else the FCFS pass-through is
+// being served silently — log loudly and raise the missing gauge.
 //
 // It reads NO metrics: the capacity RETRY rides the live detector samples
 // (pushEngineLoad, same tick). A remembered endpoint handle carries a
 // construction-time metrics CLONE, so a poll over clones could never see the geometry
-// arrive late — the read that used to live here was itself the capacity-race bug's
-// shape (and, for the gate, the E-wave latch).
+// arrive late — the read that used to live here was itself the capacity-race bug's shape.
 func (r *GroupScheduler) pollCapacity(now time.Time) {
 	r.capMu.Lock()
 	type pollTarget struct {
@@ -749,7 +734,7 @@ func (r *GroupScheduler) readSamples(candidates []fwkdl.Endpoint, now time.Time)
 	return out
 }
 
-// Pick is the dispatch decision (§5). The waiting set is the queue-head
+// Pick is the dispatch decision. The waiting set is the queue-head
 // snapshot; pre-capacity it degrades to FCFS pass-through.
 func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccessor) (fwkfc.FlowQueueAccessor, error) {
 	if band == nil {
@@ -788,7 +773,7 @@ func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccess
 	if len(heads) == 0 {
 		return nil, nil //nolint:nilnil
 	}
-	// A5: before the measured capacity arrives, FCFS pass-through (once
+	// before the measured capacity arrives: FCFS pass-through (once
 	// per process log; the gauge counts it)
 	if !r.sched.HasCapacity() {
 		r.fcfsOnce.Do(func() {
@@ -858,9 +843,9 @@ func (r *GroupScheduler) PreRequest(ctx context.Context, request *fwksched.Infer
 	return nil
 }
 
-// ResponseBody: the first chunk is prefill complete (the cold-entry
-// release, B3); EndOfStream is the finalizer for every termination
-// cause (in-flight decrement always; the payback ledger natural-only).
+// ResponseBody: the first chunk is prefill complete (the cold-entry charge is released
+// there); EndOfStream is the finalizer for every termination cause (the in-flight decrement
+// always, the payback ledger only for a natural one).
 func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.InferenceRequest, response *fwkrc.Response, target *fwkdl.EndpointMetadata) {
 	if request == nil || response == nil {
 		return
@@ -881,9 +866,9 @@ func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.Infer
 		cachedTokens = response.Usage.PromptTokenDetails.CachedTokens
 	}
 	completionTokens := response.Usage.CompletionTokens
-	// The settle's engine comes from the response's own endpoint metadata
-	// (F6: Settle without an endpoint silently folds B's keys into A's
-	// record). An empty metadata id keeps the binding.
+	// The settle's engine comes from the response's own endpoint metadata: a settle with no
+	// endpoint would fold this engine's keys into another's record. An empty metadata id
+	// keeps the binding.
 	engine := ""
 	if target != nil && target.ID.String() != "" {
 		engine = target.ID.String()
@@ -892,7 +877,7 @@ func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.Infer
 		response.TerminationCause == fwkrc.TerminationCauseNatural, time.Now())
 }
 
-// DumpState reports the group snapshot (§13).
+// DumpState reports the group snapshot.
 func (r *GroupScheduler) DumpState() (json.RawMessage, error) {
 	return json.Marshal(r.sched.Snapshot())
 }

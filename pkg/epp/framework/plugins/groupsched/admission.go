@@ -47,7 +47,7 @@ package groupsched
 //     multi-minute admission wait).
 //
 // At N=1 every rule above collapses to "the head goes to the only engine that
-// fits", which is exactly what the single-pod golden trace pins.
+// fits", which is the shape the single-engine tests pin.
 
 import (
 	"time"
@@ -110,9 +110,8 @@ type seatChoice struct {
 
 // seatEngineLocked is THE seat-time engine choice: the scheduler gathers the FACTS
 // (per-engine cost, free budget, fit, whether a victim exists) and the PLACEMENT
-// module decides. Engines without measured capacity are not candidates (an unknown
-// budget must not take seats); an engine whose safety net is firing is excluded —
-// a gate on that engine's own admissions, never a ranking of the others.
+// module decides. An engine without measured capacity is not a candidate: an unknown
+// budget must not take seats.
 func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatChoice {
 	groups := s.activeGroupsLocked()
 	cands := make([]EngineCandidate, 0, len(groups))
@@ -159,9 +158,9 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatChoice {
 
 // coldValveHeldOn reports WHICH engine's cold-entry valve is the only thing keeping
 // this head out — the engine whose BUDGET would take it while the valve refuses it — and
-// whether any engine is in that state at all. The engine id is the attribution: the
-// series said `engine="single"` on a two-engine stack until this returned a name
-// (2026-11-01). When several engines hold the head the answer is the one the placement
+// whether any engine is in that state at all. The engine id is the attribution the series
+// needs: an unnamed engine (`engine="single"` on a two-engine stack) makes the hold
+// uncountable. When several engines hold the head the answer is the one the placement
 // module would have chosen, most free budget first then engine id, so the metric names
 // the engine the head is actually waiting for instead of the first one in a loop.
 func (s *Scheduler) coldValveHeldOn(head *waiter) (string, bool) {
@@ -194,13 +193,13 @@ func (s *Scheduler) hasRotationVictimLocked(g *engineGroup, now time.Time) bool 
 
 // valveHolderVictimLocked answers the ONE case in which a valve-held head may evict.
 //
-// I2 says a valve-held head waits and never evicts, because evicting frees budget and never
-// frees the valve. That premise is false for exactly one member: the branch HOLDING the
-// cold charge. Evicting it releases the charge, which opens the valve — and it is only ever
-// done on demand, by the head that is waiting, for ONE holder, and only one the TENURE rule
+// A valve-held head normally waits and never evicts, because evicting frees budget and never
+// frees the valve. That premise is false for exactly one branch: the one HOLDING the cold
+// charge. Evicting it releases the charge, which opens the valve — and it is only ever done
+// on demand, by the head that is waiting, for ONE holder, and only one the TENURE rule
 // already releases (nothing in flight, and Q complete or silent past S). It evicts exactly
-// the holder, never "every eligible member" — the eviction storm that leaves seats cold-empty
-// (the eviction-storm class) cannot come back.
+// the holder, never "every eligible branch" — the eviction storm that leaves seats
+// cold-empty cannot come back.
 //
 // The silence bound is what protects a LIVE window: a release a few milliseconds old
 // belongs to a branch whose S has not elapsed, so its charge stays.
@@ -228,7 +227,7 @@ func (s *Scheduler) valveHolderVictimLocked(g *engineGroup, now time.Time) (stri
 	return bestReason, best
 }
 
-// entryHeadLocked is D1: the QUEUE module picks the head of the ONE shared queue. The
+// entryHeadLocked is the QUEUE module's answer: it picks the head of the ONE shared queue. The
 // module gets the pass's clock and nothing else — never the scheduler — and it answers
 // for the waiter set it was handed.
 func (s *Scheduler) entryHeadLocked(now time.Time) *waiter {

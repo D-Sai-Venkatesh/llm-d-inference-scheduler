@@ -396,19 +396,6 @@ type FootprintSizer interface {
 	// Cost is the conservative admission cost of a QUEUED request against one
 	// engine's index, in blocks.
 	Cost(idx *BlockIndex, member string, sizeBytes int64) int64
-	// TierCost is Cost with that engine's CPU-TIER SHADOW as a second residence
-	// oracle, split into the three numbers its two readers need:
-	//
-	//	cold     blocks resident in NEITHER the GPU index NOR the tier — the tier-aware
-	//	         cold estimate that hrrn-tier's denominator uses. (It is a PRIORITY input:
-	//	         the seat budget and the cold valve keep cost()'s GPU-only number.)
-	//	resident blocks the index or the tier already holds (restorable ≈ free);
-	//	total    the head's whole estimated footprint (cold + resident).
-	//
-	// A nil tier means "no offload tier configured" and reproduces Cost exactly
-	// (Cost is this function's cold term), so the tier-aware path and the default
-	// path can never disagree about the same engine state.
-	TierCost(idx *BlockIndex, tier *tierShadow, member string, sizeBytes int64) (cold, resident, total int64)
 	// Tokens converts a block count to tokens (R1: one unit everywhere).
 	Tokens(blocks int64) int64
 }
@@ -428,16 +415,10 @@ func (z IndexSizer) BudgetBlocks(numBlocks int) int {
 }
 
 func (z IndexSizer) Cost(idx *BlockIndex, member string, sizeBytes int64) int64 {
-	cold, _, _ := z.TierCost(idx, nil, member, sizeBytes)
-	return cold
-}
-
-func (z IndexSizer) TierCost(idx *BlockIndex, tier *tierShadow, member string, sizeBytes int64) (cold, resident, total int64) {
+	var cold int64
 	for _, h := range idx.SetBlocks(member) { // persisted across residencies (CP1)
-		if idx.HasNELocked(h) || tier.Holds(h) {
-			// the engine can reach this block without recomputing it: in HBM now, or
-			// restorable from its CPU tier for ~1-4 % of a prefill.
-			resident++
+		if idx.HasNELocked(h) {
+			// the engine can reach this block without recomputing it: it is in HBM.
 			continue
 		}
 		cold++
@@ -456,7 +437,7 @@ func (z IndexSizer) TierCost(idx *BlockIndex, tier *tierShadow, member string, s
 	// restorable, whatever the tier holds.
 	blockBytes := 4 * int64(z.BlockSize)
 	cold += (delta + blockBytes - 1) / blockBytes
-	return cold, resident, cold + resident
+	return cold
 }
 
 func (z IndexSizer) Tokens(blocks int64) int64 { return blocks * int64(z.BlockSize) }

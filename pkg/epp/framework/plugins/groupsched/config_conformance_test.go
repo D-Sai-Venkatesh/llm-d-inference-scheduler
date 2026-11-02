@@ -53,8 +53,6 @@ package groupsched
 //	  blockSizeTokens: 64
 //	  capacityLivenessSeconds: 120
 //	  inflightReapSeconds: 3700
-//	  cpuTierBytes: 0               # the CPU offload tier's BYTES (0 = no tier)
-//	  kvBlockBytes: 0               # one KV block's bytes (needed iff cpuTierBytes>0)
 //	  sizing: "index"               # CORE_MODULE_BLOCK (one selector per module);
 //	  entryOrder: "newcomer-first"  # CORE_ENTRY_ORDER (one value: the trim keeps one impl)
 //	  engineChoice: "most-free-budget"
@@ -110,9 +108,7 @@ ttlSeconds: 30
 inFlightCap: 64
 blockSizeTokens: 64
 capacityLivenessSeconds: 120
-inflightReapSeconds: 3700
-cpuTierBytes: 0
-kvBlockBytes: 0`,
+inflightReapSeconds: 3700`,
 	},
 	{
 		block: "CORE_MODULE_BLOCK",
@@ -125,27 +121,6 @@ rotation: "quantum"
 victim: "valve"
 safety: "none"
 executionBudget: "none"`,
-	},
-	{
-		// The OFFLOAD arm's base block: CORE_BASE_BLOCK with the two tier facts set — the
-		// campaign deployment's numbers (512 GiB tmpfs tier ÷ 6,291,456 bytes per
-		// 64-token KV block of Qwen3-30B-A3B at TP4 = ~87,381 blocks = 2.17x the GPU
-		// pool). It is here because the type half matters most for the NEW key: an int64
-		// rendered as a YAML float or a string is a CrashLoop on the one arm that needs
-		// the tier.
-		block: "CORE_BASE_BLOCK (OFFLOAD=1: cpuTierBytes/kvBlockBytes)",
-		owner: PluginType,
-		proto: Config{},
-		body: `groupBudgetFraction: 0.95
-quantum: 4
-idleSeconds: 20
-ttlSeconds: 30
-inFlightCap: 64
-blockSizeTokens: 64
-capacityLivenessSeconds: 120
-inflightReapSeconds: 3700
-cpuTierBytes: 549755813888
-kvBlockBytes: 6291456`,
 	},
 	{
 		// The branch plugin every core arm carries (BRANCH_PLUGIN=1). Its bool fields are

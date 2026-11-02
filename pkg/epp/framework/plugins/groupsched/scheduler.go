@@ -1566,6 +1566,7 @@ func (s *Scheduler) reapRequestsLocked(now time.Time) {
 				s.onForget(rid)
 			}
 			reaped[rec.branch] = m
+			s.noteAnomalyLocked(anomalyReaped)
 			continue
 		}
 		m.inflight++
@@ -1803,6 +1804,7 @@ const (
 	// anomalyNoRequestID: a Pick released a turn for a request with no id. Nothing can name
 	// it, so no record opens and its branch is not held busy by it.
 	anomalyNoRequestID = "no_request_id"
+	anomalyReaped     = "reaped"
 	// anomalyStraySettle: a settle named a request nothing tracks (a late reap, a duplicate
 	// terminal callback, or a branch that has left). Inventing a branch for it would charge an
 	// engine twice, so it changes nothing — and it is counted, because it means the map and
@@ -1812,7 +1814,7 @@ const (
 
 // anomalyKinds is every kind, in a fixed order (the metric pre-instantiates one zero series
 // per kind: a zero is a fact, an absent series is a question).
-var anomalyKinds = []string{anomalyNoTokens, anomalyNoRequestID, anomalyStraySettle}
+var anomalyKinds = []string{anomalyNoTokens, anomalyNoRequestID, anomalyStraySettle, anomalyReaped}
 
 // noteAnomalyLocked books one anomaly and tells the observer.
 func (s *Scheduler) noteAnomalyLocked(kind string) {

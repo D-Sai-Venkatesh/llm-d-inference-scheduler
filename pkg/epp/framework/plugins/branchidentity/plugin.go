@@ -88,7 +88,12 @@ const (
 	// timeout, not the flow queue's 5-minute idle GC: 16% of a0's requests waited
 	// over 600s for admission, so a 600s horizon would expire markers of requests
 	// that are still legitimately queued. Pruning errs toward continuation.
-	defaultMarkerTTLSeconds = 3600
+	//
+	// It MUST sit above the client's own timeout, or the marker of a request that is
+	// still running expires and its branch takes a second request as a different chain:
+	// the campaign harness runs a 9000s timeout and every pin sets this to 9300s, so
+	// 9300 is the default and a config that forgets the key is safe.
+	defaultMarkerTTLSeconds = 9300
 	// defaultSweepSeconds is the cap-enforcement tick.
 	defaultSweepSeconds = 60
 	// defaultMaxBranches is the table cap (the only eviction path).
@@ -118,8 +123,9 @@ type Parameters struct {
 	TokenProducer json.RawMessage `json:"tokenProducer,omitempty"`
 	// MarkerTTLSeconds bounds how long an outstanding marker (arrival or in
 	// flight) that never settles keeps its branch busy. It must be at least the
-	// client's request timeout. There is no branch TTL: branches are retained (no
-	// idle GC — a dormant client that returns must find its branch).
+	// client's request timeout (the default, 9300s, is the campaign harness's 9000s
+	// plus headroom). There is no branch TTL: branches are retained (no idle GC — a
+	// dormant client that returns must find its branch).
 	MarkerTTLSeconds float64 `json:"markerTtlSeconds,omitempty"`
 	// QueuedTTLSeconds is the deprecated name of MarkerTTLSeconds, accepted so an
 	// older arm's config still parses.

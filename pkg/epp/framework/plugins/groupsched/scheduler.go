@@ -64,11 +64,15 @@ type Config struct {
 	// without capacity seats nothing while every other series looks healthy.
 	CapacityLivenessSeconds float64 `json:"capacityLivenessSeconds"`
 
-	// InflightReapSeconds bounds the age of an in-flight request id before reconciliation
-	// drops it: the belt for a termination that no callback reported (an id is recorded at
-	// PreRequest and removed at the settle, so an id that outlives this has no owner left).
-	// It is set well above the longest real turn — a turn takes minutes — so only a leak
-	// reaches it.
+	// InflightReapSeconds bounds the age of a tracked request before reconciliation drops it:
+	// the belt for a termination that no callback reported (a record is written when a Pick
+	// releases the turn and ended at its settle, its abandon, its branch's exit — so a record
+	// that outlives this bound has no owner left).
+	//
+	// It MUST sit above the client's own request timeout, or the belt cuts a request that is
+	// still legitimately running: the campaign harness runs a 9,000 s timeout and every pin
+	// sets this to 9,300 s. The default is that same 9,300 s, so a config that forgets the key
+	// is safe rather than silently short.
 	InflightReapSeconds float64 `json:"inflightReapSeconds"`
 
 	// ---- ONE selector per module (a future idea = one new implementation + one
@@ -113,7 +117,7 @@ func defaultConfig() Config {
 		InFlightCap:             64,
 		BlockSizeTokens:         64,
 		CapacityLivenessSeconds: 120,
-		InflightReapSeconds:     3700,
+		InflightReapSeconds:     defaultInflightReapSeconds,
 		Sizing:                  "index",
 		EntryOrder:              "newcomer-first",
 		EngineChoice:            "most-free-budget",
@@ -190,7 +194,7 @@ func (c Config) validate() error {
 		return fmt.Errorf("blockSizeTokens is required (the token processor's block size; got %d)", c.BlockSizeTokens)
 	}
 	if c.InflightReapSeconds != 0 && c.InflightReapSeconds < 60 {
-		return fmt.Errorf("inflightReapSeconds must be >= 60 (the harness request timeout is 3600s; got %v)", c.InflightReapSeconds)
+		return fmt.Errorf("inflightReapSeconds must be >= 60 (it is the belt over an unobserved termination, not a timeout: the harness's own request timeout is 9000s and every pin sets 9300s; got %v)", c.InflightReapSeconds)
 	}
 	if c.CapacityLivenessSeconds < 0 {
 		return fmt.Errorf("capacityLivenessSeconds must be >= 0 (0 = default; got %v)", c.CapacityLivenessSeconds)
@@ -198,12 +202,16 @@ func (c Config) validate() error {
 	return nil
 }
 
+// defaultInflightReapSeconds is the reap bound a config that omits the key gets: the campaign
+// harness's own request timeout (9000 s) plus headroom, so the belt can only ever cut a leak.
+const defaultInflightReapSeconds = 9300
+
 // reapSeconds is the effective confirmed-id reap bound (0 → default).
 func (c Config) reapSeconds() float64 {
 	if c.InflightReapSeconds > 0 {
 		return c.InflightReapSeconds
 	}
-	return 3700
+	return defaultInflightReapSeconds
 }
 
 // ---- the queue-head snapshot (waiting state comes from the flow-control

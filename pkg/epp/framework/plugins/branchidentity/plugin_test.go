@@ -590,6 +590,11 @@ func TestFactory_Config(t *testing.T) {
 	assert.Equal(t, defaultMaxBranches, p.idx.maxBranches)
 	assert.Equal(t, defaultMarkerTTLSeconds*time.Second, p.markerTTL,
 		"the marker TTL is the client request timeout, not the flow queue's 5-minute GC")
+	// and that timeout is the campaign harness's own (9000 s) plus headroom: a marker that
+	// expires under a LIVE request would let its branch take the next request as a second
+	// chain, which is the one thing the identity may not do.
+	assert.Greater(t, defaultMarkerTTLSeconds, 9000,
+		"the default marker TTL must sit above the harness request timeout")
 
 	// The deprecated arm name still parses.
 	built, err := Factory("legacy", json.NewDecoder(strings.NewReader(

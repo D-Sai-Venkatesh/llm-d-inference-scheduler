@@ -360,6 +360,20 @@ func TestShippedCoreEnvFilesUseKnownModuleValues(t *testing.T) {
 	}
 }
 
+// TestReapBoundsSitAboveTheHarnessTimeout pins the one number pair that has to move together:
+// the request-reap bound (both the scheduler's record reap and branch identity's marker TTL)
+// is the BELT over an unobserved termination, so it must sit above the CLIENT's own timeout —
+// the campaign harness runs 9000 s — or the belt cuts a request that is still legitimately
+// running, and the branch it belonged to takes the next request as a different chain. The
+// default is the pin's own value (9300 s), so a config that omits the key is safe. (Branch
+// identity's marker TTL has the same bound and its own pin in that package.)
+func TestReapBoundsSitAboveTheHarnessTimeout(t *testing.T) {
+	const harnessTimeoutSeconds = 9000
+	if got := defaultConfig().reapSeconds(); got <= harnessTimeoutSeconds {
+		t.Fatalf("the scheduler's reap default is %vs, at or below the %ds harness timeout: it would cut live requests", got, harnessTimeoutSeconds)
+	}
+}
+
 // TestModuleValuesMatchTheEmitter pins the VALUES exp-ops can render for every module
 // selector: buildModules must accept each one and reject anything else.
 func TestModuleValuesMatchTheEmitter(t *testing.T) {

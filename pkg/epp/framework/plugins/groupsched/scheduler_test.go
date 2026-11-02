@@ -300,8 +300,8 @@ func TestMemberServedAndUnknownNeverSeated(t *testing.T) {
 			t.Fatal("the branch must be seated")
 		}
 		settle(fx.s, "m", 100, 100)
-		if fx.s.Sessions() != 1 {
-			t.Fatalf("only the seated branch has a record, got %d", fx.s.Sessions())
+		if fx.s.SeatRecords() != 1 {
+			t.Fatalf("only the seated branch has a record, got %d", fx.s.SeatRecords())
 		}
 	})
 }
@@ -650,7 +650,7 @@ func TestAnonymousPassThrough(t *testing.T) {
 		if i := fx.pick(anon); i != 0 {
 			t.Fatalf("an anonymous head must be served when no branch head is dispatchable, got %d", i)
 		}
-		if fx.s.Sessions() != 0 {
+		if fx.s.SeatRecords() != 0 {
 			t.Fatal("anonymous traffic must not be tracked")
 		}
 		fx.seatOne(t, "m", 10, time.Second)

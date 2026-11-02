@@ -217,12 +217,20 @@ func invRun(t *testing.T, seed int64, engines, capacity int, events int) string 
 		clock = clock.Add(time.Millisecond)
 		checkInvariants(t, s, i, capacity)
 	}
-	// the whole-policy view has to be self-consistent at the end too
+	// the whole-policy view has to be self-consistent at the end too: the top-level used side
+	// is the sum of the per-engine ones, and the seats are the bindings
 	snap := s.Snapshot()
+	sumNE, sumSeats := 0, 0
 	for id, es := range snap.Engines {
-		if es.NEBlocks != es.UniqueBlocks {
-			t.Fatalf("%s: the snapshot's used side disagrees with itself (%d vs %d)", id, es.NEBlocks, es.UniqueBlocks)
+		sumNE += es.NEBlocks
+		sumSeats += es.Seats
+		if got, want := es.Seats, snap.Bindings[id]; got != want {
+			t.Fatalf("%s: %d seats but %d bindings", id, got, want)
 		}
+	}
+	if snap.NEBlocks != sumNE || snap.Seats != sumSeats {
+		t.Fatalf("the snapshot's totals disagree with its own per-engine section: used %d/%d seats %d/%d",
+			snap.NEBlocks, sumNE, snap.Seats, sumSeats)
 	}
 	return trace.String()
 }

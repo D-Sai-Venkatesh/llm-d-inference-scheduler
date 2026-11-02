@@ -181,7 +181,7 @@ func (g *groupMetrics) Refresh() {
 		g.budgetBlocks.WithLabelValues(label).Set(float64(es.BudgetBlocks))
 		g.coldInFlight.WithLabelValues(label).Set(float64(es.ColdInFlight))
 		g.coldCap.WithLabelValues(label).Set(float64(es.ColdCapTokens))
-		g.exitingBranches.WithLabelValues(label).Set(float64(es.ExitingMembers))
+		g.exitingBranches.WithLabelValues(label).Set(float64(es.ExitingBranches))
 		g.exitingBlocks.WithLabelValues(label).Set(float64(es.ExitingBlocks))
 		g.exitingOldest.WithLabelValues(label).Set(es.ExitingOldestAgeS)
 		g.served.WithLabelValues(label).Add(0)

@@ -1951,7 +1951,7 @@ func (s *Scheduler) enforceBudgetLocked(g *engineGroup, now time.Time) {
 			// THE MARK IS A STATE, NOT AN EVENT: one departure is booked ONCE, when the
 			// branch actually leaves (reason "exiting-drain"). Booking the mark as an exit
 			// too double-counted every mid-flight departure in the same series — and the
-			// mark is already visible as state (ExitingMembers / ExitingBlocks /
+			// mark is already visible as state (ExitingBranches / ExitingBlocks /
 			// ExitingOldestAgeS), which is where an operator looks for "on its way out".
 			continue
 		}
@@ -2116,8 +2116,11 @@ func (s *Scheduler) Events() []Event {
 // per-engine section the multi-pod arm reports and the lights-out dumps are scored
 // on.
 type Snapshot struct {
-	Seats        int
-	UniqueBlocks int
+	Seats int
+	// NEBlocks is the USED side: every seated branch's distinct blocks, exiting branches
+	// INCLUDED (the engine pins them until their requests drain). "NE" is the old name for
+	// "charged to the non-exiting set" and is FALSE — read it as the used side, which is what
+	// admission asks about.
 	NEBlocks     int
 	BudgetBlocks int
 	// WaitersShared is the SHARED waiter queue's size — the whole policy's admission queue.
@@ -2165,14 +2168,15 @@ type Snapshot struct {
 // EngineSnapshot is ONE engine's group state: seats, the budget, the exit mix, the
 // exiting ledger and the per-engine wait ladder.
 type EngineSnapshot struct {
-	ID           string `json:"id"`
-	Seats        int    `json:"seats"`
-	UniqueBlocks int    `json:"uniqueBlocks"`
-	NEBlocks     int    `json:"neBlocks"`
-	BudgetBlocks int    `json:"budgetBlocks"`
-	NumBlocks    int    `json:"numBlocks"`
-	CapacityOK   bool   `json:"capacityOk"`
-	ColdInFlight int64  `json:"coldInFlightTokens"`
+	ID    string `json:"id"`
+	Seats int    `json:"seats"`
+	// NEBlocks is the USED side (exiting branches included): see Snapshot.NEBlocks. There is
+	// deliberately no second field for the same number under another name.
+	NEBlocks     int   `json:"neBlocks"`
+	BudgetBlocks int   `json:"budgetBlocks"`
+	NumBlocks    int   `json:"numBlocks"`
+	CapacityOK   bool  `json:"capacityOk"`
+	ColdInFlight int64 `json:"coldInFlightTokens"`
 	// ColdCapTokens is the DERIVED cold-entry stagger cap (the budget's own
 	// headroom, in tokens). A scored run divides coldInFlightTokens by THIS, not by
 	// a constant from the arm's config: the cap moves with the engine.
@@ -2182,12 +2186,15 @@ type EngineSnapshot struct {
 	// oldest one has been leaving. Read together they say whether an engine is busy or
 	// stuck: exiting_blocks inside ne_blocks is a drain in progress, and an oldest age
 	// that only grows is a drain that is not happening.
-	ExitingMembers    int     `json:"exitingMembers"`
+	// ExitingBranches is the exiting-branch count (the metric of the same name); the field was
+	// called ExitingMembers in the dump before the member→branch rename reached it.
+	ExitingBranches   int     `json:"exitingBranches"`
 	ExitingBlocks     int     `json:"exitingBlocks"`
 	ExitingOldestAgeS float64 `json:"exitingOldestAgeSeconds"`
-	BoundMembers      int     `json:"boundMembers"`
-	Served            int64   `json:"served"`
-	ForcedSeats       int64   `json:"forcedSeats"`
+	// BoundBranches is the LIVE seat-binding count for this engine — it must equal Seats.
+	BoundBranches int   `json:"boundBranches"`
+	Served        int64 `json:"served"`
+	ForcedSeats   int64 `json:"forcedSeats"`
 	// EntryWaitP50 / ReentryWaitP50 are THIS engine's median seat waits, or -1 when nothing
 	// has waited yet (see `absent`): the per-engine wait ladder, which the Prometheus
 	// histograms cannot give a lights-out dump.
@@ -2234,7 +2241,7 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 	for _, engine := range s.bindings {
 		snap.Bindings[engineLabel(engine)]++
 	}
-	var seats, uniq, ne int
+	var seats, ne int
 	for _, id := range s.groupOrder {
 		g := s.groups[id]
 		label := engineLabel(id)
@@ -2249,15 +2256,15 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 			}
 		}
 		es := EngineSnapshot{ID: label, Seats: len(g.branches),
-			ExitingMembers: exitingMembers, ExitingBlocks: g.index.ExitingBlocksLocked(),
+			ExitingBranches: exitingMembers, ExitingBlocks: g.index.ExitingBlocksLocked(),
 			ExitingOldestAgeS: exitingOldest.Seconds(),
-			UniqueBlocks:      g.index.UniqueBlocks(), NEBlocks: g.index.UniqueBlocksLocked(),
-			BudgetBlocks: g.budgetBlocks, NumBlocks: g.numBlocks,
+			NEBlocks:          g.index.UniqueBlocksLocked(),
+			BudgetBlocks:      g.budgetBlocks, NumBlocks: g.numBlocks,
 			CapacityOK:   g.numBlocks > 0,
 			ColdInFlight: g.coldInFlight, Served: g.counters.served,
 			ColdCapTokens:  g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize),
 			ForcedSeats:    g.counters.forcedSeats,
-			BoundMembers:   snap.Bindings[label],
+			BoundBranches:  snap.Bindings[label],
 			EntryWaitP50:   p50(g.counters.entryWaits),
 			ReentryWaitP50: p50(g.counters.reentryWaits),
 		}
@@ -2272,11 +2279,10 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 		}
 		snap.Engines[label] = es
 		seats += es.Seats
-		uniq += es.UniqueBlocks
 		ne += es.NEBlocks
 		snap.BudgetBlocks += g.budgetBlocks
 	}
-	snap.Seats, snap.UniqueBlocks, snap.NEBlocks = seats, uniq, ne
+	snap.Seats, snap.NEBlocks = seats, ne
 	snap.WaitersShared = len(s.waiters)
 	if n := len(s.counters.seatTurns); n > 0 {
 		sum := 0
@@ -2314,8 +2320,10 @@ func p50(w []float64) float64 {
 	return cp[len(cp)/2]
 }
 
-// Sessions returns the tracked-branch-record count (the record-leak test).
-func (s *Scheduler) Sessions() int {
+// SeatRecords is the number of per-engine seat records: one per BRANCH-SEAT, so it equals the
+// seat count by construction and a number that drifts is a leak (the record-leak test's input).
+// It is not a "session" count — a session is an attribute, never a unit of this policy.
+func (s *Scheduler) SeatRecords() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0

@@ -30,15 +30,11 @@ package groupsched
 // can see the geometry arrive late (the capacity race), and why the ticker's price
 // for it — one map read per engine per second — is the price of the fix.
 
-import (
-	"time"
-)
-
-// engineSample is one engine's LIVE reading: the KV geometry the capacity path
-// learns from, and the one packet it lives in. It is the ONLY metrics view in the
-// core (see the file header).
+// engineSample is one engine's LIVE reading: the KV geometry the capacity path learns from,
+// and the one packet it lives in. It is the ONLY metrics view in the core (see the file
+// header) — nothing here carries a timestamp, because a sample is read and used inside one
+// tick and a freshness field nothing consults is a lie about freshness.
 type engineSample struct {
 	blockSz int
 	numBlk  int
-	at      time.Time
 }

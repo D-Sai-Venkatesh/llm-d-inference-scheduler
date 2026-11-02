@@ -126,8 +126,8 @@ func TestDetectorDefaultsToNotSaturated(t *testing.T) {
 		}
 		// the live candidate set is still remembered on the ticker: it is the capacity
 		// retry's input (a remembered endpoint clone could never see the geometry arrive)
-		p.pushEngineLoad(time.Now())
-		if got := p.sampleCandidates(time.Now()); len(got) != n {
+		p.pushEngineLoad()
+		if got := p.sampleCandidates(); len(got) != n {
 			t.Fatalf("N=%d: the ticker must sample one reading per engine, got %d", n, len(got))
 		}
 	}
@@ -151,7 +151,7 @@ func TestCapacityLearnedFromLiveSamples(t *testing.T) {
 	}
 	p.Saturation(context.Background(), livePods(liveEndpoint("a", 0.1, 0, 64, 1000, time.Now()),
 		liveEndpoint("b", 0.1, 0, 64, 2000, time.Now())))
-	p.pushEngineLoad(time.Now())
+	p.pushEngineLoad()
 	if !p.sched.HasCapacityFor(engineID(0)) || !p.sched.HasCapacityFor(engineID(1)) {
 		t.Fatal("both engines' capacity must be learned from the live samples")
 	}

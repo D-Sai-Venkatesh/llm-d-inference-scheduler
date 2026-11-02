@@ -2079,10 +2079,6 @@ type Event struct {
 	ID     string    `json:"id"`     // the branch id the decision was taken for
 	Engine string    `json:"engine"` // the engine label the decision happened on
 	Detail string    `json:"detail"` // reason=… turns=… / kind=… wait=… / from=… to=… / fairness_id=… wire_id=…
-	// Branch is the fairness unit the event's id resolves to at emit time
-	// (the affinity-violation join needs branch→engine-at-seat reconstructable
-	// from the artifacts alone).
-	Branch string `json:"branch,omitempty"`
 }
 
 const eventRingSize = 2048
@@ -2091,7 +2087,6 @@ func (s *Scheduler) recordEvent(kind, id, detail string, now time.Time) {
 	ev := Event{T: now, Kind: kind, ID: id, Detail: detail}
 	if g := s.groupOfLocked(id); g != nil {
 		ev.Engine = engineLabel(g.id)
-		ev.Branch = id
 	}
 	s.recordEventOn(ev)
 }
@@ -2125,10 +2120,9 @@ type Snapshot struct {
 	UniqueBlocks int
 	NEBlocks     int
 	BudgetBlocks int
-	Waiters      int
-	// WaitersShared is the SHARED waiter queue's size. It is the same number as
-	// Waiters (a waiter belongs to no engine), and it is reported separately so a
-	// reader cannot mistake the per-engine Waiters fields for a partition.
+	// WaitersShared is the SHARED waiter queue's size — the whole policy's admission queue.
+	// There is no per-engine waiter count to confuse it with: a waiter belongs to no engine
+	// until one seats it, which is what makes N engines one admission system.
 	WaitersShared  int
 	Exits          map[string]int64
 	MeanResTurns   float64
@@ -2173,7 +2167,6 @@ type Snapshot struct {
 type EngineSnapshot struct {
 	ID           string `json:"id"`
 	Seats        int    `json:"seats"`
-	Waiters      int    `json:"waiters"`
 	UniqueBlocks int    `json:"uniqueBlocks"`
 	NEBlocks     int    `json:"neBlocks"`
 	BudgetBlocks int    `json:"budgetBlocks"`
@@ -2284,10 +2277,7 @@ func (s *Scheduler) snapshotLocked(full bool) Snapshot {
 		snap.BudgetBlocks += g.budgetBlocks
 	}
 	snap.Seats, snap.UniqueBlocks, snap.NEBlocks = seats, uniq, ne
-	// A waiter belongs to NO engine (the queue is shared), so the per-engine
-	// Waiters above are 0 by construction; the whole-policy number is the queue.
 	snap.WaitersShared = len(s.waiters)
-	snap.Waiters = snap.WaitersShared
 	if n := len(s.counters.seatTurns); n > 0 {
 		sum := 0
 		for _, t := range s.counters.seatTurns {

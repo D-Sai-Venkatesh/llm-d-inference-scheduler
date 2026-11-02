@@ -122,11 +122,8 @@ func (c chain) lastHash() prefixhash.BlockHash {
 
 // branchRecord is one live branch: its tip and its liveness.
 type branchRecord struct {
-	id string
-	// idSeed is the tip commitment the id was minted from, plus the fork ordinal
-	// and the scope.
-	idSeed prefixhash.BlockHash
-	scope  string // client session id at creation, "" when the client sent none
+	id    string
+	scope string // client session id at creation, "" when the client sent none
 
 	// The tip. (fullBlocks, lastHash, tokens) is the S2 exact key: two requests
 	// with the same triple are identical up to the whole rendered prompt.
@@ -488,7 +485,6 @@ func (ix *branchIndex) mintLocked(now time.Time, parent *branchRecord, a Arrival
 
 	rec := &branchRecord{
 		id:       id,
-		idSeed:   seed,
 		scope:    a.Scope,
 		msgCount: len(a.Roles),
 		created:  now,

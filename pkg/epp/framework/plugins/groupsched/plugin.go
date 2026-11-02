@@ -264,7 +264,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 			}
 			r.logger.V(logutil.DEBUG).Info("group-scheduler event",
 				"t", ev.T.UTC().Format(time.RFC3339Nano), "kind", ev.Kind, "id", ev.ID,
-				"detail", ev.Detail, "engine", ev.Engine, "branch", ev.Branch)
+				"detail", ev.Detail, "engine", ev.Engine)
 		}
 		go r.runTicker(handle.Context())
 	}
@@ -281,7 +281,7 @@ func (r *GroupScheduler) runTicker(ctx context.Context) {
 		case <-ticker.C:
 			now := time.Now()
 			r.pollCapacity(now)
-			r.pushEngineLoad(now)
+			r.pushEngineLoad()
 			r.sched.Tick(now)
 			r.metrics.Refresh()
 		}
@@ -667,12 +667,11 @@ func (r *GroupScheduler) rememberEndpoint(ep metricsSource) {
 	if r.endpoints == nil {
 		r.endpoints = map[string]*endpointState{}
 	}
-	st, ok := r.endpoints[key]
-	if !ok {
-		st = &endpointState{firstSeen: time.Now()}
-		r.endpoints[key] = st
+	if _, ok := r.endpoints[key]; !ok {
+		// the HANDLE is not stored on purpose: a remembered endpoint's metrics are a
+		// construction-time clone (endpointState's note), so the live read is the only input
+		r.endpoints[key] = &endpointState{firstSeen: time.Now()}
 	}
-	_ = ep // the handle is NOT stored: see endpointState's note (live read only)
 }
 
 func (r *GroupScheduler) forgetEndpoint(ep metricsSource) {
@@ -704,8 +703,8 @@ func endpointKey(ep metricsSource) string {
 // pushEngineLoad learns CAPACITY from the LIVE per-engine sample set — never from a
 // remembered endpoint (a remembered handle's metrics are a construction-time CLONE,
 // which is why nothing in this core reads one).
-func (r *GroupScheduler) pushEngineLoad(now time.Time) {
-	samples := r.sampleCandidates(now)
+func (r *GroupScheduler) pushEngineLoad() {
+	samples := r.sampleCandidates()
 	if samples == nil {
 		return // the framework has not offered a candidate set yet
 	}
@@ -720,7 +719,6 @@ func (r *GroupScheduler) pushEngineLoad(now time.Time) {
 			}
 		}
 	}
-	_ = now
 }
 
 // pollCapacity is the STARTUP LIVENESS check: once a decode endpoint has been observed,
@@ -811,24 +809,24 @@ func sameEndpoints(a, b []fwkdl.Endpoint) bool {
 	return true
 }
 
-// sampleCandidates reads every candidate's LIVE metrics (the ticker calls this at 1 Hz
-// for the capacity path and the series).
-func (r *GroupScheduler) sampleCandidates(now time.Time) map[string]engineSample {
+// sampleCandidates reads every candidate's LIVE metrics (the ticker calls this at 1 Hz for the
+// capacity path).
+func (r *GroupScheduler) sampleCandidates() map[string]engineSample {
 	if p := r.candidates.Load(); p != nil {
-		return r.readSamples(*p, now)
+		return r.readSamples(*p)
 	}
 	return nil
 }
 
 // readSamples reads the live endpoint metrics into an immutable per-engine map.
-func (r *GroupScheduler) readSamples(candidates []fwkdl.Endpoint, now time.Time) map[string]engineSample {
+func (r *GroupScheduler) readSamples(candidates []fwkdl.Endpoint) map[string]engineSample {
 	out := make(map[string]engineSample, len(candidates))
 	for _, e := range candidates {
 		if e == nil {
 			continue
 		}
 		engine := endpointKey(e)
-		s := engineSample{at: now}
+		var s engineSample
 		if m := e.GetMetrics(); m != nil {
 			s.blockSz = m.CacheBlockSize
 			s.numBlk = m.CacheNumBlocks

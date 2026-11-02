@@ -213,9 +213,8 @@ func (b *BlockIndex) insertLocked(id string, chains []Chain) {
 // model, is authoritative about what it holds). Enforcement reconciles the budget; a
 // branch absent from the engine serving it would not be recoverable.
 func (b *BlockIndex) SeatForceLocked(id string, chains []Chain) {
-	if s, seated := b.seats[id]; seated {
-		b.GrowLocked(id, chains)
-		_ = s
+	if _, seated := b.seats[id]; seated {
+		b.GrowLocked(id, chains) // already charging this branch: the newest chain replaces its set
 		return
 	}
 	b.insertLocked(id, chains)

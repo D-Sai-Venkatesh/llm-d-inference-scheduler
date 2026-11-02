@@ -499,3 +499,56 @@ func TestCoreMatchesF0PUpToTheFixes(t *testing.T) {
 	}
 	t.Logf("the core matches the f0p baseline line for line for its first %d decisions; the declared fixes take over after that", limit)
 }
+
+// TestDeterminism_OneAndTwoEngines replays the SAME synthetic N=1 and N=2 event
+// streams twice each and requires identical traces. This is the goldens' replacement:
+// with no committed trace to compare against, the property that must still hold is that
+// the decision path has NO map-order dependence — the archive build produced three
+// different traces in four replays of this scenario, and the total victim tie-break
+// (oldest completion, then member id) is what fixed it.
+//
+// The N=2 stream is the same arrivals against TWO engines, so the cross-engine pass
+// (per-engine dispatch order, the winner key, the engine id as the final tie-break) is
+// exercised too: N must be a case of the code, not a branch of it.
+func TestDeterminism_OneAndTwoEngines(t *testing.T) {
+	for _, n := range []int{1, 2} {
+		first := runScenarioEngines(t, n)
+		for i := 2; i <= 3; i++ {
+			if again := runScenarioEngines(t, n); again != first {
+				gotL, wantL := strings.Split(again, "\n"), strings.Split(first, "\n")
+				for k := 0; k < len(gotL) || k < len(wantL); k++ {
+					ga, wa := "", ""
+					if k < len(gotL) {
+						ga = gotL[k]
+					}
+					if k < len(wantL) {
+						wa = wantL[k]
+					}
+					if ga != wa {
+						t.Fatalf("N=%d: replay %d diverges at line %d:\n  run %d: %s\n  run 1: %s", n, i, k+1, i, ga, wa)
+					}
+				}
+				t.Fatalf("N=%d: replay %d diverges (length)", n, i)
+			}
+		}
+		if first == "" {
+			t.Fatalf("N=%d: the scenario produced an empty trace", n)
+		}
+	}
+}
+
+// runScenarioEngines replays the scenario against n engines of equal capacity: the
+// same event stream, one more placement choice per pass.
+func runScenarioEngines(t *testing.T, n int) string {
+	t.Helper()
+	s, err := NewScheduler(defaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		if err := s.SetNumBlocksFor(fmt.Sprintf("engine-%c", 'a'+i), 64, 1000); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return runGoldenScenarioOnSched(t, 2600, s)
+}

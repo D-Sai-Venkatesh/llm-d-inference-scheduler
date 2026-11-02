@@ -445,3 +445,43 @@ func TestChargedDrainMarkOnUnseatedRecordIsANoOp(t *testing.T) {
 		}
 	})
 }
+
+// TestReapPathsIncrementTheirOwnAnomaly: each reap path (released-window
+// vs in-flight) increments its own anomalies_total kind and only its own.
+// The reap is "the belt that should never fire" — these counters are the
+// production leak signal the handoff relies on.
+func TestReapPathsIncrementTheirOwnAnomaly(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		// A released-window record: dispatched at Pick but never arrived at a pod.
+		// Age it past inflightReapSeconds on the fixture clock.
+		h1 := head("wbranch", time.Second, 100)
+		if _, i := fx.pickEngine(h1); i < 0 {
+			t.Fatal("the head must be picked")
+		}
+		// Do NOT call DispatchedOn — the record stays released (no pod).
+		fx.tick(time.Duration(defaultConfig().InflightReapSeconds) * time.Second)
+		fx.tick(time.Second) // one more pass to run the reap
+		if got := fx.s.counters.anomalies["reaped_window"]; got != 1 {
+			t.Fatalf("reaped_window = %d, want 1 (the released-window reap must count)", got)
+		}
+		if got := fx.s.counters.anomalies["reaped_inflight"]; got != 0 {
+			t.Fatalf("reaped_inflight = %d, want 0 (the window reap must not fire the in-flight kind)", got)
+		}
+
+		// An in-flight record: dispatched AND arrived at a pod, then aged past the reap.
+		h2 := head("ibranch", time.Second, 100)
+		engine, i := fx.pickEngine(h2)
+		if i < 0 {
+			t.Fatal("the head must be picked")
+		}
+		fx.s.DispatchedOn("", h2.ReqID, engine, nil, fx.clock)
+		fx.tick(time.Duration(defaultConfig().InflightReapSeconds) * time.Second)
+		fx.tick(time.Second)
+		if got := fx.s.counters.anomalies["reaped_inflight"]; got != 1 {
+			t.Fatalf("reaped_inflight = %d, want 1 (the in-flight reap must count)", got)
+		}
+		if got := fx.s.counters.anomalies["reaped_window"]; got != 1 {
+			t.Fatalf("reaped_window = %d, want 1 (only the first branch's window reap; the in-flight reap must not fire the window kind)", got)
+		}
+	})
+}

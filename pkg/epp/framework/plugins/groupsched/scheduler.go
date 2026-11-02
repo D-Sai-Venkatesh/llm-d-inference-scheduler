@@ -1799,7 +1799,6 @@ type EngineSnapshot struct {
 	BudgetBlocks  int    `json:"budgetBlocks"`
 	NumBlocks     int    `json:"numBlocks"`
 	CapacityOK    bool   `json:"capacityOk"`
-	PendingBlocks int64  `json:"pendingBlocks"`
 	ColdInFlight  int64  `json:"coldInFlightTokens"`
 	// ColdCapTokens is the DERIVED cold-entry stagger cap (the budget's own
 	// headroom, in tokens). A scored run divides coldInFlightTokens by THIS, not by

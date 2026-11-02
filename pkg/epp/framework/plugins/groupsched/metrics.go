@@ -178,7 +178,7 @@ func (g *groupMetrics) Refresh() {
 		g.exitingBlocks.WithLabelValues(label).Set(float64(es.ExitingBlocks))
 		g.exitingOldest.WithLabelValues(label).Set(es.ExitingOldestAgeS)
 		g.served.WithLabelValues(label).Add(0)
-		for _, reason := range []string{"quantum-complete", "idle", "exiting", "engine-idle", "ttl",
+		for _, reason := range []string{"quantum-complete", "idle", "exiting", "engine-idle",
 			"exiting-drain", "budget-idle", "budget-noqueue", "budget-exiting", "engine-gone"} {
 			g.exits.WithLabelValues(label, reason).Add(0)
 		}

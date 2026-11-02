@@ -150,8 +150,14 @@ func TestCounterExitsMovesOnItsEvent(t *testing.T) {
 	if got := f.value(t, "exits_total", map[string]string{"engine": "e0", "reason": reason}); got != 1 {
 		t.Fatalf("exits_total{reason=%q} = %v, want 1", reason, got)
 	}
-	if got := f.value(t, "exits_total", map[string]string{"engine": "e0", "reason": "ttl"}); got != 0 {
-		t.Fatalf("a series for a reason that no longer exists must stay 0, got %v", got)
+	// the other reasons are pre-instantiated at 0 (a zero is a fact, an absent series is a
+	// question) — but only the reasons an exit can actually happen for: a stale one would
+	// sit in every scrape as a line that can never move.
+	if _, ok := gatherValue(t, f.reg, subsystem+"_exits_total", map[string]string{"engine": "e0", "reason": "quantum-complete"}); !ok {
+		t.Fatal("every live exit reason must be pre-instantiated for a known engine")
+	}
+	if _, ok := gatherValue(t, f.reg, subsystem+"_exits_total", map[string]string{"engine": "e0", "reason": "ttl"}); ok {
+		t.Fatal("a reason no exit can produce must have no series at all")
 	}
 }
 

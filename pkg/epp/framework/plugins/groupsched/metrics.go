@@ -228,13 +228,23 @@ func (g *groupMetrics) ObserveServed(engine string) {
 	g.served.WithLabelValues(engine).Inc()
 }
 
-// ObserveAffinityViolation records a request that landed off its branch's seat
-// engine (and the rebind that repaired it).
+// ObserveAffinityViolation records a request that landed off the engine it was charged to.
+// It is fired from BOTH sites — the PreRequest observation (which also rebinds) and the
+// settle — so the series covers the whole violation class, not half of it.
 func (g *groupMetrics) ObserveAffinityViolation(from, to string) {
 	if g == nil || g.affinityViolations == nil {
 		return
 	}
 	g.affinityViolations.WithLabelValues(from, to).Inc()
+}
+
+// ObserveRebind records the seat MOVE that repaired a violation. Separate from the
+// violation itself: a violation found at the settle repairs nothing, so counting rebinds off
+// the same event would overstate the repairs.
+func (g *groupMetrics) ObserveRebind() {
+	if g == nil || g.rebinds == nil {
+		return
+	}
 	g.rebinds.Inc()
 }
 

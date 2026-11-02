@@ -31,6 +31,7 @@ package groupsched
 // just the hook: a counter nobody can scrape is not observability.
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -238,6 +239,46 @@ func TestExitingLedgerIsVisiblePerEngine(t *testing.T) {
 		for _, name := range []string{"_exiting_branches", "_exiting_blocks", "_exiting_oldest_age_seconds"} {
 			if got, ok := gatherValue(t, reg, subsystem+name, map[string]string{"engine": engineLabel(g.id)}); !ok || got != 0 {
 				t.Fatalf("%s = %v (present=%v) after the drain, want 0", name, got, ok)
+			}
+		}
+	})
+}
+
+// THE SEAT/EXIT LINE CARRIES THE CLIENT'S OWN ID. The queue key is the branch, which joins
+// to nothing in the harness's request records; a run's seat membership is only joinable
+// through the client's correlation / request id. Pick reads it (the one unscoped hook), the
+// branch carries it, and both events name it — the EXIT included, which fires long after the
+// head is gone.
+func TestSeatAndExitCarryTheClientsRequestID(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		h := head("m", time.Second, 100)
+		h.WireID = "thread-9-r17"
+		if i := fx.pick(h); i < 0 {
+			t.Fatal("m must be seated")
+		}
+		fx.s.Settle("m", h.ReqID, struct{ Prompt, Cached int }{100 * 64, 100 * 64}, true, fx.clock)
+		// the branch leaves (a teardown is the deterministic exit; the id must still be on
+		// the EXIT line, which fires long after the head that carried it is gone)
+		fx.s.RemoveEngine(fx.s.bindings["m"], fx.clock)
+
+		var seat, exit string
+		for _, ev := range fx.s.Events() {
+			if ev.ID != "m" {
+				continue
+			}
+			switch ev.Kind {
+			case "SEAT":
+				seat = ev.Detail
+			case "EXIT":
+				exit = ev.Detail
+			}
+		}
+		if seat == "" || exit == "" {
+			t.Fatalf("want a SEAT and an EXIT event for m, got seat=%q exit=%q", seat, exit)
+		}
+		for _, d := range []string{seat, exit} {
+			if !strings.Contains(d, "wire_id=thread-9-r17") {
+				t.Fatalf("the event detail must carry the client's request id, got %q", d)
 			}
 		}
 	})

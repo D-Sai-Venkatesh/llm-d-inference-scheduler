@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkfc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
@@ -50,6 +51,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/prefixhash"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
+	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 )
 
 // PluginType is the canonical type name used to register the plugin.
@@ -202,8 +204,17 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	r.sched.onServe = r.metrics.ObserveServed
 	r.sched.onRehome = func(branch, from, to string) {
 		r.metrics.ObserveAffinityViolation(engineLabel(from), engineLabel(to))
+		r.metrics.ObserveRebind()
 		r.logger.V(logutil.DEFAULT).Info("group-scheduler: AFFINITY VIOLATION — a request landed off its seat; rebound to the observed endpoint",
 			"branch", branch, "charged", engineLabel(from), "observed", engineLabel(to))
+	}
+	// The SAME counter for the violation found at the SETTLE (nothing to rebind there: the
+	// request is over). Without this site the metric's "must be 0" claim only covered the
+	// PreRequest half, and a placement path that ignores the pin shows up exactly here.
+	r.sched.onAffinityViolation = func(branch, charged, settled string) {
+		r.metrics.ObserveAffinityViolation(engineLabel(charged), engineLabel(settled))
+		r.logger.V(logutil.DEFAULT).Info("group-scheduler: AFFINITY VIOLATION at the settle — the request ran on an engine other than the one it was charged to",
+			"branch", branch, "charged", engineLabel(charged), "settledOn", engineLabel(settled))
 	}
 	// The pin table follows the SEATS: one map write per seat, one delete per exit.
 	r.sched.onBind = func(branch, engine string) { r.pins.set(branch, engine) }
@@ -365,6 +376,25 @@ func (r *GroupScheduler) pruneChains(seen map[string]struct{}) {
 		}
 	}
 	r.chainsMu.Unlock()
+}
+
+// wireIDHeaderNames are the client's own request-identity headers, in priority order: the
+// harness's correlation id (its thread ground truth) first, then the standard request id.
+// They are read AT PICK — the only hook whose request is unscoped — and carried on the
+// branch, so a SEAT/EXIT line joins to the client's own records whatever the queue key is.
+var wireIDHeaderNames = []string{"x-correlation-id", reqcommon.RequestIDHeaderKey}
+
+// wireID is the client's own id for the request ("" when it sent neither header).
+func wireID(request *fwksched.InferenceRequest) string {
+	if request == nil {
+		return ""
+	}
+	for _, name := range wireIDHeaderNames {
+		if v, ok := metadata.GetLowerCaseHeaderValue(request.Headers, name); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // readID is the string attribute at key ("" when it is absent).
@@ -834,14 +864,15 @@ func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccess
 			return true
 		}
 		branch := ""
-		reqID, fid := "", ""
+		reqID, fid, wire := "", "", ""
 		returner := false
 		var chains []Chain
 		if req := h.OriginalRequest(); req != nil {
 			if ir := req.InferenceRequest(); ir != nil {
 				branch = r.branchOf(ir)
 				reqID = ir.RequestID
-				fid = ir.FairnessID // the wire-level identity (the queue key)
+				fid = ir.FairnessID // the queue key (the branch, unless a header named one)
+				wire = wireID(ir)   // the client's own id — the join to its request record
 				returner = isReturner(ir)
 				chains = r.chainsFor(ctx, reqID, ir)
 				if reqID != "" {
@@ -851,7 +882,7 @@ func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccess
 		}
 		queues = append(queues, q)
 		heads = append(heads, Head{Branch: branch, Returner: returner,
-			FairnessID: fid, ReqID: reqID, Arrival: h.EnqueueTime(), Chains: chains,
+			FairnessID: fid, WireID: wire, ReqID: reqID, Arrival: h.EnqueueTime(), Chains: chains,
 		})
 		return true
 	})

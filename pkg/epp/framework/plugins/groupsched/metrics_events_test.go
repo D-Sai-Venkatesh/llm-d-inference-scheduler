@@ -58,7 +58,8 @@ func newMetricFixture(t *testing.T, engines ...string) *metricFixture {
 	s.onEntry = func(engine, kind string, wait float64) { m.ObserveEntry(engine, kind, wait) }
 	s.onColdValveHeld = func(engine string) { m.ObserveColdValveHeld(engine) }
 	s.onEngineGone = func(engine string, n int) { m.ObserveEngineGone() }
-	s.onRehome = func(branch, from, to string) { m.ObserveAffinityViolation(from, to) }
+	s.onRehome = func(branch, from, to string) { m.ObserveAffinityViolation(from, to); m.ObserveRebind() }
+	s.onAffinityViolation = func(branch, charged, settled string) { m.ObserveAffinityViolation(charged, settled) }
 	for _, e := range engines {
 		if err := s.SetNumBlocksFor(e, 64, 1000); err != nil {
 			t.Fatal(err)
@@ -225,6 +226,24 @@ func TestCountersAffinityAndRebindMoveOnTheirEvent(t *testing.T) {
 	}
 	if got := f.value(t, "affinity_violations_total", map[string]string{"from": "e0", "to": "e1"}); got != 1 {
 		t.Fatalf("affinity_violations_total{e0->e1}: %v, want 1", got)
+	}
+}
+
+// and the SERIES covers BOTH sites: a violation whose symptom is the settle (the request ran
+// on an engine other than the one it was charged to, so there is nothing left to rebind)
+// moves the same counter — and must NOT move rebinds_total, because nothing was repaired.
+func TestCounterAffinityViolationMovesAtTheSettleToo(t *testing.T) {
+	f := newMetricFixture(t, "e0", "e1")
+	now := time.Unix(1793000000, 0).UTC()
+	f.seat(t, "m", 100, now) // seated on e0 and charged there
+	f.s.DispatchedOn("m", "r-m", "e0", nil, now)
+	// the response's own endpoint metadata says the turn ran on e1
+	f.s.SettleOnUsage("m", "r-m", "e1", 100*64, 0, 0, true, now)
+	if got := f.value(t, "affinity_violations_total", map[string]string{"from": "e0", "to": "e1"}); got != 1 {
+		t.Fatalf("affinity_violations_total{e0->e1} after the settle-side violation: %v, want 1", got)
+	}
+	if got := f.value(t, "rebinds_total", nil); got != 0 {
+		t.Fatalf("a settle-side violation repairs nothing, so rebinds_total must stay 0, got %v", got)
 	}
 }
 

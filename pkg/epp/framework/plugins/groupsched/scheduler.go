@@ -230,12 +230,17 @@ type Head struct {
 	// request has no tokens: it is never seated (it is dispatched without a seat, like
 	// anonymous traffic).
 	Chains []Chain
-	// FairnessID is the request's flow-control identity — the id the GATEWAY and
-	// the harness record on the wire (x_correlation_id / the client's thread id).
-	// The branch id is a DERIVED branch id and joins to nothing in the request
-	// records (measured 0/768 matches), so every SEAT/EXIT event must carry this
-	// too or a run's seat membership cannot be joined to its own requests.
+	// FairnessID is the request's flow-control identity — its QUEUE KEY. It is the
+	// derived branch id unless the client sent an explicit fairness header, so it is a
+	// join key only in the header case; the branch id itself joins to nothing in the
+	// harness's own request records (measured 0/768 matches). Every SEAT/EXIT event
+	// carries it, and WireID below is the field that actually joins to a request record.
 	FairnessID string
+	// WireID is the client's OWN id for this request, from its headers
+	// (x-correlation-id, else x-request-id): the one field that joins a SEAT/EXIT line to
+	// the harness's request records, whatever the queue key turned out to be. Read at Pick
+	// (the only unscoped hook) and carried on the branch, so an EXIT names it too.
+	WireID string
 	// Returner reports whether this request is NOT its branch's first turn — the
 	// fairness class, from branch identity's arrival record. It is phrased as the
 	// exception on purpose: the zero value must be the NEWCOMER (a head whose arrival
@@ -302,8 +307,11 @@ type branch struct {
 	// fresh struct, so the flag never has to be cleared).
 	exitingSince time.Time
 	// fairnessID is the last fairness id (queue key) this branch was seen with —
-	// the join key for its SEAT/EXIT events (see Head.FairnessID).
+	// the queue key its SEAT/EXIT events name (see Head.FairnessID).
 	fairnessID string
+	// wireID is the last client request id this branch was seen with: the field a
+	// SEAT/EXIT line joins a request record on (see Head.WireID).
+	wireID string
 }
 
 // busy reports whether the branch has work in progress: a request at a pod, or a LIVE
@@ -373,8 +381,10 @@ type waiter struct {
 	// the truth about that engine.
 	chains []Chain
 	// fairnessID rides with the head (see Head.FairnessID) so a SEAT event can name
-	// the wire-level identity even before the branch has a record.
+	// the queue key even before the branch has a record, and wireID rides with it for the
+	// join to the client's own request record (see Head.WireID).
 	fairnessID string
+	wireID     string
 }
 
 // ---- the per-engine group ----
@@ -471,6 +481,12 @@ type Scheduler struct {
 	onEvent      func(Event)
 	onRehome     func(branch, from, to string)
 	onEngineGone func(engine string, branches int)
+	// onAffinityViolation fires for a request that LANDED on an engine other than the one it
+	// was charged to, when the violation is found at the SETTLE (the observation at
+	// PreRequest already rebinds, and reports through onRehome). Both sites must reach the
+	// counter: the settle-side one is the only signal when the placement path silently
+	// ignored the pin, and the metric's whole claim is that it must be 0.
+	onAffinityViolation func(branch, charged, settled string)
 	// onBind / onUnbind are the PLACEMENT-PIN hooks: they fire when a branch's
 	// seat (and therefore its engine binding) is created or dropped, so the
 	// plugin's lock-light Filter table can follow the seats without ever touching
@@ -897,6 +913,9 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 				if h.FairnessID != "" && m.fairnessID != h.FairnessID {
 					m.fairnessID = h.FairnessID
 				}
+				if h.WireID != "" {
+					m.wireID = h.WireID
+				}
 				if m.waitingSince.IsZero() || h.Arrival.Before(m.waitingSince) {
 					m.waitingSince = h.Arrival
 				}
@@ -916,6 +935,7 @@ func (s *Scheduler) syncWaitersLocked(heads []Head, now time.Time) {
 		// branch's first turn
 		w.returner = h.Returner
 		w.fairnessID = h.FairnessID
+		w.wireID = h.WireID
 		w.chains = h.Chains
 		// the oldest arrival is what the wait is measured from: a fan-out re-arrival
 		// does not reset it
@@ -1399,6 +1419,9 @@ func (s *Scheduler) SettleOnUsage(id, reqID, engine string, promptTokens, cached
 	if engine != "" && landed != engine {
 		s.counters.affinityViolations++
 		s.recordEvent("AFFINITY-VIOLATION", id, fmt.Sprintf("bound=%s settled_on=%s", engineLabel(landed), engineLabel(engine)), now)
+		if s.onAffinityViolation != nil {
+			s.onAffinityViolation(id, landed, engine)
+		}
 	}
 	m, seated := g.branches[id]
 	if seated {
@@ -1721,7 +1744,8 @@ func (s *Scheduler) exitLocked(g *engineGroup, m *branch, reason string, now tim
 	g.index.UnseatLocked(m.id)   // and the exact chains leave the budget here
 	delete(g.branches, m.id)
 	s.countExitLocked(g, reason)
-	s.recordEvent("EXIT", m.id, fmt.Sprintf("reason=%s turns=%d fairness_id=%s", reason, m.seatTurns, fairnessOrNone(m.fairnessID)), now)
+	s.recordEvent("EXIT", m.id, fmt.Sprintf("reason=%s turns=%d fairness_id=%s wire_id=%s",
+		reason, m.seatTurns, fairnessOrNone(m.fairnessID), fairnessOrNone(m.wireID)), now)
 	if s.onExit != nil {
 		s.onExit(engineLabel(g.id), reason, m.seatTurns)
 	}
@@ -1741,7 +1765,8 @@ func (s *Scheduler) exitLocked(g *engineGroup, m *branch, reason string, now tim
 	// right before the next sync reads the head again.
 	if !m.waitingSince.IsZero() {
 		s.waiters[m.id] = &waiter{id: m.id, since: m.waitingSince,
-			returner: m.headReturner, chains: m.headChains, fairnessID: m.fairnessID}
+			returner: m.headReturner, chains: m.headChains,
+			fairnessID: m.fairnessID, wireID: m.wireID}
 	}
 }
 
@@ -1790,6 +1815,7 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, coldTokens int64, now 
 		// this head's cost rather than the chain of whatever ran.
 		waitingSince: w.since,
 		fairnessID:   w.fairnessID,
+		wireID:       w.wireID,
 		headChains:   w.chains,
 		headReturner: w.returner,
 	}
@@ -1820,8 +1846,9 @@ func (s *Scheduler) seatLocked(g *engineGroup, w *waiter, coldTokens int64, now 
 	// the fields a run's forensics need, without the event ring: branch id, wire id,
 	// engine (the Event's own field), the seat kind, the wait, and the arrival the wait is
 	// measured from
-	s.recordEvent("SEAT", w.id, fmt.Sprintf("kind=%s wait=%.3f fairness_id=%s since=%s",
-		eventKind, now.Sub(w.since).Seconds(), fairnessOrNone(w.fairnessID), w.since.UTC().Format(time.RFC3339Nano)), now)
+	s.recordEvent("SEAT", w.id, fmt.Sprintf("kind=%s wait=%.3f fairness_id=%s wire_id=%s since=%s",
+		eventKind, now.Sub(w.since).Seconds(), fairnessOrNone(w.fairnessID), fairnessOrNone(w.wireID),
+		w.since.UTC().Format(time.RFC3339Nano)), now)
 	g.branches[w.id] = m
 	return true
 }
@@ -1973,7 +2000,7 @@ type Event struct {
 	Kind   string    `json:"kind"`   // SEAT | EXIT | REBIND | AFFINITY-VIOLATION
 	ID     string    `json:"id"`     // the branch id the decision was taken for
 	Engine string    `json:"engine"` // the engine label the decision happened on
-	Detail string    `json:"detail"` // reason=… turns=… / kind=… wait=… / from=… to=… / fairness_id=…
+	Detail string    `json:"detail"` // reason=… turns=… / kind=… wait=… / from=… to=… / fairness_id=… wire_id=…
 	// Branch is the fairness unit the event's id resolves to at emit time
 	// (the affinity-violation join needs branch→engine-at-seat reconstructable
 	// from the artifacts alone).

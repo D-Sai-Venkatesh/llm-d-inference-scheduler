@@ -46,6 +46,7 @@ package groupsched
 // Every test here runs at N=1 and N=2 (the twins rule).
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -317,5 +318,51 @@ func TestSharedBlockWithAStayingBranchIsNotExcused(t *testing.T) {
 		if !staysOver {
 			t.Fatal("the pass must still see an overage: a shared block an exiting branch holds is not leaving")
 		}
+	})
+}
+
+// ---- THE CASCADE, DEFINED WITHOUT A THRESHOLD ----
+
+// TestEveryEnforcementMarkReducesTheOverage is the property a ratio can only approximate:
+// THE CASCADE IS MARKS THAT FREE NOTHING. The live batch-1 cascade made 2,520 mid-flight
+// marks for 3,104 dispatches because each pass that marked a victim measured the same
+// overage afterwards and marked the next one. So: on every pass of a pressure run, each
+// mark or eviction must STRICTLY reduce the enforcement overage, and the pass must end
+// when the overage is gone or no victim is left. Zero no-progress marks, no constant.
+func TestEveryEnforcementMarkReducesTheOverage(t *testing.T) {
+	forEnginesCap(t, defaultConfig(), 1000, func(t *testing.T, fx *engineSet) {
+		// fill the engine to the brim with branches whose blocks are all private, then
+		// squeeze the budget so enforcement has real work to do
+		for i := 0; i < 6; i++ {
+			fx.seatOne(t, fmt.Sprintf("b%d", i), 120, time.Duration(5+i)*time.Second)
+			fx.s.Chunk(fmt.Sprintf("b%d", i))
+		}
+		g := fx.g()
+		fx.s.mu.Lock()
+		g.budgetBlocks = 300 // over budget by 420 blocks with six 120-block branches
+		before := fx.s.overBudgetLocked(g)
+		fx.s.mu.Unlock()
+		if before <= 0 {
+			t.Fatalf("premise: the engine must start over budget, got %d", before)
+		}
+
+		overage := before
+		for step := 0; step < 100; step++ {
+			fx.s.mu.Lock()
+			over := fx.s.overBudgetLocked(g)
+			if over <= 0 {
+				fx.s.mu.Unlock()
+				return // done, and every step in between made progress
+			}
+			// one enforcement pass
+			fx.s.enforceBudgetLocked(g, fx.clock)
+			after := fx.s.overBudgetLocked(g)
+			fx.s.mu.Unlock()
+			if after >= over {
+				t.Fatalf("a pass that changed the ledger left the overage at %d (was %d): a mark or eviction MUST strictly reduce it", after, over)
+			}
+			overage = after
+		}
+		t.Fatalf("enforcement did not converge in 100 passes (overage %d): a no-progress loop is the cascade", overage)
 	})
 }

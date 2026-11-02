@@ -1817,16 +1817,13 @@ func (s *Scheduler) Tick(now time.Time) {
 	s.deriveLocked() // derive-don't-accumulate, every decision point
 	s.reapInflightLocked(now)
 	s.drainExitingLocked(now)
+	// NO TIMER FREES A SEAT (R6). A silent seat that nobody is waiting for costs
+	// nothing and its blocks are the reason the branch's next turn is cheap; taking it
+	// back on a clock throws that away and frees room nobody asked for. Seats are
+	// released on DEMAND (enforcement, when a head needs the room) — where a silent
+	// branch is the FIRST victim (it has no queued turn).
 	for _, g := range s.activeGroupsLocked() {
 		s.enforceBudgetLocked(g, now)
-		for id, m := range g.branches {
-			if now.Sub(m.lastActivity) > time.Duration(s.cfg.TTLSeconds*float64(time.Second)) &&
-				m.inflight == 0 && m.waitingSince.IsZero() {
-				s.exitLocked(g, m, "ttl", now)
-				g.index.ForgetLocked(id)
-				s.forgetEverSeatedLocked(id) // B7: prune consistently with the waiter path
-			}
-		}
 	}
 	// R2: NO TTL on waiters — a waiter exists because its head was present at the
 	// last sync; rotation waits are minutes. Headless, unseated records are GC'd by

@@ -48,6 +48,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/prefixhash"
+
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
@@ -153,6 +155,46 @@ func newBranchIdentity(t *testing.T) *branchidentity.Plugin {
 	return built.(*branchidentity.Plugin)
 }
 
+// chainsOfTokens is the exact chain set of one prompt, hashed by the SAME function
+// production uses (prefixhash at the engine block size): the last block partial, each
+// prompt independently seeded.
+func chainsOfTokens(tokens []uint32, blockSize int) []Chain {
+	req := &fwksched.InferenceRequest{
+		RequestID: "chain-of-tokens",
+		Headers:   map[string]string{},
+		Body: &fwkrh.InferenceRequestBody{
+			ChatCompletions: &fwkrh.ChatCompletionsRequest{},
+			TokenizedRequest: &fwkrh.TokenizedRequest{
+				Prompts: []fwkrh.PromptTokens{{TokenIDs: tokens}},
+			},
+		},
+	}
+	hashed, promptTokens := prefixhash.GetBlockHashesWithPromptTokens(context.Background(), req, blockSize, 1<<20)
+	chains := make([]Chain, 0, len(hashed))
+	for i, prompt := range hashed {
+		keys := make([]Hash, len(prompt))
+		for j, h := range prompt {
+			keys[j] = Hash(h)
+		}
+		chains = append(chains, Chain{Keys: keys, Tokens: promptTokens[i]})
+	}
+	return chains
+}
+
+// chainsOfRequest is chainsOfTokens for a whole (possibly multi-prompt) request.
+func chainsOfRequest(req *fwksched.InferenceRequest, blockSize int) []Chain {
+	hashed, promptTokens := prefixhash.GetBlockHashesWithPromptTokens(context.Background(), req, blockSize, 1<<20)
+	chains := make([]Chain, 0, len(hashed))
+	for i, prompt := range hashed {
+		keys := make([]Hash, len(prompt))
+		for j, h := range prompt {
+			keys[j] = Hash(h)
+		}
+		chains = append(chains, Chain{Keys: keys, Tokens: promptTokens[i]})
+	}
+	return chains
+}
+
 // queuedTurn is ONE arrival sitting in the queue: its request (branch identity has
 // already run on it) and the head the plugin would build from it.
 type queuedTurn struct {
@@ -174,18 +216,19 @@ type flyingTurn struct {
 // workload is the arrival model: when each branch's next turn arrives, and what BI made
 // of it when it did.
 type workload struct {
-	t      *testing.T
-	fx     *engineSet
-	bi     *branchidentity.Plugin
-	due    map[string]time.Time   // when the branch's next turn arrives (zero = none scheduled)
-	nxt    map[string]int         // the branch's next turn number
-	queued map[string]*queuedTurn // the head waiting in the queue, by logical branch
-	byID   map[string]string      // derived branch id -> logical branch
-	bid    map[string]string      // logical branch -> derived branch id
-	binds  map[string]int         // branch id -> how many times it was SEATED (onBind)
-	served map[string]int         // logical branch -> turns the fixture completed
-	bytes  map[string]int         // logical branch -> its system prompt's length
-	flying map[string]*flyingTurn // logical branch -> its turn in flight
+	t       *testing.T
+	fx      *engineSet
+	bi      *branchidentity.Plugin
+	due     map[string]time.Time   // when the branch's next turn arrives (zero = none scheduled)
+	nxt     map[string]int         // the branch's next turn number
+	queued  map[string]*queuedTurn // the head waiting in the queue, by logical branch
+	byID    map[string]string      // derived branch id -> logical branch
+	bid     map[string]string      // logical branch -> derived branch id
+	binds   map[string]int         // branch id -> how many times it was SEATED (onBind)
+	served  map[string]int         // logical branch -> turns the fixture completed
+	bytes   map[string]int         // logical branch -> its system prompt's length
+	flying  map[string]*flyingTurn // logical branch -> its turn in flight
+	retired map[string]bool        // a branch that never asks to run again
 }
 
 func newWorkload(t *testing.T, fx *engineSet) *workload {
@@ -196,7 +239,8 @@ func newWorkload(t *testing.T, fx *engineSet) *workload {
 		queued: map[string]*queuedTurn{}, byID: map[string]string{},
 		bid: map[string]string{}, binds: map[string]int{},
 		served: map[string]int{}, bytes: map[string]int{},
-		flying: map[string]*flyingTurn{},
+		flying:  map[string]*flyingTurn{},
+		retired: map[string]bool{},
 	}
 	// the seat is the only event that says a branch HELD one: a seat taken and given
 	// back inside one pass is still a seat, and a test that sampled between passes
@@ -225,6 +269,7 @@ func (w *workload) setPromptBytes(logical string, bytes int) { w.bytes[logical] 
 // retire drops a branch's queued head and its schedule: from here on it holds its
 // seat without ever asking to run again (the closed-engine filler).
 func (w *workload) retire(logical string) {
+	w.retired[logical] = true
 	delete(w.queued, logical)
 	delete(w.due, logical)
 }
@@ -282,10 +327,6 @@ func (w *workload) materialize(now time.Time) {
 			w.t.Fatalf("%s turn %d: identity said outcome=%v turn=%d, the arrival model is broken",
 				logical, turn, outcome.Outcome, outcome.Turn)
 		}
-		payload, err := req.Body.WirePayload().(fwkrh.PayloadMap).Marshal()
-		if err != nil {
-			w.t.Fatalf("%s: marshal: %v", logical, err)
-		}
 		branch := readID(req, branchidentity.BranchIdentityKey)
 		w.byID[branch] = logical
 		w.bid[logical] = branch
@@ -297,8 +338,9 @@ func (w *workload) materialize(now time.Time) {
 				Branch:     branch,
 				ReqID:      req.RequestID,
 				Arrival:    arrival,
-				SizeBytes:  int64(len(payload)),
 				FairnessID: req.FairnessID,
+				// the exact chain, from the request's own tokens at the engine block size
+				Chains: chainsOfRequest(req, 64),
 				// the class, from the arrival record the plugin reads (never restated)
 				Returner: isReturner(req),
 			},
@@ -336,8 +378,7 @@ func (w *workload) dispatchTurn(logical string) {
 	}
 	delete(w.queued, logical)
 	branch := q.head.Branch
-	keys := w.fx.s.HashTokens(q.tokens, q.req.Body.TokenizedRequest.CacheSalt, 64)
-	w.fx.s.Dispatched(branch, q.req.RequestID, keys, q.head.SizeBytes, w.fx.clock)
+	w.fx.s.Dispatched(branch, q.req.RequestID, w.fx.clock)
 	if err := w.bi.PreRequest(context.Background(), q.req, nil); err != nil {
 		w.t.Fatalf("branch identity PreRequest: %v", err)
 	}
@@ -370,7 +411,9 @@ func (w *workload) settleDue() {
 		w.bi.ResponseBody(context.Background(), f.q.req, &fwkrc.Response{EndOfStream: true}, &fwkdl.EndpointMetadata{})
 		delete(w.flying, logical)
 		w.served[logical]++
-		w.arrive(logical, now.Add(thinkGap))
+		if !w.retired[logical] {
+			w.arrive(logical, now.Add(thinkGap))
+		}
 	}
 }
 

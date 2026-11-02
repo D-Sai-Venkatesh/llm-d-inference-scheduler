@@ -53,42 +53,7 @@ import (
 	"time"
 )
 
-// coldTokensForEngine is one waiter's admission cost against ONE engine, in
-// tokens: the per-engine estimate frozen at sync time (each engine is costed
-// against its OWN index — the branch's blocks are warm or cold PER ENGINE), with
-// the pool's best-case scalar as the fallback for an engine that appeared after the
-// sync.
-func coldTokensForEngine(w *waiter, g *engineGroup, blockSize int) int64 {
-	if t, ok := w.coldTokensByEngine[g.id]; ok {
-		return t
-	}
-	return w.coldTokens
-}
-
-// setWaiterCostsLocked fills a waiting head's admission costs: the per-engine
-// vector (each engine's OWN index estimate, frozen for the decision pass — reviewer
-// R2) and the pool's best-case scalar (the minimum, used for the cold-entry charge
-// and for the turnover numbers).
-func (s *Scheduler) setWaiterCostsLocked(w *waiter) {
-	groups := s.activeGroupsLocked()
-	if len(groups) == 0 {
-		return
-	}
-	vec := make(map[string]int64, len(groups))
-	best := int64(-1)
-	for _, g := range groups {
-		e := s.mod.sizer.Tokens(s.estimateCostCachedLocked(g, w.id, w.sizeBytes))
-		vec[g.id] = e
-		if best < 0 || e < best {
-			best = e
-		}
-	}
-	if best < 0 {
-		best = 0
-	}
-	w.coldTokensByEngine = vec
-	w.coldTokens = best
-}
+var dbgNoFit, dbgNoVictim, dbgEvict, dbgValveHeld, dbgSeat int
 
 // queuedPerSeatLocked is the engine's OWN queued demand per seat it holds: seated
 // branches that have a head waiting right now, divided by its seats. It orders the
@@ -109,12 +74,11 @@ func (s *Scheduler) queuedPerSeatLocked(g *engineGroup) float64 {
 	return float64(queued) / float64(seats)
 }
 
-// freeBudgetLocked is what the engine can still admit: its budget minus its
-// accounted footprint (NE blocks, EXITING branches included — they still hold
-// them — plus the seat-time estimates not yet converted to exact keys). Negative
-// when the engine is over budget (enforcement is about to catch up).
+// freeBudgetLocked is what the engine can still admit: its budget minus its USED side
+// (every seated branch's blocks, exiting ones included — they still hold them).
+// Negative when the engine is over budget, which enforcement is about to catch up on.
 func (s *Scheduler) freeBudgetLocked(g *engineGroup) int64 {
-	return int64(g.budgetBlocks) - (int64(g.index.UniqueBlocksLocked()) + g.pendingTotal)
+	return int64(g.budgetBlocks) - int64(g.index.UniqueBlocksLocked())
 }
 
 // coldAllowsTokens is coldAllows against an EXPLICIT per-engine cost (the placement
@@ -139,21 +103,13 @@ func (s *Scheduler) coldAllowsTokens(g *engineGroup, tokens int64) bool {
 	return g.coldInFlight+min(tokens, cap) <= cap
 }
 
-// coldAllows staggers ALL cold entries IN ONE ENGINE (B6: re-entries too — WEKA
-// re-entries are fully cold), in TOKENS (R1). The cap is DERIVED (engineGroup.
-// coldCapTokens) and PER ENGINE, so the system-wide cold-entry concurrency is at
-// most N.
-func (s *Scheduler) coldAllows(g *engineGroup, w *waiter) bool {
-	return s.coldAllowsTokens(g, w.coldTokens)
-}
-
 // seatChoice is the PLACEMENT module's answer bound back to the engine.
 type seatChoice struct {
 	g *engineGroup
-	// costTokens / costBlocks are the estimate the fit test used, so the chosen
-	// engine's own numbers become the branch's cold charge and pending blocks
-	// (instead of the pool's best-case scalar).
+	// costTokens is the head's cold tokens ON THIS ENGINE: the fit test's input and the
+	// cold-entry charge the seat takes (capped by the engine's own valve).
 	costTokens int64
+	// costBlocks is the same cost in blocks (the budget's unit).
 	costBlocks int64
 	// freeBudget is what the engine could still admit when it was chosen.
 	freeBudget int64
@@ -178,8 +134,10 @@ func (s *Scheduler) seatEngineLocked(head *waiter, now time.Time) *seatChoice {
 			// lands (and alarms loudly if it never does).
 			continue
 		}
-		tokens := coldTokensForEngine(head, g, s.blockSize)
-		blocks := tokens / int64(s.blockSize)
+		// the head's exact cost ON THIS ENGINE: what this engine would have to compute
+		// (its own resident prefix discounted) and the cold tokens behind it
+		tokens := g.index.ColdTokensLocked(head.chains)
+		blocks := int64(g.index.CostLocked(head.chains))
 		free := s.freeBudgetLocked(g)
 		budgetFits := blocks <= free
 		gg := g
@@ -216,8 +174,8 @@ func (s *Scheduler) coldValveHeldOn(head *waiter) (string, bool) {
 		if g.numBlocks <= 0 {
 			continue // no measured capacity: the engine is not taking seats at all
 		}
-		tokens := coldTokensForEngine(head, g, s.blockSize)
-		if tokens/int64(s.blockSize) > s.freeBudgetLocked(g) {
+		tokens := g.index.ColdTokensLocked(head.chains)
+		if int64(g.index.CostLocked(head.chains)) > s.freeBudgetLocked(g) {
 			continue // the BUDGET is the blocker on this engine: the valve is not the reason
 		}
 		if s.coldAllowsTokens(g, tokens) {
@@ -265,6 +223,7 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 		}
 		cand := s.seatEngineLocked(head, now)
 		if cand == nil || cand.g == nil {
+			dbgNoFit++
 			// nothing to do this pass. If the reason is the cold-entry valve holding a
 			// head that WOULD fit the budget, book it AGAINST THAT ENGINE: the head waits
 			// for the prefill slot, and that is a measurable cost of the stagger (never a
@@ -272,6 +231,7 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 			// id, not "": cold_valve_held_total read `engine="single"` on a two-engine
 			// stack while this passed the empty id (2026-11-01).
 			if engine, held := s.coldValveHeldOn(head); held {
+				dbgValveHeld++
 				if s.onColdValveHeld != nil {
 					s.onColdValveHeld(engine)
 				}
@@ -279,18 +239,11 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 			return
 		}
 		if cand.fits {
-			// the chosen engine's own cost replaces the pool's best-case scalar: the
-			// cold charge, the pending blocks and the budget all belong to THAT
-			// engine from here on.
-			head.coldTokens = cand.costTokens
-			if !s.seatLocked(cand.g, head, now) {
-				// C4, PER ENGINE, always-on: the estimate passed but TrySeat rejected —
-				// refresh from the authoritative index state and RETURN (continuing
-				// with the stale estimate spins this loop forever under s.mu: the 13:00
-				// deadlock class).
-				head.coldTokens = s.mod.sizer.Tokens(s.estimateCostLocked(cand.g, head.id, head.sizeBytes))
-				return
-			}
+			// ONE number, one moment: the fit test the chooser just ran and the seat's
+			// own cost are the same computation inside the same critical section, so
+			// TrySeat cannot reject a head the chooser admitted.
+			dbgSeat++
+			s.seatLocked(cand.g, head, cand.costTokens, now)
 			continue
 		}
 		// Nothing fits BY BUDGET on the chosen engine (a valve-held head never reaches
@@ -299,8 +252,10 @@ func (s *Scheduler) rotateLocked(now time.Time) {
 		// right now).
 		reason, victim := s.rotationVictimLocked(cand.g, now)
 		if victim == nil {
+			dbgNoVictim++
 			return // this engine can free nothing; another pass will re-evaluate
 		}
+		dbgEvict++
 		// NOTE: a rotation victim is never in flight — the tenure rule refuses in-flight
 		// branches — so there is no mid-flight exit to handle here (the mid-flight class
 		// lives in the PRESSURE module, which does reach running branches).

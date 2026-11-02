@@ -1,0 +1,377 @@
+/*
+Copyright 2026 The llm-d Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package groupsched
+
+// THE RANDOMIZED INVARIANT TEST.
+//
+// A long random event stream — arrivals, Picks, dispatches, settles, aborts, engines
+// appearing and disappearing — driven through the PUBLIC API at N=1 and N=2, with every
+// invariant the design states checked after EVERY event:
+//
+//	I1/I7  used  = the union of the seated branches' chains (exiting ones included)
+//	       stay  = the union over the branches that are not exiting
+//	       no refcount below zero (the index panics on underflow, so this is the panic)
+//	R4     after every pass: |stay| <= budget, OR no eligible victim was left — always
+//	       one of the two, and it is recorded which
+//	B2     an engine's cold charge never exceeds its derived cap
+//	B10    every seated branch is bound to EXACTLY ONE engine, and the binding names it
+//	I6     nothing is seated on an engine whose capacity is unknown
+//	I2/F2  strict head-of-line: when the head fits nowhere and has no victim, nothing
+//	       behind it is seated
+//	I3     the whole run is deterministic for a fixed seed (no map-order decision)
+//	I8     the decisions move only on exogenous events and our own model: the test drives
+//	       nothing the scheduler itself pins (no metric reads, no self-reported signal)
+//
+// The trace is a digest of every decision, so determinism is checked on the DECISIONS,
+// not on the counters.
+
+import (
+	"fmt"
+	"math/rand"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+)
+
+// invEvent is one exogenous event of the stream.
+type invEvent struct {
+	kind   int
+	branch string
+	blocks int
+	engine string
+}
+
+const (
+	evArrive = iota
+	evPick
+	evSettle
+	evAbort
+	evEngineGone
+	evTick
+)
+
+type invStream struct {
+	events   []invEvent
+	branches []string
+}
+
+// newInvStream builds a seeded event stream: arrivals grow a branch's prompt (a turn),
+// and every collision of lifetimes is possible.
+func newInvStream(seed int64, n int) *invStream {
+	rng := rand.New(rand.NewSource(seed))
+	s := &invStream{}
+	for i := 0; i < 12; i++ {
+		s.branches = append(s.branches, fmt.Sprintf("b%02d", i))
+	}
+	sizes := map[string]int{}
+	for i := 0; i < n; i++ {
+		b := s.branches[rng.Intn(len(s.branches))]
+		switch rng.Intn(20) {
+		case 0, 1, 2, 3, 4: // an arrival: a new turn, a bigger prompt
+			sizes[b] += 20 + rng.Intn(120)
+			s.events = append(s.events, invEvent{kind: evArrive, branch: b, blocks: sizes[b]})
+		case 5, 6, 7, 8, 9, 10, 11, 12: // a decision pass
+			s.events = append(s.events, invEvent{kind: evPick})
+		case 13, 14, 15: // a natural settle
+			s.events = append(s.events, invEvent{kind: evSettle, branch: b})
+		case 16, 17: // a termination nobody asked for (a cancel / an error before the first chunk)
+			s.events = append(s.events, invEvent{kind: evAbort, branch: b})
+		case 18: // an engine disappears (a node rotation)
+			s.events = append(s.events, invEvent{kind: evEngineGone})
+		case 19: // the ~1s ticker
+			s.events = append(s.events, invEvent{kind: evTick})
+		}
+	}
+	return s
+}
+
+// invRun drives one stream against a fresh scheduler and returns the decision trace.
+// Every invariant is asserted after every event; a violation fails the test with the
+// event index.
+func invRun(t *testing.T, seed int64, engines, capacity int, events int) string {
+	t.Helper()
+	s, err := NewScheduler(defaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var engineIDs []string
+	for i := 0; i < engines; i++ {
+		id := fmt.Sprintf("e%d", i)
+		engineIDs = append(engineIDs, id)
+		if err := s.SetNumBlocksFor(id, 64, capacity); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clock := time.Unix(1793000000, 0).UTC()
+	stream := newInvStream(seed, events)
+
+	// the fixture's own model of what is queued and what is running
+	queued := map[string]Head{}   // branch -> its pending head
+	flying := map[string]string{} // branch -> the dispatched request id
+	growing := map[string]int{}   // branch -> the prompt size of its last arrival
+	var trace strings.Builder
+
+	settleOne := func(branch, reqID string, natural bool) {
+		if _, ok := flying[branch]; !ok {
+			return // nothing was running: a stray termination is tolerated, never counted
+		}
+		s.ChunkAt(branch, clock)
+		s.Settle(branch, reqID, struct{ Prompt, Cached int }{growing[branch], 0}, natural, clock)
+		delete(flying, branch)
+		trace.WriteString("settle " + branch + "\n")
+	}
+
+	for i, ev := range stream.events {
+		switch ev.kind {
+		case evArrive:
+			growing[ev.branch] = ev.blocks
+			// the head carries the branch's WHOLE prompt: a turn's chain, not a delta
+			queued[ev.branch] = Head{
+				Branch:  ev.branch,
+				ReqID:   fmt.Sprintf("%s-r%d", ev.branch, ev.blocks),
+				Arrival: clock,
+				Chains:  chainOf(ev.branch, ev.blocks),
+			}
+		case evPick:
+			hs := make([]Head, 0, len(queued))
+			for _, b := range sortedKeysStr(queued) {
+				hs = append(hs, queued[b])
+			}
+			engine, idx := s.PickFromHeadsEngine(hs, clock)
+			if idx < 0 {
+				trace.WriteString("pick -1\n")
+				break
+			}
+			h := hs[idx]
+			trace.WriteString("pick " + h.Branch + "\n")
+			if h.Branch == "" {
+				break
+			}
+			if !s.Seated(h.Branch) {
+				t.Fatalf("event %d: %s was dispatched without a seat", i, h.Branch)
+			}
+			// the request left the queue and is now in flight (PreRequest follows the
+			// release in the same goroutine: the handler forces a terminal hook on any
+			// failure once a pod is chosen)
+			delete(queued, h.Branch)
+			trace.WriteString("dispatch " + h.Branch + " " + engine + "\n")
+			s.DispatchedOn(h.Branch, h.ReqID, engine, clock)
+			flying[h.Branch] = h.ReqID
+		case evSettle:
+			if rid, ok := flying[ev.branch]; ok {
+				settleOne(ev.branch, rid, true)
+			}
+		case evAbort:
+			if rid, ok := flying[ev.branch]; ok {
+				settleOne(ev.branch, rid, false)
+			}
+		case evEngineGone:
+			if len(engineIDs) == 0 {
+				break
+			}
+			// deterministic choice: the last engine id
+			gone := engineIDs[len(engineIDs)-1]
+			n := s.RemoveEngine(gone, clock)
+			trace.WriteString(fmt.Sprintf("engine-gone %s %d\n", gone, n))
+			engineIDs = engineIDs[:len(engineIDs)-1]
+			for b := range flying {
+				if !s.Seated(b) {
+					delete(flying, b)
+				}
+			}
+		case evTick:
+			clock = clock.Add(time.Second)
+			s.Tick(clock)
+			// a termination nobody observed: the reap drops the id, and the drop IS a drain
+			trace.WriteString("tick\n")
+		}
+		clock = clock.Add(time.Millisecond)
+		checkInvariants(t, s, i, capacity)
+	}
+	// the whole-policy view has to be self-consistent at the end too
+	snap := s.Snapshot()
+	for id, es := range snap.Engines {
+		if es.NEBlocks != es.UniqueBlocks {
+			t.Fatalf("%s: the snapshot's used side disagrees with itself (%d vs %d)", id, es.NEBlocks, es.UniqueBlocks)
+		}
+	}
+	return trace.String()
+}
+
+// checkInvariants asserts every stated invariant against the live state.
+func checkInvariants(t *testing.T, s *Scheduler, event int, capacity int) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("event %d: the index panicked: %v", event, r)
+		}
+	}()
+	seats := map[string]string{}
+	for _, g := range s.activeGroupsLocked() {
+		g.index.checkInvariantLocked() // I1/I7: both refcounts == the recomputed union
+		if g.numBlocks <= 0 && len(g.branches) > 0 {
+			t.Fatalf("event %d: %d branches seated on %s, whose capacity is unknown (I6)", event, len(g.branches), g.id)
+		}
+		if cap := g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize); cap > 0 && g.coldInFlight > cap {
+			t.Fatalf("event %d: %s cold charge %d exceeds its cap %d (B2)", event, g.id, g.coldInFlight, cap)
+		}
+		// R4's postcondition: inside the budget, or nothing left to evict
+		if over := s.overBudgetLocked(g); over > 0 {
+			_, victim := s.rotationVictimLocked(g, s.now)
+			if victim != nil {
+				t.Fatalf("event %d: %s is %d blocks over its budget with an eligible victim %s (R4)", event, g.id, over, victim.id)
+			}
+			// no victim: the pass is DONE by construction (exiting/in-flight only)
+		}
+		for id := range g.branches {
+			if prev, dup := seats[id]; dup {
+				t.Fatalf("event %d: %s is seated on %s AND %s (B10)", event, id, prev, g.id)
+			}
+			seats[id] = g.id
+			if got := s.bindings[id]; got != g.id {
+				t.Fatalf("event %d: %s is seated on %s but its binding says %q (B10)", event, id, g.id, got)
+			}
+		}
+	}
+	// the shared queue holds exactly the unseated branches, and no seated one
+	for id := range s.waiters {
+		if _, seated := seats[id]; seated {
+			t.Fatalf("event %d: %s is both seated and waiting", event, id)
+		}
+	}
+	// and every binding names an engine that is actually holding the branch
+	for id, engine := range s.bindings {
+		if got, ok := seats[id]; ok && got != engine {
+			t.Fatalf("event %d: binding %s->%s but the seat is on %s", event, id, engine, got)
+		}
+	}
+}
+
+// sortedKeysStr is the deterministic iteration order for the fixture's head set.
+func sortedKeysStr(m map[string]Head) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestInvariantsHoldUnderRandomEvents is the gate: two engine counts, three seeds, every
+// invariant after every event.
+func TestInvariantsHoldUnderRandomEvents(t *testing.T) {
+	for _, engines := range []int{1, 2} {
+		for _, seed := range []int64{7, 11, 23} {
+			engines, seed := engines, seed
+			t.Run(fmt.Sprintf("N=%d/seed=%d", engines, seed), func(t *testing.T) {
+				if tr := invRun(t, seed, engines, 1000, 4000); tr == "" {
+					t.Fatal("the stream produced no decisions")
+				}
+			})
+		}
+	}
+}
+
+// TestDecisionStreamIsDeterministic: the same seed produces the same DECISIONS, twice.
+func TestDecisionStreamIsDeterministic(t *testing.T) {
+	for _, engines := range []int{1, 2} {
+		engines := engines
+		t.Run(fmt.Sprintf("N=%d", engines), func(t *testing.T) {
+			first := invRun(t, 31, engines, 1000, 3000)
+			for i := 2; i <= 3; i++ {
+				if again := invRun(t, 31, engines, 1000, 3000); again != first {
+					a, b := strings.Split(again, "\n"), strings.Split(first, "\n")
+					for k := 0; k < len(a) || k < len(b); k++ {
+						ga, wa := "", ""
+						if k < len(a) {
+							ga = a[k]
+						}
+						if k < len(b) {
+							wa = b[k]
+						}
+						if ga != wa {
+							t.Fatalf("run %d diverges at line %d: %q vs %q", i, k+1, ga, wa)
+						}
+					}
+					t.Fatal("the decision stream is not deterministic")
+				}
+			}
+		})
+	}
+}
+
+// TestStrictHeadOfLineUnderI2: when the head fits nowhere and has no victim, nothing
+// behind it is seated — the head keeps the queue.
+func TestStrictHeadOfLineUnderI2(t *testing.T) {
+	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
+		w := newWorkload(t, fx)
+		// fill every engine so that a big head cannot fit and nothing is evictable yet
+		for _, engine := range fx.ids {
+			w.seatStatic(t, "anchor-"+engine, engine, 40)
+		}
+		var residents []string
+		for i := 0; i < 3*len(fx.ids); i++ {
+			residents = append(residents, fmt.Sprintf("m%d", i))
+		}
+		for _, id := range residents {
+			w.arrive(id, fx.clock.Add(-time.Second))
+		}
+		for round := 0; round < 400; round++ {
+			hs, ids := w.heads(fx.clock)
+			if i := fx.pick(hs...); i >= 0 {
+				w.dispatchTurn(ids[i])
+			}
+			w.step(roundStep)
+			done := true
+			for _, id := range residents {
+				if !w.everSeated(id) || w.served[id] == 0 {
+					done = false
+				}
+			}
+			if done {
+				break
+			}
+		}
+		// now a BIG head arrives (bigger than any engine's budget) and a small one behind
+		// it: the big one fits nowhere, so the small one must not be seated either
+		// a prompt three times the seat budget: it can never fit an engine
+		w.setPromptBytes("big", maxBudget(fx)*3*256)
+		w.arrive("big", fx.clock.Add(-time.Minute))
+		w.arrive("small", fx.clock.Add(-time.Second))
+		w.heads(fx.clock) // materialise both
+		hs, ids := w.heads(fx.clock)
+		if i := fx.pick(hs...); i >= 0 {
+			t.Fatalf("the pass served %s while the head fits nowhere and has no victim", ids[i])
+		}
+		if w.everSeated("small") {
+			t.Fatal("a head behind a blocked head was seated: the queue is not strict head-of-line (I2)")
+		}
+		if w.everSeated("big") {
+			t.Fatal("a head bigger than every budget was seated")
+		}
+	})
+}
+
+// maxBudget is the fixture's per-engine seat budget in blocks.
+func maxBudget(fx *engineSet) int {
+	fx.s.mu.Lock()
+	defer fx.s.mu.Unlock()
+	return fx.s.groups[fx.ids[0]].budgetBlocks
+}

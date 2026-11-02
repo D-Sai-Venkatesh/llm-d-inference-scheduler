@@ -37,6 +37,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/branchidentity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/bandselection"
@@ -79,11 +80,22 @@ func (r *intRequest) InferenceRequest() *fwksched.InferenceRequest { return r.in
 func (r *intRequest) ReceivedTimestamp() time.Time                 { return time.Now() }
 
 // newIntRequest builds a request the way the real stack does: branch identity has already
-// derived the BRANCH id (the queue key) and the client's session rides as an attribute.
-func newIntRequest(branch, id string, size uint64) *intRequest {
+// derived the BRANCH id (the queue key), the token producer has already rendered the
+// tokens (the exact chain the scheduler costs), and the client's session rides as an
+// attribute. blocks is the prompt's size in 64-token blocks.
+func newIntRequest(branch, id string, blocks uint64) *intRequest {
+	size := blocks * 256 // the wire size a prompt of this length has at 4 bytes/token
 	ir := &fwksched.InferenceRequest{RequestID: id, RequestSizeBytes: int(size), FairnessID: branch}
 	ir.PutAttribute(branchidentity.BranchIdentityKey, branch)
 	ir.PutAttribute(agentidentity.AgentIdentityKey, branch)
+	ir.PutAttribute(branchidentity.BranchArrivalKey, branchidentity.BranchArrival{
+		Outcome: branchidentity.OutcomeNew, Turn: 1})
+	ir.Body = &fwkrh.InferenceRequestBody{
+		ChatCompletions: &fwkrh.ChatCompletionsRequest{},
+		TokenizedRequest: &fwkrh.TokenizedRequest{
+			Prompts: []fwkrh.PromptTokens{{TokenIDs: tokenRun(int(seedFor(branch)%1000003)+1, int(blocks)*64)}},
+		},
+	}
 	return &intRequest{id: id, key: flowcontrol.FlowKey{ID: branch, Priority: 0}, size: size, infReq: ir}
 }
 
@@ -165,7 +177,7 @@ func TestIntegrationDispatchThroughRealController(t *testing.T) {
 	// m enqueues and dispatches (a branch; the queue is real). The
 	// dispatch is fast — wait on the RESULT, not the queue depth.
 	go func() {
-		req := newIntRequest("m", "m-1", uint64(bytesFor(400)))
+		req := newIntRequest("m", "m-1", uint64(400))
 		outcome, err := fc.EnqueueAndWait(context.Background(), req)
 		results <- dispatchResult{id: "m-1", outcome: outcome, err: err}
 	}()
@@ -180,7 +192,7 @@ func TestIntegrationDispatchThroughRealController(t *testing.T) {
 
 	// w enqueues behind the budget (400 + 600 > 950): it stays queued.
 	go func() {
-		req := newIntRequest("w", "w-1", uint64(bytesFor(600)))
+		req := newIntRequest("w", "w-1", uint64(600))
 		outcome, err := fc.EnqueueAndWait(context.Background(), req)
 		results <- dispatchResult{id: "w-1", outcome: outcome, err: err}
 	}()
@@ -226,7 +238,7 @@ func TestIntegrationNewcomerEntry(t *testing.T) {
 	fc, _ := newIntegrationHarness(t, plugin)
 	results := make(chan dispatchResult, 1)
 	go func() {
-		req := newIntRequest("new", "new-1", uint64(bytesFor(100)))
+		req := newIntRequest("new", "new-1", uint64(100))
 		outcome, err := fc.EnqueueAndWait(context.Background(), req)
 		results <- dispatchResult{id: "new-1", outcome: outcome, err: err}
 	}()

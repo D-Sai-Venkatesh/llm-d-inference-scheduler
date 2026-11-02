@@ -34,7 +34,7 @@ func TestT1SeatGoesToTheMostFreeBudget(t *testing.T) {
 	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
 		if len(fx.ids) < 2 {
 			// N=1: the same code with one candidate — the head lands on it.
-			h := head("m", time.Second, bytesFor(100))
+			h := head("m", time.Second, 100)
 			if e, i := fx.pickEngine(h); i != 0 || e != fx.ids[0] {
 				t.Fatalf("N=1: the only engine must take the head, got %q/%d", e, i)
 			}
@@ -45,7 +45,7 @@ func TestT1SeatGoesToTheMostFreeBudget(t *testing.T) {
 		// the resident's prefill lands, so its engine's cold-entry slot is free again
 		// (the derived cap is 5 % of the engine, and an outstanding prefill owns it)
 		fx.s.Chunk("big")
-		h := head("m", time.Second, bytesFor(100))
+		h := head("m", time.Second, 100)
 		e, i := fx.pickEngine(h)
 		if i != 0 {
 			t.Fatalf("the head must be seated and dispatched, got %d", i)
@@ -82,7 +82,7 @@ func TestT2ExitUnbindsAndReentryReseatsAfresh(t *testing.T) {
 			other = fx.ids[1]
 		}
 		fx.seatOn(t, first, "fill", 900, 2*time.Second)
-		h := head("m", 900*time.Second, bytesFor(300))
+		h := head("m", 900*time.Second, 300)
 		e, i := fx.pickEngine(h)
 		if i < 0 {
 			t.Fatal("the re-entering branch must be seated somewhere")
@@ -117,7 +117,7 @@ func TestT3e4RegressionNoLockInOnQueueDepth(t *testing.T) {
 		before := fx.s.Snapshot()
 		for i := 0; i < 6; i++ {
 			id := fmt.Sprintf("q%d", i)
-			h := head(id, time.Duration(60-i)*time.Second, bytesFor(50))
+			h := head(id, time.Duration(60-i)*time.Second, 50)
 			if _, j := fx.pickEngine(h); j < 0 {
 				t.Fatalf("head %d must be seated: 3 %% KV and a deep waiting queue are not saturation", i)
 			}
@@ -171,10 +171,12 @@ func TestPerEngineDedupAndIndependence(t *testing.T) {
 	now := time.Unix(1793000000, 0).UTC()
 	shared := keys(200, 42)
 	for _, id := range []string{"m1", "m2"} {
-		if i := s.PickFromHeads([]Head{head(id, time.Second, bytesFor(200))}, now); i != 0 {
+		// the SAME chain: two branches whose prompts share every block
+		h := headWithChain(id, time.Second, []Chain{{Keys: shared, Tokens: 200 * 64}})
+		if i := s.PickFromHeads([]Head{h}, now); i != 0 {
 			t.Fatalf("%s must seat", id)
 		}
-		s.Dispatched(id, "r-"+id, shared, bytesFor(200), now) // the SAME keys
+		s.Dispatched(id, "r-"+id, now)
 	}
 	snap := s.Snapshot()
 	if len(snap.Engines) != 2 {
@@ -206,10 +208,10 @@ func TestEngineGoneReleasesMembersToTheSharedQueue(t *testing.T) {
 	}
 	now := time.Unix(1793000000, 0).UTC()
 	for _, id := range []string{"m1", "m2", "m3"} {
-		if i := s.PickFromHeads([]Head{head(id, time.Second, bytesFor(300))}, now); i != 0 {
+		if i := s.PickFromHeads([]Head{head(id, time.Second, 300)}, now); i != 0 {
 			t.Fatalf("%s must seat", id)
 		}
-		s.Dispatched(id, "r-"+id, keys(300, seedFor(id)), bytesFor(300), now)
+		s.Dispatched(id, "r-"+id, now)
 		s.Chunk(id)
 		s.Settle(id, "r-"+id, struct{ Prompt, Cached int }{300, 300}, true, now)
 	}
@@ -228,7 +230,7 @@ func TestEngineGoneReleasesMembersToTheSharedQueue(t *testing.T) {
 	if gone == "a" {
 		survivor = "b"
 	}
-	e, i := s.PickFromHeadsEngine([]Head{head("m1", 30*time.Second, bytesFor(300))}, now)
+	e, i := s.PickFromHeadsEngine([]Head{head("m1", 30*time.Second, 300)}, now)
 	if i < 0 {
 		t.Fatal("the released branch must be seatable on the survivor")
 	}
@@ -244,7 +246,7 @@ func TestFilterPinsTheSeatEngine(t *testing.T) {
 	plugin := newTestPlugin(t, cfg, 2, 1000)
 	s := plugin.sched
 	now := time.Unix(1793000000, 0).UTC()
-	if i := s.PickFromHeads([]Head{head("m", time.Second, bytesFor(200))}, now); i != 0 {
+	if i := s.PickFromHeads([]Head{head("m", time.Second, 200)}, now); i != 0 {
 		t.Fatal("the branch must seat")
 	}
 	seat := s.bindings["m"]
@@ -390,7 +392,7 @@ func TestColdValveHeldHeadNeverEvicts(t *testing.T) {
 			fx.s.mu.Unlock()
 		}
 		for attempt := 0; attempt < 4; attempt++ {
-			h := head(fmt.Sprintf("cold%d", attempt), time.Second, bytesFor(900))
+			h := head(fmt.Sprintf("cold%d", attempt), time.Second, 900)
 			_, i := fx.pickEngine(h)
 			if i >= 0 {
 				t.Fatalf("attempt %d: a valve-held head must not be dispatched, got %d", attempt, i)
@@ -408,7 +410,7 @@ func TestColdValveHeldHeadNeverEvicts(t *testing.T) {
 		for i := range fx.ids {
 			fx.s.Chunk(fmt.Sprintf("res%d", i))
 		}
-		if _, i := fx.pickEngine(head("coldX", time.Second, bytesFor(900))); i < 0 {
+		if _, i := fx.pickEngine(head("coldX", time.Second, 900)); i < 0 {
 			t.Fatal("R11: once the cold prefills land, the waiting head must be seatable")
 		}
 	})
@@ -426,7 +428,7 @@ func TestColdValveHeldHeadSeatsOnTheSibling(t *testing.T) {
 		fx.seatOne(t, "coldA", 300, 5*time.Second)
 		engA := fx.s.bindings["coldA"]
 		// the next head fits the budget on both; A's valve refuses it and B's allows
-		h := head("next", time.Second, bytesFor(50))
+		h := head("next", time.Second, 50)
 		_, i := fx.pickEngine(h)
 		if i < 0 {
 			t.Fatal("the head must seat (on the SIBLING), not wait")

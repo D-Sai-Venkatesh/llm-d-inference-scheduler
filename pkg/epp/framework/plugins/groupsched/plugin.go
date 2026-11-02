@@ -31,7 +31,6 @@ package groupsched
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -51,6 +50,7 @@ import (
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/branchidentity"
 	sourcenotifications "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/notifications"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/prefixhash"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 )
@@ -322,14 +322,44 @@ func (r *GroupScheduler) Consumes() fwkplugin.DataDependencies {
 	}
 }
 
-// Produces declares the request attributes PreRequest writes.
-func (r *GroupScheduler) Produces() map[fwkplugin.DataKey]any {
-	return map[fwkplugin.DataKey]any{
-		requestKeysKey: []Hash(nil),
-	}
-}
+// Produces declares no request attribute: the schedule needs nothing published back onto
+// the request. The chains are computed once at Pick and cached ON the request, which is an
+// internal cache, not a contract with another plugin.
+func (r *GroupScheduler) Produces() map[fwkplugin.DataKey]any { return nil }
 
-var requestKeysKey = fwkplugin.NewDataKey("group-keys", PluginType)
+// requestChainsKey carries a request's exact prefill chains between Picks. Pick runs at
+// ~1 kHz over the same queued request, so hashing a prompt per pass would be absurd; the
+// request is where the tokens it is derived from already live.
+var requestChainsKey = fwkplugin.NewDataKey("group-chains", PluginType)
+
+// maxChainBlocks bounds a prompt's chain. It is effectively unbounded: a cap here would
+// silently stop counting a long prompt's tail, which is exactly the occupancy the budget
+// exists to bound.
+const maxChainBlocks = 1 << 20
+
+// chainsFor is the request's EXACT prefill chains: one per prompt, from the tokens the
+// token producer rendered at arrival. Each prompt is hashed independently because the
+// engine runs it as its own sequence, and its last block is partial — so its key is
+// private to that exact token sequence, which is why a new turn is never free.
+func (r *GroupScheduler) chainsFor(ctx context.Context, request *fwksched.InferenceRequest) []Chain {
+	if request == nil || request.Body == nil || request.Body.TokenizedRequest == nil {
+		return nil
+	}
+	if cached, ok := fwksched.ReadRequestAttribute[[]Chain](request, requestChainsKey); ok {
+		return cached
+	}
+	hashed, promptTokens := prefixhash.GetBlockHashesWithPromptTokens(ctx, request, r.cfg.BlockSizeTokens, maxChainBlocks)
+	chains := make([]Chain, 0, len(hashed))
+	for i, prompt := range hashed {
+		keys := make([]Hash, len(prompt))
+		for j, h := range prompt {
+			keys[j] = Hash(h)
+		}
+		chains = append(chains, Chain{Keys: keys, Tokens: promptTokens[i]})
+	}
+	request.PutAttribute(requestChainsKey, chains)
+	return chains
+}
 
 // readID is the non-empty string attribute at key ("" when absent).
 func readID(request *fwksched.InferenceRequest, key fwkplugin.DataKey) string {
@@ -761,7 +791,7 @@ func (r *GroupScheduler) readSamples(candidates []fwkdl.Endpoint, now time.Time)
 
 // Pick is the dispatch decision (§5). The waiting set is the queue-head
 // snapshot (S0-1); pre-capacity it degrades to FCFS pass-through (A5).
-func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor) (fwkfc.FlowQueueAccessor, error) {
+func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccessor) (fwkfc.FlowQueueAccessor, error) {
 	if band == nil {
 		return nil, nil //nolint:nilnil
 	}
@@ -777,23 +807,21 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 			return true
 		}
 		branch := ""
-		reqID, size, fid := "", int64(0), ""
+		reqID, fid := "", ""
 		returner := false
+		var chains []Chain
 		if req := h.OriginalRequest(); req != nil {
 			if ir := req.InferenceRequest(); ir != nil {
 				branch = r.branchOf(ir)
 				reqID = ir.RequestID
 				fid = ir.FairnessID // the wire-level identity (the queue key)
 				returner = isReturner(ir)
-				size = int64(ir.RequestSizeBytes)
-				if size <= 0 {
-					size = int64(req.ByteSize())
-				}
+				chains = r.chainsFor(ctx, ir)
 			}
 		}
 		queues = append(queues, q)
 		heads = append(heads, Head{Branch: branch, Returner: returner,
-			FairnessID: fid, ReqID: reqID, Arrival: h.EnqueueTime(), SizeBytes: size,
+			FairnessID: fid, ReqID: reqID, Arrival: h.EnqueueTime(), Chains: chains,
 		})
 		return true
 	})
@@ -821,10 +849,9 @@ func (r *GroupScheduler) Pick(_ context.Context, band fwkfc.PriorityBandAccessor
 // NewState satisfies the FairnessPolicy contract.
 func (r *GroupScheduler) NewState(_ context.Context) any { return nil }
 
-// PreRequest runs after the request leaves the queue (dispatch): the
-// exact tier-A keys from the TokenizedRequest correct the estimate
-// (S0-1 d) — and REPLACE the reservation the Pick took, keeping only the
-// turn's output growth (the execution budget's second term).
+// PreRequest runs after the request leaves the queue (dispatch). It records the in-flight
+// request and reconciles the engine the framework ACTUALLY picked with the one the seat
+// assumed; nothing is charged here, because the seat charged the exact chains.
 func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) error {
 	// capacity first (belt-and-braces, third acquisition path): it must not
 	// depend on the request being trackable — anonymous traffic used to
@@ -841,33 +868,10 @@ func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.Inferen
 	if id == "" {
 		return nil
 	}
-	keys := r.blockKeysFor(request)
-	if keys == nil {
-		return errors.New("group-scheduler: no TokenizedRequest on the request (token-producer required; no tier-B fallback)")
-	}
-	request.PutAttribute(requestKeysKey, keys)
-	size := int64(request.RequestSizeBytes)
-	// The engine here is AUTHORITATIVE (the pendingEngine idiom): Pick
-	// charged the seat to the branch's homed engine, and the framework's
-	// actual choice moves that charge if it disagrees.
-	r.sched.DispatchedOnUsage(id, request.RequestID, engine, keys, size, time.Now())
+	// The engine here is AUTHORITATIVE: the seat was placed on the branch's engine at
+	// Pick, and the framework's actual choice moves it if it disagrees.
+	r.sched.DispatchedOnUsage(id, request.RequestID, engine, time.Now())
 	return nil
-}
-
-// blockKeysFor derives the chained token-block keys (tier A).
-func (r *GroupScheduler) blockKeysFor(request *fwksched.InferenceRequest) []Hash {
-	if request == nil || request.Body == nil || request.Body.TokenizedRequest == nil {
-		return nil
-	}
-	tp := request.Body.TokenizedRequest
-	if len(tp.Prompts) == 0 {
-		return nil
-	}
-	var all []uint32
-	for _, p := range tp.Prompts {
-		all = append(all, p.TokenIDs...)
-	}
-	return r.sched.HashTokens(all, tp.CacheSalt, r.cfg.BlockSizeTokens)
 }
 
 // ResponseBody: the first chunk is prefill complete (the cold-entry

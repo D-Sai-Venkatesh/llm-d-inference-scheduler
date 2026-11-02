@@ -323,7 +323,7 @@ func TestChargedDrainExitingWithQueuedHeadReleases(t *testing.T) {
 func TestChargedDrainExitingIsNeverDispatched(t *testing.T) {
 	chargedPath(t, defaultConfig(), "exiting-no-dispatch", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-gone", true)
-		if _, i := fx.pickEngine(head("gone", 10*time.Second, bytesFor(300))); i >= 0 {
+		if _, i := fx.pickEngine(head("gone", 10*time.Second, 300)); i >= 0 {
 			t.Fatal("an exiting branch must not be dispatched for its queued head")
 		}
 		if got := neOn(fx, g); got != 700 {
@@ -332,42 +332,43 @@ func TestChargedDrainExitingIsNeverDispatched(t *testing.T) {
 	})
 }
 
-// ---- path 5: Forget, and the double-release asymmetry ----
+// ---- path 5: the release is exactly once, and a fresh residency starts clean ----
 
-// Forget is the OTHER half of the one release point (the TTL sweep and the silence GC
-// use it). On a SEATED branch it must release both counters — the exiting branch's
-// included — and a later Unseat must be a harmless no-op rather than a second release
-// (which would underflow and panic). Then a fresh residency must start non-exiting and
-// charge exactly once.
-func TestChargedDrainForgetReleasesAndUnseatIsIdempotent(t *testing.T) {
-	chargedPath(t, defaultConfig(), "forget", func(t *testing.T, fx *engineSet, g *engineGroup) {
+// The release point is UNSET and idempotent: unseating an exiting branch releases both
+// counters (the used side and, for an exiting branch, nothing more on the stay side),
+// a second unseat is a harmless no-op rather than a second release (which would
+// underflow and panic), and the next residency starts non-exiting and charges once.
+func TestChargedDrainUnseatIsExactlyOnce(t *testing.T) {
+	chargedPath(t, defaultConfig(), "unseat-once", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-gone", true)
 
 		fx.s.mu.Lock()
-		g.index.ForgetLocked("gone")
-		g.index.checkInvariantLocked()
-		fx.s.mu.Unlock()
-		if got, want := neOn(fx, g), 400; got != want {
-			t.Fatalf("Forget on a seated exiting branch: NE = %d want %d", got, want)
-		}
-		// the double release: Unseat and a second Forget must both be no-ops
-		fx.s.mu.Lock()
 		g.index.UnseatLocked("gone")
-		g.index.ForgetLocked("gone")
 		g.index.checkInvariantLocked()
-		ok, _ := g.index.TrySeatLocked("gone", 950)
 		n := g.index.UniqueBlocksLocked()
 		fx.s.mu.Unlock()
+		if got, want := neOn(fx, g), 400; got != want {
+			t.Fatalf("unseating a seated exiting branch: NE = %d want %d", got, want)
+		}
+		if n != 400 {
+			t.Fatalf("used after the unseat: %d want 400 (the survivor's)", n)
+		}
+		// the second release must be a no-op, not an underflow
+		fx.s.mu.Lock()
+		g.index.UnseatLocked("gone")
+		g.index.checkInvariantLocked()
+		ok, _ := g.index.TrySeatLocked("gone", chainOf("gone", 400), 950)
+		n = g.index.UniqueBlocksLocked()
+		exiting := g.index.ExitingLocked("gone")
+		fx.s.mu.Unlock()
 		if !ok {
-			t.Fatal("the record must be re-seatable after the Forget")
+			t.Fatal("the branch must be re-seatable after its release")
 		}
-		if got, want := n, 400; got != want {
-			// a forgotten record has no block set left, so the fresh residency adds
-			// nothing: the 400 is the survivor's. What matters is that neither the
-			// release nor the re-seat moved anybody else's charge.
-			t.Fatalf("a fresh residency after Forget: NE = %d want %d (charged once)", got, want)
+		if got, want := n, 800; got != want {
+			// the fresh residency charges its own chain: 400 (survivor) + 400 (its own)
+			t.Fatalf("a fresh residency: NE = %d want %d (charged once, on its own blocks)", got, want)
 		}
-		if g.index.Exiting("gone") {
+		if exiting {
 			t.Fatal("a fresh residency must not inherit the exiting flag")
 		}
 	})

@@ -16,51 +16,46 @@ limitations under the License.
 
 package groupsched
 
+// THE BLOCK INDEX's own suite: the two refcounts, the exact cost, and the property the
+// binary search rests on (residency is prefix-closed).
+
 import (
 	"fmt"
 	"math/rand"
-	"slices"
-	"strings"
 	"sync"
 	"testing"
 )
 
-// newIdx builds an index at the campaign's measured block size (64
-// tokens — the review's S0-3: 40,183 blocks x 64 = 2.57M).
 func newIdx(t *testing.T) *BlockIndex {
+	t.Helper()
 	idx, err := NewBlockIndex(64)
 	if err != nil {
-		t.Fatalf("NewBlockIndex: %v", err)
+		t.Fatal(err)
 	}
 	return idx
 }
 
-// body builds a body from aligned chunks with a per-chunk distinct
-// filler so within-body dedup cannot hide counting errors.
-func body(sysChunks int, privChunks int, base rune) []byte {
-	var b strings.Builder
-	for i := 0; i < sysChunks; i++ {
-		b.WriteString(strings.Repeat("S", 256)) // 64 tokens x 4 B = 256 B chunks
-	}
-	for i := 0; i < privChunks; i++ {
-		b.WriteString(strings.Repeat(string(base+rune(i%26)), 256))
-	}
-	return []byte(b.String())
+// chain is a one-prompt chain of n blocks drawn from a shared or private key space:
+// same seed ⇒ same prefix (the shared-prefix shape), different seed ⇒ no sharing.
+func chain(seed string, n int) []Chain {
+	return []Chain{{Keys: keys(n, seedFor(seed)), Tokens: n * 64}}
 }
 
-func mustSeat(t *testing.T, idx *BlockIndex, id string, b []byte, budget int) (cost int) {
-	idx.Track(id, 0)
-	if err := idx.UpdateWaiting(id, "r", b); err != nil {
-		t.Fatalf("UpdateWaiting: %v", err)
-	}
-	ok, cost := idx.TrySeat(id, budget)
+// chainWithPrefix is a chain that REUSES another branch's first prefixBlocks keys: the
+// shape a fork (or a growing turn) has on one engine.
+func chainWithPrefix(prefix string, prefixBlocks int, own string, ownBlocks int) []Chain {
+	k := append(keys(prefixBlocks, seedFor(prefix)), keys(ownBlocks, seedFor(own))...)
+	return []Chain{{Keys: k, Tokens: (prefixBlocks + ownBlocks) * 64}}
+}
+
+func mustSeat(t *testing.T, idx *BlockIndex, id string, chains []Chain, budget int) int {
+	t.Helper()
+	ok, cost := idx.TrySeatLocked(id, chains, budget)
 	if !ok {
-		t.Fatalf("TrySeat(%s) rejected", id)
+		t.Fatalf("TrySeat(%s) rejected (cost %d)", id, cost)
 	}
 	return cost
 }
-
-// ---- S0-3: units ----
 
 func TestFailClosedOnUnknownBlockSize(t *testing.T) {
 	if _, err := NewBlockIndex(0); err == nil {
@@ -69,344 +64,325 @@ func TestFailClosedOnUnknownBlockSize(t *testing.T) {
 	if _, err := NewBlockIndex(-1); err == nil {
 		t.Fatal("negative block size must fail closed")
 	}
-	for _, bs := range []int{16, 64, 256} {
-		idx, err := NewBlockIndex(bs)
-		if err != nil {
-			t.Fatalf("bs=%d: %v", bs, err)
-		}
-		want := bs * 4
-		if bs*4 < minChunkBytes {
-			want = minChunkBytes
-		}
-		if idx.ChunkBytes() != want {
-			t.Fatalf("bs=%d chunkBytes=%d want %d", bs, idx.ChunkBytes(), want)
-		}
-		// one chunk per engine block (subject to the 64-byte floor)
-		wantChunks := (256 + idx.ChunkBytes() - 1) / idx.ChunkBytes()
-		if n := len(idx.HashBody(make([]byte, 256))); n != wantChunks {
-			t.Fatalf("bs=%d: 256B body -> %d chunks, want %d", bs, n, wantChunks)
-		}
-		if idx.EstimateTokens(40183) != int64(40183*bs) {
-			t.Fatalf("token estimate wrong at bs=%d", bs)
-		}
-	}
-}
-
-// ---- S0-2: chained hashes ----
-
-func TestChainedHashPositionSensitive(t *testing.T) {
 	idx := newIdx(t)
-	sysA := body(2, 0, 'A') // "SSSS..." x2
-	sysB := body(1, 1, 'Z') // "SSS..." + "ZZZ..." — same total, different structure
-	// the same private chunk after different prefixes must NOT match
-	tailX := []byte(strings.Repeat("X", 256))
-	h1 := idx.HashBody(append(append([]byte{}, sysA...), tailX...))
-	h2 := idx.HashBody(append(append([]byte{}, sysB...), tailX...))
-	if slices.Equal(h1[2:], h2[2:]) {
-		t.Fatal("identical content after divergent prefixes must hash differently (chaining)")
+	if idx.BlockSizeTokens() != 64 {
+		t.Fatalf("block size: %d want 64", idx.BlockSizeTokens())
 	}
 }
 
-func TestChainedHashNoWithinBodyDedup(t *testing.T) {
+// ---- the exact cost ----
+
+// A head's cost is everything beyond the engine's resident PREFIX: the shared prefix is
+// free, and the partial last block is paid for (it must be computed).
+func TestCostIsTheColdPartOfTheChain(t *testing.T) {
 	idx := newIdx(t)
-	// a body of 5 IDENTICAL chunks must count as 5 blocks, not 1
-	rep := strings.Repeat(strings.Repeat("R", 256), 5)
-	if n := len(idx.HashBody([]byte(rep))); n != 5 {
-		t.Fatalf("repeated chunks: %d blocks, want 5 (no within-body dedup)", n)
+	mustSeat(t, idx, "a", chain("A", 4), 1000)
+	if got := idx.CostLocked(chainWithPrefix("A", 3, "B", 2)); got != 2 {
+		t.Fatalf("a head sharing 3 of a's 4 blocks costs %d, want 2 (1 new shared tail + 1 private)", got)
+	}
+	if got := idx.CostLocked(chain("A", 4)); got != 0 {
+		t.Fatalf("a fully resident chain costs %d, want 0", got)
+	}
+	if got := idx.ColdTokensLocked(chain("A", 4)); got != 0 {
+		t.Fatalf("a fully resident chain has %d cold tokens, want 0", got)
+	}
+	// the partial tail: 100 tokens at 64/block is 2 blocks, the second partial
+	partial := []Chain{{Keys: keys(2, seedFor("P")), Tokens: 100}}
+	if got := idx.CostLocked(partial); got != 2 {
+		t.Fatalf("a 100-token prompt costs %d blocks, want 2 (the partial block counts)", got)
+	}
+	if got := idx.ColdTokensLocked(partial); got != 100 {
+		t.Fatalf("a 100-token prompt is %d cold tokens, want 100", got)
 	}
 }
 
-func TestChainedHashSharedPrefixShares(t *testing.T) {
-	idx := newIdx(t)
-	a := idx.HashBody(body(3, 1, 'A'))
-	b := idx.HashBody(body(3, 2, 'N'))
-	shared := 0
-	for i := 0; i < 3 && i < len(a) && i < len(b); i++ {
-		if a[i] == b[i] {
-			shared++
-		} else {
-			break
-		}
-	}
-	if shared != 3 {
-		t.Fatalf("aligned shared prefix: %d shared chunks, want 3", shared)
-	}
-}
-
-func TestEmptyBodyNoPhantomBlock(t *testing.T) {
-	idx := newIdx(t)
-	if n := len(idx.HashBody(nil)); n != 0 {
-		t.Fatalf("empty body: %d chunks, want 0 (no phantom shared block)", n)
-	}
-}
-
-// ---- S0-1: exiting state (the review's R1/R2/R3, restated for the charged-drain rule) ----
-
-func TestExitingUnseatDoesNotStealNE(t *testing.T) {
-	// R1: a and b share 3 chunks; MarkExiting(a) then Unseat(a) must
-	// leave b's budget contribution intact.
-	idx := newIdx(t)
-	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
-	mustSeat(t, idx, "b", body(3, 2, 'N'), 1000)
-	neBoth := idx.UniqueBlocks() // 3 shared + 1 + 2 = 6
-	if neBoth != 6 {
-		t.Fatalf("NE both: %d want 6", neBoth)
-	}
-	idx.MarkExiting("a")
-	idx.Unseat("a")
-	if got := idx.UniqueBlocks(); got != 5 { // 3 shared + 2 private to b
-		t.Fatalf("R1: NE after exiting-unseat: %d want 5 (stolen from b!)", got)
-	}
-}
-
-// An exiting branch's blocks STAY on the used side until it drains: mark the
-// branch, and the budget still pays for its blocks (the engine pins them until the
-// running request finishes). Releasing them at the mark was the accounting bug the
-// multi-pod wave measured at 14-18 % of the pool.
-func TestExitingMemberStaysChargedUntilUnseat(t *testing.T) {
-	idx := newIdx(t)
-	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
-	before := idx.UniqueBlocks()
-	idx.MarkExiting("a")
-	if got := idx.UniqueBlocks(); got != before {
-		t.Fatalf("NE after MarkExiting: %d want %d (the blocks are still held)", got, before)
-	}
-	idx.Unseat("a")
-	if got := idx.UniqueBlocks(); got != 0 {
-		t.Fatalf("NE after the drain (Unseat): %d want 0", got)
-	}
-	idx.checkInvariantLocked()
-}
-
-// MarkExiting changes no counter, so repeating it cannot double-release anything.
-func TestMarkExitingIdempotent(t *testing.T) {
-	idx := newIdx(t)
-	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
-	ne := idx.UniqueBlocks()
-	idx.MarkExiting("a")
-	idx.MarkExiting("a")
-	idx.MarkExiting("a")
-	if got := idx.UniqueBlocks(); got != ne {
-		t.Fatalf("R2: NE after triple MarkExiting: %d want %d", got, ne)
-	}
-	if got := idx.UniqueBlocks(); got != 4 {
-		t.Fatalf("still seated+counted: %d want 4", got)
-	}
-	idx.checkInvariantLocked()
-}
-
-// An exiting branch's growth is pinned by the engine like anyone else's, so it is
-// charged: the retiree's next turn is real KV, and the budget must see it.
-func TestExitingMemberGrowthStaysCharged(t *testing.T) {
-	idx := newIdx(t)
-	mustSeat(t, idx, "a", body(3, 1, 'A'), 1000)
-	mustSeat(t, idx, "b", body(3, 2, 'N'), 1000)
-	idx.MarkExiting("a")
-	before := idx.UniqueBlocks()
-	// a grows while exiting: the new blocks enter both counters
-	if err := idx.UpdateWaiting("a", "r", body(0, 2, 'Q')); err != nil {
-		t.Fatal(err)
-	}
-	if err := idx.SettleDispatched("a", "r", body(0, 2, 'Q')); err != nil {
-		t.Fatal(err)
-	}
-	if got := idx.UniqueBlocks(); got != idx.UniqueBlocks() || got <= before-2 {
-		t.Fatalf("R3: NE after exiting branch growth: %d (union %d) want the exiting branch fully charged", got, idx.UniqueBlocks())
-	}
-	idx.checkInvariantLocked()
-}
-
-// ---- seating semantics ----
-
+// One number, one moment: TrySeat's cost is the same computation the placement module
+// makes, and a rejected seat charges nothing.
 func TestTrySeatAtomicBudget(t *testing.T) {
 	idx := newIdx(t)
-	mustSeat(t, idx, "a", body(2, 2, 'A'), 100) // 4 blocks
-	// budget exactly 6: b shares 2, adds 2 private -> total 6, fits
-	if err := idx.UpdateWaiting("b", "r", body(2, 2, 'B')); err != nil {
-		t.Fatal(err)
-	}
-	ok, cost := idx.TrySeat("b", 6)
+	mustSeat(t, idx, "a", chain("A", 4), 100)
+	// budget 6: b shares 2 of a's blocks and adds 2 → exactly 6
+	ok, cost := idx.TrySeatLocked("b", chainWithPrefix("A", 2, "B", 2), 6)
 	if !ok || cost != 2 {
 		t.Fatalf("seat b: ok=%v cost=%d want true/2", ok, cost)
 	}
-	// c would exceed
-	if err := idx.UpdateWaiting("c", "r", body(0, 5, 'C')); err != nil {
-		t.Fatal(err)
-	}
-	ok, cost = idx.TrySeat("c", 6)
+	ok, cost = idx.TrySeatLocked("c", chain("C", 5), 6)
 	if ok || cost != 5 {
 		t.Fatalf("seat c: ok=%v cost=%d want false/5", ok, cost)
 	}
 	if idx.Seated("c") {
-		t.Fatal("c must not be seated on rejection")
+		t.Fatal("a rejected seat must not be seated")
 	}
+	idx.mu.Lock()
+	idx.checkInvariantLocked()
+	idx.mu.Unlock()
 }
 
-func TestSeatWithSetNoPreSettle(t *testing.T) {
-	// R6: the seat request must NOT be pre-settled; settling the same
-	// body later must occupy exactly one window slot.
+// ---- the two refcounts (R4) ----
+
+// An exiting branch's blocks are still pinned by the engine, so they stay on the USED
+// side and leave the STAY side: that difference is what enforcement acts on.
+func TestExitingMovesStayNotUsed(t *testing.T) {
 	idx := newIdx(t)
-	bd := body(2, 1, 'A')
-	mustSeat(t, idx, "a", bd, 1000)
-	if err := idx.SettleDispatched("a", "r", bd); err != nil {
-		t.Fatal(err)
+	mustSeat(t, idx, "a", chain("A", 3), 1000)
+	used, stay := idx.UniqueBlocks(), idx.StayBlocks()
+	idx.MarkExitingLocked("a")
+	if idx.UniqueBlocks() != used {
+		t.Fatalf("exiting moved the used side: %d -> %d", used, idx.UniqueBlocks())
 	}
-	s := idx.sessions["a"]
-	if len(s.dispHist) != 1 {
-		t.Fatalf("R6: dispatch history after one settle: %d want 1 (no pre-settle)", len(s.dispHist))
+	if idx.StayBlocks() != stay-3 {
+		t.Fatalf("exiting must release the stay side: %d -> %d", stay, idx.StayBlocks())
 	}
-	// settling again (same body, second turn) is a second real dispatch
-	if err := idx.SettleDispatched("a", "r", bd); err != nil {
-		t.Fatal(err)
+	if idx.ExitingBlocksLocked() != 3 {
+		t.Fatalf("exiting blocks: %d want 3", idx.ExitingBlocksLocked())
 	}
-	if len(s.dispHist) != 2 {
-		t.Fatalf("second settle: %d want 2", len(s.dispHist))
+	idx.UnseatLocked("a")
+	if idx.UniqueBlocks() != 0 || idx.StayBlocks() != 0 {
+		t.Fatalf("after the drain: used %d stay %d, want 0/0", idx.UniqueBlocks(), idx.StayBlocks())
 	}
+	idx.mu.Lock()
+	idx.checkInvariantLocked()
+	idx.mu.Unlock()
 }
 
-func TestRecordPersistsAcrossResidencies(t *testing.T) {
+// A block an exiting branch SHARES with a staying one must stay on the staying branch's
+// account: excusing the exiting branch's whole set is the under-eviction R4 exists for.
+func TestExitingDoesNotExcuseASharedBlock(t *testing.T) {
 	idx := newIdx(t)
-	bd := body(2, 2, 'A')
-	mustSeat(t, idx, "a", bd, 1000)
-	if err := idx.SettleDispatched("a", "r", bd); err != nil {
-		t.Fatal(err)
+	mustSeat(t, idx, "parent", chain("P", 3), 1000)
+	mustSeat(t, idx, "child", chainWithPrefix("P", 3, "C", 2), 1000) // 3 shared + 2 own
+	if used, stay := idx.UniqueBlocksLocked(), idx.StayBlocksLocked(); used != 5 || stay != 5 {
+		t.Fatalf("premise: used %d stay %d, want 5/5", used, stay)
 	}
-	idx.Unseat("a")
-	// re-seat: the session's history still counts (multi-chain re-entry)
-	if err := idx.UpdateWaiting("a", "r", body(0, 1, 'Z')); err != nil {
-		t.Fatal(err)
+	idx.MarkExitingLocked("child")
+	// Only the child's OWN two blocks leave the stay side: the three it shares are still
+	// held by the parent, so they stay. (The excuse-based arithmetic this replaces read
+	// the child's whole set as leaving — used 5 − `exit` 5 = nothing over the budget,
+	// while the parent's three blocks were still pinned.)
+	if got := idx.StayBlocksLocked(); got != 3 {
+		t.Fatalf("stay after the child exits: %d want 3 (the 3 shared blocks stay with the parent)", got)
 	}
-	ok, cost := idx.TrySeat("a", 1000)
-	if !ok {
-		t.Fatal("re-seat rejected")
+	if got := idx.UniqueBlocksLocked(); got != 5 {
+		t.Fatalf("used after the child exits: %d want 5 (the child's blocks are still pinned)", got)
 	}
-	// 4 original blocks + 1 new private = 5 in the all-seated counter
-	if got := idx.UniqueBlocks(); got != 5 {
-		t.Fatalf("re-entry counts history: %d want 5", got)
+	idx.UnseatLocked("child")
+	if got := idx.StayBlocksLocked(); got != 3 {
+		t.Fatalf("stay after the child drains: %d want 3", got)
 	}
-	_ = cost
+	idx.mu.Lock()
+	idx.checkInvariantLocked()
+	idx.mu.Unlock()
 }
 
-func TestSettleWindowSlideReleases(t *testing.T) {
+// MarkExiting is idempotent: repeating it cannot double-release the stay side.
+func TestMarkExitingIdempotent(t *testing.T) {
 	idx := newIdx(t)
-	// five divergent turns: the 4-window slides, the first turn's private
-	// blocks leave the set and the counters
-	mustSeat(t, idx, "a", body(2, 1, 'A'), 1000)
-	if err := idx.SettleDispatched("a", "r", body(2, 1, 'A')); err != nil {
-		t.Fatal(err) // settle the entry request so the window arithmetic is clean
+	mustSeat(t, idx, "a", chain("A", 4), 1000)
+	idx.MarkExitingLocked("a")
+	stay := idx.StayBlocksLocked()
+	idx.MarkExitingLocked("a")
+	idx.MarkExitingLocked("a")
+	if idx.StayBlocksLocked() != stay {
+		t.Fatalf("triple MarkExiting moved the stay side")
 	}
-	peak := 0
-	for i := 0; i < 5; i++ {
-		bd := body(2, 1, rune('A'+i))
-		if err := idx.UpdateWaiting("a", fmt.Sprintf("w%d", i), bd); err != nil {
-			t.Fatal(err)
-		}
-		if err := idx.SettleDispatched("a", fmt.Sprintf("w%d", i), bd); err != nil {
-			t.Fatal(err)
-		}
-		if u := idx.UniqueBlocks(); u > peak {
-			peak = u
-		}
+	if idx.UniqueBlocksLocked() != 4 {
+		t.Fatalf("used after triple MarkExiting: %d want 4", idx.UniqueBlocksLocked())
 	}
-	// window = 4 bodies x 1 private + 2 shared = 6 max; first body's
-	// private block must be released by the slide
-	if got := idx.UniqueBlocks(); got > 6 {
-		t.Fatalf("window slide did not release: %d > 6", got)
-	}
+	idx.mu.Lock()
+	idx.checkInvariantLocked()
+	idx.mu.Unlock()
 }
 
-func TestReplaceWaitingCancelAndMutation(t *testing.T) {
+// An exiting branch's growth is real KV the engine pins, so it is charged — to the USED
+// side only.
+func TestExitingGrowthStaysCharged(t *testing.T) {
 	idx := newIdx(t)
-	orig := body(2, 2, 'A')
-	if err := idx.UpdateWaiting("a", "r", orig); err != nil {
-		t.Fatal(err)
+	mustSeat(t, idx, "a", chain("A", 3), 1000)
+	idx.MarkExitingLocked("a")
+	used, stay := idx.UniqueBlocksLocked(), idx.StayBlocksLocked()
+	idx.GrowLocked("a", chain("A", 5))
+	if got := idx.UniqueBlocksLocked(); got != used+2 {
+		t.Fatalf("used after an exiting branch grows: %d want %d", got, used+2)
 	}
-	ok, _ := idx.TrySeat("a", 1000)
-	if !ok {
-		t.Fatal("seat")
+	if got := idx.StayBlocksLocked(); got != stay {
+		t.Fatalf("stay after an exiting branch grows: %d want %d", got, stay)
 	}
-	before := idx.UniqueBlocks()
-	// cancel: the waiting request's blocks leave the budget
-	if err := idx.Cancel("a", "r"); err != nil {
-		t.Fatal(err)
+	idx.mu.Lock()
+	idx.checkInvariantLocked()
+	idx.mu.Unlock()
+}
+
+// Growth replaces the partial tail block: the grown chain's tail is a NEW key, and the
+// old one leaves. The counters follow exactly.
+func TestGrowthReplacesThePartialTail(t *testing.T) {
+	idx := newIdx(t)
+	// 182 tokens is two whole blocks and a partial third; 212 tokens makes that third
+	// whole and adds a partial fourth, so the third block's key CHANGES and a fourth
+	// appears.
+	full := keys(2, seedFor("A"))
+	oldTail, newTail, fourth := Hash(0x1001), Hash(0x1002), Hash(0x1003)
+	short := []Chain{{Keys: append(append([]Hash{}, full...), oldTail), Tokens: 182}}
+	idx.TrySeatLocked("a", short, 1000)
+	if got := idx.UniqueBlocksLocked(); got != 3 {
+		t.Fatalf("used: %d want 3", got)
 	}
-	if got := idx.UniqueBlocks(); got != 0 {
-		t.Fatalf("cancel: NE %d want 0 (was %d)", got, before)
+	grown := []Chain{{Keys: append(append([]Hash{}, full...), newTail, fourth), Tokens: 212}}
+	idx.GrowLocked("a", grown)
+	if got := idx.UniqueBlocksLocked(); got != 4 {
+		t.Fatalf("used after growth: %d want 4 (the tail was replaced, one block added)", got)
 	}
-	// mutation: swap in a new body
-	if err := idx.UpdateWaiting("a", "r", orig); err != nil {
-		t.Fatal(err)
+	if idx.HasNELocked(oldTail) {
+		t.Fatal("the replaced partial tail must leave the used side")
 	}
-	mutated := body(2, 3, 'M')
-	if err := idx.UpdateWaiting("a", "r", mutated); err != nil {
-		t.Fatal(err)
+	idx.mu.Lock()
+	idx.checkInvariantLocked()
+	idx.mu.Unlock()
+}
+
+// The record does not outlive the seat: a re-seat costs the branch's chain again,
+// because nothing was remembered between residencies.
+func TestNoResidencyMemoryBetweenSeats(t *testing.T) {
+	idx := newIdx(t)
+	mustSeat(t, idx, "a", chain("A", 4), 1000)
+	idx.UnseatLocked("a")
+	if idx.TrackedCount() != 0 {
+		t.Fatalf("a record outlived its seat: %d records", idx.TrackedCount())
 	}
-	if got := idx.UniqueBlocks(); got != 5 {
-		t.Fatalf("mutation: NE %d want 5", got)
-	}
-	// settling the MUTATED body works (no orphan waiting entry)
-	if err := idx.SettleDispatched("a", "r", mutated); err != nil {
-		t.Fatal(err)
-	}
-	if n := len(idx.sessions["a"].waiting); n != 0 {
-		t.Fatalf("orphan waiting entries: %d", n)
+	ok, cost := idx.TrySeatLocked("a", chain("A", 4), 1000)
+	if !ok || cost != 4 {
+		t.Fatalf("re-seat: ok=%v cost=%d want true/4 (nothing is remembered)", ok, cost)
 	}
 }
 
 func TestDoubleUnseatIsSafeNoOp(t *testing.T) {
 	idx := newIdx(t)
-	mustSeat(t, idx, "a", body(2, 1, 'A'), 1000)
-	idx.Unseat("a")
-	after := idx.UniqueBlocks()
-	idx.Unseat("a") // the seated-set guard makes this a no-op, not an underflow
-	if idx.UniqueBlocks() != after {
-		t.Fatalf("double unseat changed counters: %d -> %d", after, idx.UniqueBlocks())
+	mustSeat(t, idx, "a", chain("A", 3), 1000)
+	idx.UnseatLocked("a")
+	after := idx.UniqueBlocksLocked()
+	idx.UnseatLocked("a") // no record, so nothing to release — not an underflow
+	if idx.UniqueBlocksLocked() != after {
+		t.Fatalf("double unseat changed the counters: %d -> %d", after, idx.UniqueBlocksLocked())
 	}
 }
 
-// ---- the invariant + randomized property test (the review's demand) ----
+// ---- R2's property: prefix closure, and the binary search equals a brute-force scan ----
 
-func TestRandomizedPropertyInvariants(t *testing.T) {
+// TestPrefixClosureAndSearchCost runs random seat/grow/exit sequences and checks, after
+// every step, (1) that residency is PREFIX-CLOSED — if block i of a chain is held, every
+// block before it is — and (2) that the O(log n) cost equals the brute-force count of the
+// chain's blocks the engine does not hold. (2) is what the search is worth on; (1) is why
+// it is legal.
+//
+// The chains are built the way production builds them: as prefixhash chains of TOKEN
+// streams, so sharing is a shared token prefix and every key commits to the blocks before
+// it. (Synthetic key lists cannot express that commitment, and a test built from them can
+// "share" a block at two different positions — which no real chain can.)
+func TestPrefixClosureAndSearchCost(t *testing.T) {
 	idx := newIdx(t)
 	rng := rand.New(rand.NewSource(42))
-	alphabet := "ABCDEFGHIJKLMNOP"
-	state := map[string][]byte{}
-	ids := []string{"s0", "s1", "s2", "s3"}
-	for step := 0; step < 2000; step++ {
+	ids := []string{"s0", "s1", "s2", "s3", "s4"}
+	// three shared prompt prefixes of different lengths: every branch extends one of them
+	// with its own tail, which is the fork/growth shape the engine dedups
+	shared := [][]uint32{}
+	for i := 0; i < 3; i++ {
+		shared = append(shared, tokenRun(1+3*i, 40+i*17))
+	}
+	own := func(n int) []uint32 { return tokenRun(500+rng.Intn(50), n) }
+	tokens := map[string][]uint32{}
+	chains := map[string][]Chain{}
+
+	for step := 0; step < 3000; step++ {
 		id := ids[rng.Intn(len(ids))]
-		switch rng.Intn(8) {
-		case 0, 1: // new waiting body (shared prefix + random tail)
-			sysN := rng.Intn(3)
-			privN := 1 + rng.Intn(3)
-			var b []byte
-			b = append(b, body(sysN, 0, 'S')...)
-			b = append(b, body(0, privN, rune(alphabet[rng.Intn(len(alphabet))]))...)
-			_ = idx.UpdateWaiting(id, "r", b)
-			state[id] = b
-		case 2:
-			_ = idx.UpdateWaiting(id, "r", state[id])
-			ok, _ := idx.TrySeat(id, 3+rng.Intn(20))
-			_ = ok
-		case 3:
-			idx.Unseat(id)
-		case 4:
-			idx.MarkExiting(id)
-		case 5:
-			if len(state[id]) > 0 {
-				_ = idx.SettleDispatched(id, "r", state[id])
+		switch rng.Intn(6) {
+		case 0, 1: // (re)seat: a shared prefix + a private tail
+			toks := append(append([]uint32{}, shared[rng.Intn(len(shared))]...), own(1+rng.Intn(90))...)
+			c := chainsOfTokens(toks, 64)
+			idx.mu.Lock()
+			_, already := idx.seats[id]
+			idx.mu.Unlock()
+			if already {
+				continue
 			}
-		case 6:
-			idx.Forget(id)
-			delete(state, id)
-		case 7:
-			idx.FitBlocks(idx.HashBody(state[id]))
+			want := bruteCost(idx, c) // measured BEFORE the seat changes the index
+			ok, cost := idx.TrySeatLocked(id, c, 1+rng.Intn(40))
+			if !ok {
+				continue
+			}
+			if cost != want {
+				t.Fatalf("step %d: seat cost %d != brute force %d", step, cost, want)
+			}
+			tokens[id], chains[id] = toks, c
+		case 2: // grow: the branch's next turn continues its own prompt
+			if _, seated := chains[id]; !seated {
+				continue
+			}
+			tokens[id] = append(tokens[id], own(1+rng.Intn(70))...)
+			chains[id] = chainsOfTokens(tokens[id], 64)
+			idx.GrowLocked(id, chains[id])
+		case 3:
+			idx.MarkExitingLocked(id)
+		case 4:
+			idx.UnseatLocked(id)
+			delete(tokens, id)
+			delete(chains, id)
+		case 5: // ask for a cost without changing anything
+			if c, ok := chains[id]; ok {
+				if got, want := idx.CostLocked(c), bruteCost(idx, c); got != want {
+					t.Fatalf("step %d: cost %d != brute force %d", step, got, want)
+				}
+			}
 		}
 		idx.mu.Lock()
 		idx.checkInvariantLocked()
+		for _, s := range idx.seats {
+			for _, c := range s.chains {
+				// prefix closure: once a block is missing, nothing after it may be held
+				missing := false
+				for _, h := range c.Keys {
+					_, held := idx.blocks[h]
+					if !held {
+						missing = true
+						continue
+					}
+					if missing {
+						t.Fatalf("step %d: residency is not prefix-closed (chain of %d blocks)", step, len(c.Keys))
+					}
+				}
+			}
+		}
 		idx.mu.Unlock()
 	}
 }
 
+// tokenRun is a deterministic run of n distinct-ish token ids from seed.
+func tokenRun(seed, n int) []uint32 {
+	out := make([]uint32, n)
+	v := uint32(seed)*2654435761 + 1
+	for i := range out {
+		v = v*1664525 + 1013904223
+		out[i] = v%50000 + 1
+	}
+	return out
+}
+
+// bruteCost is the cost without the prefix argument: every chain block the engine does
+// not hold.
+func bruteCost(idx *BlockIndex, chains []Chain) int {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	n := 0
+	for _, c := range chains {
+		for _, h := range c.Keys {
+			if _, held := idx.blocks[h]; !held {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// The index is called under the scheduler's lock, but its own methods are safe too: a
+// concurrent mix of seat/grow/exit must keep both refcounts consistent.
 func TestConcurrentSharedPrefixes(t *testing.T) {
 	idx := newIdx(t)
 	var wg sync.WaitGroup
@@ -416,16 +392,15 @@ func TestConcurrentSharedPrefixes(t *testing.T) {
 			defer wg.Done()
 			id := fmt.Sprintf("s%d", w)
 			for i := 0; i < 40; i++ {
-				bd := append(body(2, 0, 'S'), body(0, 1+rngInt(3), rune('A'+w))...)
-				_ = idx.UpdateWaiting(id, "r", bd)
-				idx.TrySeat(id, 1000)
-				_ = idx.SettleDispatched(id, "r", bd)
-				if i%7 == 0 {
-					idx.MarkExiting(id)
-				}
+				c := chainWithPrefix("shared", 2, fmt.Sprintf("own%d", w), 1+i%3)
+				idx.mu.Lock()
+				idx.TrySeatLocked(id, chainsClone(c), 1000)
+				idx.MarkExitingLocked(id)
+				idx.GrowLocked(id, chainsClone(c))
 				if i%5 == 0 {
-					idx.Unseat(id)
+					idx.UnseatLocked(id)
 				}
+				idx.mu.Unlock()
 				idx.UniqueBlocks()
 			}
 		}(w)
@@ -436,11 +411,11 @@ func TestConcurrentSharedPrefixes(t *testing.T) {
 	idx.mu.Unlock()
 }
 
-var rngMu sync.Mutex
-var prng = rand.New(rand.NewSource(7))
-
-func rngInt(n int) int {
-	rngMu.Lock()
-	defer rngMu.Unlock()
-	return prng.Intn(n)
+// chainsClone copies a chain set (the concurrency test mutates shared slices).
+func chainsClone(c []Chain) []Chain {
+	out := make([]Chain, len(c))
+	for i := range c {
+		out[i] = Chain{Keys: append([]Hash(nil), c[i].Keys...), Tokens: c[i].Tokens}
+	}
+	return out
 }

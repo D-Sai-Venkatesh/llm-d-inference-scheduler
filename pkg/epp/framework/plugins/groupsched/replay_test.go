@@ -42,14 +42,25 @@ var scenarioT0 = time.Unix(1793000000, 0).UTC()
 
 // ---- the scenario model ----
 
-// gsSession is one scripted chain: its turns arrive on a pattern, grow
-// their context, and sometimes go silent (TTL) or re-enter late.
+// gsSession is one scripted chain: its turns arrive on a pattern, grow their context,
+// and sometimes go silent or re-enter late.
 type gsSession struct {
-	id       string
-	chain    []Hash // the growing context (one block per turn-step chunk)
+	id string
+	// blocks is the context the branch has RUN so far (its chain's length). A turn's
+	// prompt is that plus its own growth, and the prompt is fixed at ARRIVAL: the chain
+	// travels on the head, which is the whole point of taking the cost at the decision.
+	blocks   int
 	turn     int
 	kind     string // "main" | "single" | "reentry" | "canceller"
 	nextTurn int    // sim second of the next arrival
+}
+
+// turnChain is the chain the branch's NEXT turn will run: everything the branch has run
+// plus this turn's growth, with the keys ordered so that a later turn extends an earlier
+// one (a branch's turns are a continuation).
+func (g *gsSession) turnChain() []Chain {
+	n := g.blocks + g.turnBlocks()
+	return []Chain{{Keys: keys(n, seedFor(g.id)), Tokens: n * 64}}
 }
 
 // scenarioSessions builds the scripted session set: 46 sessions over
@@ -69,7 +80,7 @@ func scenarioSessions() []*gsSession {
 		}
 		ss = append(ss, &gsSession{
 			id:       fmt.Sprintf("s%02d", i),
-			chain:    keys(8, Hash(1000+i)),
+			blocks:   8, // the context it starts with
 			kind:     kind,
 			nextTurn: 20 + 9*i, // staggered arrivals, 20s..425s
 		})
@@ -217,8 +228,8 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 		return fmt.Sprintf("%s-r%02d", id, reqSeq[id])
 	}
 
-	// inFlight: reqID -> (session, arrivalSim, sizeBytes) — the requests
-	// dispatched and not yet settled; settle after a decode period.
+	// inFlight: the requests dispatched and not yet settled; settle after a decode
+	// period.
 	type flight struct {
 		sess     *gsSession
 		reqID    string
@@ -235,10 +246,10 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 			if g.nextTurn <= sim {
 				// the head is queued since nextTurn
 				hs = append(hs, Head{
-					Branch:    g.id,
-					ReqID:     fmt.Sprintf("%s-r%02d", g.id, reqSeq[g.id]+1),
-					Arrival:   scenarioT0.Add(time.Duration(g.nextTurn) * time.Second),
-					SizeBytes: int64(len(g.chain)+g.turnBlocks()) * 4 * 64,
+					Branch:  g.id,
+					ReqID:   fmt.Sprintf("%s-r%02d", g.id, reqSeq[g.id]+1),
+					Arrival: scenarioT0.Add(time.Duration(g.nextTurn) * time.Second),
+					Chains:  g.turnChain(),
 				})
 			}
 		}
@@ -291,13 +302,10 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 			h := hs[i]
 			g := byID(h.Branch)
 			reqID := nextReqID(g.id)
-			// the dispatched request's context = chain + this turn's growth
+			// the dispatched turn's context is the one the head carried
 			g.turn++
-			newBlocks := g.turnBlocks()
-			for _, k := range keys(newBlocks, Hash(1000+len(ss)+g.turn*31+int(Hash(g.id[1]))%97)) {
-				g.chain = append(g.chain, k)
-			}
-			s.Dispatched(g.id, reqID, append([]Hash(nil), g.chain...), h.SizeBytes, now)
+			g.blocks += g.turnBlocks()
+			s.Dispatched(g.id, reqID, now)
 			// schedule the settle; cancellers fail their 3rd turn
 			natural := true
 			if g.kind == "canceller" && g.turn == 3 {
@@ -305,7 +313,7 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 			}
 			decode := 5 + (g.turn*7)%35
 			flying = append(flying, &flight{sess: g, reqID: reqID, arr: sim,
-				blocks: len(g.chain), settleAt: sim + decode, natural: natural})
+				blocks: g.blocks, settleAt: sim + decode, natural: natural})
 			// the next arrival (or silence)
 			gap := g.thinkGap()
 			if g.kind == "reentry" && g.turn == 3 {
@@ -315,7 +323,7 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 			} else {
 				g.nextTurn = 1 << 29 // silent forever (single-shot)
 			}
-			tr.line("t=%d PICK %d -> %s req=%s blocks=%d", sim, i, g.id, reqID, len(g.chain))
+			tr.line("t=%d PICK %d -> %s req=%s blocks=%d", sim, i, g.id, reqID, g.blocks)
 			for _, l := range entryLog {
 				tr.line("t=%d %s", sim, l)
 			}

@@ -58,7 +58,7 @@ func TestColdCapIsTheBudgetsHeadroomPerEngine(t *testing.T) {
 	}
 	for _, c := range combs {
 		g := &engineGroup{numBlocks: c.numBlocks}
-		budget := IndexSizer{Fraction: c.fraction, BlockSize: c.blockSize}.BudgetBlocks(c.numBlocks)
+		budget := IndexSizer{Fraction: c.fraction}.BudgetBlocks(c.numBlocks)
 		g.budgetBlocks = budget
 		capTokens := g.coldCapTokens(c.fraction, c.blockSize)
 		headroomTokens := (1 - c.fraction) * float64(c.numBlocks) * float64(c.blockSize)
@@ -75,7 +75,7 @@ func TestColdCapIsTheBudgetsHeadroomPerEngine(t *testing.T) {
 	}
 	// the derived value at the campaign shape is the constant it replaces, to within
 	// one block: 2009 blocks x 64 = 128,576 tokens (the knob said 131,072).
-	g := &engineGroup{numBlocks: 40183, budgetBlocks: IndexSizer{Fraction: 0.95, BlockSize: 64}.BudgetBlocks(40183)}
+	g := &engineGroup{numBlocks: 40183, budgetBlocks: IndexSizer{Fraction: 0.95}.BudgetBlocks(40183)}
 	if got := g.coldCapTokens(0.95, 64); got != 128576 {
 		t.Fatalf("campaign-shape cap: %d want 128576 (2009 blocks x 64)", got)
 	}
@@ -91,11 +91,11 @@ func TestColdChargeIsCappedAtTheCap(t *testing.T) {
 		if capTokens != 200*64 { // 5 % of 4,000 blocks = 200 blocks
 			t.Fatalf("cap %d want %d", capTokens, 200*64)
 		}
-		big := bytesFor(1000) // 5x the headroom, well inside the 3,800-block budget
+		big := 1000 // 5x the headroom, well inside the 3,800-block budget
 		if i := fx.pick(head("huge", time.Second, big)); i != 0 {
 			t.Fatal("an empty valve must admit one entry of any size (R11)")
 		}
-		dispatch(t, fx.s, "huge", keys(1000, 9), big)
+		dispatch(t, fx.s, "huge")
 		if got := g.coldInFlight; got != capTokens {
 			t.Fatalf("charge %d want the cap %d (capped, not the entry's 1,000 blocks)", got, capTokens)
 		}
@@ -108,7 +108,7 @@ func TestColdChargeIsCappedAtTheCap(t *testing.T) {
 		}
 		// ... and the second entry waits until the first prefill lands. At N=2 it seats
 		// on the SIBLING instead: the cap is per engine, so the sibling has its own slot.
-		i := fx.pick(head("next", time.Second, bytesFor(10)))
+		i := fx.pick(head("next", time.Second, 10))
 		if len(fx.ids) == 1 && i >= 0 {
 			t.Fatalf("a second cold entry must wait while the valve is full, got %d", i)
 		}
@@ -119,7 +119,7 @@ func TestColdChargeIsCappedAtTheCap(t *testing.T) {
 		}
 		fx.s.Chunk("huge")
 		if len(fx.ids) == 1 {
-			if i := fx.pick(head("after", time.Second, bytesFor(10))); i != 0 {
+			if i := fx.pick(head("after", time.Second, 10)); i != 0 {
 				t.Fatal("the valve must open when the prefill completes")
 			}
 		}

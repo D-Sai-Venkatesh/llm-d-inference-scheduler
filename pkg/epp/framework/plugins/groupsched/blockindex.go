@@ -14,351 +14,279 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package groupsched implements the group scheduler (ALGORITHM-group.md):
-// a working set of sessions whose unique prefix blocks fit a budget of the
-// GPU cache, branches dispatched immediately, rotation by payback.
-//
-// This file is the block accounting (decision D4, tier B — the reviewed
-// build, applying all six fixes from the adversarial review of the first
-// draft):
-//
-//   - CHAINED hashes: h_i = H(salt ‖ h_{i−1} ‖ chunk_i). The engine's
-//     prefix cache is chained — a block is reusable only if every token
-//     before it matches — so identical chunk content after divergent
-//     prefixes must NOT count as shared, and repeated chunks within one
-//     body must not be deduplicated. Chaining makes the hash sequence a
-//     position-sensitive fingerprint of the body's prefix structure.
-//   - ONE UNIT end to end: the chunk length is derived from the MEASURED
-//     engine block size (block_size tokens × ~4 bytes/token), and the
-//     index FAILS CLOSED until the caller provides it (NewBlockIndex
-//     rejects block_size ≤ 0). The campaign engine runs 64-token blocks
-//     (40,183 × 64 = 2.57M) — a hardcoded default silently admitting 4×
-//     the cache was the first draft's S0-3.
-//   - PER-SESSION EXITING STATE: the budget counter is the union over
-//     seated branches, EXITING ONES INCLUDED, maintained as an invariant,
-//     not approximated by refcount tricks. An exiting branch is still
-//     holding its blocks — the engine pins them until the request drains —
-//     so charging the budget only for "non-exiting" branches meant the
-//     budget forgot 14-18 % of the pool while the pool was still paying
-//     for it (measured on the multi-pod wave; preempt-rootcause §7.3).
-//     MarkExiting is idempotent and changes no counter: it marks "do not
-//     dispatch, do not re-seat", and the release happens exactly once, at
-//     Unseat/Forget.
-//   - ATOMIC TrySeat: fit and seat in one critical section (no TOCTOU
-//     between FitBlocks and seating).
-//   - O(Δ) COUNTER DIFFS: every mutation computes the set delta and
-//     applies only the delta — no containsHash scans under the lock.
-//   - NO PHANTOM BLOCKS: an empty body hashes to zero chunks. The
-//     trailing partial chunk counts as one block (conservative).
-//
-// Remaining tier-B approximations, accepted and documented (see the
-// review's measurement plan before relying on them in production):
-//   - chunk boundaries are body bytes, not engine tokens: bytes/token
-//     varies by content (CJK ~3 B/char, base64 ~2.5–3 B/token, image
-//     URLs severe undercounts — multimodal bodies must be excluded by
-//     the caller);
-//   - the router sees the raw messages JSON, not the engine's templated
-//     prompt; per-request fields serialized before the messages shift
-//     chunk alignment across turns (overcount, safe direction);
-//   - FNV-64a is salted per index (crafted cross-tenant collisions made
-//     non-trivial), not cryptographic.
 package groupsched
 
+// THE BLOCK INDEX — one engine's model of which KV blocks it holds.
+//
+// It answers three questions, all in BLOCKS (the seat budget's unit):
+//   - what does this branch cost on this engine? the cold part of its chains, exactly;
+//   - how full is the engine? two refcounts, one per question (below);
+//   - may this branch be seated? fit and seat in ONE critical section.
+//
+// The keys are chained block hashes of the engine's own tokens (prefixhash: block i
+// commits to every block before it). Two consequences the whole design rests on:
+//
+//   - RESIDENCY IS PREFIX-CLOSED. A chain's blocks are added and removed as a whole, and
+//     a key commits to its prefix, so if block i of a chain is held then 0..i-1 are held
+//     too. The resident part of a chain is therefore a PREFIX, found by binary search —
+//     never by scanning a set.
+//   - SHARING IS A SHARED PREFIX. Two branches share blocks exactly when their prompts
+//     share a prefix, which is what the engine's own prefix cache dedups.
+//
+// TWO REFCOUNTS, ONE PER QUESTION:
+//
+//	blocks     (USED) — every seated branch, exiting ones included. An exiting branch's
+//	                    blocks are still pinned by the engine until its request drains, so
+//	                    ADMISSION asks about this one.
+//	blocksStay (STAY) — the seated branches that are NOT exiting. Those are the blocks
+//	                    that will still be there when the retirees are gone, so
+//	                    ENFORCEMENT asks about this one. A block an exiting branch
+//	                    shares with a staying one stays counted here, which is the
+//	                    under-eviction the two views exist to avoid.
+//
+// A branch's record exists exactly as long as it holds a seat: it is created by the
+// seat and dropped by the unseat, so nothing here is a history.
+
 import (
-	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"sync"
-	"time"
 )
 
-// Errors returned by the index. All are programming or wiring faults on
-// the caller's side except ErrBudgetUnknown.
-var (
-	ErrBlockSizeUnknown = errors.New("groupsched: engine block size not set (fail closed)")
-	ErrNotTracked       = errors.New("groupsched: session not tracked")
-	ErrAlreadySeated    = errors.New("groupsched: session already seated")
-)
+// ErrBlockSizeUnknown is the fail-closed startup error: the block size must be
+// measured, never assumed (a hardcoded default once admitted four times the cache).
+var ErrBlockSizeUnknown = errors.New("groupsched: engine block size not set (fail closed)")
 
-// DefaultDispatchWindow is the number of recent dispatched requests whose
-// blocks make up a session's set (D4: covers sub-agent chains that
-// interleave with the main chain; for one growing chain the union of the
-// window equals the latest prompt, which is what the engine holds).
-const DefaultDispatchWindow = 4
-
-// minChunkBytes floors the derived chunk length (tiny block sizes must
-// not produce pathological chunk counts).
-const minChunkBytes = 64
-
-// Hash is a chained chunk hash.
+// Hash is one chained block hash (prefixhash's key space).
 type Hash uint64
 
-// BlockIndex is the group-level unique-block accounting: a reference
-// counter over the blocks of seated branches, plus the budget counter over
-// the same set (a draining branch's blocks stay charged until it is
-// unseated, because the engine still holds them).
+// Chain is one prompt's EXACT prefill chain: the block keys of its tokens (the last
+// block is partial, so its key is private to that exact token sequence) and the
+// prompt's token count.
 //
-// Session records persist across residencies (Unseat keeps the record so
-// a re-seated multi-chain session counts its full set; Forget drops the
-// record when the session leaves the system).
+// The chains are computed ONCE per request, at its first Pick, from the tokens the
+// token producer rendered at arrival — so every cost the scheduler takes is exact for
+// the prefill it will run. Decode growth is not part of it: the seat budget's headroom
+// pays for that.
+type Chain struct {
+	Keys   []Hash
+	Tokens int
+}
+
+// BlockIndex is one engine's KV-block accounting.
 //
-// Safe for concurrent use.
+// Safe for concurrent use; the scheduler calls the Locked variants under its own lock.
 type BlockIndex struct {
-	mu sync.Mutex
-
-	salt            Hash
+	mu              sync.Mutex
 	blockSizeTokens int
-	chunkBytes      int
-	// version bumps on EVERY mutation (the scheduler's estimate cache
-	// key — M2: Picks run at ~1kHz; unchanged state must not recompute).
-	version uint64
 
-	// blocks is the refcount over every SEATED branch's set: the USED side, which is
-	// what admission asks about (an exiting branch's blocks are still pinned by the
-	// engine, so they are occupied).
-	blocks map[Hash]int
-	// blocksStay is the refcount over the seated branches that are NOT exiting: the
-	// STAY side, which is what enforcement asks about. A block an exiting branch shares
-	// with a staying one does not leave at the drain, so the overage must be measured on
-	// what actually stays.
+	blocks     map[Hash]int
 	blocksStay map[Hash]int
-	sessions   map[string]*sessionBlocks
-	seated     map[string]struct{}
+	// seats holds every seated branch's record. There is no record for a branch without
+	// a seat: the head carries its own exact chains, so the index has nothing to
+	// remember between residencies.
+	seats map[string]*seatBlocks
 }
 
-// sessionBlocks is one branch's rolling block set: the union of its waiting
-// requests and its last-window dispatched requests (the fixed 4-request window:
-// one entry per live prefix chain, expiring after S, was tried and retired), plus
-// the seating state.
-type sessionBlocks struct {
-	id            string
-	window        int
-	waiting       map[string][]Hash    // reqID -> chained hashes
-	waitSince     map[string]time.Time // reqID -> arrival (the entry-order input)
-	lastSizeBytes int64                // last-known wire size (the estimate baseline)
-	dispHist      [][]Hash
-	dispSet       map[Hash]struct{}
-	waitSet       map[Hash]struct{}
-	exiting       bool
+// seatBlocks is one seated branch's footprint: its newest chains (the turns of its
+// branch extend one another, so the newest chain is its set) and the keys actually
+// charged for it.
+type seatBlocks struct {
+	chains []Chain
+	// charged is the deduplicated union of the chains' keys: what the two refcounts were
+	// incremented by at the seat, and what the unseat releases.
+	charged map[Hash]struct{}
+	exiting bool
 }
 
-// NewBlockIndex returns an index for an engine whose KV blocks hold
-// blockSizeTokens tokens (from cache_config_info / the endpoint metrics).
-// It fails closed on blockSizeTokens <= 0: the unit must be measured,
-// never assumed.
+// NewBlockIndex returns the index for an engine whose KV blocks hold blockSizeTokens
+// tokens. It fails closed on a non-positive block size.
 func NewBlockIndex(blockSizeTokens int) (*BlockIndex, error) {
 	if blockSizeTokens <= 0 {
 		return nil, fmt.Errorf("%w: got %d", ErrBlockSizeUnknown, blockSizeTokens)
 	}
-	var saltBytes [8]byte
-	_, _ = rand.Read(saltBytes[:])
 	return &BlockIndex{
-		salt:            Hash(binary.LittleEndian.Uint64(saltBytes[:])),
 		blockSizeTokens: blockSizeTokens,
-		chunkBytes:      chunkBytesFor(blockSizeTokens),
 		blocks:          make(map[Hash]int),
 		blocksStay:      make(map[Hash]int),
-		sessions:        make(map[string]*sessionBlocks),
-		seated:          make(map[string]struct{}),
+		seats:           make(map[string]*seatBlocks),
 	}, nil
 }
 
-// chunkBytesFor converts the measured block size (tokens) to a chunk
-// length (bytes) at ~4 bytes/token, floored.
-func chunkBytesFor(blockSizeTokens int) int {
-	b := blockSizeTokens * 4
-	if b < minChunkBytes {
-		b = minChunkBytes
-	}
-	return b
-}
-
-// ChunkBytes is the chunk length in use (blockSizeTokens × ~4).
-func (b *BlockIndex) ChunkBytes() int { return b.chunkBytes }
-
-// BlockSizeTokens is the measured engine block size in tokens.
+// BlockSizeTokens is the engine block size in tokens.
 func (b *BlockIndex) BlockSizeTokens() int { return b.blockSizeTokens }
 
-// HashBody chunks a serialized request body and returns the CHAINED hash
-// of each chunk: h_i = H(salt ‖ h_{i−1} ‖ chunk_i). Position-sensitive:
-// identical content after divergent prefixes hashes differently, and
-// repeated chunks within a body are NOT deduplicated (the engine's
-// prefix cache is chained the same way). An empty body returns zero
-// chunks (no phantom shared block). The trailing partial chunk counts as
-// one block (conservative).
-func (b *BlockIndex) HashBody(body []byte) []Hash {
-	b.mu.Lock()
-	salt, cb := b.salt, b.chunkBytes
-	b.mu.Unlock()
-	return hashBody(body, cb, salt)
-}
-
-func hashBody(body []byte, chunkBytes int, salt Hash) []Hash {
-	if len(body) == 0 {
-		return nil
-	}
-	n := (len(body) + chunkBytes - 1) / chunkBytes
-	out := make([]Hash, 0, n)
-	h := fnv.New64a()
-	var prev Hash
-	for i := 0; i < len(body); i += chunkBytes {
-		end := i + chunkBytes
-		if end > len(body) {
-			end = len(body)
+// chargeSet deduplicates the union of the chains' keys. Duplicate keys are possible
+// within one request: two identical prompts render identical chains, and the engine
+// holds that block once.
+func chargeSet(chains []Chain) map[Hash]struct{} {
+	var out map[Hash]struct{}
+	for _, c := range chains {
+		if out == nil {
+			out = make(map[Hash]struct{}, len(c.Keys))
 		}
-		h.Reset()
-		var s [8]byte
-		binary.LittleEndian.PutUint64(s[:], uint64(salt))
-		h.Write(s[:])
-		binary.LittleEndian.PutUint64(s[:], uint64(prev))
-		h.Write(s[:])
-		h.Write(body[i:end])
-		prev = Hash(h.Sum64())
-		out = append(out, prev)
+		for _, h := range c.Keys {
+			out[h] = struct{}{}
+		}
 	}
 	return out
 }
 
-// ---- session records ----
-
-// Track creates (or returns) a session record. Idempotent; the record
-// persists across residencies until Forget.
-func (b *BlockIndex) Track(id string, window int) *sessionBlocks {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if s, ok := b.sessions[id]; ok {
-		return s
-	}
-	if window <= 0 {
-		window = DefaultDispatchWindow
-	}
-	s := &sessionBlocks{id: id, window: window,
-		waiting: make(map[string][]Hash), waitSince: make(map[string]time.Time),
-		dispSet: make(map[Hash]struct{}), waitSet: make(map[Hash]struct{})}
-	b.sessions[id] = s
-	return s
-}
-
-// Forget drops a session's record entirely (the session left the
-// system). A seated session is unseated first.
-func (b *BlockIndex) Forget(id string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	s, ok := b.sessions[id]
-	if !ok {
-		return
-	}
-	if _, isSeated := b.seated[id]; isSeated {
-		b.releaseLocked(s)
-		delete(b.seated, id)
-	}
-	delete(b.sessions, id)
-}
-
-// set returns the session's full block set (waiting ∪ dispatch window).
-// The returned map must not be mutated by callers.
-func (s *sessionBlocks) set() map[Hash]struct{} {
-	if len(s.waitSet) == 0 {
-		return s.dispSet
-	}
-	out := make(map[Hash]struct{}, len(s.dispSet)+len(s.waitSet))
-	for h := range s.dispSet {
-		out[h] = struct{}{}
-	}
-	for h := range s.waitSet {
-		out[h] = struct{}{}
-	}
-	return out
-}
-
-// ---- seating ----
-
-// TrySeat seats a session atomically against a budget in BLOCKS: the
-// session's current set (its waiting requests — a newcomer's entry
-// request must be recorded via UpdateWaiting first) is costed against
-// the budget group, and the seat happens only if
-// UniqueBlocksNE + cost <= budgetBlocks. Returns (ok, cost).
-//
-// The waiting request is NOT settled into the dispatch window here; the
-// scheduler settles it at dispatch (SettleDispatched) — the first
-// draft's pre-settle caused a double window push.
-func (b *BlockIndex) TrySeat(id string, budgetBlocks int) (bool, int) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	s, ok := b.sessions[id]
-	if !ok {
-		s = b.TrackLocked(id, 0)
-	}
-	if _, isSeated := b.seated[id]; isSeated {
-		return true, 0 // already a branch
-	}
-	cost := 0
-	for h := range s.set() {
-		if _, held := b.blocks[h]; !held {
-			cost++
+// residentPrefixLocked is how many of the chain's blocks this engine already holds —
+// the resident PREFIX, which is a binary search because residency is prefix-closed.
+func (b *BlockIndex) residentPrefixLocked(keys []Hash) int {
+	lo, hi := 0, len(keys)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if _, held := b.blocks[keys[mid]]; held {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
 	}
+	return lo
+}
+
+// CostLocked is the exact admission cost of a branch on this engine, in blocks: what
+// the engine would have to compute, i.e. every block beyond its resident prefix, per
+// chain.
+func (b *BlockIndex) CostLocked(chains []Chain) int {
+	n := 0
+	for _, c := range chains {
+		n += len(c.Keys) - b.residentPrefixLocked(c.Keys)
+	}
+	return n
+}
+
+// ColdTokensLocked is the same cost in TOKENS (the cold valve's unit): the prompt's
+// tokens beyond the resident prefix. It counts the partial last block exactly, which
+// the block-rounded cost cannot, and a fully resident chain is zero.
+func (b *BlockIndex) ColdTokensLocked(chains []Chain) int64 {
+	var n int64
+	for _, c := range chains {
+		p := b.residentPrefixLocked(c.Keys)
+		if p == len(c.Keys) {
+			continue // nothing to prefill
+		}
+		n += int64(c.Tokens - p*b.blockSizeTokens)
+	}
+	return n
+}
+
+// TrySeatLocked seats a branch if its exact cost fits the budget, and inserts its chains
+// in the same critical section: the fit test and the seat can never disagree, because
+// there is one number and one moment.
+func (b *BlockIndex) TrySeatLocked(id string, chains []Chain, budgetBlocks int) (bool, int) {
+	if _, seated := b.seats[id]; seated {
+		return true, 0
+	}
+	cost := b.CostLocked(chains)
 	if len(b.blocks)+cost > budgetBlocks {
 		return false, cost
 	}
-	b.version++ // R4: the seated write
-	b.seated[id] = struct{}{}
-	s.exiting = false // a fresh residency is non-exiting
-	for h := range s.set() {
-		b.blocks[h]++
-		b.blocksStay[h]++
-	}
+	b.insertLocked(id, chains)
 	return true, cost
 }
 
-// TrackLocked is Track without its own lock.
-func (b *BlockIndex) TrackLocked(id string, window int) *sessionBlocks {
-	if s, ok := b.sessions[id]; ok {
-		return s
+// insertLocked creates the seat's record and charges its keys to both counters.
+func (b *BlockIndex) insertLocked(id string, chains []Chain) {
+	s := &seatBlocks{chains: chains, charged: chargeSet(chains)}
+	b.seats[id] = s
+	for h := range s.charged {
+		b.blocks[h]++
+		b.blocksStay[h]++
 	}
-	b.version++ // R4: record creation changes SetBlocks
-	if window <= 0 {
-		window = DefaultDispatchWindow
-	}
-	s := &sessionBlocks{id: id, window: window,
-		waiting: make(map[string][]Hash), waitSince: make(map[string]time.Time),
-		dispSet: make(map[Hash]struct{}), waitSet: make(map[Hash]struct{})}
-	b.sessions[id] = s
-	return s
 }
 
-// Unseat removes a session from the group (its record persists; its
-// blocks are released from both counters — an exiting branch's too, since
-// this is the moment it actually drains).
-func (b *BlockIndex) Unseat(id string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	s, ok := b.sessions[id]
+// SeatForceLocked seats a branch WITHOUT the budget check: the blocks are taken as
+// already present on this engine (an observed placement said so — the engine, not the
+// model, is authoritative about what it holds). Enforcement reconciles the budget; a
+// branch absent from the engine serving it would not be recoverable.
+func (b *BlockIndex) SeatForceLocked(id string, chains []Chain) {
+	if s, seated := b.seats[id]; seated {
+		b.GrowLocked(id, chains)
+		_ = s
+		return
+	}
+	b.insertLocked(id, chains)
+}
+
+// GrowLocked makes a seated branch's chains the NEWEST ones it has: a branch's turns
+// extend one another, so the newest chain is its set, and the difference is charged (or
+// released, for the partial block the growing tail replaced).
+func (b *BlockIndex) GrowLocked(id string, chains []Chain) {
+	s, ok := b.seats[id]
+	if !ok || sameChains(s.chains, chains) {
+		return
+	}
+	old := s.charged
+	s.chains = chains
+	s.charged = chargeSet(chains)
+	b.applyDeltaLocked(s, old)
+}
+
+// sameChains reports whether two chain sets are the same length for every prompt — the
+// O(1) check that a branch's set did not change (the common case at a 1 kHz Pick).
+func sameChains(a, c []Chain) bool {
+	if len(a) != len(c) {
+		return false
+	}
+	for i := range a {
+		if len(a[i].Keys) != len(c[i].Keys) || a[i].Tokens != c[i].Tokens {
+			return false
+		}
+	}
+	return true
+}
+
+// applyDeltaLocked charges the keys the branch gained and releases the keys it lost.
+// A non-exiting branch moves both counters; an exiting one only the USED side (its stay
+// charge was released at its mark).
+func (b *BlockIndex) applyDeltaLocked(s *seatBlocks, old map[Hash]struct{}) {
+	for h := range s.charged {
+		if _, had := old[h]; !had {
+			b.blocks[h]++
+			if !s.exiting {
+				b.blocksStay[h]++
+			}
+		}
+	}
+	for h := range old {
+		if _, has := s.charged[h]; !has {
+			b.dec(b.blocks, h)
+			if !s.exiting {
+				b.dec(b.blocksStay, h)
+			}
+		}
+	}
+}
+
+// UnseatLocked releases a branch's seat and drops its record: this is the ONE release
+// point, and the record does not outlive the seat (a re-seat costs the branch nothing to
+// rebuild — its head carries the chain).
+func (b *BlockIndex) UnseatLocked(id string) {
+	s, ok := b.seats[id]
 	if !ok {
 		return
 	}
-	if _, isSeated := b.seated[id]; !isSeated {
-		return
-	}
-	b.releaseLocked(s)
-	delete(b.seated, id)
-}
-
-// releaseLocked removes s's set from both counters. Refcount underflow is a
-// programming error and panics (the first draft's `c > 0` guards masked real
-// bugs).
-func (b *BlockIndex) releaseLocked(s *sessionBlocks) {
-	b.version++ // R4: every mutation path bumps at its primitive
-	for h := range s.set() {
+	for h := range s.charged {
 		b.dec(b.blocks, h)
 		if !s.exiting {
 			b.dec(b.blocksStay, h) // an exiting branch left the STAY side at its mark
 		}
 	}
+	delete(b.seats, id)
 }
 
+// Unseat is UnseatLocked under the index's own lock.
+func (b *BlockIndex) Unseat(id string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.UnseatLocked(id)
+}
+
+// dec decrements a refcount, panicking on underflow: a refcount below zero is a
+// programming error, and a silent one would poison every later decision.
 func (b *BlockIndex) dec(m map[Hash]int, h Hash) {
 	c, ok := m[h]
 	if !ok || c <= 0 {
@@ -371,224 +299,114 @@ func (b *BlockIndex) dec(m map[Hash]int, h Hash) {
 	}
 }
 
-// MarkExiting marks a branch "on its way out": it is not dispatched and not
-// re-seated, and it leaves at its next drain. Its blocks STAY on the budget's
-// used side until it is unseated — the engine pins them until the running request
-// finishes, so releasing them at the mark undercounts the pool for exactly the
-// interval the retiree is still consuming it. Idempotent.
-//
-// The write DOES move one counter: blocksExit, the subset of the used side that is
-// already leaving. That is what lets enforcement tell "the engine is full" from "the
-// engine is full for another moment, by branches I have already sent away" — without
-// it a pass that marks one branch sees the same over-budget number and marks the
-// next, and the next (the cascade measured on the live batch-1 anchor: 2,520
-// mid-flight marks for 3,104 dispatches, branches draining after p50 = 1 turn).
+// MarkExitingLocked marks a branch as on its way out: it is not dispatched and not
+// re-seated, and it leaves at its next drain. Its blocks stay on the USED side — the
+// engine pins them until the request finishes — and leave the STAY side, which is what
+// tells enforcement that evicting it again would free nothing. Idempotent.
+func (b *BlockIndex) MarkExitingLocked(id string) {
+	s, ok := b.seats[id]
+	if !ok || s.exiting {
+		return
+	}
+	s.exiting = true
+	for h := range s.charged {
+		b.dec(b.blocksStay, h)
+	}
+}
+
+// MarkExiting is MarkExitingLocked under the index's own lock.
 func (b *BlockIndex) MarkExiting(id string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.markExitingLocked(id)
+	b.MarkExitingLocked(id)
 }
 
-func (b *BlockIndex) markExitingLocked(id string) {
-	s, ok := b.sessions[id]
-	if !ok || s.exiting {
-		return // idempotent
-	}
-	if _, isSeated := b.seated[id]; !isSeated {
-		return // an unseated session is not exiting
-	}
-	b.version++
-	s.exiting = true
-	for h := range s.set() {
-		b.dec(b.blocksStay, h) // from here on its blocks are accounted as leaving
-	}
+// ExitingLocked reports the branch's exiting state.
+func (b *BlockIndex) ExitingLocked(id string) bool {
+	s, ok := b.seats[id]
+	return ok && s.exiting
 }
 
-// ---- waiting / dispatch bookkeeping ----
-
-// UpdateWaiting ingests a newly arrived request body for a session
-// (tracked, seated or not), keyed by the request ID the caller uses at
-// dispatch — the scheduler never has to keep the body, and a rewritten
-// body is simply re-registered under its reqID. If seated, the session's
-// NEW blocks are counted into the group (both counters) — the growth
-// re-check substrate (D13).
-func (b *BlockIndex) UpdateWaiting(id, reqID string, body []byte) error {
-	hashes := b.HashBody(body)
+// Exiting is ExitingLocked under the index's own lock.
+func (b *BlockIndex) Exiting(id string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s := b.TrackLocked(id, 0) // first sight creates the record
-	old := s.set()
-	if _, ok := s.waiting[reqID]; ok {
-		// a retry rewrote the body under the same reqID: drop the old
-		// entry (and its waitSet contribution) before registering the new
-		delete(s.waiting, reqID)
-		s.rebuildWaitSet()
-	}
-	s.waiting[reqID] = hashes
-	for _, h := range hashes {
-		s.waitSet[h] = struct{}{}
-	}
-	b.applyDeltaLocked(s, old)
-	return nil
+	return b.ExitingLocked(id)
 }
 
-// SettleDispatched moves a request from waiting to the dispatch window,
-// matched by the request ID registered at UpdateWaiting. A reqID that
-// never waited is dispatched directly (its hashes are computed from the
-// body the caller passes). Window slides release blocks that left the
-// session's set.
-func (b *BlockIndex) SettleDispatched(id, reqID string, body []byte) error {
+// Seated reports whether the branch holds a seat here.
+func (b *BlockIndex) Seated(id string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s := b.TrackLocked(id, 0) // first sight creates the record
-	old := s.set()
-	hashes, ok := s.waiting[reqID]
-	if !ok {
-		// never waited (dispatched directly): hash the body now
-		hashes = b.HashBodyLocked(body)
-	} else {
-		delete(s.waiting, reqID)
-		s.rebuildWaitSet()
-	}
-	s.pushDispatched(hashes)
-	b.applyDeltaLocked(s, old)
-	return nil
+	_, ok := b.seats[id]
+	return ok
 }
 
-// HashBodyLocked is HashBody under an already-held lock.
-func (b *BlockIndex) HashBodyLocked(body []byte) []Hash {
-	return hashBody(body, b.chunkBytes, b.salt)
-}
+// ---- the counted views ----
 
-// Cancel drops a waiting request (client disconnect, queue eviction),
-// matched by request ID. O(Δ) counter maintenance.
-func (b *BlockIndex) Cancel(id, reqID string) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	s, ok := b.sessions[id]
-	if !ok {
-		return ErrNotTracked
-	}
-	if _, ok := s.waiting[reqID]; !ok {
-		return fmt.Errorf("groupsched: no waiting request %s for %s", reqID, id)
-	}
-	old := s.set()
-	delete(s.waiting, reqID)
-	s.rebuildWaitSet()
-	b.applyDeltaLocked(s, old)
-	return nil
-}
+// UniqueBlocksLocked is the USED side: every seated branch's blocks, exiting included.
+func (b *BlockIndex) UniqueBlocksLocked() int { return len(b.blocks) }
 
-// applyDeltaLocked applies the counter diff between the session's
-// previous set and its current set: increments for new blocks, decrements
-// for gone blocks. Both counters follow a SEATED session, exiting or not
-// (an exiting branch's new turn is pinned by the engine like any other).
-func (b *BlockIndex) applyDeltaLocked(s *sessionBlocks, old map[Hash]struct{}) {
-	b.version++ // R4: bumps even when unseated (SetBlocks feeds estimates)
-	_, isSeated := b.seated[s.id]
-	if !isSeated {
-		return // unseated sessions' records are private
-	}
-	cur := s.set()
-	for h := range cur {
-		if _, had := old[h]; !had {
-			b.blocks[h]++
-			if !s.exiting {
-				b.blocksStay[h]++
-			}
-		}
-	}
-	for h := range old {
-		if _, has := cur[h]; !has {
-			b.dec(b.blocks, h)
-			if !s.exiting {
-				b.dec(b.blocksStay, h)
-			}
-		}
-	}
-}
-
-func (s *sessionBlocks) pushDispatched(hashes []Hash) {
-	s.dispHist = append(s.dispHist, hashes)
-	if len(s.dispHist) > s.window {
-		s.dispHist = s.dispHist[len(s.dispHist)-s.window:]
-	}
-	s.rebuildDispSet()
-}
-
-func (s *sessionBlocks) rebuildDispSet() {
-	s.dispSet = make(map[Hash]struct{})
-	for _, w := range s.dispHist {
-		for _, h := range w {
-			s.dispSet[h] = struct{}{}
-		}
-	}
-}
-
-func (s *sessionBlocks) rebuildWaitSet() {
-	s.waitSet = make(map[Hash]struct{})
-	for _, w := range s.waiting {
-		for _, h := range w {
-			s.waitSet[h] = struct{}{}
-		}
-	}
-}
-
-// ---- queries ----
-
-// FitBlocks returns how many of the candidate's blocks are NOT already
-// held by the budget group: the admission cost estimate. With
-// chained hashes the candidate's hashes are position-sensitive, so only
-// true prefix sharing discounts.
-func (b *BlockIndex) FitBlocks(hashes []Hash) int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	n := 0
-	for _, h := range hashes {
-		if _, held := b.blocks[h]; !held {
-			n++
-		}
-	}
-	return n
-}
-
-// UniqueBlocks is the group's size in unique blocks (all seated branches).
+// UniqueBlocks is UniqueBlocksLocked under the index's own lock.
 func (b *BlockIndex) UniqueBlocks() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return len(b.blocks)
 }
 
-// Seated reports whether the session is currently a group branch.
-func (b *BlockIndex) Seated(id string) bool {
+// StayBlocksLocked is the STAY side: the blocks of the branches that are not exiting.
+// Enforcement measures the overage against it.
+func (b *BlockIndex) StayBlocksLocked() int { return len(b.blocksStay) }
+
+// StayBlocks is StayBlocksLocked under the index's own lock.
+func (b *BlockIndex) StayBlocks() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	_, ok := b.seated[id]
+	return len(b.blocksStay)
+}
+
+// ExitingBlocksLocked is the part of the USED side that belongs only to exiting branches
+// (used − stay): the overage enforcement must NOT evict again, and admission still
+// refuses.
+func (b *BlockIndex) ExitingBlocksLocked() int { return len(b.blocks) - len(b.blocksStay) }
+
+// ExitingBlocks is ExitingBlocksLocked under the index's own lock.
+func (b *BlockIndex) ExitingBlocks() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.blocks) - len(b.blocksStay)
+}
+
+// HasNELocked reports whether a key is on the USED side.
+func (b *BlockIndex) HasNELocked(h Hash) bool {
+	_, ok := b.blocks[h]
 	return ok
 }
 
-// Exiting reports the branch's exiting state.
-func (b *BlockIndex) Exiting(id string) bool {
+// ChainsLocked is a seated branch's chains: what a rebind carries to the engine that is
+// observed to be serving it.
+func (b *BlockIndex) ChainsLocked(id string) []Chain {
+	s, ok := b.seats[id]
+	if !ok {
+		return nil
+	}
+	return s.chains
+}
+
+// TrackedCount is the number of seat records (one per seat, by construction).
+func (b *BlockIndex) TrackedCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s, ok := b.sessions[id]
-	return ok && s.exiting
+	return len(b.seats)
 }
 
-// EstimateTokens converts a block count to tokens at the measured block
-// size (one unit end to end).
-func (b *BlockIndex) EstimateTokens(blocks int) int64 {
-	return int64(blocks) * int64(b.blockSizeTokens)
-}
-
-// checkInvariantLocked recomputes both counters from the seated sets and
-// panics on divergence. Used by tests (the review's invariant checker).
+// checkInvariantLocked recomputes both refcounts from the records and panics on
+// divergence. Tests call it after every mutation.
 func (b *BlockIndex) checkInvariantLocked() {
 	want := make(map[Hash]int)
 	wantStay := make(map[Hash]int)
-	for id := range b.seated {
-		s := b.sessions[id]
-		for h := range s.set() {
+	for _, s := range b.seats {
+		for h := range s.charged {
 			want[h]++
 			if !s.exiting {
 				wantStay[h]++
@@ -613,286 +431,4 @@ func sameCounts(a, c map[Hash]int) bool {
 		}
 	}
 	return true
-}
-
-// ---- the scheduler-facing core: Locked variants and waiting-order queries ----
-// The scheduler holds its own lock and calls these; the public API above
-// wraps the same logic for standalone use and tests.
-
-// UpdateWaitingLocked is UpdateWaiting under an already-held lock, with
-// the arrival time recorded for the entry-order queries.
-func (b *BlockIndex) UpdateWaitingLocked(id, reqID string, hashes []Hash) {
-	s := b.TrackLocked(id, 0)
-	old := s.set()
-	if _, ok := s.waiting[reqID]; ok {
-		delete(s.waiting, reqID)
-		s.rebuildWaitSet()
-	}
-	s.waiting[reqID] = hashes
-	s.waitSince[reqID] = time.Now()
-	for _, h := range hashes {
-		s.waitSet[h] = struct{}{}
-	}
-	b.applyDeltaLocked(s, old)
-}
-
-// SettleDispatchedAtLocked is SettleDispatchedLocked with an explicit time (the derived
-// window's chain timestamps — deterministic tests).
-func (b *BlockIndex) SettleDispatchedAtLocked(id, reqID string, hashes []Hash, now time.Time) {
-	s := b.TrackLocked(id, 0)
-	old := s.set()
-	if _, ok := s.waiting[reqID]; ok {
-		delete(s.waiting, reqID)
-		delete(s.waitSince, reqID)
-		s.rebuildWaitSet()
-	}
-	if hashes != nil {
-		s.pushDispatched(hashes)
-	}
-	b.applyDeltaLocked(s, old)
-}
-
-// SettleDispatchedLocked is SettleDispatched under an already-held lock.
-func (b *BlockIndex) SettleDispatchedLocked(id, reqID string, hashes []Hash) {
-	s := b.TrackLocked(id, 0)
-	old := s.set()
-	if _, ok := s.waiting[reqID]; ok {
-		delete(s.waiting, reqID)
-		delete(s.waitSince, reqID)
-		s.rebuildWaitSet()
-	}
-	if hashes != nil {
-		s.pushDispatched(hashes)
-	}
-	b.applyDeltaLocked(s, old)
-}
-
-// CancelLocked is Cancel under an already-held lock.
-func (b *BlockIndex) CancelLocked(id, reqID string) error {
-	s, ok := b.sessions[id]
-	if !ok {
-		return ErrNotTracked
-	}
-	if _, ok := s.waiting[reqID]; !ok {
-		return fmt.Errorf("groupsched: no waiting request %s for %s", reqID, id)
-	}
-	old := s.set()
-	delete(s.waiting, reqID)
-	delete(s.waitSince, reqID)
-	s.rebuildWaitSet()
-	b.applyDeltaLocked(s, old)
-	return nil
-}
-
-// WaitingSince returns the arrival time of the session's OLDEST waiting
-// request (zero if none) — the "oldest waiting request first" input.
-func (b *BlockIndex) WaitingSince(id string) time.Time {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.waitingSinceLocked(id)
-}
-
-func (b *BlockIndex) waitingSinceLocked(id string) time.Time {
-	s, ok := b.sessions[id]
-	if !ok {
-		return time.Time{}
-	}
-	var oldest time.Time
-	for _, t := range s.waitSince {
-		if oldest.IsZero() || t.Before(oldest) {
-			oldest = t
-		}
-	}
-	return oldest
-}
-
-// OldestWaiting returns the reqID of the session's oldest waiting
-// request, or "".
-func (b *BlockIndex) OldestWaiting(id string) string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	s, ok := b.sessions[id]
-	if !ok {
-		return ""
-	}
-	var bestID string
-	var best time.Time
-	for rid, t := range s.waitSince {
-		if best.IsZero() || t.Before(best) || (t.Equal(best) && rid < bestID) {
-			best, bestID = t, rid
-		}
-	}
-	return bestID
-}
-
-// ExitingLocked reports the exiting state under an already-held lock.
-func (b *BlockIndex) ExitingLocked(id string) bool {
-	s, ok := b.sessions[id]
-	return ok && s.exiting
-}
-
-// MarkExitingLocked is MarkExiting under an already-held lock.
-func (b *BlockIndex) MarkExitingLocked(id string) { b.markExitingLocked(id) }
-
-// UnseatLocked is Unseat under an already-held lock.
-func (b *BlockIndex) UnseatLocked(id string) {
-	s, ok := b.sessions[id]
-	if !ok {
-		return
-	}
-	if _, isSeated := b.seated[id]; !isSeated {
-		return
-	}
-	b.releaseLocked(s)
-	delete(b.seated, id)
-}
-
-// ForgetLocked is Forget under an already-held lock.
-func (b *BlockIndex) ForgetLocked(id string) {
-	s, ok := b.sessions[id]
-	if !ok {
-		return
-	}
-	if _, isSeated := b.seated[id]; isSeated {
-		b.releaseLocked(s)
-		delete(b.seated, id)
-	}
-	delete(b.sessions, id)
-}
-
-// TrySeatLocked is TrySeat under an already-held lock.
-func (b *BlockIndex) TrySeatLocked(id string, budgetBlocks int) (bool, int) {
-	s := b.TrackLocked(id, 0)
-	if _, isSeated := b.seated[id]; isSeated {
-		return true, 0
-	}
-	cost := 0
-	for h := range s.set() {
-		if _, held := b.blocks[h]; !held {
-			cost++
-		}
-	}
-	if len(b.blocks)+cost > budgetBlocks {
-		return false, cost
-	}
-	b.version++ // R4: the seated write
-	b.seated[id] = struct{}{}
-	s.exiting = false
-	for h := range s.set() {
-		b.blocks[h]++
-		b.blocksStay[h]++
-	}
-	return true, cost
-}
-
-// SeatForceLocked seats a session WITHOUT the budget check: the block set
-// is taken as present on this engine (an affinity reconciliation observed
-// it there — the engine, not our estimate, is authoritative about what it
-// holds). The next enforce pass evicts to fit; an over-budget counter is
-// recoverable, a branch absent from the engine serving it is not.
-func (b *BlockIndex) SeatForceLocked(id string) {
-	s := b.TrackLocked(id, 0)
-	if _, isSeated := b.seated[id]; isSeated {
-		return
-	}
-	b.version++ // R4: the seated write
-	b.seated[id] = struct{}{}
-	s.exiting = false
-	for h := range s.set() {
-		b.blocks[h]++
-		b.blocksStay[h]++
-	}
-}
-
-// FitBlocksLocked is FitBlocks under an already-held lock.
-func (b *BlockIndex) FitBlocksLocked(hashes []Hash) int {
-	n := 0
-	for _, h := range hashes {
-		if _, held := b.blocks[h]; !held {
-			n++
-		}
-	}
-	return n
-}
-
-// StayBlocksLocked is the STAY side's size: seated branches that are not exiting.
-// Enforcement measures the overage against it.
-func (b *BlockIndex) StayBlocksLocked() int { return len(b.blocksStay) }
-
-// StayBlocks is StayBlocksLocked under the index's own lock.
-func (b *BlockIndex) StayBlocks() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return len(b.blocksStay)
-}
-
-// ExitingBlocksLocked is how many distinct blocks of the USED side belong only to
-// exiting branches (used − stay) — the part of the overage that enforcement must not
-// evict again, and that admission still refuses (it is pinned until the drain).
-func (b *BlockIndex) ExitingBlocksLocked() int { return len(b.blocks) - len(b.blocksStay) }
-
-// ExitingBlocks is ExitingBlocksLocked under the index's own lock.
-func (b *BlockIndex) ExitingBlocks() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return len(b.blocks) - len(b.blocksStay)
-}
-
-// UniqueBlocksLocked is UniqueBlocks under an already-held lock (ALL
-// seated branches, including exiting — their blocks stay pinned until
-// they drain; the size-aware gate's usage term, M4).
-func (b *BlockIndex) UniqueBlocksLocked() int { return len(b.blocks) }
-
-// VersionLocked is the mutation counter under an already-held lock (the
-// estimate-cache key).
-func (b *BlockIndex) VersionLocked() uint64 { return b.version }
-
-// SetBlocks returns the session's full block set (the fit input).
-func (b *BlockIndex) SetBlocks(id string) []Hash {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	s, ok := b.sessions[id]
-	if !ok {
-		return nil
-	}
-	out := make([]Hash, 0, len(s.dispSet)+len(s.waitSet))
-	for h := range s.set() {
-		out = append(out, h)
-	}
-	return out
-}
-
-// TrackedCount is the number of session records (the leak test's input).
-func (b *BlockIndex) TrackedCount() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return len(b.sessions)
-}
-
-// LastSizeBytesLocked returns the session's last dispatched body size
-// (the estimate delta's baseline; 0 when never dispatched).
-func (b *BlockIndex) LastSizeBytesLocked(id string) int64 {
-	s, ok := b.sessions[id]
-	if !ok {
-		return 0
-	}
-	return s.lastSizeBytes
-}
-
-// HasNELocked reports whether a hash is held by the budget group (the USED side):
-// the estimate path's membership test.
-func (b *BlockIndex) HasNELocked(h Hash) bool {
-	_, ok := b.blocks[h]
-	return ok
-}
-
-// SetSizeLocked records the session's last-known wire size (the estimate
-// delta's baseline). Stored on the session record so it persists across
-// residencies with the block set.
-func (b *BlockIndex) SetSizeLocked(id string, sizeBytes int64) int64 {
-	b.version++ // R4: the lastSizeBytes write feeds the estimate delta
-	s := b.TrackLocked(id, 0)
-	old := s.lastSizeBytes
-	s.lastSizeBytes = sizeBytes
-	return old
 }

@@ -106,7 +106,7 @@ func TestColdValveHeldIsAttributedToTheEngine(t *testing.T) {
 		}
 
 		// a head that fits every engine's BUDGET but is refused by every engine's VALVE
-		if i := fx.pick(head("waiting", time.Second, bytesFor(200))); i >= 0 {
+		if i := fx.pick(head("waiting", time.Second, 200)); i >= 0 {
 			t.Fatalf("the head must NOT be seated (the valve holds it), got pick %d", i)
 		}
 		if len(held) == 0 {

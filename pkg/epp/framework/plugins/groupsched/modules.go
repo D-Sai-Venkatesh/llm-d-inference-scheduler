@@ -339,29 +339,26 @@ func betterEngine(c, best EngineCandidate) bool {
 
 // ---- SIZING ------------------------------------------------------------------
 
-// FootprintSizer answers "what does this head cost on this engine?" and "how many
-// blocks may this engine seat?".
-type FootprintSizer interface {
+// SeatBudget answers how many blocks one engine may seat.
+//
+// It used to answer the FOOTPRINT too. It no longer does: every cost is now exact, from
+// the request's own tokens against the engine's own index (BlockIndex.CostLocked), so
+// there is one number and one place that computes it. What is left of the module is the
+// one deployment fact it alone knows — the fraction of the engine's measured KV the
+// seats may hold.
+type SeatBudget interface {
 	Name() string
 	// BudgetBlocks is one engine's seat budget, from its measured KV capacity
-	// (num_gpu_blocks): the deployment's own statement about how much of the
-	// engine's KV may be held. The CPU offload tier does not widen it — native
-	// offload is write-through, so it adds no seat (the cold valve's cap stays
-	// GPU-only for the same reason).
+	// (num_gpu_blocks): the deployment's own statement about how much of the engine's
+	// KV may be held. The CPU offload tier does not widen it — native offload is
+	// write-through, so it adds no seat (the cold valve's cap stays GPU-only for the
+	// same reason).
 	BudgetBlocks(numBlocks int) int
-	// Cost is the conservative admission cost of a QUEUED request against one
-	// engine's index, in blocks.
-	Cost(idx *BlockIndex, branch string, sizeBytes int64) int64
-	// Tokens converts a block count to tokens (R1: one unit everywhere).
-	Tokens(blocks int64) int64
 }
 
-// IndexSizer is the default: the engine's own BlockIndex (dedup against what the
-// engine already holds) plus the wire-size delta over the branch's last dispatched
-// body, and a budget of fraction × num_gpu_blocks.
+// IndexSizer is the one implementation: fraction × num_gpu_blocks.
 type IndexSizer struct {
-	Fraction  float64
-	BlockSize int
+	Fraction float64
 }
 
 func (IndexSizer) Name() string { return "index" }
@@ -369,34 +366,6 @@ func (IndexSizer) Name() string { return "index" }
 func (z IndexSizer) BudgetBlocks(numBlocks int) int {
 	return int(z.Fraction * float64(numBlocks))
 }
-
-func (z IndexSizer) Cost(idx *BlockIndex, branch string, sizeBytes int64) int64 {
-	var cold int64
-	for _, h := range idx.SetBlocks(branch) { // persisted across residencies (CP1)
-		if idx.HasNELocked(h) {
-			// the engine can reach this block without recomputing it: it is in HBM.
-			continue
-		}
-		cold++
-	}
-	// the baseline is the branch's last DISPATCHED body size (the index record,
-	// updated at PreRequest) — never the current head's size, or the second sight of
-	// the same head would estimate zero new blocks.
-	delta := sizeBytes - idx.LastSizeBytesLocked(branch)
-	if delta < 0 {
-		delta = 0
-	}
-	// ROUNDED UP: a partial block still occupies a block. Truncating the division
-	// understates every head whose growth is not a whole block, in the same
-	// direction as (and on top of) the byte-to-token conversion this estimate is
-	// stuck with. The GROWTH is always cold: a block that never existed cannot be
-	// restorable, whatever the tier holds.
-	blockBytes := 4 * int64(z.BlockSize)
-	cold += (delta + blockBytes - 1) / blockBytes
-	return cold
-}
-
-func (z IndexSizer) Tokens(blocks int64) int64 { return blocks * int64(z.BlockSize) }
 
 // ---- DISPATCH ----------------------------------------------------------------
 
@@ -524,7 +493,7 @@ func (NoopSafety) Score(float64, bool) float64 { return 0 }
 // modules is the wired set. NewScheduler builds it ONCE from Config; nothing below
 // ever consults Config for a policy decision again (no cross-module knobs).
 type modules struct {
-	sizer    FootprintSizer
+	sizer    SeatBudget
 	entry    EntryOrder
 	place    EngineChooser
 	tenure   RotationPolicy
@@ -539,7 +508,7 @@ func buildModules(cfg Config) (modules, error) {
 	var m modules
 	switch cfg.Sizing {
 	case "", "index":
-		m.sizer = IndexSizer{Fraction: cfg.GroupBudgetFraction, BlockSize: cfg.BlockSizeTokens}
+		m.sizer = IndexSizer{Fraction: cfg.GroupBudgetFraction}
 	default:
 		return m, errValue("sizing", cfg.Sizing, "index")
 	}

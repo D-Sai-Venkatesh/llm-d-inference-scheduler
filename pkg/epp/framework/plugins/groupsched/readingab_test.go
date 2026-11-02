@@ -16,44 +16,28 @@ limitations under the License.
 
 package groupsched
 
-// THE READING A / READING B REPLAY (one replay, the root-cause doc's §13 experiment).
+// THE EXACTNESS REPLAY: every cost the scheduler takes is the request's own prefill
+// chain, on the wave's real prompt-size distribution.
 //
-// THE QUESTION. The multi-pod wave's core arms preempted 13 times against FCFS's 5 on
-// an engine both arms keep at the capacity edge. Two readings of the artifacts survived:
+// THE QUESTION IT ANSWERS. The admission cost used to be an ESTIMATE — the branch's
+// remembered set plus ceil(wire bytes / 4B) — which measured 0.895 of the true block
+// count on the campaign's traffic (n = 1,206, p05 0.848 / p95 0.909), i.e. the budget
+// ran ~10 % short at admission and was corrected only at PreRequest. With the engine
+// tokens attached at arrival there is nothing left to estimate: the chain is hashed from
+// the prompt itself, so the cost is exact at the first Pick.
 //
-//	Reading A  the SEAT INDEX inherits the branch-identity layer's byte-derived block
-//	           count (bytes/256), which measures 0.895 of the true token count
-//	           (n = 1,206 real requests, p05 0.848 / p95 0.909) — so the budget is
-//	           ~10.5 % short every sample and the engine is oversubscribed continuously.
-//	Reading B  the index is token-exact; the 0.895 bias belongs to a different layer.
+// THE REPLAY. For every request in the corpus distribution below (the wave's own 2,450
+// records, sampled every 5th percentile) it builds the token stream, hashes it exactly
+// as production does (prefixhash at the engine block size), and checks the three
+// numbers the budget depends on:
 //
-// THE REPLAY. Real prompt-token counts (the empirical distribution of the wave's own
-// 2,450 records), the measured byte ratio, and the engine the arms ran on (40,183
-// blocks of 64 tokens). For every request it drives the REAL paths — Pick seats, the
-// token producer's token IDs become the tier-A keys (HashTokens retaining the trailing
-// partial block), PreRequest lands them — and then reads back three numbers for the
-// same request:
+//	cost      the cold part of the chain — must be ceil(tokens / 64)
+//	cold tok  the valve's charge — must be the prompt's own token count
+//	charged   what the seat puts on the used side — must be the same as the cost
 //
-//	blocks_in_index  what the branch is CHARGED (its set in the engine's BlockIndex)
-//	bytes/256        what a byte-derived counter would say
-//	entry estimate   what a QUEUED head is charged at admission (IndexSizer.Cost)
-//
-// THE ANSWER (measured, printed by the test): blocks_in_index is token-exact —
-// ceil(tokens / 64) for every request, ratio 1.000, no bias — so READING B HOLDS for
-// the budget's used side. The 0.895 bias is real but it lives in the ADMISSION
-// ESTIMATE, which cannot be token-exact: at Pick time the tokenizer has not run for
-// that request yet (the data producers run AFTER the queue is released), so the only
-// available quantity is the wire size. That estimate carries the byte bias for at most
-// the Pick->PreRequest window and is then replaced by the exact keys (D13).
-//
-// THE MEASURED BYTE RATIO. The block-count ratio 0.895 inverted through the estimator
-// is 0.895 x 256 / 64 = 3.58 bytes per token, and that is the value used here. (The
-// root-cause doc's prose says "~4.47 bytes/token", which would make a bytes/4 count
-// read HIGH; the measurement it reports is 0.895, i.e. LOW. The measurement is what the
-// replay uses.)
-//
-// PROVENANCE of promptSizes: records/profile_export.jsonl of results/exp-ops/mp-q4-c64
-// (2,450 rows), input_sequence_length, sampled at every 5th percentile:
+// PROVENANCE of promptSizeQuantiles: records/profile_export.jsonl of
+// results/exp-ops/mp-q4-c64 (2,450 rows), input_sequence_length, sampled at every 5th
+// percentile:
 //
 //	tar xzOf records/*.tar.gz --wildcards '*/profile_export.jsonl' \
 //	  | python3 -c 'import sys,json;v=sorted(int(json.loads(l)["metrics"]["input_sequence_length"]["value"]) for l in sys.stdin);n=len(v);print([v[min(n-1,round(p/100*(n-1)))] for p in range(0,101,5)])'
@@ -62,7 +46,6 @@ import (
 	"fmt"
 	"sort"
 	"testing"
-	"time"
 )
 
 // promptSizeQuantiles is the wave's own prompt-token distribution (p0..p100, step 5);
@@ -72,13 +55,8 @@ var promptSizeQuantiles = []int{
 	75933, 81134, 86547, 91884, 98033, 104611, 115559, 131899, 157181, 209035,
 }
 
-const (
-	// readingABByteRatio is the measured corpus ratio: the branch-identity block count
-	// (bytes/256) read 0.895 of the true token count, i.e. 0.895 x 256 / 64 bytes per
-	// token.
-	readingABByteRatio = 0.895 * 256.0 / 64.0
-	readingABBlocks    = 40183 // the campaign engine's num_gpu_blocks
-)
+// readingABBlocks is the campaign engine's num_gpu_blocks (2.57M tokens of KV).
+const readingABBlocks = 40183
 
 func pct(vals []float64, p float64) float64 {
 	if len(vals) == 0 {
@@ -96,8 +74,8 @@ func pct(vals []float64, p float64) float64 {
 	return s[i]
 }
 
-func TestSeatIndexBlockCountReadings(t *testing.T) {
-	s, err := NewScheduler(defaultConfig()) // fraction 0.95, blockSize 64
+func TestAdmissionCostIsExactOnTheCorpus(t *testing.T) {
+	s, err := NewScheduler(defaultConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,120 +84,89 @@ func TestSeatIndexBlockCountReadings(t *testing.T) {
 		t.Fatal(err)
 	}
 	g := s.groups[engine]
-	now := time.Unix(1793000000, 0).UTC()
-	sizer := IndexSizer{Fraction: 0.95, BlockSize: 64}
 
-	var inIndex, byteDerived, estimate []float64
-	var exact, partial int
+	var ratios []float64
+	var partial, exact int
 	const n = 420 // 20 draws per quantile bucket
 	for i := 0; i < n; i++ {
 		tokens := promptSizeQuantiles[(i*7)%len(promptSizeQuantiles)]
-		sizeBytes := int64(float64(tokens)*readingABByteRatio + 0.5)
-		branch := fmt.Sprintf("m%03d", i)
-		reqID := fmt.Sprintf("r%03d", i)
-		now = now.Add(time.Millisecond)
-
-		// the ADMISSION estimate: what a queued head is charged before its exact keys
-		// exist (this is the only quantity available at Pick time).
-		estBlocks := sizer.Cost(g.index, branch, sizeBytes)
-
-		// Pick: the head is seated (the engine has room; prefill is acked below).
-		h := Head{Branch: branch, ReqID: reqID, Arrival: now.Add(-time.Second), SizeBytes: sizeBytes}
-		if got := s.PickFromHeads([]Head{h}, now); got != 0 {
-			t.Fatalf("request %d: head not seated (pick %d)", i, got)
-		}
-		// PreRequest: the token producer's token IDs become the tier-A keys.
 		ids := make([]uint32, tokens)
 		for j := range ids {
-			ids[j] = uint32(j % 50257)
+			ids[j] = uint32(j%50257) + 1
 		}
-		keys := s.HashTokens(ids, "", 64)
-		s.DispatchedOn(branch, reqID, engine, keys, sizeBytes, now)
-
-		charged := int64(len(g.index.SetBlocks(branch)))
-		trueBlocks := float64((tokens + 63) / 64) // the engine's own allocation (tail block included)
-		if charged != int64(trueBlocks) {
-			t.Fatalf("request %d: index charged %d blocks for %d tokens, want %d (token-exact)",
-				i, charged, tokens, int64(trueBlocks))
+		chains := chainsOfTokens(ids, 64)
+		wantBlocks := (tokens + 63) / 64
+		if len(chains) != 1 || len(chains[0].Keys) != wantBlocks {
+			t.Fatalf("request %d (%d tokens): %d chains of %d blocks, want 1 chain of %d",
+				i, tokens, len(chains), len(chains[0].Keys), wantBlocks)
 		}
+		cost := g.index.CostLocked(chains)
+		if cost != wantBlocks {
+			t.Fatalf("request %d (%d tokens): cost %d blocks, want %d — the cost must be the exact chain",
+				i, tokens, cost, wantBlocks)
+		}
+		if cold := g.index.ColdTokensLocked(chains); cold != int64(tokens) {
+			t.Fatalf("request %d (%d tokens): cold charge %d tokens, want %d", i, tokens, cold, tokens)
+		}
+		// and the seat charges exactly that
+		s.mu.Lock()
+		ok, seatedCost := g.index.TrySeatLocked(fmt.Sprintf("m%03d", i), chains, readingABBlocks)
+		used := g.index.UniqueBlocksLocked()
+		s.mu.Unlock()
+		if !ok || seatedCost != cost || used != wantBlocks {
+			t.Fatalf("request %d: seat ok=%v cost=%d used=%d, want true/%d/%d",
+				i, ok, seatedCost, used, cost, wantBlocks)
+		}
+		// the next request is costed against an engine that now holds this chain
+		if next := g.index.CostLocked(chains); next != 0 {
+			t.Fatalf("request %d: a fully resident chain still costs %d", i, next)
+		}
+		s.mu.Lock()
+		g.index.UnseatLocked(fmt.Sprintf("m%03d", i))
+		s.mu.Unlock()
+		ratios = append(ratios, float64(cost)/float64(wantBlocks))
 		if tokens%64 != 0 {
 			partial++
 		}
-		inIndex = append(inIndex, float64(charged)/trueBlocks)
-		byteDerived = append(byteDerived, float64((sizeBytes+255)/256)/trueBlocks)
-		estimate = append(estimate, float64(estBlocks)/trueBlocks)
 		exact++
-
-		// the request finishes: prefill acked, then it leaves (the replay measures
-		// per-request counts; the budget's own accumulation is the goldens' business).
-		s.ChunkAt(branch, now)
-		s.Settle(branch, reqID, struct{ Prompt, Cached int }{tokens, 0}, true, now)
-		s.mu.Lock()
-		g.index.MarkExitingLocked(branch)
-		s.mu.Unlock()
-		s.Settle(branch, "", struct{ Prompt, Cached int }{0, 0}, true, now.Add(time.Millisecond))
 	}
-	s.mu.Lock()
-	left := len(g.branches)
-	s.mu.Unlock()
-	if left != 0 {
-		t.Fatalf("%d branches still seated at the end of the replay", left)
-	}
-
-	t.Logf("READING A/B REPLAY — n=%d requests, %d with a partial tail block, engine %d blocks x 64 tokens, %.2f B/token",
-		n, partial, readingABBlocks, readingABByteRatio)
-	t.Logf("  blocks charged in the INDEX      / true blocks: p05 %.3f  p50 %.3f  p95 %.3f   (1.000 = token-exact)",
-		pct(inIndex, 5), pct(inIndex, 50), pct(inIndex, 95))
-	t.Logf("  bytes/256 (the byte-derived count) / true blocks: p05 %.3f  p50 %.3f  p95 %.3f",
-		pct(byteDerived, 5), pct(byteDerived, 50), pct(byteDerived, 95))
-	t.Logf("  the ADMISSION estimate (at Pick)   / true blocks: p05 %.3f  p50 %.3f  p95 %.3f",
-		pct(estimate, 5), pct(estimate, 50), pct(estimate, 95))
-
-	// VERDICT, asserted so it cannot drift: the seat index is TOKEN-EXACT (Reading B),
-	// and the 0.895 byte bias is confined to the admission estimate.
-	for i, r := range inIndex {
+	t.Logf("EXACTNESS REPLAY — n=%d requests, %d with a partial tail block, engine %d blocks x 64 tokens",
+		n, partial, readingABBlocks)
+	t.Logf("  cost / true blocks: p05 %.3f  p50 %.3f  p95 %.3f   (1.000 = exact)",
+		pct(ratios, 5), pct(ratios, 50), pct(ratios, 95))
+	for i, r := range ratios {
 		if r != 1 {
-			t.Fatalf("request %d: the index charged %.4f of the true block count — the used side must be token-exact", i, r)
+			t.Fatalf("request %d: cost %.4f of the true block count — the cost must be exact", i, r)
 		}
 	}
-	if m := pct(estimate, 50); m > 0.92 || m < 0.87 {
-		t.Fatalf("the admission estimate reads %.3f of the true block count at p50: the replay's premise (a ~0.895 byte-derived estimate) is gone", m)
+	if exact != n {
+		t.Fatalf("%d of %d requests were exact", exact, n)
 	}
-	t.Logf("  VERDICT: Reading B — the budget's USED side is token-exact; the %.3f byte bias is the ENTRY ESTIMATE's, which is structural (no tokens exist at Pick time)",
-		pct(estimate, 50))
 }
 
-// THE TRAILING PARTIAL BLOCK (fix 7), at the key counter and at the estimate. Both are
-// the same defect in two places: a partial block was dropped where the engine allocates
-// it, and both directions cost headroom. Runs at N=1 and N=2 because the estimate is
-// per engine (the delta is costed against ONE engine's index).
-func TestPartialBlockIsCountedInKeysAndEstimate(t *testing.T) {
-	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-		s := fx.s
-		ids := make([]uint32, 65)
-		for i := range ids {
-			ids[i] = uint32(i)
+// THE TRAILING PARTIAL BLOCK: the engine allocates a block for the last tokens of a
+// prompt whether or not they fill it, so the chain counts it — and the valve's charge,
+// which is in tokens, does not.
+func TestPartialBlockIsCountedInTheChain(t *testing.T) {
+	s, err := NewScheduler(defaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := func(n int) []uint32 {
+		out := make([]uint32, n)
+		for i := range out {
+			out[i] = uint32(i) + 1
 		}
-		if got := len(s.HashTokens(ids, "", 64)); got != 2 {
-			t.Fatalf("65 tokens at 64/block: %d keys, want 2 (the tail block is allocated)", got)
-		}
-		if got := len(s.HashTokens(ids[:64], "", 64)); got != 1 {
-			t.Fatalf("64 tokens at 64/block: %d keys, want 1", got)
-		}
-		if got := len(s.HashTokens(nil, "", 64)); got != 0 {
-			t.Fatalf("empty body: %d keys, want 0 (no phantom block)", got)
-		}
-		// the estimate: a delta that is not a whole number of blocks rounds UP
-		g := fx.g()
-		sizer := IndexSizer{Fraction: 0.95, BlockSize: 64}
-		if got := sizer.Cost(g.index, "fresh", 256); got != 1 {
-			t.Fatalf("a 256-byte head (exactly one block): estimate %d, want 1", got)
-		}
-		if got := sizer.Cost(g.index, "fresh", 257); got != 2 {
-			t.Fatalf("a 257-byte head (one block + 1 byte): estimate %d, want 2 — a partial block occupies a block", got)
-		}
-		if got := sizer.Cost(g.index, "fresh", 0); got != 0 {
-			t.Fatalf("an empty head: estimate %d, want 0", got)
-		}
-	})
+		return out
+	}
+	if got := len(chainsOfTokens(ids(65), 64)[0].Keys); got != 2 {
+		t.Fatalf("65 tokens at 64/block: %d keys, want 2 (the tail block is allocated)", got)
+	}
+	if got := len(chainsOfTokens(ids(64), 64)[0].Keys); got != 1 {
+		t.Fatalf("64 tokens at 64/block: %d keys, want 1", got)
+	}
+	if got := len(chainsOfTokens(nil, 64)); got != 0 {
+		t.Fatalf("no tokens: %d chains, want 0 (no phantom block)", got)
+	}
+	_ = s
 }

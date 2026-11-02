@@ -43,10 +43,6 @@ func keys(n int, seed Hash) []Hash {
 	return out
 }
 
-// bytesFor converts blocks to the wire size that estimates them at 4 bytes/token
-// (the estimate path's convention).
-func bytesFor(blocks int) int64 { return int64(blocks) * 4 * 64 }
-
 // seedFor derives a DISTINCT block key set per (branch, size) — two branches must not
 // share blocks by accident, or the index's dedup would hide the second one's footprint.
 func seedFor(id string) Hash {
@@ -57,16 +53,37 @@ func seedFor(id string) Hash {
 	return h
 }
 
-// head is one queue head for branch id (ago = how long it has waited).
-func head(id string, ago time.Duration, sizeBytes int64) Head {
-	return Head{Branch: id, ReqID: "r-" + id, Arrival: time.Now().Add(-ago), SizeBytes: sizeBytes}
+// chainOf is the EXACT prefill chain a head of n blocks of a branch's own content has:
+// the blocks are the branch's own keys, so two branches share nothing unless a test
+// gives them the same seed on purpose.
+func chainOf(id string, blocks int) []Chain {
+	return []Chain{{Keys: keys(blocks, seedFor(id)), Tokens: blocks * 64}}
 }
 
-// dispatch drives the released-request path: Pick chose the head, the producer
-// tokenized, PreRequest corrects with the exact keys.
-func dispatch(t *testing.T, s *Scheduler, id string, k []Hash, size int64) {
+// chainPrefixedBy is a chain whose first prefixBlocks keys are another branch's: the
+// shared-prefix shape (a fork, or a turn that grows an existing prompt).
+func chainPrefixedBy(prefix string, prefixBlocks int, own string, ownBlocks int) []Chain {
+	k := append(keys(prefixBlocks, seedFor(prefix)), keys(ownBlocks, seedFor(own))...)
+	return []Chain{{Keys: k, Tokens: (prefixBlocks + ownBlocks) * 64}}
+}
+
+// head is one queue head for branch id (ago = how long it has waited), carrying the
+// branch's exact chain of n blocks.
+func head(id string, ago time.Duration, blocks int) Head {
+	return Head{Branch: id, ReqID: "r-" + id, Arrival: time.Now().Add(-ago),
+		Chains: chainOf(id, blocks)}
+}
+
+// headWithChain is head for a test that builds the chain itself (shared prefixes).
+func headWithChain(id string, ago time.Duration, chains []Chain) Head {
+	return Head{Branch: id, ReqID: "r-" + id, Arrival: time.Now().Add(-ago), Chains: chains}
+}
+
+// dispatch drives the released-request path: Pick chose the head, the framework picked
+// the engine, PreRequest records the in-flight request.
+func dispatch(t *testing.T, s *Scheduler, id string) {
 	t.Helper()
-	s.Dispatched(id, "r-"+id, k, size, time.Now())
+	s.Dispatched(id, "r-"+id, time.Now())
 }
 
 // settleChunk is the first response chunk (prefill complete) + the natural settle.
@@ -199,11 +216,11 @@ func newSched(t *testing.T) *Scheduler {
 // seatOne seats one branch on the fixture through the public path.
 func (fx *engineSet) seatOne(t *testing.T, id string, blocks int, ago time.Duration) {
 	t.Helper()
-	h := head(id, ago, bytesFor(blocks))
+	h := head(id, ago, blocks)
 	if i := fx.pick(h); i < 0 {
 		t.Fatalf("branch %s must be seated", id)
 	}
-	dispatch(t, fx.s, id, keys(blocks, seedFor(id)), bytesFor(blocks))
+	dispatch(t, fx.s, id)
 }
 
 // ---- the tests ----
@@ -213,7 +230,7 @@ func (fx *engineSet) seatOne(t *testing.T, id string, blocks int, ago time.Durat
 func TestMemberServedAndUnknownNeverSeated(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 100, time.Second)
-		if i := fx.pick(head("m", time.Second, bytesFor(100))); i != 0 {
+		if i := fx.pick(head("m", time.Second, 100)); i != 0 {
 			t.Fatalf("a seated branch's head must dispatch, got %d", i)
 		}
 		if !fx.s.Seated("m") {
@@ -237,9 +254,9 @@ func TestNewcomerFirstThenOldest(t *testing.T) {
 		settle(fx.s, "filler", 800, 800)
 		fx.tighten(t)
 		// the returning branch's turn is a continuation; the other's is its first
-		ret := head("ret", 30*time.Second, bytesFor(100))
+		ret := head("ret", 30*time.Second, 100)
 		ret.Returner = true
-		hs := []Head{ret, head("new", time.Second, bytesFor(100))}
+		hs := []Head{ret, head("new", time.Second, 100)}
 		fx.pick(hs...)
 		if !fx.s.Seated("new") {
 			t.Fatal("the newcomer must be seated first (D1 newcomer-first)")
@@ -258,7 +275,7 @@ func TestOldestWaiterIsTheHead(t *testing.T) {
 		fx.seatOne(t, "filler", 800, 5*time.Second)
 		settle(fx.s, "filler", 800, 800)
 		fx.tighten(t)
-		hs := []Head{head("young", time.Second, bytesFor(100)), head("old", 30*time.Second, bytesFor(100))}
+		hs := []Head{head("young", time.Second, 100), head("old", 30*time.Second, 100)}
 		fx.pick(hs...)
 		if !fx.s.Seated("old") {
 			t.Fatal("the oldest waiting head must be seated first")
@@ -334,17 +351,17 @@ func TestBudgetValvePrefersTheDoneMember(t *testing.T) {
 		settle(fx.s, "done", 450, 450) // finished its turn: no queued head
 		fx.tighten(t)
 		fx.seatOne(t, "busy", 450, 4*time.Second)
-		// `busy` wants to run again (a queued head), and its request GROWS to 200
-		// blocks: 450 + 450 + 200 > 950 budget => the valve must fire
+		// `busy` wants to run again (a queued head) and its next prompt is 200 blocks
+		// longer: 450 + 650 > 950 budget => the valve must fire
 		fx.s.mu.Lock()
 		fx.g().branches["busy"].waitingSince = fx.clock.Add(-time.Second)
 		fx.g().branches["busy"].lastActivity = fx.clock
 		fx.s.mu.Unlock()
-		if i := fx.pick(head("busy", time.Second, bytesFor(200))); i != 0 {
+		if i := fx.pick(head("busy", time.Second, 650)); i != 0 {
 			t.Fatalf("the branch's grown head must dispatch, got %d", i)
 		}
-		dispatch(t, fx.s, "busy", keys(200, 77), bytesFor(200)) // the growth lands
-		fx.s.PickFromHeads(nil, fx.clock)                       // an empty-queue Pick: enforcement runs there now
+		dispatch(t, fx.s, "busy")         // the growth lands
+		fx.s.PickFromHeads(nil, fx.clock) // an empty-queue Pick: enforcement runs there now
 		fx.s.mu.Lock()
 		_, doneSeated := fx.g().branches["done"]
 		_, busySeated := fx.g().branches["busy"]
@@ -363,28 +380,41 @@ func TestBudgetValvePrefersTheDoneMember(t *testing.T) {
 
 // No eviction while in flight: a branch with a running request is marked exiting at
 // most, never removed, until the drain completes.
+//
+// The GROWTH of a seated branch is charged when its turn is DISPATCHED (a seat is an
+// admission right: the turn runs, and the overage it creates is enforcement's business on
+// the next pass, with the grower in flight). So the sequence is: the grown head is served,
+// the next pass marks the branch, and the branch leaves once both of its requests have
+// drained.
 func TestNoEvictionWhileInFlight(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 400, 2*time.Second)
 		fx.s.Chunk("m") // m's prefill landed (its turn keeps decoding); the cold slot is free
+		fx.tighten(t)   // every other engine is closed, so m2 must share m's budget
 		fx.seatOne(t, "m2", 400, time.Second)
 		// m's first turn is still running when its second (grown) head is served
-		i := fx.pick(head("m", time.Millisecond, bytesFor(700)))
-		if i != 0 {
+		if i := fx.pick(head("m", time.Millisecond, 700)); i != 0 {
 			t.Fatalf("the branch's second head must be served (in-flight cap), got %d", i)
 		}
-		dispatch(t, fx.s, "m", keys(700, 3), bytesFor(700))
-		fx.s.PickFromHeads(nil, fx.clock)
+		dispatch(t, fx.s, "m")
+		fx.s.PickFromHeads(nil, fx.clock) // the next pass enforces the growth
 		if !fx.s.Seated("m") {
 			t.Fatal("a branch in flight must never be evicted (marked exiting at most)")
 		}
 		settle(fx.s, "m", 400, 0)
 		settle(fx.s, "m", 700, 0)
+		fx.s.PickFromHeads(nil, fx.clock)
 		if fx.s.Seated("m") {
 			t.Fatal("after the drain the exiting branch must leave")
 		}
-
 	})
+}
+
+// overOf is the engine's overage on enforcement's own view (the stay side).
+func overOf(fx *engineSet) int64 {
+	fx.s.mu.Lock()
+	defer fx.s.mu.Unlock()
+	return fx.s.overBudgetLocked(fx.g())
 }
 
 // AN EXITING MEMBER'S BLOCKS STAY ON THE USED SIDE UNTIL IT DRAINS. Marking a
@@ -473,14 +503,14 @@ func TestExitingVictimDoesNotSpinEnforcement(t *testing.T) {
 // the budget by a mile — the valve, not the budget, is the binding constraint.
 func TestColdEntryValveIsPerEngine(t *testing.T) {
 	forEnginesCap(t, defaultConfig(), 10000, func(t *testing.T, fx *engineSet) {
-		big := bytesFor(1000) // twice the derived cap (500 blocks), far inside the budget
+		big := 1000 // twice the derived cap (500 blocks), far inside the budget
 		if got, want := fx.g().coldCapTokens(0.95, 64), int64(500*64); got != want {
 			t.Fatalf("derived cold cap: %d want %d", got, want)
 		}
 		if i := fx.pick(head("big1", time.Second, big)); i != 0 {
 			t.Fatal("a big newcomer must be seated when nothing cold is in flight (R11)")
 		}
-		dispatch(t, fx.s, "big1", keys(1000, 1), big)
+		dispatch(t, fx.s, "big1")
 		h2 := []Head{head("big2", time.Second, big)}
 		i := fx.pick(h2...)
 		if len(fx.ids) == 1 {
@@ -510,7 +540,7 @@ func TestColdEntryValveIsPerEngine(t *testing.T) {
 // tracked, and never outranks a branch's head.
 func TestAnonymousPassThrough(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-		anon := Head{Branch: "", ReqID: "anon-1", Arrival: fx.clock.Add(-time.Second), SizeBytes: 1000}
+		anon := Head{Branch: "", ReqID: "anon-1", Arrival: fx.clock.Add(-time.Second)}
 		if i := fx.pick(anon); i != 0 {
 			t.Fatalf("an anonymous head must be served when no branch head is dispatchable, got %d", i)
 		}
@@ -518,8 +548,8 @@ func TestAnonymousPassThrough(t *testing.T) {
 			t.Fatal("anonymous traffic must not be tracked")
 		}
 		fx.seatOne(t, "m", 10, time.Second)
-		anonLater := Head{Branch: "", ReqID: "anon-2", Arrival: fx.clock, SizeBytes: 1000}
-		if i := fx.pick(anonLater, head("m", time.Second, bytesFor(10))); i != 1 {
+		anonLater := Head{Branch: "", ReqID: "anon-2", Arrival: fx.clock}
+		if i := fx.pick(anonLater, head("m", time.Second, 10)); i != 1 {
 			t.Fatalf("the branch's head must outrank the anonymous one: got %d", i)
 		}
 	})
@@ -547,10 +577,10 @@ func TestHoldTheLine(t *testing.T) {
 		m2.lastActivity = fx.clock
 		fx.s.mu.Unlock()
 		hs := []Head{
-			head("m1", 3*time.Second, bytesFor(400)),
-			head("bighead", 2*time.Second, bytesFor(900)),
-			head("small", 100*time.Millisecond, bytesFor(100)),
-			head("m2", 2*time.Second, bytesFor(400)),
+			head("m1", 3*time.Second, 400),
+			head("bighead", 2*time.Second, 900),
+			head("small", 100*time.Millisecond, 100),
+			head("m2", 2*time.Second, 400),
 		}
 		for round := 0; round < 4; round++ {
 			i := fx.pick(hs...)
@@ -558,7 +588,7 @@ func TestHoldTheLine(t *testing.T) {
 				t.Fatal("hold the line violated: small jumped the blocked big head")
 			}
 			if i >= 0 && hs[i].Branch != "" {
-				dispatch(t, fx.s, hs[i].Branch, keys(400, 9), bytesFor(400))
+				dispatch(t, fx.s, hs[i].Branch)
 				settle(fx.s, hs[i].Branch, 400, 400)
 			}
 		}
@@ -698,7 +728,7 @@ func TestProvisionalInflightReaped(t *testing.T) {
 		fx.seatOne(t, "m", 100, time.Second)
 		// one more head, picked but never dispatched => provisional (a NEW req id, or
 		// the record would simply overwrite the confirmed one)
-		h2 := head("m", time.Second, bytesFor(100))
+		h2 := head("m", time.Second, 100)
 		h2.ReqID = "r-m-2"
 		fx.pick(h2)
 		fx.s.mu.Lock()
@@ -739,12 +769,12 @@ func TestLeakedColdChargeVanishesOnDerive(t *testing.T) {
 // E4a instrumentation exists for).
 func TestSeatExitEventsCarryFairnessIDAndEngine(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-		h := head("m", time.Second, bytesFor(100))
+		h := head("m", time.Second, 100)
 		h.FairnessID = "thread-7"
 		if i := fx.pick(h); i != 0 {
 			t.Fatal("the branch must seat")
 		}
-		dispatch(t, fx.s, "m", keys(100, 1), bytesFor(100))
+		dispatch(t, fx.s, "m")
 		evs := fx.s.Events()
 		var seat, exit *Event
 		for i := range evs {
@@ -829,7 +859,7 @@ func TestStaleQueueViewNeverIdleEvicts(t *testing.T) {
 		fx.seatOne(t, "m", 200, time.Second)
 		settle(fx.s, "m", 200, 200)
 		// (a) a head arrives, Pick sees it, then a Tick lands just after -> protected
-		fx.pick(head("m", time.Second, bytesFor(200)))
+		fx.pick(head("m", time.Second, 200))
 		fx.tick(25 * time.Second) // silence past S, but the head is queued
 		if !fx.s.Seated("m") {
 			t.Fatal("BUG 3: a head present at the last sync must protect its branch from an idle eviction")
@@ -863,9 +893,10 @@ func TestExitingIsCountedAndRotationNeverPicksInflight(t *testing.T) {
 		m.waitingSince = time.Time{}
 		m.lastActivity = fx.clock.Add(-time.Hour) // silent, so class 2 has a victim...
 		fx.s.mu.Unlock()
-		// ...but the branch is in flight, so class 2 skips it: force class 4 by making
-		// every branch in flight and the engine over budget
-		fx.dispatchBig(t, "run", 400)
+		// ...but the branch is in flight, so class 2 skips it: force class 4 by taking the
+		// engine over budget with the branch's own next prompt (400 blocks longer), which
+		// sync charges in the same pass enforcement runs in
+		fx.dispatchBig(t, "run", 1200)
 		fx.s.mu.Lock()
 		fx.s.enforceBudgetLocked(fx.g(), fx.clock)
 		fx.s.mu.Unlock()
@@ -889,14 +920,17 @@ func TestExitingIsCountedAndRotationNeverPicksInflight(t *testing.T) {
 	})
 }
 
-// dispatchBig grows a branch's footprint with an extra request (the pressure path's
-// trigger), through the public API.
+// dispatchBig serves a branch's next turn whose PROMPT is `blocks` long (the head carries
+// the whole chain, so the growth is whatever the new prompt adds), through the public API.
 func (fx *engineSet) dispatchBig(t *testing.T, id string, blocks int) {
 	t.Helper()
-	h := head(id, time.Second, bytesFor(blocks))
+	h := head(id, time.Second, blocks)
 	h.ReqID = "r-" + id + "-grow"
-	if i := fx.pick(h); i < 0 {
-		t.Fatalf("the branch's growth head must dispatch, got %d", i)
+	// the growth is charged at SYNC, inside this pass, so enforcement may already have
+	// condemned the branch by the time the dispatch is chosen — the pass order is
+	// sync → enforce → rotate/seat → dispatch, and a prompt that no longer fits must not
+	// run. The pick's answer is therefore the fixture's to ignore.
+	if i := fx.pick(h); i >= 0 {
+		fx.s.Dispatched(id, h.ReqID, fx.clock)
 	}
-	fx.s.Dispatched(id, h.ReqID, keys(blocks, seedFor(id)+97), bytesFor(blocks), fx.clock)
 }

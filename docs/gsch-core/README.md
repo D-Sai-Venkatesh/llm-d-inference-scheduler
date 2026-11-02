@@ -101,9 +101,9 @@ base block with the core's:
 # emitted key that Config does not have is a CrashLoop on every arm (the
 # residueRelease lesson). Build-side contract: TestConfigEmitterConformance.
 if [ "${CHAIN:-}" = "groupsched-core" ]; then
-  # CORE_ENTRY_ORDER is "newcomer-first" (default) or "hrrn-bounded" (F5', see §4d):
-  # ONE value, and buildModules fails closed on anything else (a typo must never
-  # silently measure the anchor twice).
+  # ONE value per module, and buildModules fails closed on anything else (a typo must
+  # never silently measure the anchor twice). hrrn-bounded / hrrn-tier / tier-inclusive /
+  # execution-budget / budget-fraction are RETIRED values: the config rejects them.
   printf -v CORE_MODULE_BLOCK '    sizing: "%s"\n    entryOrder: "%s"\n    engineChoice: "%s"\n    rotation: "%s"\n    victim: "%s"\n    safety: "%s"\n    executionBudget: "%s"' \
     "${CORE_SIZING:-index}" "${CORE_ENTRY_ORDER:-newcomer-first}" \
     "${CORE_ENGINE_CHOICE:-most-free-budget}" "${CORE_ROTATION:-quantum}" \
@@ -122,6 +122,9 @@ export CORE_MODULE_BLOCK
   accepts `none` only. (Historically it was refused unless the arm was explicitly a backstop arm
   (it is not part of the wave);
 * `CORE_DETECTOR` must be `group` on a core arm and `utilization-detector` on FCFS;
+* `INFLIGHT_REAP_SECONDS` (and branch identity's `markerTtlSeconds`) must sit ABOVE the
+  client's own request timeout — the campaign harness runs 9000 s and the pins are 9300; the
+  plugin's defaults are 9300 too, so an arm that omits both keys is safe;
 * `AFFINITY_FILTER=0` and `BRANCH_PLUGIN=1` are mandatory on a core arm;
 * `TTL_SECONDS` no longer renders: no timer frees a seat and a waiting head keeps its
   place, so `ttlSeconds` is now an UNKNOWN key the strict decode rejects. The
@@ -130,7 +133,10 @@ export CORE_MODULE_BLOCK
 
 ## 3. The collector (the 15 s series)
 
-The wave's BALANCE gate reads the per-engine series every 15 s. A core arm must scrape:
+The wave's BALANCE gate reads the per-engine series every 15 s. A core arm must scrape the
+NINETEEN names below and nothing else (`pkg/epp/framework/plugins/groupsched/README.md` §3 is
+the authority; `TestMetricSurfaceIsExactlyTheKeptSet` pins the set and
+`TestConfigEmitterConformance` pins the config keys):
 
 | series | meaning |
 |---|---|
@@ -138,25 +144,25 @@ The wave's BALANCE gate reads the per-engine series every 15 s. A core arm must 
 | `llm_d_epp_group_waiters_shared` | the ONE shared queue's depth |
 | `llm_d_epp_group_budget_blocks{engine}` / `num_gpu_blocks{engine}` / `ne_blocks{engine}` | sizing + the budget's used side |
 | `llm_d_epp_group_exits_total{engine,reason}` | DEPARTURES by reason (`budget-*`, `quantum-complete`, `idle`, `engine-idle`, `exiting-drain`, `engine-gone`). `ttl` is gone with the knob. **`reason="exiting"` no longer exists**: the mid-flight mark is a STATE (`exitingBranches`/`exitingBlocks`/`exitingOldest`) and the departure is booked once, as `exiting-drain` (a reducer that summed `exiting*` was double-counting every mid-flight exit) |
-| `llm_d_epp_group_dispatches_total{engine}` | served per engine |
-| `llm_d_epp_group_entry_wait_seconds{engine}` / `reentry_wait_seconds{engine}` | the wait ladder |
-| `llm_d_epp_group_detector_pool_score` | what the detector handed the flow controller (0 = open, the default) |
-| `llm_d_epp_group_engine_kv_usage{engine}` / `engine_waiting_queue{engine}` | the detector's raw input (REPORTING only on a `none` arm) |
-| `llm_d_epp_group_safety_fired{engine}` / `safety_fires_total{engine}` / `safety_fired_seconds_total{engine}` | the backstop's state (all zero on a `none` arm) |
-| `llm_d_epp_group_detector_stale_samples_total{engine}` | samples excluded as stale (proves the live read is fresh) |
-| `llm_d_epp_group_queue_view_age_seconds` | how old the queue-head EVIDENCE behind the view is, on the decision clock (−1 = nothing observed yet). It grows exactly while Picks stop (a closed pool gate), i.e. the window in which a head can be queued while `waitingSince` says otherwise — the C8 race's size, which is invisible in every other series |
-| `llm_d_epp_group_queue_view_untrusted_passes_total` | budget-enforcement passes that ran with that view older than `idleSeconds`, so the C8 guard skipped the head-presence victim classes. 0 on a healthy stack; nonzero means the enforcement passes are re-syncing less often than S |
-| `llm_d_epp_group_filter_decisions_total{decision}` | `pinned` vs `passthrough-*` (a run whose decisions are all passthrough is NOT pinned) |
-| `llm_d_epp_group_cold_cap_tokens{engine}` | the DERIVED cold-entry stagger cap (the budget's headroom, in tokens). Scorers divide `cold_inflight_tokens` by THIS; the cap moves with the engine and must never be copied out of an arm's config |
-| `llm_d_epp_group_cold_valve_held_total{engine}` | heads the valve held back (the budget would have admitted them; they WAIT). Non-zero is the stagger's measured cost; a value under `engine="single"` on a multi-engine stack was a labelling defect fixed in 8397e9aa |
-| `llm_d_epp_group_running_blocks{engine}` / `execution_budget_blocks{engine}` | THE EXECUTION BUDGET's two sides (§4g): the engine's RUNNING set (the dedup-exact union of its in-flight requests' chain blocks, from the EPP's own accounting) and the budget it is tested against (`fraction x num_gpu_blocks`). Read them as a ratio — that ratio IS the two-budget arm's mechanism, and `execution_budget_blocks == 0` means no dispatch gate is wired (every arm whose selector is `none`; `running_blocks` is then 0 by construction) |
-| `llm_d_epp_group_dispatch_holds_total{engine}` / `dispatch_held_turns_total{engine}` / `dispatch_held_seconds{engine}` | the gate's cost, two ways: decision PASSES that held at least one turn, TURNS held (counted once, at the first denial) and how long each held turn waited before it dispatched |
-| `llm_d_epp_group_cold_valve_held_gated_total{engine}` / `gate_charge_hold_seconds{engine}` | THE ONE INTERACTION between the two budgets, measured: cold-entry valve holds whose outstanding charge belonged to a turn the execution budget was HOLDING, and the age of the oldest such charge right now (0 = no admission is blocked by the interaction; a value that only grows IS an admission stall, and the refinement is to suspend a held turn's charge while it is held) |
-| `llm_d_epp_group_entry_wait_seconds_count{engine}` | the ADMISSION rate (seats taken per engine): the histogram's own count. Compare it against the tier-inclusive arm's — that is the number the interaction above would move |
-| `llm_d_epp_group_event_ring_dropped_total` | SEAT/EXIT events the bounded ring has wrapped past — how much of the window lies BEFORE the dump's `RecentEvents` tail. The stdout event stream is the durable copy; this measures what the dump lost |
+| `llm_d_epp_group_exiting_branches{engine}` / `exiting_blocks{engine}` / `exiting_oldest_age_seconds{engine}` | the exiting ledger (the mark is a STATE, not an exit) |
+| `llm_d_epp_group_cold_inflight_tokens{engine}` / `cold_cap_tokens{engine}` | the cold-entry charge and its DERIVED cap |
+| `llm_d_epp_group_dispatches_total{engine}` | served per engine, PLUS `engine="nocapacity"` for the pre-capacity pass-through (no engine served those) |
+| `llm_d_epp_group_entry_wait_seconds{engine,kind}` | the wait ladder — ONE histogram, `kind=new`/`reentry` |
+| `llm_d_epp_group_cold_valve_held_total{engine}` | Pick PASSES in which the head was held by that engine's valve (a pass count: Pick runs at ~1 kHz). Scorers divide `cold_inflight_tokens` by `cold_cap_tokens`, never by a constant from an arm's config |
+| `llm_d_epp_group_capacity_missing{engine}` / `capacity_learned_total{via,engine}` | the startup liveness alarm and the acquisition audit |
+| `llm_d_epp_group_engine_gone_total` / `rebinds_total` / `affinity_violations_total{from,to}` | teardowns / seat moves that repaired an affinity violation / violations themselves (both sites, an invariant: must be 0) |
+| `llm_d_epp_group_anomalies_total{kind}` | the should-be-zero ledger: `no_tokens_head`, `no_request_id`, `stray_settle` |
 
-The gate line to read on a `none` arm: `detector_pool_score == 0` for the whole window
-(the pool gate never closed) and `safety_fired == 0` everywhere (the backstop was off).
+**Series this build does NOT have** (they existed before the trim, and a dashboard that still
+queries them reads nothing): `detector_pool_score`, `engine_kv_usage`, `engine_waiting_queue`,
+`safety_fired` / `safety_fires_total` / `safety_fired_seconds_total` / `safety_skips_total`,
+`detector_stale_samples_total`, `queue_view_age_seconds`,
+`queue_view_untrusted_passes_total`, `filter_decisions_total`, `running_blocks` /
+`execution_reserved_blocks` / `execution_budget_blocks`, `dispatch_holds_total` /
+`dispatch_held_turns_total` / `dispatch_held_seconds`, `cold_valve_held_gated_total`,
+`gate_charge_hold_seconds`, `tier_shadow_blocks` / `tier_shadow_capacity_blocks` /
+`tier_shadow_pairs_total`. The detector still answers the flow controller's pool gate, but it
+answers 0.0 (not saturated) and there is no series for a constant.
 
 ## 4. Declared differences vs f0p (each measured separately on the replay)
 
@@ -478,53 +484,62 @@ A new way to get a Q4 no-offload cell on THIS build is a digest-named copy (the
 
 ## 4b. Pre-flight gates (every core arm, before its window counts)
 
-* `llm_d_epp_group_detector_pool_score == 0` for the WHOLE window (the pool gate never
-  closed) and `safety_fired{engine} == 0` everywhere on a `safety: "none"` arm.
-* capacity learned within 120 s on EVERY engine: `num_gpu_blocks{engine} > 0` and
-  `capacity_missing{engine} == 0` on the first scrape after the window starts, and
-  `capacity_learned_total{via="live-detector"}` present per engine. (The flow
-  controller calls the detector on a TICKER, not only when work arrives —
-  `pkg/epp/flowcontrol/controller/internal/processor.go:270-271`, and even for an empty
-  pool at :486-488 — so the live capacity path runs while the stack is idle. The
-  endpoint-event and PreRequest paths remain as fast first attempts.)
-* pre-capacity pass-through is counted and must be ~0 over the window:
-  `llm_d_epp_group_fcfs_dispatches_total{engine="nocapacity"}`.
-* `llm_d_epp_group_filter_decisions_total{decision="pinned"}` ≫ `passthrough-*` (a run
-  whose decisions are all passthrough is NOT pinned).
-* `llm_d_epp_group_cold_valve_held_total{engine}` is REPORTING: on a cap-binding arm it
-  is the stagger's waiting cost, and it must never be accompanied by budget exits it
-  caused. **Its `engine` label is the engine the head WAITS for** (the one whose budget
-  would have admitted it while its valve refused it, most-free-budget first) — it read
-  `engine="single"` on a two-engine stack until 2026-11-01, because the admission loop
-  passed an empty engine id.
-* `llm_d_epp_group_queue_view_age_seconds` ≤ `idleSeconds` and
-  `queue_view_untrusted_passes_total` = 0 for the window: the C8 guard ("a stale queue
-  view never justifies an eviction") then never had to fire. A growing age with the
-  ticker running means the queue view is not being refreshed; a nonzero pass count means
-  victim choices are being made without head evidence — report it, do not chase it.
+Every gate below reads a series this build actually exports (§3). The retired series — the
+pool-score / safety / queue-view / filter-decision / execution-budget ones — have no gate
+here any more: they do not exist.
+
+* capacity learned within 120 s on EVERY engine: `llm_d_epp_group_budget_blocks{engine} > 0`
+  and `capacity_missing{engine} == 0` on the first scrape after the window starts, and
+  `capacity_learned_total{via="live-detector"}` present per engine. (The flow controller
+  calls the detector on a TICKER, not only when work arrives —
+  `pkg/epp/flowcontrol/controller/internal/processor.go:270-271`, and even for an empty pool
+  at :486-488 — so the live capacity path runs while the stack is idle. The endpoint-event
+  and PreRequest paths remain as fast first attempts.)
+* the pre-capacity window never happened: `llm_d_epp_group_dispatches_total{engine="nocapacity"}`
+  stays 0 over the window (it is pre-instantiated, so a 0 is readable from the first scrape).
+  A nonzero value means requests were served unseated before the metrics arrived, and that
+  arm's outcome numbers are FCFS, not the policy's.
+* the pin is working: `affinity_violations_total` stays 0 (both sites feed it — the PreRequest
+  observation and the settle), and `seats{engine} > 0` on every engine within the first
+  minutes (an engine with no seats is an engine whose placement is not being used).
+* `llm_d_epp_group_cold_valve_held_total{engine}` is REPORTING: on a cap-binding arm it is the
+  stagger's waiting cost (a PASS count — Pick runs at ~1 kHz), and it must never be
+  accompanied by budget exits it caused. Its `engine` label is the engine the head WAITS for.
+* `llm_d_epp_group_anomalies_total{kind}` stays 0 for every kind (`no_tokens_head`,
+  `no_request_id`, `stray_settle`). A nonzero `no_tokens_head` means the render produced no
+  tokens for a queued turn — the arm is losing its render and those requests were served
+  unseated.
+* the exit mix is a SHAPE, not a number: `exits_total{reason="exiting-drain"}` (the mid-flight
+  departures) against `quantum-complete` + `idle` (the rotation). A window where
+  `exiting-drain` dominates is memory pressure, and `exiting_oldest_age_seconds` must not climb
+  monotonically on any engine.
+* RULE O (package README §2c) is visible if it fires: an engine whose `ne_blocks` sits ABOVE
+  `budget_blocks` for a whole residency, with `seats{engine}` = 1 and no `affinity_violations`.
+  That is a legal oversize seat, not an accounting error — but it means the deployment can
+  produce requests bigger than 95 % of an engine's cache, and the arm's "0 preemptions" claim
+  needs a second look.
 * run-level safety: preemptions ≤ the FCFS arm's (hard fail if above).
-* **TTL exits are reported PER ARM at c32 and c64** (`llm_d_epp_group_exits_total{reason="ttl"}`):
-  the silence TTL is inert at c128 (1-6 exits per arm) and the open question is whether
-  it matters at low load, where seats are not scarce and a member could sit idle longer.
+* **the released-window bound is S** (`idleSeconds`): a leaked release window delays admission
+  by at most S on that one engine. It shows up as `cold_inflight_tokens` pinned at
+  `cold_cap_tokens` with `cold_valve_held_total` climbing for ≤ S, then clearing with no exit.
 
 ### Instrumentation rules (apply to the collector and the reducers, not the build)
 
-* Every safety/gate gauge emits a REAL 0/1 in every mode (a `none` arm exports
-  `safety_fired = 0` and `detector_pool_score = 0`; an absent series is a question, a
-  zero is a fact). Where a series cannot exist, the arm config carries an explicit
-  "instrumented" flag rather than relying on a missing value.
-* The 15 s poller writes BLANK or `-1` for an absent series — NEVER 0 (a 0 is a
-  measurement; a gap is not).
-* Reducers filter the shared otel stream BY POD (two arms run concurrently; the stream
-  is not per-arm).
+* A ZERO IS A FACT and an absent series is a QUESTION: the gauges and the counters that can be
+  pre-instantiated are (`dispatches_total{engine="nocapacity"}` and every
+  `anomalies_total{kind}` read 0 from the first scrape).
+* The 15 s poller writes BLANK or `-1` for an absent series — NEVER 0 (a 0 is a measurement; a
+  gap is not).
+* Reducers filter the shared otel stream BY POD (two arms run concurrently; the stream is not
+  per-arm), and they must not sum `exits_total` across reasons: the exit mix is the signal.
 
 ## 4c. Hot path
 
-The flow controller polls the detector at ~1 kHz. Measured on this build:
-`BenchmarkSaturationNoop` = 7.5 ns/op, 0 B/op, 0 allocs/op;
-`BenchmarkSaturationMemoryOnly` = 43 ns/op, 0 B/op, 0 allocs/op (the score is
-recomputed at most once per refresh interval, otherwise read from an atomic). The wave's
-report carries the EPP arrival-path p99 against B2a f0p's.
+The flow controller polls the detector at ~1 kHz. `Saturation` stores the live candidate set
+(a no-op unless the set changed: one interface compare and one atomic store) and answers 0.0;
+there is no second implementation to benchmark, and the memory-only score the old numbers
+measured is gone with the net. The wave's report carries the EPP arrival-path p99 against
+B2a f0p's.
 
 ## 4d. The F5′ arm (bounded HRRN) — the ONE value that changes
 

@@ -17,35 +17,6 @@ limitations under the License.
 package groupsched
 
 // THE BLOCK INDEX — one engine's model of which KV blocks it holds.
-//
-// It answers three questions, all in BLOCKS (the seat budget's unit):
-//   - what does this branch cost on this engine? the cold part of its chains, exactly;
-//   - how full is the engine? two refcounts, one per question (below);
-//   - may this branch be seated? fit and seat in ONE critical section.
-//
-// The keys are chained block hashes of the engine's own tokens (prefixhash: block i
-// commits to every block before it). Two consequences the whole design rests on:
-//
-//   - RESIDENCY IS PREFIX-CLOSED. A chain's blocks are added and removed as a whole, and
-//     a key commits to its prefix, so if block i of a chain is held then 0..i-1 are held
-//     too. The resident part of a chain is therefore a PREFIX, found by binary search —
-//     never by scanning a set.
-//   - SHARING IS A SHARED PREFIX. Two branches share blocks exactly when their prompts
-//     share a prefix, which is what the engine's own prefix cache dedups.
-//
-// TWO REFCOUNTS, ONE PER QUESTION:
-//
-//	blocks     (USED) — every seated branch, exiting ones included. An exiting branch's
-//	                    blocks are still pinned by the engine until its request drains, so
-//	                    ADMISSION asks about this one.
-//	blocksStay (STAY) — the seated branches that are NOT exiting. Those are the blocks
-//	                    that will still be there when the retirees are gone, so
-//	                    ENFORCEMENT asks about this one. A block an exiting branch
-//	                    shares with a staying one stays counted here, which is the
-//	                    under-eviction the two views exist to avoid.
-//
-// A branch's record exists exactly as long as it holds a seat: it is created by the
-// seat and dropped by the unseat, so nothing here is a history.
 
 import (
 	"errors"
@@ -53,44 +24,33 @@ import (
 	"sync"
 )
 
-// ErrBlockSizeUnknown is the fail-closed startup error: the block size must be
-// measured, never assumed (a hardcoded default once admitted four times the cache).
+// ErrBlockSizeUnknown is the fail-closed startup error: the block size must be measured, never
+// assumed (a hardcoded default once admitted four times the cache).
 var ErrBlockSizeUnknown = errors.New("groupsched: engine block size not set (fail closed)")
 
 // Hash is one chained block hash (prefixhash's key space).
 type Hash uint64
 
-// Chain is one prompt's EXACT prefill chain: the block keys of its tokens (the last
-// block is partial, so its key is private to that exact token sequence) and the
-// prompt's token count.
-//
-// The chains are computed ONCE per request, at its first Pick, from the tokens the
-// token producer rendered at arrival — so every cost the scheduler takes is exact for
-// the prefill it will run. Decode growth is not part of it: the seat budget's headroom
-// pays for that.
+// Chain is one prompt's EXACT prefill chain: the block keys of its tokens (the last block is
+// partial, so its key is private to that exact token sequence) and the prompt's token count.
 type Chain struct {
 	Keys   []Hash
 	Tokens int
 }
 
 // BlockIndex is one engine's KV-block accounting.
-//
-// Safe for concurrent use; the scheduler calls the Locked variants under its own lock.
 type BlockIndex struct {
 	mu              sync.Mutex
 	blockSizeTokens int
 
 	blocks     map[Hash]int
 	blocksStay map[Hash]int
-	// seats holds every seated branch's record. There is no record for a branch without
-	// a seat: the head carries its own exact chains, so the index has nothing to
-	// remember between residencies.
+	// seats holds every seated branch's record.
 	seats map[string]*seatBlocks
 }
 
-// seatBlocks is one seated branch's footprint: its newest chains (the turns of its
-// branch extend one another, so the newest chain is its set) and the keys actually
-// charged for it.
+// seatBlocks is one seated branch's footprint: its newest chains (the turns of its branch
+// extend one another, so the newest chain is its set) and the keys actually charged for it.
 type seatBlocks struct {
 	chains []Chain
 	// charged is the deduplicated union of the chains' keys: what the two refcounts were
@@ -99,8 +59,7 @@ type seatBlocks struct {
 	exiting bool
 }
 
-// NewBlockIndex returns the index for an engine whose KV blocks hold blockSizeTokens
-// tokens. It fails closed on a non-positive block size.
+// NewBlockIndex returns the index for an engine whose KV blocks hold blockSizeTokens tokens.
 func NewBlockIndex(blockSizeTokens int) (*BlockIndex, error) {
 	if blockSizeTokens <= 0 {
 		return nil, fmt.Errorf("%w: got %d", ErrBlockSizeUnknown, blockSizeTokens)
@@ -116,9 +75,7 @@ func NewBlockIndex(blockSizeTokens int) (*BlockIndex, error) {
 // BlockSizeTokens is the engine block size in tokens.
 func (b *BlockIndex) BlockSizeTokens() int { return b.blockSizeTokens }
 
-// chargeSet deduplicates the union of the chains' keys. Duplicate keys are possible
-// within one request: two identical prompts render identical chains, and the engine
-// holds that block once.
+// chargeSet deduplicates the union of the chains' keys.
 func chargeSet(chains []Chain) map[Hash]struct{} {
 	var out map[Hash]struct{}
 	for _, c := range chains {
@@ -132,8 +89,8 @@ func chargeSet(chains []Chain) map[Hash]struct{} {
 	return out
 }
 
-// residentPrefixLocked is how many of the chain's blocks this engine already holds —
-// the resident PREFIX, which is a binary search because residency is prefix-closed.
+// residentPrefixLocked is how many of the chain's blocks this engine already holds — the
+// resident PREFIX, which is a binary search because residency is prefix-closed.
 func (b *BlockIndex) residentPrefixLocked(keys []Hash) int {
 	lo, hi := 0, len(keys)
 	for lo < hi {
@@ -147,17 +104,8 @@ func (b *BlockIndex) residentPrefixLocked(keys []Hash) int {
 	return lo
 }
 
-// CostLocked is the exact admission cost of a branch on this engine, in blocks: how many
-// NEW blocks the seat would add to the engine's used side.
-//
-// It is COST == CHARGE BY CONSTRUCTION: the same deduplicated union the seat charges
-// (chargeSet), minus what the engine already holds. Summing per chain instead — the obvious
-// shape, and the wrong one — counted a multi-prompt request's byte-identical prompts twice,
-// so the fit test and the seat disagreed: TrySeat could refuse a seat that would have fitted
-// (conservative, but the "one number, one moment" claim stops being true).
-//
-// It costs one pass over the chains and their keys per engine per head at Pick. That is the
-// price of the identity above, and it is O(keys) with no binary search per chain.
+// CostLocked is the exact admission cost of a branch on this engine, in blocks: how many NEW
+// blocks the seat would add to the engine's used side.
 func (b *BlockIndex) CostLocked(chains []Chain) int {
 	n := 0
 	for h := range chargeSet(chains) {
@@ -168,9 +116,8 @@ func (b *BlockIndex) CostLocked(chains []Chain) int {
 	return n
 }
 
-// ColdTokensLocked is the same cost in TOKENS (the cold valve's unit): the prompt's
-// tokens beyond the resident prefix. It counts the partial last block exactly, which
-// the block-rounded cost cannot, and a fully resident chain is zero.
+// ColdTokensLocked is the same cost in TOKENS (the cold valve's unit): the prompt's tokens
+// beyond the resident prefix.
 func (b *BlockIndex) ColdTokensLocked(chains []Chain) int64 {
 	var n int64
 	for _, c := range chains {
@@ -183,9 +130,9 @@ func (b *BlockIndex) ColdTokensLocked(chains []Chain) int64 {
 	return n
 }
 
-// TrySeatLocked seats a branch if its exact cost fits the budget, and inserts its chains
-// in the same critical section: the fit test and the seat can never disagree, because
-// there is one number and one moment.
+// TrySeatLocked seats a branch if its exact cost fits the budget, and inserts its chains in
+// the same critical section: the fit test and the seat can never disagree, because there is
+// one number and one moment.
 func (b *BlockIndex) TrySeatLocked(id string, chains []Chain, budgetBlocks int) (bool, int) {
 	if _, seated := b.seats[id]; seated {
 		return true, 0
@@ -208,10 +155,9 @@ func (b *BlockIndex) insertLocked(id string, chains []Chain) {
 	}
 }
 
-// SeatForceLocked seats a branch WITHOUT the budget check: the blocks are taken as
-// already present on this engine (an observed placement said so — the engine, not the
-// model, is authoritative about what it holds). Enforcement reconciles the budget; a
-// branch absent from the engine serving it would not be recoverable.
+// SeatForceLocked seats a branch WITHOUT the budget check: the blocks are taken as already
+// present on this engine (an observed placement said so — the engine, not the model, is
+// authoritative about what it holds).
 func (b *BlockIndex) SeatForceLocked(id string, chains []Chain) {
 	if _, seated := b.seats[id]; seated {
 		b.GrowLocked(id, chains) // already charging this branch: the newest chain replaces its set
@@ -220,9 +166,9 @@ func (b *BlockIndex) SeatForceLocked(id string, chains []Chain) {
 	b.insertLocked(id, chains)
 }
 
-// GrowLocked makes a seated branch's chains the NEWEST ones it has: a branch's turns
-// extend one another, so the newest chain is its set, and the difference is charged (or
-// released, for the partial block the growing tail replaced).
+// GrowLocked makes a seated branch's chains the NEWEST ones it has: a branch's turns extend
+// one another, so the newest chain is its set, and the difference is charged (or released, for
+// the partial block the growing tail replaced).
 func (b *BlockIndex) GrowLocked(id string, chains []Chain) {
 	s, ok := b.seats[id]
 	if !ok || sameChains(s.chains, chains) {
@@ -235,15 +181,6 @@ func (b *BlockIndex) GrowLocked(id string, chains []Chain) {
 }
 
 // sameChains reports whether two chain sets are the SAME CHAINS, not merely the same shape.
-//
-// It compares the last key of each chain as well as its length and token count, and that is
-// exact rather than a sample: a key is a CHAINED hash, so it commits to every block before
-// it — equal length, equal tokens and an equal tip is the same token sequence, block for
-// block. The cost is O(prompts) (one comparison per prompt, no scan of the keys), which is
-// the common case at a 1 kHz Pick and cheap enough that an equal SHAPE with different
-// content must not slip through: branch identity's tolerance lets a continuation differ in
-// its last full block plus the partial block, and a shape-only test would keep the OLD keys
-// charged (under-costing the next arrival, over-costing a fork of the new chain).
 func sameChains(a, c []Chain) bool {
 	if len(a) != len(c) {
 		return false
@@ -264,8 +201,6 @@ func sameChains(a, c []Chain) bool {
 }
 
 // applyDeltaLocked charges the keys the branch gained and releases the keys it lost.
-// A non-exiting branch moves both counters; an exiting one only the USED side (its stay
-// charge was released at its mark).
 func (b *BlockIndex) applyDeltaLocked(s *seatBlocks, old map[Hash]struct{}) {
 	for h := range s.charged {
 		if _, had := old[h]; !had {
@@ -285,9 +220,9 @@ func (b *BlockIndex) applyDeltaLocked(s *seatBlocks, old map[Hash]struct{}) {
 	}
 }
 
-// UnseatLocked releases a branch's seat and drops its record: this is the ONE release
-// point, and the record does not outlive the seat (a re-seat costs the branch nothing to
-// rebuild — its head carries the chain).
+// UnseatLocked releases a branch's seat and drops its record: this is the ONE release point,
+// and the record does not outlive the seat (a re-seat costs the branch nothing to rebuild —
+// its head carries the chain).
 func (b *BlockIndex) UnseatLocked(id string) {
 	s, ok := b.seats[id]
 	if !ok {
@@ -309,8 +244,8 @@ func (b *BlockIndex) Unseat(id string) {
 	b.UnseatLocked(id)
 }
 
-// dec decrements a refcount, panicking on underflow: a refcount below zero is a
-// programming error, and a silent one would poison every later decision.
+// dec decrements a refcount, panicking on underflow: a refcount below zero is a programming
+// error, and a silent one would poison every later decision.
 func (b *BlockIndex) dec(m map[Hash]int, h Hash) {
 	c, ok := m[h]
 	if !ok || c <= 0 {
@@ -323,10 +258,8 @@ func (b *BlockIndex) dec(m map[Hash]int, h Hash) {
 	}
 }
 
-// MarkExitingLocked marks a branch as on its way out: it is not dispatched and not
-// re-seated, and it leaves at its next drain. Its blocks stay on the USED side — the
-// engine pins them until the request finishes — and leave the STAY side, which is what
-// tells enforcement that evicting it again would free nothing. Idempotent.
+// MarkExitingLocked marks a branch as on its way out: it is not dispatched and not re-seated,
+// and it leaves at its next drain.
 func (b *BlockIndex) MarkExitingLocked(id string) {
 	s, ok := b.seats[id]
 	if !ok || s.exiting {
@@ -379,7 +312,6 @@ func (b *BlockIndex) UniqueBlocks() int {
 }
 
 // StayBlocksLocked is the STAY side: the blocks of the branches that are not exiting.
-// Enforcement measures the overage against it.
 func (b *BlockIndex) StayBlocksLocked() int { return len(b.blocksStay) }
 
 // StayBlocks is StayBlocksLocked under the index's own lock.
@@ -389,9 +321,8 @@ func (b *BlockIndex) StayBlocks() int {
 	return len(b.blocksStay)
 }
 
-// ExitingBlocksLocked is the part of the USED side that belongs only to exiting branches
-// (used − stay): the overage enforcement must NOT evict again, and admission still
-// refuses.
+// ExitingBlocksLocked is the part of the USED side that belongs only to exiting branches (used
+// − stay): the overage enforcement must NOT evict again, and admission still refuses.
 func (b *BlockIndex) ExitingBlocksLocked() int { return len(b.blocks) - len(b.blocksStay) }
 
 // ExitingBlocks is ExitingBlocksLocked under the index's own lock.
@@ -408,8 +339,7 @@ func (b *BlockIndex) HasNELocked(h Hash) bool {
 }
 
 // ChargedBlocksLocked is the number of DISTINCT blocks this seat holds on the engine: the
-// footprint a single branch costs the budget. RULE O's no-thrash rule asks whether one
-// branch's own footprint exceeds the engine's budget, and that is this number.
+// footprint a single branch costs the budget.
 func (b *BlockIndex) ChargedBlocksLocked(id string) int {
 	if s, ok := b.seats[id]; ok {
 		return len(s.charged)
@@ -434,8 +364,7 @@ func (b *BlockIndex) TrackedCount() int {
 	return len(b.seats)
 }
 
-// checkInvariantLocked recomputes both refcounts from the records and panics on
-// divergence. Tests call it after every mutation.
+// checkInvariantLocked recomputes both refcounts from the records and panics on divergence.
 func (b *BlockIndex) checkInvariantLocked() {
 	want := make(map[Hash]int)
 	wantStay := make(map[Hash]int)

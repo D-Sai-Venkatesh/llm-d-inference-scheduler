@@ -16,55 +16,7 @@ limitations under the License.
 
 package groupsched
 
-// THE EMITTER CONTRACT (exp-ops ↔ plugin config). The exp-ops renderer writes this
-// plugin's `parameters:` block as YAML and the EPP decodes it with unknown fields
-// REJECTED, so an emitted key that no longer exists in Config is not a warning — it is
-// a CrashLoop on every arm that carries it (the residueRelease lesson, 2026-10-31).
-//
-// The blocks below are the EMITTER's side of the contract, copied from the printf
-// bodies in exp-ops/lib/common.sh. They are checked against Config's STRUCT TAGS by
-// reflection, so a field rename or deletion fails HERE instead of in a deploy — and in
-// both directions: a Config field the emitter cannot address is also a bug (the knob
-// would silently do nothing on every arm).
-//
-// THE TYPE HALF (the logRequests lesson, 2026-11-01). A key check is not enough:
-// exp-ops writes env values VERBATIM, so `BRANCH_LOG_REQUESTS=1` rendered
-// `logRequests: 1`, and a YAML NUMBER into a Go BOOL fails the strict decode exactly
-// like an unknown key does — with the key correct, and with no unit test looking at the
-// value. So the blocks are also DECODED, through the loader's own path (YAML → JSON,
-// then fwkplugin.StrictDecoder), into the plugin's Parameters struct: a value whose
-// YAML type does not match the Go field fails this build test instead of CrashLooping a
-// pod. TestEmittedBoolMustBeAYAMLBoolNotANumber pins the regression itself, and
-// TestShippedCoreEnvFilesUseYAMLBools pins the shipped wave configs (the copies this
-// build hands to exp-ops) so the hazard cannot come back through a file nobody decodes.
-//
-// The ENUM half pins the VALUES: validate() rejects an unknown module value and the EPP
-// would CrashLoop on that arm, so a value the emitter can write but the plugin rejects
-// is caught here too.
-//
-// CORE SHAPE (what a core arm renders):
-//
-//	parameters:                     # CORE_BASE_BLOCK
-//	  groupBudgetFraction: 0.95
-//	  quantum: 4
-//	  idleSeconds: 20
-//	  inFlightCap: 64
-//	  blockSizeTokens: 64
-//	  capacityLivenessSeconds: 120
-//	  inflightReapSeconds: 3700
-//	  sizing: "index"               # CORE_MODULE_BLOCK (one selector per module);
-//	  entryOrder: "newcomer-first"  # CORE_ENTRY_ORDER (one value: the trim keeps one impl)
-//	  engineChoice: "most-free-budget"
-//	  rotation: "quantum"
-//	  victim: "valve"
-//	  safety: "none"             # CORE_SAFETY (one value: the seat budget is the control)
-//	  executionBudget: "none"    # CORE_EXECUTION_BUDGET (one value: the seam is empty)
-//	flowControl:
-//	  saturationDetector:
-//	    pluginRef: group           # the SAME plugin instance answers the pool gate
-//
-// and the one other parameter block a core arm carries: BRANCH_IDENTITY_BLOCK
-// (branch-identity), whose bool fields are the reason the type half exists.
+// THE EMITTER CONTRACT (exp-ops ↔ plugin config).
 
 import (
 	"os"
@@ -79,11 +31,9 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/branchidentity"
 )
 
-// emittedBlock is one `parameters:` block exp-ops renders: its TEXT (the printf body
-// from exp-ops/lib/common.sh, at the values the shipped arms render) and the plugin
-// whose Parameters struct must decode it. Keeping the text — not just the keys — is
-// what makes the guard a TYPE check: the block goes through the EPP's own decode path,
-// so a wrong key AND a wrong value type both fail.
+// emittedBlock is one `parameters:` block exp-ops renders: its TEXT (the printf body from exp-
+// ops/lib/common.sh, at the values the shipped arms render) and the plugin whose Parameters
+// struct must decode it.
 type emittedBlock struct {
 	block string // the exp-ops block name (common.sh / docs/gsch-core/README.md §2)
 	owner string // the plugin type whose parameters these are
@@ -91,10 +41,7 @@ type emittedBlock struct {
 	body  string // rendered `key: value` lines, exactly as the emitter prints them
 }
 
-// emittedBlocks mirrors the printf blocks in exp-ops/lib/common.sh. The VALUES are the
-// shipped core arms' (docs/gsch-core/*.env) and the emitter's own defaults; the guard is
-// about KEYS and TYPES, so when an arm changes a number, change it here too (a stale
-// value here means the arms and the contract were never compared).
+// emittedBlocks mirrors the printf blocks in exp-ops/lib/common.sh.
 var emittedBlocks = []emittedBlock{
 	{
 		block: "CORE_BASE_BLOCK",
@@ -121,9 +68,7 @@ safety: "none"
 executionBudget: "none"`,
 	},
 	{
-		// The branch plugin every core arm carries (BRANCH_PLUGIN=1). Its bool fields are
-		// the ones the emitter can get wrong: forkOnBusy/stickyBusyGuard/retryRule are
-		// *bool and logRequests/logHeaders are bool, all written from env values VERBATIM.
+		// The branch plugin every core arm carries (BRANCH_PLUGIN=1).
 		block: "BRANCH_IDENTITY_BLOCK",
 		owner: branchidentity.PluginType,
 		proto: branchidentity.Parameters{},
@@ -137,8 +82,8 @@ sessionHeaders: []`,
 	},
 }
 
-// blockKeys parses the emitted keys out of a rendered block, so the key check and the
-// decode check can never drift apart (one list, not two).
+// blockKeys parses the emitted keys out of a rendered block, so the key check and the decode
+// check can never drift apart (one list, not two).
 func blockKeys(t *testing.T, b emittedBlock) []string {
 	t.Helper()
 	var keys []string
@@ -159,11 +104,9 @@ func blockKeys(t *testing.T, b emittedBlock) []string {
 	return keys
 }
 
-// strictDecodeEmitted feeds a rendered parameter block through the loader's own path:
-// YAML → JSON (sigs.k8s.io/yaml, as the config loader does) → strict JSON decode with
-// unknown fields rejected (configloader.go hands each factory
-// fwkplugin.StrictDecoder). Using the real path is the point: this test fails on exactly
-// the input startup fails on, key or type.
+// strictDecodeEmitted feeds a rendered parameter block through the loader's own path: YAML →
+// JSON (sigs.k8s.io/yaml, as the config loader does) → strict JSON decode with unknown fields
+// rejected (configloader.go hands each factory fwkplugin.StrictDecoder).
 func strictDecodeEmitted(t *testing.T, what, body string, proto any) error {
 	t.Helper()
 	raw, err := yaml.YAMLToJSON([]byte(body))
@@ -209,11 +152,9 @@ func TestConfigEmitterConformance(t *testing.T) {
 	}
 }
 
-// TestEmittedBlocksDecodeIntoTheirParameters is the TYPE half of the contract: every
-// block exp-ops renders must decode into its plugin's Parameters struct through the
-// loader's strict path. A key that no longer exists fails here (belt and braces — the
-// reflection check above catches it with a better message), and so does a VALUE whose
-// YAML type does not match the Go field.
+// TestEmittedBlocksDecodeIntoTheirParameters is the TYPE half of the contract: every block
+// exp-ops renders must decode into its plugin's Parameters struct through the loader's strict
+// path.
 func TestEmittedBlocksDecodeIntoTheirParameters(t *testing.T) {
 	for _, b := range emittedBlocks {
 		if err := strictDecodeEmitted(t, b.block, b.body, b.proto); err != nil {
@@ -226,9 +167,9 @@ func TestEmittedBlocksDecodeIntoTheirParameters(t *testing.T) {
 
 // TestEmittedBoolMustBeAYAMLBoolNotANumber is the residueRelease/logRequests lesson made
 // structural: a numeric literal where the Go field is a bool must FAIL the guard.
-// `logRequests: 1` is what `BRANCH_LOG_REQUESTS=1` rendered in the shipped
-// docs/gsch-core/*.env files — and a strict decode cannot turn a YAML number into a Go
-// bool, so a type mismatch has to be a build test, not a crash-looping pod.
+// `logRequests: 1` is what `BRANCH_LOG_REQUESTS=1` rendered in the shipped docs/gsch-
+// core/*.env files — and a strict decode cannot turn a YAML number into a Go bool, so a type
+// mismatch has to be a build test, not a crash-looping pod.
 func TestEmittedBoolMustBeAYAMLBoolNotANumber(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -259,9 +200,7 @@ func TestEmittedBoolMustBeAYAMLBoolNotANumber(t *testing.T) {
 }
 
 // boolEnvKnobs are the env knobs exp-ops renders into a Go BOOL field (branch-identity's
-// logRequests/logHeaders and the three *bool rules). The emitter writes env values
-// VERBATIM into the YAML, so a numeric spelling here is a YAML number in the rendered
-// config — the crash-loop class this guard exists for.
+// logRequests/logHeaders and the three *bool rules).
 var boolEnvKnobs = []string{
 	"BRANCH_FORK_ON_BUSY",
 	"BRANCH_STICKY_BUSY_GUARD",
@@ -272,9 +211,7 @@ var boolEnvKnobs = []string{
 
 // TestShippedCoreEnvFilesUseYAMLBools pins the env files this build SHIPS to exp-ops
 // (docs/gsch-core/*.env): every knob that lands in a Go bool field must be spelled
-// `true`/`false`, never `1`/`0`. It is a separate check from the block decode because
-// the env files are the input the block is rendered FROM — a `1` there only becomes
-// visible here, and this test is what keeps the fix from being re-broken by a copy.
+// `true`/`false`, never `1`/`0`.
 func TestShippedCoreEnvFilesUseYAMLBools(t *testing.T) {
 	files, err := filepath.Glob(filepath.Join("..", "..", "..", "..", "..", "docs", "gsch-core", "*.env"))
 	if err != nil {
@@ -308,10 +245,7 @@ func TestShippedCoreEnvFilesUseYAMLBools(t *testing.T) {
 	}
 }
 
-// moduleEnvKnobs maps exp-ops' selector env knobs to the Config field each one fills. The
-// emitter writes the value VERBATIM into the rendered `parameters:` block, and
-// buildModules fails CLOSED on a value it does not know — so a typo in a shipped arm is a
-// CrashLoop, which is worth catching in the build rather than in a deploy.
+// moduleEnvKnobs maps exp-ops' selector env knobs to the Config field each one fills.
 var moduleEnvKnobs = map[string]string{
 	"CORE_SIZING":           "Sizing",
 	"CORE_ENTRY_ORDER":      "EntryOrder",
@@ -322,9 +256,9 @@ var moduleEnvKnobs = map[string]string{
 	"CORE_EXECUTION_BUDGET": "ExecutionBudget",
 }
 
-// TestShippedCoreEnvFilesUseKnownModuleValues pins the selector VALUES in the env files
-// this build ships: every one must be a value buildModules accepts, because the alternative
-// is an arm that refuses to start.
+// TestShippedCoreEnvFilesUseKnownModuleValues pins the selector VALUES in the env files this
+// build ships: every one must be a value buildModules accepts, because the alternative is an
+// arm that refuses to start.
 func TestShippedCoreEnvFilesUseKnownModuleValues(t *testing.T) {
 	files, err := filepath.Glob(filepath.Join("..", "..", "..", "..", "..", "docs", "gsch-core", "*.env"))
 	if err != nil {
@@ -364,9 +298,7 @@ func TestShippedCoreEnvFilesUseKnownModuleValues(t *testing.T) {
 // the request-reap bound (both the scheduler's record reap and branch identity's marker TTL)
 // is the BELT over an unobserved termination, so it must sit above the CLIENT's own timeout —
 // the campaign harness runs 9000 s — or the belt cuts a request that is still legitimately
-// running, and the branch it belonged to takes the next request as a different chain. The
-// default is the pin's own value (9300 s), so a config that omits the key is safe. (Branch
-// identity's marker TTL has the same bound and its own pin in that package.)
+// running, and the branch it belonged to takes the next request as a different chain.
 func TestReapBoundsSitAboveTheHarnessTimeout(t *testing.T) {
 	const harnessTimeoutSeconds = 9000
 	if got := defaultConfig().reapSeconds(); got <= harnessTimeoutSeconds {

@@ -17,28 +17,6 @@ limitations under the License.
 package groupsched
 
 // THE SCOPED-HOOKS TEST (F13) — the test class whose absence let a silent breakage ship.
-//
-// The framework SCOPES the request a plugin receives at Filter, Scorer, PreRequest, the
-// profile/scheduling points and every DataProducer (datalayer.ScopeInvocation /
-// ScopeRequest). Under a scope an undeclared read RESOLVES AS ABSENT and an undeclared write
-// is DROPPED (and fails PreRequest through violations.Write()). So a policy that reads its
-// unit of work out of a request ATTRIBUTE sees "" — silently — and degrades to "every
-// request anonymous, nothing seated, nothing starved, FCFS", which looks healthy in every
-// outcome metric.
-//
-// That is exactly what shipped: branch identity PUBLISHES the branch at RequestHeader and the
-// policy read it in every hook, while every existing test called the hooks with an UNSCOPED
-// request — so nothing could fail. This file drives the hooks through the REAL scoping
-// functions and fails on any violation, read or write, for every request shape a run can
-// produce.
-//
-// It also pins where the branch comes from, because that is the invariant the fix rests on:
-//
-//	Pick         the flow controller's own queue item, UNSCOPED — the ONLY hook that reads the
-//	             arrival attributes (branch identity wrote them at RequestHeader). The
-//	             flow-control package applies no request scope (processor.go: fairnessP.Pick).
-//	every other  the scheduler's OWN request record, resolved by request id — no request
-//	hook         attribute is read there and none is written.
 
 import (
 	"context"
@@ -64,8 +42,7 @@ import (
 	testutils "github.com/llm-d/llm-d-router/test/utils"
 )
 
-// Extension-point labels for the scope. They only label the violation counter and the log;
-// PreRequest uses the framework's own constant so it matches the director's exactly.
+// Extension-point labels for the scope.
 const (
 	scopedFilterPoint   = "Filter"
 	scopedResponsePoint = "ResponseBody"
@@ -78,8 +55,7 @@ const (
 )
 
 // scopeViolations sums plugin_data_scope_violations_total for one plugin over BOTH access
-// kinds. A rejected READ sets no error (it resolves as absent), so the counter is the only
-// place a read violation lands — and a read violation is the defect this file exists for.
+// kinds.
 func scopeViolations(t *testing.T, pluginName string) float64 {
 	t.Helper()
 	eppmetrics.Register() // the violation counter is the read path's only signal
@@ -110,8 +86,7 @@ func labelValue(m *dto.Metric, name string) string {
 }
 
 // bareRequest is a request carrying nothing but what the wire provides: an id, a size, the
-// tokens the render backend produced (the exact chain), and the client's headers. The
-// identity plugins under test are the ones that write the attributes.
+// tokens the render backend produced (the exact chain), and the client's headers.
 func bareRequest(id string, blocks uint64, headers map[string]string) *intRequest {
 	size := blocks * 256 // the wire size a prompt of this length has at 4 bytes/token
 	ir := &fwksched.InferenceRequest{RequestID: id, RequestSizeBytes: int(size), Headers: headers}
@@ -127,9 +102,9 @@ func bareRequest(id string, blocks uint64, headers map[string]string) *intReques
 // scopedCase is one request shape a run can produce.
 type scopedCase struct {
 	name string
-	// build runs the REAL identity plugins on a fresh request, exactly where the director
-	// runs them (RequestHeader, unscoped), and hands back the request the flow controller
-	// would enqueue: its queue key is the request's flow identity.
+	// build runs the REAL identity plugins on a fresh request, exactly where the director runs
+	// them (RequestHeader, unscoped), and hands back the request the flow controller would
+	// enqueue: its queue key is the request's flow identity.
 	build func(t *testing.T, id string) *intRequest
 	// anonymous marks the shape that must stay untracked.
 	anonymous bool
@@ -137,9 +112,8 @@ type scopedCase struct {
 
 // scopedCases are the shapes every arm must survive: branch identity (what the arms run), an
 // explicit client fairness header (the operator override), no identity at all (pass-through),
-// and branch identity with agent identity ALSO in the config (the branch must stay the
-// derived one). A config with agent identity and no branch identity is not a shape a run can
-// have: the startup gate refuses it (TestAgentIdentityOnlyConfigIsRefused).
+// and branch identity with agent identity ALSO in the config (the branch must stay the derived
+// one).
 func scopedCases(t *testing.T) []scopedCase {
 	t.Helper()
 	bi := newBranchIdentity(t)
@@ -166,15 +140,13 @@ func scopedCases(t *testing.T) []scopedCase {
 			},
 		},
 		{
-			// THE EXPLICIT HEADER: the client's fairness id becomes the queue key while the
-			// BRANCH stays branch identity's. The policy's unit is the branch — the wire
-			// fairness id is a join key, never the identity — so the seat must follow the
-			// branch even though the queue is named by the client.
+			// THE EXPLICIT HEADER: the client's fairness id becomes the queue key while the BRANCH
+			// stays branch identity's.
 			name: "explicit-fairness-header",
 			build: func(t *testing.T, id string) *intRequest {
 				req := bareRequest(id, 100, map[string]string{epmetadata.FlowFairnessIDKey: "client-tenant-7"})
-				// the director reads the header into the request's flow identity BEFORE the
-				// header processors run (director.go), so it is what the identity plugin sees
+				// the director reads the header into the request's flow identity BEFORE the header
+				// processors run (director.go), so it is what the identity plugin sees
 				req.InferenceRequest().FairnessID = "client-tenant-7"
 				require.NoError(t, bi.RequestHeader(context.Background(), req.InferenceRequest()))
 				require.Equal(t, "client-tenant-7", req.InferenceRequest().FairnessID,
@@ -194,12 +166,8 @@ func scopedCases(t *testing.T) []scopedCase {
 			},
 		},
 		{
-			// AGENT IDENTITY ALSO CONFIGURED: an accepted config (branch identity is present),
-			// and the agent id must NOT become the branch. An agent (session) id is a
-			// multi-chain member — its parallel sub-agents are separate chains — while the
-			// index keeps ONE chain per tracked id, so seating by agent id would
-			// under-account the engine. The branch stays branch identity's. (A config with
-			// agent identity ALONE is refused at startup: TestAgentIdentityOnlyConfigIsRefused.)
+			// AGENT IDENTITY ALSO CONFIGURED: an accepted config (branch identity is present), and the
+			// agent id must NOT become the branch.
 			name: "agent-identity-also-configured",
 			build: func(t *testing.T, id string) *intRequest {
 				req := bareRequest(id, 100, map[string]string{agentidentity.ClaudeCodeSessionHeader: scopedAgentSession})
@@ -229,8 +197,8 @@ func TestScopedHooksResolveTheBranchAndViolateNothing(t *testing.T) {
 
 					req := tc.build(t, "s-1")
 
-					// PICK — through the REAL flow controller, so the release happens exactly
-					// where it happens in production (the flow-control path applies no scope).
+					// PICK — through the REAL flow controller, so the release happens exactly where it
+					// happens in production (the flow-control path applies no scope).
 					outcome, err := fc.EnqueueAndWait(context.Background(), req)
 					require.NoError(t, err)
 					require.Equal(t, fcTypes.QueueOutcomeDispatched, outcome, "the request must dispatch")
@@ -273,8 +241,8 @@ func TestScopedHooksResolveTheBranchAndViolateNothing(t *testing.T) {
 							"the observed PreRequest closes the released window")
 					}
 
-					// RESPONSE BODY — scoped as well (the director does not scope this hook
-					// today; the policy must be clean under the strictest reading anyway).
+					// RESPONSE BODY — scoped as well (the director does not scope this hook today; the policy
+					// must be clean under the strictest reading anyway).
 					for _, response := range []*fwkrc.Response{
 						{StartOfStream: true},
 						{EndOfStream: true, TerminationCause: fwkrc.TerminationCauseNatural},
@@ -307,11 +275,7 @@ func TestScopedHooksResolveTheBranchAndViolateNothing(t *testing.T) {
 }
 
 // TestAgentIdentityOnlyConfigIsRefused pins the startup gate's ONE rejected config: agent
-// identity without branch identity. It is refused, not degraded — an agent id is a
-// MULTI-CHAIN member (its parallel sub-agents are separate chains) while this policy's index
-// keeps ONE chain per tracked id, so seating by agent id would under-account the engine. The
-// alternative (seat by agent id anyway) is what an undeclared fallback did once, and it is
-// the mechanism R3 removed.
+// identity without branch identity.
 func TestAgentIdentityOnlyConfigIsRefused(t *testing.T) {
 	build := func(t *testing.T) *GroupScheduler {
 		t.Helper()
@@ -353,8 +317,7 @@ func TestAgentIdentityOnlyConfigIsRefused(t *testing.T) {
 }
 
 // TestBranchIdentityIsScopeClean drives the OTHER identity plugin we added through the same
-// scoping: its PreRequest/ResponseBody reads must all be keys it Produces. (The reviewers
-// reported it clean; pinning it here means a later read of somebody else's key fails.)
+// scoping: its PreRequest/ResponseBody reads must all be keys it Produces.
 func TestBranchIdentityIsScopeClean(t *testing.T) {
 	bi := newBranchIdentity(t)
 	req := bareRequest("bi-1", 100, map[string]string{})

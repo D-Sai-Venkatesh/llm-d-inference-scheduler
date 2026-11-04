@@ -17,23 +17,6 @@ limitations under the License.
 package groupsched
 
 // THE DERIVED COLD-ENTRY CAP (constants table, README §3).
-//
-// There is no coldEntryCapTokens knob: the cap is the seat budget's own headroom,
-// per engine,
-//
-//	coldCapTokens = floor((1 - groupBudgetFraction) x num_gpu_blocks) x blockSizeTokens
-//
-// so the valve can only ever spend the margin the budget reserved for it. The
-// invariant these tests pin, per engine:
-//
-//	coldCapTokens <= (1 - groupBudgetFraction) x num_gpu_blocks x blockSizeTokens
-//	budgetBlocks  = floor(groupBudgetFraction x num_gpu_blocks)
-//	coldInFlight  <= coldCapTokens            (the charge is capped at the cap)
-//
-// The cap it replaces (131,072 tokens, a config value in a unit the budget never
-// used) was 5.10 % of the campaign engine's pool while the budget's headroom was
-// 5.00 % — two constants in two units describing one margin, and the valve was
-// measured 1.44-1.53x over its own value in 20-30 % of the samples.
 
 import (
 	"fmt"
@@ -73,17 +56,17 @@ func TestColdCapIsTheBudgetsHeadroomPerEngine(t *testing.T) {
 			t.Fatalf("%+v: negative cap %d", c, capTokens)
 		}
 	}
-	// the derived value at the campaign shape is the constant it replaces, to within
-	// one block: 2009 blocks x 64 = 128,576 tokens (the knob said 131,072).
+	// the derived value at the campaign shape is the constant it replaces, to within one block:
+	// 2009 blocks x 64 = 128,576 tokens (the knob said 131,072).
 	g := &engineGroup{numBlocks: 40183, budgetBlocks: IndexSizer{Fraction: 0.95}.BudgetBlocks(40183)}
 	if got := g.coldCapTokens(0.95, 64); got != 128576 {
 		t.Fatalf("campaign-shape cap: %d want 128576 (2009 blocks x 64)", got)
 	}
 }
 
-// The charge is CAPPED at the cap, so the invariant holds even for an entry bigger
-// than the whole headroom — which is exactly when the old rule ("one cold entry is
-// always allowed", as an EXCEPTION to the cap) let the charge run 1.5x over.
+// The charge is CAPPED at the cap, so the invariant holds even for an entry bigger than the
+// whole headroom — which is exactly when the old rule ("one cold entry is always allowed", as
+// an EXCEPTION to the cap) let the charge run 1.5x over.
 func TestColdChargeIsCappedAtTheCap(t *testing.T) {
 	forEnginesCap(t, defaultConfig(), 4000, func(t *testing.T, fx *engineSet) {
 		g := fx.g()
@@ -106,8 +89,7 @@ func TestColdChargeIsCappedAtTheCap(t *testing.T) {
 				t.Fatalf("engine %s: cold charge %d exceeds its cap %d", es.ID, es.ColdInFlight, es.ColdCapTokens)
 			}
 		}
-		// ... and the second entry waits until the first prefill lands. At N=2 it seats
-		// on the SIBLING instead: the cap is per engine, so the sibling has its own slot.
+		// ... and the second entry waits until the first prefill lands.
 		i := fx.pick(head("next", time.Second, 10))
 		if len(fx.ids) == 1 && i >= 0 {
 			t.Fatalf("a second cold entry must wait while the valve is full, got %d", i)
@@ -126,9 +108,9 @@ func TestColdChargeIsCappedAtTheCap(t *testing.T) {
 	})
 }
 
-// A cold charge is never released by anything but its own release points, and the
-// per-engine sum is what the invariant is about: two engines at N=2 each carry their
-// own cap, never a shared one.
+// A cold charge is never released by anything but its own release points, and the per-engine
+// sum is what the invariant is about: two engines at N=2 each carry their own cap, never a
+// shared one.
 func TestColdCapIsPerEngine(t *testing.T) {
 	forEnginesCap(t, defaultConfig(), 4000, func(t *testing.T, fx *engineSet) {
 		for i := range fx.ids {

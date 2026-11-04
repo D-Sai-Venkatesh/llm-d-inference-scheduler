@@ -16,13 +16,6 @@ limitations under the License.
 
 // Package groupsched implements the group scheduler: one shared queue of branches, a seat
 // budget per engine, and the rules in SCHEDULER-REDESIGN.md.
-//
-// Hook wiring: a request blocks in flow control at admission → the fairness Pick (here)
-// sees it as a queue head, with its tokens already rendered by branch identity at arrival →
-// the chosen queue is released → PreRequest (here) records the in-flight request and
-// reconciles the engine the framework actually picked → the engine → ResponseBody (here)
-// settles. So the waiting set and every cost come from the queues at Pick time, and every
-// cost is the request's own exact prefill chain.
 package groupsched
 
 import (
@@ -69,19 +62,13 @@ var (
 	_ fwksched.Filter             = &GroupScheduler{}
 )
 
-// GroupScheduler is a single named instance shared by every hookup: the flow-control
-// FAIRNESS POLICY, the scheduling FILTER, and the SATURATION DETECTOR — one plugin,
-// one state, so the three answers cannot disagree.
-//
-//	policy    Pick: which queued request dispatches next (seated branches only)
-//	filter    Filter: which engine may serve it (the branch's seat)
-//	detector  Saturation: is the POOL saturated (the flow controller's dispatch gate)
-//
-// The detector answers 0 (NOT saturated) from an atomic read and never takes the
-// scheduler's mutex (the flow controller polls it about once per millisecond). That is not
-// a placeholder: the SEAT BUDGET is the admission control, and this policy only ever
-// releases requests of branches it has seated, so a pool-level gate has nothing left to
-// decide.
+// GroupScheduler is a single named instance shared by every hookup: the flow-control FAIRNESS
+// POLICY, the scheduling FILTER, and the SATURATION DETECTOR — one plugin, one state, so the
+// three answers cannot disagree. policy Pick: which queued request dispatches next (seated
+// branches only) filter Filter: which engine may serve it (the branch's seat) detector
+// Saturation: is the POOL saturated (the flow controller's dispatch gate) The detector answers
+// 0 (NOT saturated) from an atomic read and never takes the scheduler's mutex (the flow
+// controller polls it about once per millisecond).
 type GroupScheduler struct {
 	typedName fwkplugin.TypedName
 	cfg       Config
@@ -89,62 +76,41 @@ type GroupScheduler struct {
 	sched   *Scheduler
 	metrics *groupMetrics
 	handle  fwkplugin.Handle
-	// logger is the plugin's logger: startup state at the default level (a run's arm
-	// and its wiring must be readable from the artifacts), per-request detail at V(DEBUG)
-	// — off unless the operator asks for it.
+	// logger is the plugin's logger: startup state at the default level (a run's arm and its
+	// wiring must be readable from the artifacts), per-request detail at V(DEBUG) — off unless
+	// the operator asks for it.
 	logger logr.Logger
 
 	fcfsOnce sync.Once
 
 	// ---- capacity acquisition (the capacity race) ----
-	//
-	// num_gpu_blocks arrives on the endpoint's METRICS, and an endpoint's
-	// creation event fires BEFORE the first scrape has populated them, so the
-	// event path alone can miss the capacity for the whole process lifetime (it
-	// did, live: the only thing that ever recovered it was a metadata nudge). The
-	// plugin therefore keeps the endpoint HANDLES it has seen and re-reads their
-	// metrics on the ticker: the datalayer refreshes a ModelServer's metrics IN
-	// PLACE (atomic pointer swap inside the same endpoint object), so a stored
-	// handle is a live poll target.
-	//
-	// MULTI-POD: capacity, the liveness deadline and the acquisition audit
-	// are PER ENDPOINT. "First capacity wins" was a single-pool assumption;
-	// an engine whose metrics never arrive must not look healthy just
-	// because its sibling learned its own num_gpu_blocks.
+	// num_gpu_blocks arrives on the endpoint's METRICS, and an endpoint's creation event fires
+	// BEFORE the first scrape has populated them, so the event path alone can miss the capacity
+	// for the whole process lifetime (it did, live: the only thing that ever recovered it was a
+	// metadata nudge).
 	capMu     sync.Mutex
 	endpoints map[string]*endpointState // endpoint id -> handle + acquisition state
 	hetero    map[string]struct{}       // engines already reported as capacity-heterogeneous
 	// ---- the placement pin (the seat binding mirror) ----
-	//
-	// candidates is the LIVE endpoint set the framework last offered to Saturation
-	// (stored only when it changes). It is the only metrics path in the core: a
-	// remembered endpoint handle carries a construction-time CLONE
-	// (fwksched.NewEndpoint → metrics.Clone()), so the capacity retry reads THIS set.
+	// candidates is the LIVE endpoint set the framework last offered to Saturation (stored only
+	// when it changes).
 	candidates atomic.Pointer[[]fwkdl.Endpoint]
 
-	// pins mirrors the scheduler's branch→engine SEAT binding AND its request id →
-	// branch mapping, so the Filter and the scheduler can each answer "which branch is
-	// this request?" WITHOUT taking s.mu (see filter.go's lock discipline). The
-	// scheduler pushes every seat/unseat/rebind and every release/forget through
-	// onBind/onUnbind/onRelease/onForget; nothing here infers anything.
+	// pins mirrors the scheduler's branch→engine SEAT binding AND its request id → branch
+	// mapping, so the Filter and the scheduler can each answer "which branch is this request?"
+	// WITHOUT taking s.mu (see filter.go's lock discipline).
 	pins *pinTable
 
-	// chains memoizes each QUEUED request's exact prefill chain, keyed by request id and
-	// pruned to the ids the last Pick saw: Pick runs at ~1 kHz over the same requests, and
-	// the chain is a hash of the whole prompt. Our own state, never a request attribute
-	// (a scoped hook may not write one — see chainsFor).
+	// chains memoizes each QUEUED request's exact prefill chain, keyed by request id and pruned
+	// to the ids the last Pick saw: Pick runs at ~1 kHz over the same requests, and the chain is
+	// a hash of the whole prompt.
 	chainsMu sync.Mutex
 	chains   map[string][]Chain
 }
 
 // endpointState is one discovered endpoint's capacity-acquisition state.
 type endpointState struct {
-	// NOTE: no metrics handle is stored. A remembered handle's metrics are a
-	// construction-time CLONE (fwksched.NewEndpoint → metrics.Clone()), so every read
-	// of one is a frozen input; the live view is the detector plugin's sample set
-	// (liveSource).
-	// firstSeen is this endpoint's first observation (its OWN liveness
-	// deadline starts here, not the process's).
+	// NOTE: no metrics handle is stored.
 	firstSeen time.Time
 	// warned is the one-shot per-endpoint liveness warning.
 	warned bool
@@ -152,9 +118,7 @@ type endpointState struct {
 	via string
 }
 
-// Factory builds a GroupScheduler. FAILS CLOSED without the
-// token-producer (Consumes) and on an invalid config; the index attaches
-// at startup with the config's block size (the token processor's value).
+// Factory builds a GroupScheduler.
 func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
 	cfg := defaultConfig()
 	if rawParameters != nil {
@@ -180,25 +144,21 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		hetero:    map[string]struct{}{},
 		pins:      newPinTable(),
 		chains:    map[string][]Chain{},
-		// the handle is held for the RegisterDependencies-time gate: plugin
-		// construction order is NOT the config order (the runner may build
-		// the fairness policy first), so the token-producer check cannot
-		// run at Factory time — RegisterDependencies runs after ALL
-		// plugins are constructed and added.
+		// the handle is held for the RegisterDependencies-time gate: plugin construction order is
+		// NOT the config order (the runner may build the fairness policy first), so the token-
+		// producer check cannot run at Factory time — RegisterDependencies runs after ALL plugins
+		// are constructed and added.
 		handle: handle,
 	}
 	r.metrics = newGroupMetrics(r.sched)
-	// The effective config is echoed at the DEFAULT level, always: a run's arm must be
-	// verifiable from its own log (it is also carried in DumpState/Snapshot.Config). It is
-	// rendered as sorted key=value pairs, NOT as JSON: a logger escapes quotes inside a
-	// message, which no tool can parse afterwards.
+	// The effective config is echoed at the DEFAULT level, always: a run's arm must be verifiable
+	// from its own log (it is also carried in DumpState/Snapshot.Config).
 	r.logger.V(logutil.DEFAULT).Info("group-scheduler: effective config " + configEcho(cfg))
 	r.logPolicy()
 
-	// The observation hooks are installed UNCONDITIONALLY: the metrics they
-	// feed are nil-safe, and a unit-mode run (no handle) must record the same
-	// accounting as a live one — the affinity-violation and engine-gone
-	// counters are CORRECTNESS signals, not decoration.
+	// The observation hooks are installed UNCONDITIONALLY: the metrics they feed are nil-safe,
+	// and a unit-mode run (no handle) must record the same accounting as a live one — the
+	// affinity-violation and engine-gone counters are CORRECTNESS signals, not decoration.
 	r.sched.onExit = func(engine, reason string, _ int) { r.metrics.ObserveExit(engine, reason) }
 	r.sched.onEntry = r.metrics.ObserveEntry
 	r.sched.onServe = r.metrics.ObserveServed
@@ -209,8 +169,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 			"branch", branch, "charged", engineLabel(from), "observed", engineLabel(to))
 	}
 	// The SAME counter for the violation found at the SETTLE (nothing to rebind there: the
-	// request is over). Without this site the metric's "must be 0" claim only covered the
-	// PreRequest half, and a placement path that ignores the pin shows up exactly here.
+	// request is over).
 	r.sched.onAffinityViolation = func(branch, charged, settled string) {
 		r.metrics.ObserveAffinityViolation(engineLabel(charged), engineLabel(settled))
 		r.logger.V(logutil.DEFAULT).Info("group-scheduler: AFFINITY VIOLATION at the settle — the request ran on an engine other than the one it was charged to",
@@ -219,9 +178,8 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// The pin table follows the SEATS: one map write per seat, one delete per exit.
 	r.sched.onBind = func(branch, engine string) { r.pins.set(branch, engine) }
 	r.sched.onUnbind = func(branch string) { r.pins.del(branch) }
-	// The pin table also follows the REQUESTS: a release names its branch, and the record's
-	// end forgets it. This is what makes the Filter able to resolve a scoped request to its
-	// branch by request id alone.
+	// The pin table also follows the REQUESTS: a release names its branch, and the record's end
+	// forgets it.
 	r.sched.onRelease = func(branch, reqID string) { r.pins.setRequest(reqID, branch) }
 	r.sched.onForget = func(reqID string) { r.pins.delRequest(reqID) }
 	r.sched.onAnomaly = r.metrics.ObserveAnomaly
@@ -234,13 +192,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 			"engine", engineLabel(engine), "branches", branches)
 	}
 	if handle != nil {
-		// THE DETECTOR-IDENTITY GATE. The loader FABRICATES the stock utilization
-		// detector when the config names none (loader/defaults.go ensureSaturationDetector),
-		// so a core arm can silently run the stock 0.80 kv / 5-waiting roofline gate
-		// instead of this plugin — the arm would then measure someone else's policy.
-		// Exactly one detector may exist, and on a core arm it must be THIS plugin
-		// (flowControl.saturationDetector.pluginRef: <this plugin's name>). Any other
-		// detector instance in the same config is announced as a conflict.
+		// THE DETECTOR-IDENTITY GATE.
 		if others := r.otherDetectors(); len(others) > 0 {
 			r.logger.V(logutil.DEFAULT).Info(
 				"group-scheduler: WARNING DETECTOR CONFLICT — another plugin answers the flow-control saturation gate; point flowControl.saturationDetector.pluginRef at this one",
@@ -253,11 +205,8 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 				return nil, fmt.Errorf("failed to register metrics of the '%s' plugin: %w", PluginType, err)
 			}
 		}
-		// the per-id SEAT/EXIT event stream, at V(DEBUG): off by default, because one
-		// line per seat and per exit is measurement detail, not startup state. The detail
-		// carries what a run's forensics need without the event ring — branch id, wire id,
-		// engine, reason, waiting-since, turns served — and the engine is also its own
-		// field, never spliced into the detail.
+		// the per-id SEAT/EXIT event stream, at V(DEBUG): off by default, because one line per seat
+		// and per exit is measurement detail, not startup state.
 		r.sched.onEvent = func(ev Event) {
 			if !r.logger.V(logutil.DEBUG).Enabled() {
 				return
@@ -292,53 +241,19 @@ func (r *GroupScheduler) TypedName() fwkplugin.TypedName { return r.typedName }
 
 // Consumes declares NOTHING, and that is the honest declaration: no attribute this policy
 // reads is one the framework would let it read through a declared dependency.
-//
-// The one attribute it reads at all is branch identity's branch id, at Pick — and it cannot
-// be declared, which is a startup constraint rather than a preference: the DAG's layer
-// validator rejects a dependency whose PRODUCER sits in a later layer than its consumer, and
-// branch identity implements PreRequest (request-control layer) while this policy is a
-// FairnessPolicy (flow-control layer 0), so declaring its key makes the EPP refuse to start
-// with "invalid plugin layer execution order". The layer model is the thing to fix upstream
-// (a draft note in README §5; never opened by an agent).
-//
-// AND THAT IS FINE, because this policy does not read the branch from a request outside
-// Pick: Pick receives the flow controller's own queue item UNSCOPED (processor.go:
-// fairnessP.Pick — the flow-control package applies no request scope), which is why it can
-// read the undeclared key at all. Every other hook is handed a SCOPED request
-// (ScopeInvocation in scheduler_profile.go, ScopeRequest in requestcontrol/director.go)
-// where an undeclared read RESOLVES AS ABSENT, so a branch id read that way would silently be
-// "" — an unseated, unstarved, pass-through scheduler that looks healthy in every outcome
-// metric. Those hooks resolve the branch from the scheduler's own record of the release
-// instead (Scheduler.branchOfRequestLocked), by request id.
-//
-// validateBranchProducer is the fail-closed startup check that replaces the declaration: the
-// branch-identity plugin must EXIST in the same config.
 func (r *GroupScheduler) Consumes() fwkplugin.DataDependencies {
 	return fwkplugin.DataDependencies{}
 }
 
 // Produces declares no request attribute, and that is now the whole truth: the plugin
-// publishes NOTHING onto the request. Its own bookkeeping (the per-request chains, the
-// released record) lives in its own state, so no scoped hook can lose a write here and no
-// scoped read can come back empty.
+// publishes NOTHING onto the request.
 func (r *GroupScheduler) Produces() map[fwkplugin.DataKey]any { return nil }
 
-// maxChainBlocks bounds a prompt's chain. It is effectively unbounded: a cap here would
-// silently stop counting a long prompt's tail, which is exactly the occupancy the budget
-// exists to bound.
+// maxChainBlocks bounds a prompt's chain.
 const maxChainBlocks = 1 << 20
 
-// chainsFor is the request's EXACT prefill chains: one per prompt, from the tokens the
-// token producer rendered at arrival. Each prompt is hashed independently because the
-// engine runs it as its own sequence, and its last block is partial — so its key is
-// private to that exact token sequence, which is why a new turn is never free.
-//
-// THE MEMO IS OURS, NOT THE REQUEST'S. Pick runs at ~1 kHz over the same queued request, so
-// re-hashing a prompt per pass would be absurd; the memo is keyed by request id and pruned
-// to the ids this pass saw, so it is bounded by the queue depth. It used to be a request
-// attribute — an undeclared WRITE, which at Pick (unscoped) happened to survive and at
-// PreRequest (scoped) would have been DROPPED and reported as a violation, failing the
-// request (director.go: violations.Write() fails PreRequest).
+// chainsFor is the request's EXACT prefill chains: one per prompt, from the tokens the token
+// producer rendered at arrival.
 func (r *GroupScheduler) chainsFor(ctx context.Context, reqID string, request *fwksched.InferenceRequest) []Chain {
 	if request == nil || request.Body == nil || request.Body.TokenizedRequest == nil {
 		return nil
@@ -367,8 +282,8 @@ func (r *GroupScheduler) chainsFor(ctx context.Context, reqID string, request *f
 }
 
 // pruneChains drops every memo entry this pass did not see: a request that left the queue
-// (dispatched, cancelled, expired) needs no chain any more, and at Pick its chain has
-// already been handed to the release record that carries it from here on.
+// (dispatched, cancelled, expired) needs no chain any more, and at Pick its chain has already
+// been handed to the release record that carries it from here on.
 func (r *GroupScheduler) pruneChains(seen map[string]struct{}) {
 	r.chainsMu.Lock()
 	for id := range r.chains {
@@ -381,8 +296,6 @@ func (r *GroupScheduler) pruneChains(seen map[string]struct{}) {
 
 // wireIDHeaderNames are the client's own request-identity headers, in priority order: the
 // harness's correlation id (its thread ground truth) first, then the standard request id.
-// They are read AT PICK — the only hook whose request is unscoped — and carried on the
-// branch, so a SEAT/EXIT line joins to the client's own records whatever the queue key is.
 var wireIDHeaderNames = []string{"x-correlation-id", reqcommon.RequestIDHeaderKey}
 
 // wireID is the client's own id for the request ("" when it sent neither header).
@@ -407,8 +320,8 @@ func readID(request *fwksched.InferenceRequest, key fwkplugin.DataKey) string {
 	return id
 }
 
-// otherDetectors lists the OTHER plugins in this config that implement the
-// framework's SaturationDetector (the detector-identity gate's input).
+// otherDetectors lists the OTHER plugins in this config that implement the framework's
+// SaturationDetector (the detector-identity gate's input).
 func (r *GroupScheduler) otherDetectors() []string {
 	if r.handle == nil {
 		return nil
@@ -426,23 +339,7 @@ func (r *GroupScheduler) otherDetectors() []string {
 	return out
 }
 
-// branchOf is the request's branch id — the queue key, read from branch identity. A request
-// without one is ANONYMOUS: it is never seated and never starved (pass-through). The branch
-// is the identity, and a session header is an attribute, never a key: nothing here falls
-// back to it.
-//
-// NO AGENT-IDENTITY FALLBACK, deliberately. A fallback looks like a kindness and is a
-// correctness hole: an agent (a session) id is a MULTI-CHAIN member — its parallel sub-agents
-// are separate chains — while the redesigned index keeps ONE chain per tracked id (one
-// branch, one chain, R3). Seating by agent id would therefore charge the sub-agents' blocks
-// to one record and UNDER-ACCOUNT the engine. A config with no branch identity is refused at
-// startup instead (validateBranchProducer) — fail closed, not a degraded queue key.
-//
-// PICK ONLY. This is the one hook whose request is the flow controller's own queue item,
-// unscoped (processor.go: fairnessP.Pick(ctx, flowGroup) — the flow-control package applies
-// no request scope), so the arrival attributes are readable exactly here. Every other hook
-// is handed a scoped copy of the request and resolves the branch from the scheduler's
-// record of the release (Scheduler.branchOfRequestLocked) instead.
+// branchOf is the request's branch id — the queue key, read from branch identity.
 func (r *GroupScheduler) branchOf(request *fwksched.InferenceRequest) string {
 	if request == nil {
 		return ""
@@ -450,17 +347,8 @@ func (r *GroupScheduler) branchOf(request *fwksched.InferenceRequest) string {
 	return readID(request, branchidentity.BranchIdentityKey)
 }
 
-// isReturner reports whether the request is NOT its branch's first turn — the
-// fairness class the entry order sorts on. It is branch identity's arrival record,
-// not a history the scheduler keeps: a branch's first turn is exactly a request the
-// identity minted as new or forked. A request with no arrival record (identity not
-// in the config, or a render failure) is a NEWCOMER: nothing is known about its
-// history, and the safe direction is to give it the seat ahead of incumbents.
-//
-// PICK ONLY, for the same reason as branchOf — and note the failure mode if that ever
-// stops holding: under a scope this read resolves as absent, so every request would
-// classify as a NEWCOMER. That is the safe direction by construction (a newcomer is never
-// demoted), which is why the class is phrased as the exception.
+// isReturner reports whether the request is NOT its branch's first turn — the fairness class
+// the entry order sorts on.
 func isReturner(request *fwksched.InferenceRequest) bool {
 	if request == nil {
 		return false
@@ -489,14 +377,6 @@ func (r *GroupScheduler) validateTokenProducer() error {
 
 // validateBranchProducer is the fail-closed branch-source gate: the branch-identity plugin
 // must be in the same config, and it is the ONLY source accepted.
-//
-// Without it every request is anonymous and Pick degrades to pass-through — a failure that
-// looks healthy in every outcome metric, which is why it fails at startup instead. Agent
-// identity is NOT an accepted substitute: an agent (session) id is a multi-chain member — its
-// parallel sub-agents are separate chains — while this policy's index keeps ONE chain per
-// tracked id, so seating by agent id would under-account the engine (see branchOf). A config
-// that offers only agent identity therefore refuses to start, which is the honest answer:
-// this policy cannot be correct on it.
 func (r *GroupScheduler) validateBranchProducer() error {
 	if r.handle == nil {
 		return nil // unit/test mode
@@ -527,15 +407,9 @@ func (r *GroupScheduler) validateBranchProducer() error {
 	return nil
 }
 
-// RegisterDependencies runs after every plugin is constructed — the
-// STARTUP fail-closed gate lives here: a missing token-producer is a
-// full-outage misconfiguration (every request would error at PreRequest,
-// the backstop), burning an arm before anyone noticed. The producer's
-// BACKEND is not inspectable from outside the plugin — an estimate-backend
-// producer still passes this gate (it produces tokens; whether those tokens are the
-// ENGINE's own is the config author's responsibility — the render backend must be the
-// sidecar serving the deployed model's tokenizer, and a blockSizeTokens mismatch fails
-// loudly at the first measured engine).
+// RegisterDependencies runs after every plugin is constructed — the STARTUP fail-closed gate
+// lives here: a missing token-producer is a full-outage misconfiguration (every request would
+// error at PreRequest, the backstop), burning an arm before anyone noticed.
 func (r *GroupScheduler) RegisterDependencies(reg fwkdl.Registrar) error {
 	if err := r.validateTokenProducer(); err != nil {
 		return err
@@ -554,16 +428,10 @@ func (r *GroupScheduler) RegisterDependencies(reg fwkdl.Registrar) error {
 	})
 }
 
-// Extract learns num_gpu_blocks (and checks the block size matches the
-// config — a mismatch fails loudly) from the endpoint lifecycle EVENTS, and
-// remembers the endpoint so the ticker can retry its capacity acquisition (the
-// event carries the metrics before the first scrape has populated them — the
-// capacity race).
-//
-// The engine SET is DISCOVERED here, never configured: an add-or-update
-// creates (or refreshes) that endpoint's engine group, and a delete tears it
-// down. Node rotation exercises the scale-down path regularly, and it must not leave
-// charges on a dead engine.
+// Extract learns num_gpu_blocks (and checks the block size matches the config — a mismatch
+// fails loudly) from the endpoint lifecycle EVENTS, and remembers the endpoint so the ticker
+// can retry its capacity acquisition (the event carries the metrics before the first scrape
+// has populated them — the capacity race).
 func (r *GroupScheduler) Extract(_ context.Context, event fwkdl.EndpointEvent) error {
 	if event.Endpoint == nil {
 		return nil
@@ -579,10 +447,7 @@ func (r *GroupScheduler) Extract(_ context.Context, event fwkdl.EndpointEvent) e
 	return nil
 }
 
-// learnCapacity takes ONE engine's measured capacity from a metrics snapshot,
-// once per engine. Shared by every acquisition path (endpoint event, metrics
-// poll, PreRequest) so the block-size match check and the "first capacity
-// wins" rule are identical everywhere — and per engine, never pooled.
+// learnCapacity takes ONE engine's measured capacity from a metrics snapshot, once per engine.
 func (r *GroupScheduler) learnCapacity(engine string, m *fwkdl.Metrics, via string) error {
 	if m == nil || m.CacheBlockSize <= 0 || m.CacheNumBlocks <= 0 {
 		return nil
@@ -591,8 +456,8 @@ func (r *GroupScheduler) learnCapacity(engine string, m *fwkdl.Metrics, via stri
 		return nil
 	}
 	if err := r.sched.SetNumBlocksFor(engine, m.CacheBlockSize, m.CacheNumBlocks); err != nil {
-		// EVERY mismatched engine is named, not just the one that failed first: a single
-		// engine's misconfigured block size must not hide behind another's.
+		// EVERY mismatched engine is named, not just the one that failed first: a single engine's
+		// misconfigured block size must not hide behind another's.
 		for bad, berr := range r.sched.BlockSizeMismatches() {
 			r.logger.V(logutil.DEFAULT).Info("group-scheduler: BLOCK SIZE MISMATCH — this engine's measured block size disagrees with the configured one, so its budget would be in the wrong unit; fix --block-size or blockSizeTokens",
 				"engine", bad, "err", berr.Error())
@@ -620,11 +485,11 @@ func (r *GroupScheduler) learnCapacity(engine string, m *fwkdl.Metrics, via stri
 	return nil
 }
 
-// reportHeterogeneousCapacity fails LOUDLY when a newly measured engine's
-// num_gpu_blocks deviates from the first engine's by more than 1%: per-engine
-// budgets are only sound while the engines are interchangeable, and a
-// heterogeneous pool must never silently inherit another engine's budget
-// (log + gauge; the policy keeps running on each engine's own measurement).
+// reportHeterogeneousCapacity fails LOUDLY when a newly measured engine's num_gpu_blocks
+// deviates from the first engine's by more than 1%: per-engine budgets are only sound while
+// the engines are interchangeable, and a heterogeneous pool must never silently inherit
+// another engine's budget (log + gauge; the policy keeps running on each engine's own
+// measurement).
 func (r *GroupScheduler) reportHeterogeneousCapacity() {
 	hetero := r.sched.HeterogeneousEngines(0.01)
 	if len(hetero) == 0 {
@@ -648,10 +513,7 @@ func (r *GroupScheduler) reportHeterogeneousCapacity() {
 		"engines", strings.Join(fresh, ", "))
 }
 
-// metricsSource is the narrow poll target: anything whose metrics can be
-// re-read. Both the datalayer endpoint (whose metrics are swapped in place by
-// the collector) and the scheduler's endpoint snapshot satisfy it; polling a
-// snapshot is harmless (it is simply never fresher).
+// metricsSource is the narrow poll target: anything whose metrics can be re-read.
 type metricsSource interface {
 	GetMetrics() *fwkdl.Metrics
 	GetMetadata() *fwkdl.EndpointMetadata
@@ -668,8 +530,8 @@ func (r *GroupScheduler) rememberEndpoint(ep metricsSource) {
 		r.endpoints = map[string]*endpointState{}
 	}
 	if _, ok := r.endpoints[key]; !ok {
-		// the HANDLE is not stored on purpose: a remembered endpoint's metrics are a
-		// construction-time clone (endpointState's note), so the live read is the only input
+		// the HANDLE is not stored on purpose: a remembered endpoint's metrics are a construction-
+		// time clone (endpointState's note), so the live read is the only input
 		r.endpoints[key] = &endpointState{firstSeen: time.Now()}
 	}
 }
@@ -683,9 +545,9 @@ func (r *GroupScheduler) forgetEndpoint(ep metricsSource) {
 	delete(r.endpoints, key)
 	delete(r.hetero, key)
 	r.capMu.Unlock()
-	// tear the engine's group down: its branches are exited, their homing
-	// released, its budget/index dropped (leaving charges on a dead engine
-	// poisons every later budget decision on a scale-down).
+	// tear the engine's group down: its branches are exited, their homing released, its
+	// budget/index dropped (leaving charges on a dead engine poisons every later budget decision
+	// on a scale-down).
 	r.sched.RemoveEngine(key, time.Now())
 	r.metrics.SetCapacityMissing(r.sched.GroupLabel(key), false)
 }
@@ -700,17 +562,17 @@ func endpointKey(ep metricsSource) string {
 	return fmt.Sprint(ep)
 }
 
-// pushEngineLoad learns CAPACITY from the LIVE per-engine sample set — never from a
-// remembered endpoint (a remembered handle's metrics are a construction-time CLONE,
-// which is why nothing in this core reads one).
+// pushEngineLoad learns CAPACITY from the LIVE per-engine sample set — never from a remembered
+// endpoint (a remembered handle's metrics are a construction-time CLONE, which is why nothing
+// in this core reads one).
 func (r *GroupScheduler) pushEngineLoad() {
 	samples := r.sampleCandidates()
 	if samples == nil {
 		return // the framework has not offered a candidate set yet
 	}
 	for engine, sm := range samples {
-		// The event-time copy may carry an empty geometry forever (the capacity race),
-		// and the live value is the same metric, so the retry rides this tick.
+		// The event-time copy may carry an empty geometry forever (the capacity race), and the live
+		// value is the same metric, so the retry rides this tick.
 		if sm.blockSz > 0 && sm.numBlk > 0 && !r.sched.HasCapacityFor(engine) {
 			if err := r.learnCapacity(engine, &fwkdl.Metrics{CacheBlockSize: sm.blockSz,
 				CacheNumBlocks: sm.numBlk}, "live-detector"); err != nil {
@@ -721,14 +583,9 @@ func (r *GroupScheduler) pushEngineLoad() {
 	}
 }
 
-// pollCapacity is the STARTUP LIVENESS check: once a decode endpoint has been observed,
-// its capacity must arrive within capacityLivenessSeconds, else the FCFS pass-through is
-// being served silently — log loudly and raise the missing gauge.
-//
-// It reads NO metrics: the capacity RETRY rides the live detector samples
-// (pushEngineLoad, same tick). A remembered endpoint handle carries a
-// construction-time metrics CLONE, so a poll over clones could never see the geometry
-// arrive late — the read that used to live here was itself the capacity-race bug's shape.
+// pollCapacity is the STARTUP LIVENESS check: once a decode endpoint has been observed, its
+// capacity must arrive within capacityLivenessSeconds, else the FCFS pass-through is being
+// served silently — log loudly and raise the missing gauge.
 func (r *GroupScheduler) pollCapacity(now time.Time) {
 	r.capMu.Lock()
 	type pollTarget struct {
@@ -770,22 +627,14 @@ func (r *GroupScheduler) pollCapacity(now time.Time) {
 	}
 }
 
-// Saturation answers the flow controller's pool gate: 0.0 (NOT saturated), always. The
-// seat budget is the admission control — this policy only ever releases requests of
-// branches it has seated, so a pool-level gate has nothing left to decide.
-//
-// It still stores the LIVE candidate set on the way (a no-op unless the set changed):
-// that set is the ticker's capacity-retry input, and this hook is the only place the
-// framework hands the plugin live endpoint objects. HOT PATH (≈1 kHz): one interface
-// compare and one atomic store when nothing changed, no mutex, no allocation.
+// Saturation answers the flow controller's pool gate: 0.0 (NOT saturated), always.
 func (r *GroupScheduler) Saturation(_ context.Context, candidates []fwkdl.Endpoint) float64 {
 	r.storeCandidates(candidates)
 	return 0
 }
 
-// storeCandidates keeps the LIVE endpoint set (the datastore mutates these objects in
-// place, so a stored slice is a live view, unlike a plugin's remembered endpoint clone).
-// It is a no-op when the set is unchanged — one compare per call, no allocation.
+// storeCandidates keeps the LIVE endpoint set (the datastore mutates these objects in place,
+// so a stored slice is a live view, unlike a plugin's remembered endpoint clone).
 func (r *GroupScheduler) storeCandidates(cands []fwkdl.Endpoint) bool {
 	if prev := r.candidates.Load(); prev != nil && sameEndpoints(*prev, cands) {
 		return false
@@ -795,8 +644,8 @@ func (r *GroupScheduler) storeCandidates(cands []fwkdl.Endpoint) bool {
 	return true
 }
 
-// sameEndpoints compares two candidate sets by identity (the interface values hold
-// pointers to the datastore's endpoint objects).
+// sameEndpoints compares two candidate sets by identity (the interface values hold pointers to
+// the datastore's endpoint objects).
 func sameEndpoints(a, b []fwkdl.Endpoint) bool {
 	if len(a) != len(b) {
 		return false
@@ -836,21 +685,10 @@ func (r *GroupScheduler) readSamples(candidates []fwkdl.Endpoint) map[string]eng
 	return out
 }
 
-// nocapacityEngine is the dispatches_total label for a pre-capacity pass-through dispatch. It
-// is deliberately NOT an engine id: no engine served the request, and a per-engine series
-// must never carry a value that is not one.
+// nocapacityEngine is the dispatches_total label for a pre-capacity pass-through dispatch.
 const nocapacityEngine = "nocapacity"
 
-// Pick is the dispatch decision. The waiting set is the queue-head
-// snapshot; pre-capacity it degrades to FCFS pass-through.
-//
-// THIS IS THE ONLY HOOK THAT READS THE REQUEST'S ATTRIBUTES. The flow controller hands it
-// its own queue items (processor.go: fairnessP.Pick(ctx, flowGroup)), and the flow-control
-// package applies no request scope — so the branch id and the arrival record branch identity
-// wrote at RequestHeader are readable here, and nowhere else. Every later hook is handed a
-// SCOPED request (Filter/Scorer via scheduler_profile.go, PreRequest via director.go,
-// producers via plugin_executor.go) and resolves its branch from the record this Pick
-// releases, by request id.
+// Pick is the dispatch decision.
 func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccessor) (fwkfc.FlowQueueAccessor, error) {
 	if band == nil {
 		return nil, nil //nolint:nilnil
@@ -895,17 +733,17 @@ func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccess
 	if len(heads) == 0 {
 		return nil, nil //nolint:nilnil
 	}
-	// before the measured capacity arrives: FCFS pass-through (once
-	// per process log; the gauge counts it)
+	// before the measured capacity arrives: FCFS pass-through (once per process log; the gauge
+	// counts it)
 	if !r.sched.HasCapacity() {
 		r.fcfsOnce.Do(func() {
 			r.logger.V(logutil.DEFAULT).Info("group-scheduler: num_gpu_blocks not yet measured; serving FCFS until the endpoint metrics arrive")
 		})
 		r.sched.FCFSServed()
-		// and COUNTED ON THE DISPATCH SERIES, under the one label value that belongs to no
-		// engine: without it the whole pre-capacity window is invisible in
-		// dispatches_total, which reads 0 while requests are being served — an operator then
-		// has capacity_missing alone to tell "serving unseated" from "serving nothing".
+		// and COUNTED ON THE DISPATCH SERIES, under the one label value that belongs to no engine:
+		// without it the whole pre-capacity window is invisible in dispatches_total, which reads 0
+		// while requests are being served — an operator then has capacity_missing alone to tell
+		// "serving unseated" from "serving nothing".
 		r.metrics.ObserveServed(nocapacityEngine)
 		if i := FCFSPick(heads); i >= 0 {
 			return queues[i], nil
@@ -922,21 +760,13 @@ func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccess
 func (r *GroupScheduler) NewState(_ context.Context) any { return nil }
 
 // Produce implements DataProducer ONLY to receive RequestAbandoned (see the upstream draft
-// note: the framework has the right event, but exposes it to data producers only). It
-// produces nothing — the scheduler reads the request, it publishes no data for anyone.
-//
-// RequestAbandoned is what covers a request the flow controller released but that never
-// reached PreRequest (the pinned engine vanished, a screener or an admitter refused it,
-// scheduling failed): without it such a request would leave its branch's released window
-// open forever.
+// note: the framework has the right event, but exposes it to data producers only).
 func (r *GroupScheduler) Produce(context.Context, *fwksched.InferenceRequest, []fwksched.Endpoint) error {
 	return nil
 }
 
-// RequestAbandoned ends the record of a request that left the request path without
-// reaching PreRequest. It is safe when no record exists. The branch is the record's — this
-// hook's request is the framework's (unscoped today), but the scheduler's own record is the
-// one source of truth everywhere, so the branch is never read off the request at all.
+// RequestAbandoned ends the record of a request that left the request path without reaching
+// PreRequest.
 func (r *GroupScheduler) RequestAbandoned(_ context.Context, request *fwksched.InferenceRequest) {
 	if request == nil {
 		return
@@ -944,19 +774,10 @@ func (r *GroupScheduler) RequestAbandoned(_ context.Context, request *fwksched.I
 	r.sched.Abandon("", request.RequestID)
 }
 
-// PreRequest runs after the request leaves the queue (dispatch). It records the in-flight
-// request and reconciles the engine the framework ACTUALLY picked with the one the seat
-// assumed; nothing is charged here, because the seat charged the exact chains.
-//
-// THE BRANCH IS NOT READ FROM THE REQUEST. This hook's request is SCOPED
-// (datalayer.ScopeRequest, director.go), so an attribute read the plugin did not declare
-// resolves as absent and an undeclared write is DROPPED and turns into a failed PreRequest
-// (violations.Write()). The branch — and the chain the release charged — come from the
-// record the Pick wrote, resolved by request id.
+// PreRequest runs after the request leaves the queue (dispatch).
 func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.InferenceRequest, schedulingResult *fwksched.SchedulingResult) error {
-	// capacity first (belt-and-braces, third acquisition path): it must not
-	// depend on the request being trackable — anonymous traffic used to
-	// return before ever teaching the budget.
+	// capacity first (belt-and-braces, third acquisition path): it must not depend on the request
+	// being trackable — anonymous traffic used to return before ever teaching the budget.
 	engine := ""
 	if endpoint := pickedEndpoint(schedulingResult); endpoint != nil {
 		r.rememberEndpoint(endpoint)
@@ -968,19 +789,15 @@ func (r *GroupScheduler) PreRequest(_ context.Context, request *fwksched.Inferen
 	if request == nil {
 		return nil
 	}
-	// The engine here is AUTHORITATIVE: the seat was placed on the branch's engine at
-	// Pick, and the framework's actual choice moves it if it disagrees. The chain is the
-	// one the release recorded, so a branch that holds no seat at all is seated by the
-	// observation with exactly the cost its head was charged.
+	// The engine here is AUTHORITATIVE: the seat was placed on the branch's engine at Pick, and
+	// the framework's actual choice moves it if it disagrees.
 	r.sched.DispatchedOnUsage("", request.RequestID, engine, nil, time.Now())
 	return nil
 }
 
-// ResponseBody: the first chunk is prefill complete (the cold-entry charge is released
-// there); EndOfStream is the finalizer for every termination cause (the in-flight decrement
-// always, the payback ledger only for a natural one). Both are branch-level facts, and the
-// branch is the record's, by request id (this hook is unscoped today; the record is used
-// regardless so one source of truth covers every hook).
+// ResponseBody: the first chunk is prefill complete (the cold-entry charge is released there);
+// EndOfStream is the finalizer for every termination cause (the in-flight decrement always,
+// the payback ledger only for a natural one).
 func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.InferenceRequest, response *fwkrc.Response, target *fwkdl.EndpointMetadata) {
 	if request == nil || response == nil {
 		return
@@ -998,8 +815,7 @@ func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.Infer
 	}
 	completionTokens := response.Usage.CompletionTokens
 	// The settle's engine comes from the response's own endpoint metadata: a settle with no
-	// endpoint would fold this engine's keys into another's record. An empty metadata id
-	// keeps the binding.
+	// endpoint would fold this engine's keys into another's record.
 	engine := ""
 	if target != nil && target.ID.String() != "" {
 		engine = target.ID.String()
@@ -1047,7 +863,7 @@ func configEcho(cfg Config) string {
 }
 
 // logPolicy states what the wired policy DOES, in words, at the default level: a run's
-// artifact then says what ran without decoding knob names. One line per module.
+// artifact then says what ran without decoding knob names.
 func (r *GroupScheduler) logPolicy() {
 	cfg := r.cfg
 	r.logger.V(logutil.DEFAULT).Info("group-scheduler: policy",

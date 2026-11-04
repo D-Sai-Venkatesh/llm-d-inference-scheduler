@@ -17,40 +17,6 @@ limitations under the License.
 package groupsched
 
 // THE CORE'S MODULES.
-//
-// The policy is a set of SMALL modules behind narrow interfaces. Each module owns
-// exactly one question, has exactly ONE default implementation, and is selected by
-// exactly ONE config value — so a future idea is a new implementation of ONE
-// interface plus ONE value, never a new knob on five modules.
-//
-//	IDENTITY    the branch-identity plugin (separate plugin, unchanged): the
-//	            branch id IS the queue key. This package only READS it.
-//	SIZING      SeatBudget: one engine's seat budget, from its measured KV capacity — the
-//	            ONE implementation IndexSizer: budget = fraction x num_gpu_blocks. What a
-//	            head COSTS is not a module's answer any more: it is exact, from the
-//	            engine's own BlockIndex. The CPU offload tier is a DEPLOYMENT fact, not a
-//	            sizing input: native offload is write-through, so it adds no seat.
-//	QUEUE       EntryOrder: which waiter is the head — newcomer-first, then oldest
-//	            arrival, then id (a TOTAL order: a map-order tie-break is a real bug).
-//	PLACEMENT   EngineChooser: which engine takes the head. Default: the most free budget
-//	            left AFTER the seat, among the engines where it fits, tie → lowest id.
-//	TENURE      RotationPolicy: when a resident may be released. Default the fixed
-//	            quantum Q (one value, default 4; Q8 is the same code with 8).
-//	PRESSURE    VictimChooser: who leaves under MEMORY pressure. Default: the budget valve
-//	            (with RULE O's no-thrash clause: an engine's sole, oversize resident is
-//	            never a pressure victim — it leaves by tenure).
-//	SAFETY      SafetyDetector: a seam with ONE wired value, NONE — the seat budget is the
-//	            whole admission control, so a net has nothing to add and no implementation
-//	            ships (a future one brings its own evidence and one config value).
-//	DISPATCH    DispatchGate: whether a seated branch's turn may RUN on its engine now.
-//	            ONE wired value, NONE (an admitted turn runs). A gate that BINDS would need
-//	            the engine's running-set accounting, which the trim removed with its parked
-//	            implementation — it must be re-added with the gate that prices it.
-//	OBSERVABILITY the hooks + groupMetrics (metrics.go) + the event log.
-//
-// The modules never see *Scheduler: they receive the facts they are allowed to use
-// as arguments (a small context struct with the READ-ONLY callbacks they need), and
-// they return decisions, never state. The scheduler owns all state.
 
 import (
 	"time"
@@ -63,14 +29,12 @@ type TenureCtx struct {
 	// Now is the decision pass's clock (never time.Now — a replayed decision stream must be
 	// reproducible).
 	Now time.Time
-	// IdleSeconds is S, the silence bound: a branch silent that long (and with no
-	// queued head) is not going to use its seat.
+	// IdleSeconds is S, the silence bound: a branch silent that long (and with no queued head) is
+	// not going to use its seat.
 	IdleSeconds float64
 }
 
-// Headless reports that this branch has no queued head. Decisions run INSIDE Pick, where
-// `waitingSince` was just synced from the live queue, so the absence is a fact of this pass
-// rather than a guess about an old snapshot.
+// Headless reports that this branch has no queued head.
 func (c TenureCtx) Headless(m *branch) bool { return m.waitingSince.IsZero() }
 
 // Silent reports the idle test for a branch: no queued head and no activity for S.
@@ -82,8 +46,7 @@ func (c TenureCtx) Silent(m *branch) bool {
 type RotationPolicy interface {
 	// Name is the config value that selects the policy.
 	Name() string
-	// Eligible reports the reason a branch may be rotated ("" and false = it may
-	// not). A branch with anything in flight is NEVER eligible.
+	// Eligible reports the reason a branch may be rotated ("" and false = it may not).
 	Eligible(m *branch, ctx TenureCtx) (string, bool)
 }
 
@@ -96,8 +59,8 @@ func (FixedQuantum) Name() string { return "quantum" }
 
 func (p FixedQuantum) Eligible(m *branch, ctx TenureCtx) (string, bool) {
 	if m.busy() {
-		// a request at a pod, OR a live released window: a turn is in progress either
-		// way, and rotating it out would evict a branch that is about to run
+		// a request at a pod, OR a live released window: a turn is in progress either way, and
+		// rotating it out would evict a branch that is about to run
 		return "", false
 	}
 	if m.busyPeriods >= p.Q {
@@ -114,25 +77,19 @@ func (p FixedQuantum) Eligible(m *branch, ctx TenureCtx) (string, bool) {
 // PressureCtx is what a victim chooser may consult about ONE engine.
 type PressureCtx struct {
 	Now time.Time
-	// Exiting reports that the branch is already on its way out (it drains, then
-	// goes).
+	// Exiting reports that the branch is already on its way out (it drains, then goes).
 	Exiting func(id string) bool
-	// RotationVictim is the TENURE module's demand-driven choice over this engine
-	// (nil when no branch is release-eligible under it).
+	// RotationVictim is the TENURE module's demand-driven choice over this engine (nil when no
+	// branch is release-eligible under it).
 	RotationVictim func() (string, *branch)
 	// Silent is the same idle test the tenure policy uses.
 	Silent func(m *branch) bool
 	// SoleOversize reports RULE O's no-thrash case: this branch is the engine's ONLY staying
-	// resident AND its own footprint alone exceeds the engine's budget — the seat Rule O
-	// granted on an empty engine. Such a branch is never a pressure victim: evicting it
-	// frees the engine and admits nothing (the head that displaced it already left), so the
-	// pass is DONE. It leaves by TENURE like everyone else (Q busy periods, or S of silence
-	// when a waiter needs the room).
+	// resident AND its own footprint alone exceeds the engine's budget — the seat Rule O granted
+	// on an empty engine.
 	SoleOversize func(m *branch) bool
-	// Headless reports whether the branch has no turn wanting to run: no queued head AND no
-	// LIVE released window. A live window counts here (it is a turn on its way, so a branch
-	// that has one is never "done"); a DEAD one does not, which is exactly how a branch
-	// whose request died in the window becomes evictable on demand after S.
+	// Headless reports whether the branch has no turn wanting to run: no queued head AND no LIVE
+	// released window.
 	Headless func(m *branch) bool
 }
 
@@ -142,24 +99,17 @@ type VictimChooser interface {
 	Victim(branches []*branch, ctx PressureCtx) (string, *branch)
 }
 
-// BudgetValve is the memory-pressure order:
-//
-//	(1) a rotation victim (the tenure rule already releases this branch);
-//	(2) DONE or SILENT — no queued turn, or silent past S;
-//	(3) mid-quantum IDLE, oldest last completion first (the safety valve that only
-//	    genuine GROWTH pressure reaches: every admission was budget-checked);
-//	(4) anything else — a branch with a request RUNNING. It is marked exiting and leaves at
-//	    its drain: the mark is progress, because its blocks leave the stay side immediately.
+// BudgetValve is the memory-pressure order: (1) a rotation victim (the tenure rule already
+// releases this branch); (2) DONE or SILENT — no queued turn, or silent past S; (3) mid-
+// quantum IDLE, oldest last completion first (the safety valve that only genuine GROWTH
+// pressure reaches: every admission was budget-checked); (4) anything else — a branch with a
+// request RUNNING.
 type BudgetValve struct{}
 
 func (BudgetValve) Name() string { return "valve" }
 
 func (BudgetValve) Victim(branches []*branch, ctx PressureCtx) (string, *branch) {
-	// RULE O's NO-THRASH clause, FIRST — before the rotation victim and every pressure
-	// class. A sole oversize stay-member is never an enforcement victim: it is over
-	// budget by construction, so any pass would otherwise mark its own resident — the
-	// cascade the two-view accounting exists to prevent. It leaves only through
-	// rotateLocked, by tenure, when a waiter needs the room.
+	// RULE O's NO-THRASH clause, FIRST — before the rotation victim and every pressure class.
 	if ctx.SoleOversize != nil {
 		var sole *branch
 		stay := 0
@@ -195,12 +145,7 @@ func (BudgetValve) Victim(branches []*branch, ctx PressureCtx) (string, *branch)
 	if best != nil {
 		return "budget-noqueue", best
 	}
-	// class (3): mid-quantum. THE ORDER MATTERS: a branch that has not served a turn
-	// in this residency, or that has a queued head right now, is the LAST choice —
-	// taking its seat back before its first turn makes it wait another admission cycle.
-	// (measured on the old build, which took seats from branches whose head had been queued
-	// the whole time; the campaign notes carry the counts). Only then "oldest last
-	// completion", then id.
+	// class (3): mid-quantum.
 	for _, m := range branches {
 		if ctx.Exiting(m.id) || m.busy() {
 			continue
@@ -228,30 +173,22 @@ func (BudgetValve) Victim(branches []*branch, ctx PressureCtx) (string, *branch)
 
 // ---- QUEUE -------------------------------------------------------------------
 
-// EntryCtx is what an entry order may consult about ONE decision pass. It is an
-// argument and not hidden state on purpose: the module sees only the facts the
-// scheduler hands it (never *Scheduler, never time.Now), so a replay is reproducible
-// and a policy cannot quietly read a clock its inputs never carried.
+// EntryCtx is what an entry order may consult about ONE decision pass.
 type EntryCtx struct {
 	// Now is the decision pass's clock (never time.Now — a replayed decision stream must be
-	// reproducible). "How long this head has waited" is derived from it and the waiter's
-	// own oldest arrival, never stored.
+	// reproducible).
 	Now time.Time
 }
 
 // EntryOrder answers "which waiter is the head?" over the ONE shared queue.
-//
-// The comparison MUST be a TOTAL order ending in the branch id. That is not a style
-// preference: a comparison that falls back to map iteration order produced three
-// different traces in four replays of one scenario.
 type EntryOrder interface {
 	Name() string
 	// Head returns the head of the waiter set, or nil when nothing is waiting.
 	Head(waiters map[string]*waiter, ctx EntryCtx) *waiter
 }
 
-// NewcomerFirst is the default: newcomers before returning branches, then the oldest
-// arrival, then the id (a total order, so map iteration cannot leak into a decision).
+// NewcomerFirst is the default: newcomers before returning branches, then the oldest arrival,
+// then the id (a total order, so map iteration cannot leak into a decision).
 type NewcomerFirst struct{}
 
 func (NewcomerFirst) Name() string { return "newcomer-first" }
@@ -279,31 +216,25 @@ func newcomerLess(a, b *waiter) bool {
 
 // ---- PLACEMENT ---------------------------------------------------------------
 
-// EngineCandidate is one engine's offer for one waiting head — the FACTS the
-// placement module may decide on. The scheduler computes them; the module never
-// touches an engine.
+// EngineCandidate is one engine's offer for one waiting head — the FACTS the placement module
+// may decide on.
 type EngineCandidate struct {
 	// Engine is the engine id (the deterministic tie-break).
 	Engine string
-	// CostTokens is this head's admission cost ON THIS ENGINE (tokens), and
-	// CostBlocks its block-quantised form.
+	// CostTokens is this head's admission cost ON THIS ENGINE (tokens), and CostBlocks its block-
+	// quantised form.
 	CostTokens int64
 	CostBlocks int64
 	// FreeBudget is what the engine can still admit (budget − accounted footprint).
 	FreeBudget int64
-	// Budget is the engine's SEAT BUDGET in blocks (fraction × its own num_gpu_blocks):
-	// the number an EMPTY engine could admit, which is what RULE O's trigger is measured
-	// against.
+	// Budget is the engine's SEAT BUDGET in blocks (fraction × its own num_gpu_blocks): the
+	// number an EMPTY engine could admit, which is what RULE O's trigger is measured against.
 	Budget int64
 	// BudgetFits reports CostBlocks <= FreeBudget.
 	BudgetFits bool
-	// Fits reports BudgetFits AND that the COLD-ENTRY VALVE allows this head on this
-	// engine. Both halves are kept apart on purpose: a head that fits by budget but is held
-	// by the valve must WAIT, because evicting frees budget and never frees the valve — a
-	// loop that evicted for such a head emptied the seats and hurried nothing.
+	// Fits reports BudgetFits AND that the COLD-ENTRY VALVE allows this head on this engine.
 	Fits bool
-	// HasVictim is LAZY (it costs a scan): may the engine evict an eligible
-	// incumbent right now?
+	// HasVictim is LAZY (it costs a scan): may the engine evict an eligible incumbent right now?
 	HasVictim func() bool
 }
 
@@ -314,32 +245,9 @@ type EngineChooser interface {
 	Choose(cands []EngineCandidate) int
 }
 
-// MostFreeBudget is the default: among the engines where the head FITS (budget AND the
-// cold valve), the one with the MOST FREE BUDGET AFTER the seat — free minus this head's
-// cost on it; ties → lowest engine id.
-//
-// "After" rather than "before" is the same principle evaluated on the state the decision
-// produces, and it is dedup-aware for free: a fork whose parent's prefix is already
-// resident on A costs almost nothing there, so it lands on A unless B is genuinely
-// emptier — no separate affinity rule, and nothing to tune.
-//
-//   - RULE O (the liveness fix): a head whose EXACT cost exceeds every engine's seat
-//     budget cannot fit even an empty engine, and the 0.95 margin alone used to refuse it
-//     for ever. An EMPTY engine takes it instead (the candidate's Fits already says so —
-//     the scheduler computes it, because the empty-engine case is a fact about the engine,
-//     not a placement preference). With no empty engine, eviction is the way forward on
-//     THIS module's own choice of engine (most free budget, then id), and the order
-//     converges: every eviction raises that engine's free budget, so the same engine stays
-//     the pick until it is empty — never a spread of evictions across the pool.
-//   - If NOTHING fits but some engine fits BY BUDGET (i.e. the cold-entry valve is
-//     holding the head), the answer is "wait": the valve opens by itself when that
-//     engine's cold prefill produces its first token, and no eviction can hurry it. (This
-//     guard is what RULE O drops for its own case: there, evicting DOES lead to a seat —
-//     the empty engine — so holding the head back instead would destroy nothing and admit
-//     nothing.)
-//   - Only when nothing fits by BUDGET either is eviction the way forward: the engine
-//     that can free a seat by an eligible rotation, again most free budget first
-//     (evicting on the least-pressured engine gives up the least warm state).
+// MostFreeBudget is the default: among the engines where the head FITS (budget AND the cold
+// valve), the one with the MOST FREE BUDGET AFTER the seat — free minus this head's cost on
+// it; ties → lowest engine id.
 type MostFreeBudget struct{}
 
 func (MostFreeBudget) Name() string { return "most-free-budget" }
@@ -358,11 +266,8 @@ func (MostFreeBudget) Choose(cands []EngineCandidate) int {
 		return best
 	}
 	if oversizeEverywhere(cands) {
-		// RULE O, the no-empty-engine half: evict on the engine this module would pick
-		// anyway, and let the next iteration re-ask. Nothing is evicted that the tenure
-		// rule does not already release (HasVictim is the same scan the rotation uses), so
-		// this is the ordinary demand-driven exit — it just is not refused because the head
-		// can never fit a NON-empty budget.
+		// RULE O, the no-empty-engine half: evict on the engine this module would pick anyway, and
+		// let the next iteration re-ask.
 		for i := range cands {
 			if cands[i].HasVictim == nil || !cands[i].HasVictim() {
 				continue
@@ -373,11 +278,8 @@ func (MostFreeBudget) Choose(cands []EngineCandidate) int {
 		}
 		return best
 	}
-	// The cold valve is holding this head somewhere: WAIT — never evict — because evicting
-	// frees budget and never the valve. The valve opens by itself: the charge holding it is
-	// released when its owner's prefill produces a token, and — the case that used to need
-	// an eviction exception — when its owner's released window outlives S and the branch
-	// stops counting as busy (F1's derivation releases the charge at that same pass).
+	// The cold valve is holding this head somewhere: WAIT — never evict — because evicting frees
+	// budget and never the valve.
 	for i := range cands {
 		if cands[i].BudgetFits {
 			return -1
@@ -405,10 +307,7 @@ func betterFit(c, best EngineCandidate) bool {
 }
 
 // oversizeEverywhere reports RULE O's trigger: the head's exact cost exceeds the SEAT BUDGET
-// of every candidate engine, so it could not fit one even if that engine were empty. (An
-// engine's free budget equals its budget exactly when it is empty, which is why the empty
-// case is decided per candidate and this predicate only decides "may eviction happen at
-// all".)
+// of every candidate engine, so it could not fit one even if that engine were empty.
 func oversizeEverywhere(cands []EngineCandidate) bool {
 	if len(cands) == 0 {
 		return false
@@ -421,8 +320,8 @@ func oversizeEverywhere(cands []EngineCandidate) bool {
 	return true
 }
 
-// betterEngine is the placement total order for the engines that cannot take the head (and
-// for naming the engine a valve-held head waits for): most free budget, then engine id.
+// betterEngine is the placement total order for the engines that cannot take the head (and for
+// naming the engine a valve-held head waits for): most free budget, then engine id.
 func betterEngine(c, best EngineCandidate) bool {
 	if c.FreeBudget != best.FreeBudget {
 		return c.FreeBudget > best.FreeBudget
@@ -433,19 +332,10 @@ func betterEngine(c, best EngineCandidate) bool {
 // ---- SIZING ------------------------------------------------------------------
 
 // SeatBudget answers how many blocks one engine may seat.
-//
-// It used to answer the FOOTPRINT too. It no longer does: every cost is now exact, from
-// the request's own tokens against the engine's own index (BlockIndex.CostLocked), so
-// there is one number and one place that computes it. What is left of the module is the
-// one deployment fact it alone knows — the fraction of the engine's measured KV the
-// seats may hold.
 type SeatBudget interface {
 	Name() string
-	// BudgetBlocks is one engine's seat budget, from its measured KV capacity
-	// (num_gpu_blocks): the deployment's own statement about how much of the engine's
-	// KV may be held. The CPU offload tier does not widen it — native offload is
-	// write-through, so it adds no seat (the cold valve's cap stays GPU-only for the
-	// same reason).
+	// BudgetBlocks is one engine's seat budget, from its measured KV capacity (num_gpu_blocks):
+	// the deployment's own statement about how much of the engine's KV may be held.
 	BudgetBlocks(numBlocks int) int
 }
 
@@ -463,64 +353,44 @@ func (z IndexSizer) BudgetBlocks(numBlocks int) int {
 // ---- DISPATCH ----------------------------------------------------------------
 
 // DispatchCtx is what a dispatch gate may consult about ONE seated head on ONE engine.
-// It is a VALUE, and every field is a number the scheduler already has in hand: the
-// check runs per candidate head on every decision pass, so it must neither allocate nor
-// reach into an engine.
 type DispatchCtx struct {
-	// Engine is the engine the head would run on (the branch's seat — a head never
-	// moves engines, so this is also the attribution of a hold).
+	// Engine is the engine the head would run on (the branch's seat — a head never moves engines,
+	// so this is also the attribution of a hold).
 	Engine string
 	// Branch is the head's branch id (reporting only; the gate decides on blocks).
 	Branch string
-	// RunningBlocks is the engine's running set: the dedup-exact union of its in-flight
-	// requests' chain blocks, from the EPP's own accounting. It is NEVER an endpoint
-	// metric — that is what keeps a gate out of the old per-engine gate's failure class
-	// (a metrics clone that latched and locked an engine out).
+	// RunningBlocks is the engine's running set: the dedup-exact union of its in-flight requests'
+	// chain blocks, from the EPP's own accounting.
 	RunningBlocks int64
-	// ReservedBlocks is the engine's used side OUTSIDE that key set: the charges its
-	// in-flight requests hold that carry no chain keys (an unborn dispatch's growth).
+	// ReservedBlocks is the engine's used side OUTSIDE that key set: the charges its in-flight
+	// requests hold that carry no chain keys (an unborn dispatch's growth).
 	ReservedBlocks int64
-	// ChainBlocks is what THIS head would ADD to the running set: the cold part of its
-	// chain against that set (dedup), PLUS its own output growth.
+	// ChainBlocks is what THIS head would ADD to the running set: the cold part of its chain
+	// against that set (dedup), PLUS its own output growth.
 	ChainBlocks int64
 	// BudgetBlocks is this engine's dispatch budget in blocks (DispatchGate.BudgetBlocks).
 	BudgetBlocks int64
-	// Idle reports that NOTHING is in flight on the engine — no chain running and no
-	// reservation outstanding (a turn admitted in the Pick->PreRequest window IS in
-	// flight, even though its exact keys have not arrived yet).
+	// Idle reports that NOTHING is in flight on the engine — no chain running and no reservation
+	// outstanding (a turn admitted in the Pick->PreRequest window IS in flight, even though its
+	// exact keys have not arrived yet).
 	Idle bool
 }
 
-// DispatchGate answers exactly one question: may this seated branch's turn RUN on its
-// engine now?
-//
-// THE SEAM IS EMPTY, DELIBERATELY. The seat budget is the whole admission control: an
-// admitted turn runs, which is what NoopDispatchGate answers and the only value the
-// config accepts. A gate that BINDS needs the engine's running-set accounting (the
-// dedup-exact union of its in-flight requests' chain blocks, plus the charges those
-// requests hold outside their keys); the trim removed that accounting with its parked
-// implementation, so a future gate re-adds the numbers it prices — one implementation of
-// this interface plus one config value, per the module contract. What must NOT come back
-// with it is the OLD per-engine gate's input: endpoint metrics (a construction-time
-// clone that froze and latched) or a raw request count. The accounting must be the EPP's
-// own, per engine, by construction.
-//
-// A gate does not RANK: it excludes a head for this pass, and the scheduler keeps its
-// own order (FIFO by turn arrival among the dispatch-eligible — see PickFromHeadsEngine).
+// DispatchGate answers exactly one question: may this seated branch's turn RUN on its engine
+// now?
 type DispatchGate interface {
 	Name() string
-	// BudgetBlocks is this engine's dispatch budget in blocks, from its measured GPU
-	// capacity (num_gpu_blocks). 0 means NO dispatch budget: the gate can never bind,
-	// which is what the default answers and what an unmeasured engine gets (it takes no
-	// seats anyway, so it has no seated head to gate).
+	// BudgetBlocks is this engine's dispatch budget in blocks, from its measured GPU capacity
+	// (num_gpu_blocks). 0 means NO dispatch budget: the gate can never bind, which is what the
+	// default answers and what an unmeasured engine gets (it takes no seats anyway, so it has no
+	// seated head to gate).
 	BudgetBlocks(numBlocks int) int64
-	// Allows is the decision. It must not store the context (the hot path reuses none of
-	// it and relies on the value staying on the stack).
+	// Allows is the decision.
 	Allows(c DispatchCtx) bool
 }
 
-// NoopDispatchGate never holds a dispatch: the seat budget is the admission control and
-// an admitted turn runs. It is the ONE wired value ("none").
+// NoopDispatchGate never holds a dispatch: the seat budget is the admission control and an
+// admitted turn runs.
 type NoopDispatchGate struct{}
 
 func (NoopDispatchGate) Name() string { return "none" }
@@ -531,42 +401,24 @@ func (NoopDispatchGate) Allows(DispatchCtx) bool { return true }
 
 // ---- SAFETY ------------------------------------------------------------------
 
-// SafetyDetector is the SAFETY seam. The ONE wired value is NoopSafety: the seat
-// budget is the whole admission control ("safety: none").
-//
-// THE PRECONDITION A FUTURE NET INHERITS (R5): it may be consulted ONLY inside the
-// decision pass — Pick, under the scheduler's own mutex, on the queue view that pass just
-// synced — and never from the ticker, a hook or a background read. A net priced at one
-// moment and acted on at another is the SECOND DECISION PATH R5 removed (a stale view
-// justified evictions nobody asked for), so the seam takes its inputs as arguments from
-// the pass and reads nothing of its own. The only wired value answers a constant, which is
-// why nothing can violate the rule today; the rule is what keeps a new one from re-opening
-// the hole.
-//
-// The memory-only net (threshold = the budget's own fraction, live kv scrape) was the
-// parked alternative and is REMOVED with its readers: the per-engine holds that asked
-// it, the pool score the framework detector returned, and the live-sample staleness
-// rule. What remains of the seam is the type: a future net is one implementation of
-// this interface plus one config value, and it must bring its own evidence — the trim
-// also removed the verdict path (safetyFiredLocked) rather than leaving a hook nothing
-// can reach.
+// SafetyDetector is the SAFETY seam.
 type SafetyDetector interface {
 	Name() string
-	// Threshold is the utilisation at which the net fires (the budget's own
-	// fraction: no second constant).
+	// Threshold is the utilisation at which the net fires (the budget's own fraction: no second
+	// constant).
 	Threshold() float64
-	// Fired reports whether a scrape fires the net. have=false (no snapshot, or a
-	// stale one) is OPEN: the seat budget is the primary control, so a detector that
-	// fails closed would only add a stall mode of its own.
+	// Fired reports whether a scrape fires the net. have=false (no snapshot, or a stale one) is
+	// OPEN: the seat budget is the primary control, so a detector that fails closed would only
+	// add a stall mode of its own.
 	Fired(kv float64, have bool) bool
-	// Score is the utilisation the framework's Saturation signal uses: kv /
-	// Threshold, so 1.0 means exactly "firing".
+	// Score is the utilisation the framework's Saturation signal uses: kv / Threshold, so 1.0
+	// means exactly "firing".
 	Score(kv float64, have bool) float64
 }
 
-// class3Less is the mid-quantum (class 3) victim order: UNSTARTED or WANTING branches
-// sort last (they have not had the seat long enough for it to be worth reclaiming),
-// then the oldest last completion, then the id.
+// class3Less is the mid-quantum (class 3) victim order: UNSTARTED or WANTING branches sort
+// last (they have not had the seat long enough for it to be worth reclaiming), then the oldest
+// last completion, then the id.
 func class3Less(a, b *branch) bool {
 	aRaw := a.seatTurns == 0 || !a.waitingSince.IsZero()
 	bRaw := b.seatTurns == 0 || !b.waitingSince.IsZero()
@@ -576,8 +428,7 @@ func class3Less(a, b *branch) bool {
 	return olderCompletion(a, b)
 }
 
-// NoopSafety never fires: dispatch and admission are governed by the seat budget
-// alone.
+// NoopSafety never fires: dispatch and admission are governed by the seat budget alone.
 type NoopSafety struct{}
 
 func (NoopSafety) Name() string { return "none" }
@@ -590,8 +441,7 @@ func (NoopSafety) Score(float64, bool) float64 { return 0 }
 
 // ---- the bundle --------------------------------------------------------------
 
-// modules is the wired set. NewScheduler builds it ONCE from Config; nothing below
-// ever consults Config for a policy decision again (no cross-module knobs).
+// modules is the wired set.
 type modules struct {
 	sizer    SeatBudget
 	entry    EntryOrder
@@ -602,8 +452,8 @@ type modules struct {
 	gate     DispatchGate
 }
 
-// buildModules resolves one implementation per interface from the config's single
-// selector value, failing closed on an unknown value.
+// buildModules resolves one implementation per interface from the config's single selector
+// value, failing closed on an unknown value.
 func buildModules(cfg Config) (modules, error) {
 	var m modules
 	switch cfg.Sizing {

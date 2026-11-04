@@ -17,12 +17,6 @@ limitations under the License.
 package groupsched
 
 // THE CORE MECHANISM SUITE.
-//
-// EVERY test here runs at N=1 AND N=2 (the twins rule): the single-engine stack is
-// the N=1 case of the same code, so a behaviour that only holds at one engine count
-// is a bug by definition. forEngines(t, fn) is the twin runner; fn receives a
-// fixture whose engines are named e0, e1 and whose capacity is 1000 blocks each
-// (budget 950) unless the test overrides it.
 
 import (
 	"fmt"
@@ -43,8 +37,8 @@ func keys(n int, seed Hash) []Hash {
 	return out
 }
 
-// seedFor derives a DISTINCT block key set per (branch, size) — two branches must not
-// share blocks by accident, or the index's dedup would hide the second one's footprint.
+// seedFor derives a DISTINCT block key set per (branch, size) — two branches must not share
+// blocks by accident, or the index's dedup would hide the second one's footprint.
 func seedFor(id string) Hash {
 	h := Hash(1469598103934665603)
 	for i := 0; i < len(id); i++ {
@@ -53,22 +47,22 @@ func seedFor(id string) Hash {
 	return h
 }
 
-// chainOf is the EXACT prefill chain a head of n blocks of a branch's own content has:
-// the blocks are the branch's own keys, so two branches share nothing unless a test
-// gives them the same seed on purpose.
+// chainOf is the EXACT prefill chain a head of n blocks of a branch's own content has: the
+// blocks are the branch's own keys, so two branches share nothing unless a test gives them the
+// same seed on purpose.
 func chainOf(id string, blocks int) []Chain {
 	return []Chain{{Keys: keys(blocks, seedFor(id)), Tokens: blocks * 64}}
 }
 
-// chainPrefixedBy is a chain whose first prefixBlocks keys are another branch's: the
-// shared-prefix shape (a fork, or a turn that grows an existing prompt).
+// chainPrefixedBy is a chain whose first prefixBlocks keys are another branch's: the shared-
+// prefix shape (a fork, or a turn that grows an existing prompt).
 func chainPrefixedBy(prefix string, prefixBlocks int, own string, ownBlocks int) []Chain {
 	k := append(keys(prefixBlocks, seedFor(prefix)), keys(ownBlocks, seedFor(own))...)
 	return []Chain{{Keys: k, Tokens: (prefixBlocks + ownBlocks) * 64}}
 }
 
-// head is one queue head for branch id (ago = how long it has waited), carrying the
-// branch's exact chain of n blocks.
+// head is one queue head for branch id (ago = how long it has waited), carrying the branch's
+// exact chain of n blocks.
 func head(id string, ago time.Duration, blocks int) Head {
 	return Head{Branch: id, ReqID: "r-" + id, Arrival: time.Now().Add(-ago),
 		Chains: chainOf(id, blocks)}
@@ -81,12 +75,6 @@ func headWithChain(id string, ago time.Duration, chains []Chain) Head {
 
 // dispatch drives the released-request path: Pick chose the head, the framework picked the
 // engine, PreRequest records the in-flight request.
-//
-// IT TAKES A DECISION PASS FIRST, at the pass clock, with the released turn no longer queued:
-// that is the released WINDOW (between the release and PreRequest), and in production a
-// ~1 kHz Pick lands inside it. Calling Dispatched straight after the Pick hid every rule that
-// read the window as idle (B2); the pass is part of the lifecycle now, so a fixture cannot
-// skip it by accident.
 func dispatch(t *testing.T, s *Scheduler, id string) {
 	t.Helper()
 	s.PickFromHeads(nil, s.now)
@@ -103,7 +91,6 @@ func settle(s *Scheduler, id string, prompt, cached int) {
 }
 
 // ---- the request map, for a test that declares a branch's request state directly ----
-//
 // A request is tracked by ONE record (scheduler.go's reqRec), so a test that wants "this
 // branch has a request at a pod" writes that record the way PreRequest does and lets the
 // branch's derived counts follow it — never the fields directly, which is exactly the
@@ -132,7 +119,6 @@ func noInFlightLocked(s *Scheduler, m *branch) {
 }
 
 // pendingLocked replaces m's released-but-not-at-a-pod record with reqID ("" clears it).
-// The caller holds s.mu.
 func pendingLocked(s *Scheduler, m *branch, now time.Time, reqID string) {
 	for rid, rec := range s.reqs {
 		if rec.branch == m.id && rec.pod.IsZero() {
@@ -148,9 +134,8 @@ func pendingLocked(s *Scheduler, m *branch, now time.Time, reqID string) {
 }
 
 // releasedWindow is the decision pass that lands between a release and PreRequest in
-// production (Pick runs at ~1 kHz; a fixture that dispatches immediately has no window at
-// all, which is how every rule that read the window as idle stayed hidden). The released turn
-// is no longer queued, so the pass is given no heads.
+// production (Pick runs at ~1 kHz; a fixture that dispatches immediately has no window at all,
+// which is how every rule that read the window as idle stayed hidden).
 func releasedWindow(s *Scheduler, now time.Time) {
 	s.PickFromHeads(nil, now)
 }
@@ -208,8 +193,8 @@ func (fx *engineSet) branch(t *testing.T, id string) (*branch, *engineGroup) {
 	return nil, nil
 }
 
-// g is the fixture's FIRST engine group (the single-engine assertions' target; at
-// N=2 a test that means "any engine" must say so explicitly).
+// g is the fixture's FIRST engine group (the single-engine assertions' target; at N=2 a test
+// that means "any engine" must say so explicitly).
 func (fx *engineSet) g() *engineGroup { return fx.s.groups[fx.ids[0]] }
 
 // allGroups is every engine group of the fixture, in id order.
@@ -231,8 +216,8 @@ func (fx *engineSet) pickEngine(hs ...Head) (string, int) {
 	return fx.s.PickFromHeadsEngine(hs, fx.clock)
 }
 
-// seatOn seats one branch on a NAMED engine through the public path (the seat-time
-// choice must agree with the ask, or the test's premise is broken).
+// seatOn seats one branch on a NAMED engine through the public path (the seat-time choice must
+// agree with the ask, or the test's premise is broken).
 func (fx *engineSet) seatOn(t *testing.T, engine, id string, blocks int, ago time.Duration) {
 	t.Helper()
 	fx.seatOne(t, id, blocks, ago)
@@ -241,10 +226,9 @@ func (fx *engineSet) seatOn(t *testing.T, engine, id string, blocks int, ago tim
 	}
 }
 
-// tighten makes room scarce on the FIRST engine and absent everywhere else: the
-// test seats its own branches first, then every OTHER engine is filled to its budget
-// with one 950-block filler (the most-free-budget rule puts each one there). A test
-// that asserts "only one seat fits" is then true at N=1 and at N=2 alike.
+// tighten makes room scarce on the FIRST engine and absent everywhere else: the test seats its
+// own branches first, then every OTHER engine is filled to its budget with one 950-block
+// filler (the most-free-budget rule puts each one there).
 func (fx *engineSet) tighten(t *testing.T) {
 	t.Helper()
 	for i, e := range fx.ids {
@@ -263,7 +247,8 @@ func (fx *engineSet) tighten(t *testing.T) {
 	fx.s.mu.Unlock()
 }
 
-// newSched is the legacy single-engine fixture// newSched is the legacy single-engine fixture (the "" engine id, capacity 1000).
+// newSched is the legacy single-engine fixture// newSched is the legacy single-engine fixture
+// (the "" engine id, capacity 1000).
 func newSched(t *testing.T) *Scheduler {
 	t.Helper()
 	s, err := NewScheduler(defaultConfig())
@@ -288,8 +273,8 @@ func (fx *engineSet) seatOne(t *testing.T, id string, blocks int, ago time.Durat
 
 // ---- the tests ----
 
-// A branch with a queued head dispatches immediately once seated; an unknown branch
-// is never seated by dispatching to it (non-branches never run unseated).
+// A branch with a queued head dispatches immediately once seated; an unknown branch is never
+// seated by dispatching to it (non-branches never run unseated).
 func TestMemberServedAndUnknownNeverSeated(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 100, time.Second)
@@ -306,13 +291,13 @@ func TestMemberServedAndUnknownNeverSeated(t *testing.T) {
 	})
 }
 
-// Newcomers go first among the WAITING heads (D1 as f0p ran it), and the seat goes
-// to the newcomer even though the returning branch has waited longer.
+// Newcomers go first among the WAITING heads (D1 as f0p ran it), and the seat goes to the
+// newcomer even though the returning branch has waited longer.
 func TestNewcomerFirstThenOldest(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-		// fill EVERY engine's budget so exactly ONE of the two queued heads can be
-		// seated (the twin rule: at N=2 the second engine must not simply take it)
-		// the filler lands on e0 (id tie), THEN the other engines are closed off
+		// fill EVERY engine's budget so exactly ONE of the two queued heads can be seated (the twin
+		// rule: at N=2 the second engine must not simply take it) the filler lands on e0 (id tie),
+		// THEN the other engines are closed off
 		fx.seatOne(t, "filler", 800, 5*time.Second)
 		settle(fx.s, "filler", 800, 800)
 		fx.tighten(t)
@@ -330,8 +315,8 @@ func TestNewcomerFirstThenOldest(t *testing.T) {
 	})
 }
 
-// Among two WAITING heads of the same class, the OLDEST arrival is the head, and it
-// is the one that gets the seat.
+// Among two WAITING heads of the same class, the OLDEST arrival is the head, and it is the one
+// that gets the seat.
 func TestOldestWaiterIsTheHead(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		// the filler lands on e0 (id tie), THEN the other engines are closed off
@@ -349,8 +334,8 @@ func TestOldestWaiterIsTheHead(t *testing.T) {
 	})
 }
 
-// The quantum Q is the tenure rule: a branch that completed Q busy periods is
-// rotation-eligible, one mid-quantum is not. Q4 vs Q8 is a VALUE, same code.
+// The quantum Q is the tenure rule: a branch that completed Q busy periods is rotation-
+// eligible, one mid-quantum is not.
 func TestQuantumIsTheTenureRule(t *testing.T) {
 	for _, q := range []int{4, 8} {
 		q := q
@@ -403,19 +388,19 @@ func TestInFlightNeverEligible(t *testing.T) {
 	})
 }
 
-// The budget valve (MEMORY PRESSURE): when an engine's footprint grows past its
-// budget, the victim is the DONE branch (no queued turn) — never the branch that is
-// waiting to run (f0p's order).
+// The budget valve (MEMORY PRESSURE): when an engine's footprint grows past its budget, the
+// victim is the DONE branch (no queued turn) — never the branch that is waiting to run (f0p's
+// order).
 func TestBudgetValvePrefersTheDoneMember(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-		// order matters: the first branch lands on e0 (id tie), THEN the other
-		// engines are closed off, so the second branch has to share e0
+		// order matters: the first branch lands on e0 (id tie), THEN the other engines are closed
+		// off, so the second branch has to share e0
 		fx.seatOne(t, "done", 450, 5*time.Second)
 		settle(fx.s, "done", 450, 450) // finished its turn: no queued head
 		fx.tighten(t)
 		fx.seatOne(t, "busy", 450, 4*time.Second)
-		// `busy` wants to run again (a queued head) and its next prompt is 200 blocks
-		// longer: 450 + 650 > 950 budget => the valve must fire
+		// `busy` wants to run again (a queued head) and its next prompt is 200 blocks longer: 450 +
+		// 650 > 950 budget => the valve must fire
 		fx.s.mu.Lock()
 		fx.g().branches["busy"].waitingSince = fx.clock.Add(-time.Second)
 		fx.g().branches["busy"].lastActivity = fx.clock
@@ -441,14 +426,8 @@ func TestBudgetValvePrefersTheDoneMember(t *testing.T) {
 	})
 }
 
-// No eviction while in flight: a branch with a running request is marked exiting at
-// most, never removed, until the drain completes.
-//
-// The GROWTH of a seated branch is charged when its turn is DISPATCHED (a seat is an
-// admission right: the turn runs, and the overage it creates is enforcement's business on
-// the next pass, with the grower in flight). So the sequence is: the grown head is served,
-// the next pass marks the branch, and the branch leaves once both of its requests have
-// drained.
+// No eviction while in flight: a branch with a running request is marked exiting at most,
+// never removed, until the drain completes.
 func TestNoEvictionWhileInFlight(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 400, 2*time.Second)
@@ -459,9 +438,8 @@ func TestNoEvictionWhileInFlight(t *testing.T) {
 		if i := fx.pick(head("m", time.Millisecond, 700)); i != 0 {
 			t.Fatalf("the branch's second head must be served (in-flight cap), got %d", i)
 		}
-		// THE RELEASED WINDOW: between the release and PreRequest nothing has reached a pod
-		// yet, and in production a ~1 kHz Pick lands HERE. That pass must not evict the
-		// branch (the old fixture dispatched immediately, which hid the window entirely).
+		// THE RELEASED WINDOW: between the release and PreRequest nothing has reached a pod yet, and
+		// in production a ~1 kHz Pick lands HERE.
 		fx.s.PickFromHeads(nil, fx.clock)
 		if !fx.s.Seated("m") {
 			t.Fatal("a released window is in flight: the branch must never be evicted inside it")
@@ -482,9 +460,6 @@ func TestNoEvictionWhileInFlight(t *testing.T) {
 
 // m8: a branch evicted while it has a QUEUED head re-enters the shared queue with THAT HEAD's
 // cost and class — not with the chain the engine last ran, and not with a forced "returner".
-// The old re-queue used index.ChainsLocked (the turn that just finished) and returner=true, so
-// the next seat was priced for the wrong prompt and the entry order was told an incumbent was
-// an incumbent whatever its queued head was.
 func TestExitRequeuesWithTheQueuedHead(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 100, time.Second) // it ran a 100-block turn
@@ -525,12 +500,7 @@ func overOf(fx *engineSet) int64 {
 	return fx.s.overBudgetLocked(fx.g())
 }
 
-// AN EXITING MEMBER'S BLOCKS STAY ON THE USED SIDE UNTIL IT DRAINS. Marking a
-// branch exiting says "do not dispatch, do not re-seat" — it says nothing about the
-// engine, which keeps the branch's blocks pinned until the running request finishes.
-// Excluding them from the budget at the mark was a plain accounting bug: the budget
-// then believed it had 14-18 % of the pool free while the pool was still paying for
-// it (measured on the multi-pod wave).
+// AN EXITING MEMBER'S BLOCKS STAY ON THE USED SIDE UNTIL IT DRAINS.
 func TestExitingMemberStaysOnTheUsedSideUntilDrain(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		for i := range fx.ids {
@@ -567,9 +537,9 @@ func TestExitingMemberStaysOnTheUsedSideUntilDrain(t *testing.T) {
 	})
 }
 
-// An exiting branch that cannot be freed must END the enforcement pass: marking is
-// idempotent and its blocks stay charged, so re-picking it would spin the loop
-// forever under the scheduler's mutex.
+// An exiting branch that cannot be freed must END the enforcement pass: marking is idempotent
+// and its blocks stay charged, so re-picking it would spin the loop forever under the
+// scheduler's mutex.
 func TestExitingVictimDoesNotSpinEnforcement(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 900, 2*time.Second)
@@ -580,9 +550,9 @@ func TestExitingVictimDoesNotSpinEnforcement(t *testing.T) {
 		// way over budget with the only branch already exiting
 		g.budgetBlocks = 100
 		fx.s.mu.Unlock()
-		// The enforcement pass runs BEFORE Tick's queue re-sync, so a clock this far
-		// ahead leaves the queue view untrustworthy — the one path that names an
-		// already-exiting branch as the victim.
+		// The enforcement pass runs BEFORE Tick's queue re-sync, so a clock this far ahead leaves
+		// the queue view untrustworthy — the one path that names an already-exiting branch as the
+		// victim.
 		fx.clock = fx.clock.Add(60 * time.Second)
 		done := make(chan struct{})
 		go func() {
@@ -600,13 +570,9 @@ func TestExitingVictimDoesNotSpinEnforcement(t *testing.T) {
 	})
 }
 
-// The cold-entry valve: one cold entry is ALWAYS allowed (R11); a second waits until
-// the first's prefill completes — and the cap is PER ENGINE, so at N=2 the second
-// oversized entry may seat immediately on the sibling engine.
-//
-// The cap is DERIVED from the engine: 10,000 blocks at 0.95 leaves 500 blocks of
-// headroom = 32,000 tokens, so a 1,000-block entry is twice the cap and still fits
-// the budget by a mile — the valve, not the budget, is the binding constraint.
+// The cold-entry valve: one cold entry is ALWAYS allowed (R11); a second waits until the
+// first's prefill completes — and the cap is PER ENGINE, so at N=2 the second oversized entry
+// may seat immediately on the sibling engine.
 func TestColdEntryValveIsPerEngine(t *testing.T) {
 	forEnginesCap(t, defaultConfig(), 10000, func(t *testing.T, fx *engineSet) {
 		big := 1000 // twice the derived cap (500 blocks), far inside the budget
@@ -642,8 +608,8 @@ func TestColdEntryValveIsPerEngine(t *testing.T) {
 	})
 }
 
-// Anonymous traffic (R9) is served when no branch head is dispatchable, is never
-// tracked, and never outranks a branch's head.
+// Anonymous traffic (R9) is served when no branch head is dispatchable, is never tracked, and
+// never outranks a branch's head.
 func TestAnonymousPassThrough(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		anon := Head{Branch: "", ReqID: "anon-1", Arrival: fx.clock.Add(-time.Second)}
@@ -664,9 +630,9 @@ func TestAnonymousPassThrough(t *testing.T) {
 // Hold the line: a blocked head does not let a later, smaller head jump it.
 func TestHoldTheLine(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-		// both residents must live on ONE engine, so the tests' own branches are seated
-		// first (the first lands on e0 by the id tie) and THEN the other engines are
-		// closed off; a resident that still lands elsewhere makes the shape invalid
+		// both residents must live on ONE engine, so the tests' own branches are seated first (the
+		// first lands on e0 by the id tie) and THEN the other engines are closed off; a resident
+		// that still lands elsewhere makes the shape invalid
 		fx.seatOne(t, "m1", 450, 3*time.Second)
 		settle(fx.s, "m1", 450, 450)
 		fx.tighten(t)
@@ -701,19 +667,14 @@ func TestHoldTheLine(t *testing.T) {
 	})
 }
 
-// No starvation: under steady load every branch with a queued turn is eventually
-// seated. The fixture is production-shaped (arrival_fixture_test.go): a head exists
-// from its arrival until it is dispatched, an unserved branch keeps its head however
-// long it waits, and the newcomer class is branch identity's arrival record.
+// No starvation: under steady load every branch with a queued turn is eventually seated.
 func TestNoStarvation(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		w := newWorkload(t, fx)
 
-		// THE SHAPE — every engine FULL, and the same shape at any engine count: one
-		// small anchor per engine (a headless branch that holds 40 of the 950 blocks)
-		// and three residents per engine on top of it. Without the anchors the
-		// residents would spread and an engine would keep room for a waiter; with
-		// them, "no seat fits" is true at N=1 and at N=2 alike.
+		// THE SHAPE — every engine FULL, and the same shape at any engine count: one small anchor
+		// per engine (a headless branch that holds 40 of the 950 blocks) and three residents per
+		// engine on top of it.
 		for _, engine := range fx.ids {
 			w.seatStatic(t, "anchor-"+engine, engine, 40)
 		}
@@ -746,8 +707,8 @@ func TestNoStarvation(t *testing.T) {
 			}
 			t.Fatal("the fixture could not seat and turn over its residents")
 		}
-		// NON-VACUITY, per engine: the budgets really are full, so every waiter's seat
-		// costs a rotation (the check is the fixture's, not the scheduler's)
+		// NON-VACUITY, per engine: the budgets really are full, so every waiter's seat costs a
+		// rotation (the check is the fixture's, not the scheduler's)
 		fx.s.mu.Lock()
 		for _, g := range fx.s.activeGroupsLocked() {
 			if free := fx.s.freeBudgetLocked(g); free >= 300 {
@@ -757,8 +718,8 @@ func TestNoStarvation(t *testing.T) {
 		}
 		fx.s.mu.Unlock()
 
-		// eight branches nobody has served: each has ONE queued turn (its first) from
-		// now until it dispatches
+		// eight branches nobody has served: each has ONE queued turn (its first) from now until it
+		// dispatches
 		var waiters []string
 		for i := 0; i < 8; i++ {
 			waiters = append(waiters, fmt.Sprintf("w%d", i))
@@ -797,9 +758,9 @@ func TestNoStarvation(t *testing.T) {
 				t.Errorf("starvation: %s never held a seat", id)
 			}
 		}
-		// CONTENTION, restated from the scheduler's own books: the budgets were full when
-		// the waiters arrived and nothing frees blocks except an exit, so every waiter's
-		// seat must have cost at least one eviction
+		// CONTENTION, restated from the scheduler's own books: the budgets were full when the
+		// waiters arrived and nothing frees blocks except an exit, so every waiter's seat must have
+		// cost at least one eviction
 		exits := int64(0)
 		for _, n := range fx.s.Snapshot().Exits {
 			exits += n
@@ -812,10 +773,7 @@ func TestNoStarvation(t *testing.T) {
 }
 
 // C8, MADE TO BITE: a branch with a QUEUED TURN is not idle — even silent past S, and even
-// while that turn cannot dispatch (the in-flight cap holds it). The fixture used to set
-// waitingSince by hand and then run a Tick; a Tick no longer decides anything (R5), so the
-// assertion could not fail. This one drives the REAL sync with the head in the queue view, and
-// asserts the tenure rule refuses the branch.
+// while that turn cannot dispatch (the in-flight cap holds it).
 func TestWaitingMemberIsNotIdleEvicted(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 400, time.Second)
@@ -845,8 +803,8 @@ func TestWaitingMemberIsNotIdleEvicted(t *testing.T) {
 		if !fx.s.Seated("m") {
 			t.Fatal("a branch with a queued turn must not be evicted (C8)")
 		}
-		// and a Tick alone decides nothing (R5): no decision point, no eviction — the gate
-		// being closed can never manufacture one
+		// and a Tick alone decides nothing (R5): no decision point, no eviction — the gate being
+		// closed can never manufacture one
 		fx.tick(5 * time.Minute)
 		if !fx.s.Seated("m") {
 			t.Fatal("a Tick must not evict: decisions live in Pick (R5)")
@@ -854,10 +812,9 @@ func TestWaitingMemberIsNotIdleEvicted(t *testing.T) {
 	})
 }
 
-// NO RECORD BEFORE PreRequest (R7): a request that is picked and never reaches a pod
-// leaves no in-flight record at all — the branch carries the released window instead, and
-// the terminal callback the handler forces for every scheduled request closes it. Nothing
-// is invented: no provisional record, no synthetic id.
+// NO RECORD BEFORE PreRequest (R7): a request that is picked and never reaches a pod leaves no
+// in-flight record at all — the branch carries the released window instead, and the terminal
+// callback the handler forces for every scheduled request closes it.
 func TestNoRecordBeforePreRequest(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 100, time.Second)
@@ -897,8 +854,8 @@ func TestNoRecordBeforePreRequest(t *testing.T) {
 	})
 }
 
-// A leaked cold charge is re-derived away at the next decision point
-// (derive-don't-accumulate).
+// A leaked cold charge is re-derived away at the next decision point (derive-
+// don't-accumulate).
 func TestLeakedColdChargeVanishesOnDerive(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 100, time.Second)
@@ -914,8 +871,8 @@ func TestLeakedColdChargeVanishesOnDerive(t *testing.T) {
 	})
 }
 
-// The SEAT/EXIT event log carries the fairness id and the engine (the join key the
-// E4a instrumentation exists for).
+// The SEAT/EXIT event log carries the fairness id and the engine (the join key the E4a
+// instrumentation exists for).
 func TestSeatExitEventsCarryFairnessIDAndEngine(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		h := head("m", time.Second, 100)
@@ -966,12 +923,12 @@ func contains(s, sub string) bool {
 	return false
 }
 
-// BUG 2: the MID-QUANTUM victim order never takes a seat back from a branch that has
-// not served a turn in this residency while a branch that HAS served one is available.
+// BUG 2: the MID-QUANTUM victim order never takes a seat back from a branch that has not
+// served a turn in this residency while a branch that HAS served one is available.
 func TestClass3VictimPrefersAServedMember(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-		// two residents, both with a queued head (so class 2 finds nothing), neither
-		// eligible by the tenure rule
+		// two residents, both with a queued head (so class 2 finds nothing), neither eligible by the
+		// tenure rule
 		fx.seatOne(t, "served", 200, 9*time.Second)
 		settle(fx.s, "served", 200, 200) // served one turn
 		fx.seatOne(t, "fresh", 200, 8*time.Second)
@@ -1001,8 +958,8 @@ func TestClass3VictimPrefersAServedMember(t *testing.T) {
 	})
 }
 
-// BUG 3 (the C8 race): a head that arrives just before a Tick protects its branch, and
-// a STALE queue view must never justify an idle eviction.
+// BUG 3 (the C8 race): a head that arrives just before a Tick protects its branch, and a STALE
+// queue view must never justify an idle eviction.
 func TestStaleQueueViewNeverIdleEvicts(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 200, time.Second)
@@ -1013,8 +970,8 @@ func TestStaleQueueViewNeverIdleEvicts(t *testing.T) {
 		if !fx.s.Seated("m") {
 			t.Fatal("BUG 3: a head present at the last sync must protect its branch from an idle eviction")
 		}
-		// (b) no Pick has run for longer than S (the flow controller's gate is closed):
-		// the queue view is stale, so silence is NOT evidence and nothing may be evicted
+		// (b) no Pick has run for longer than S (the flow controller's gate is closed): the queue
+		// view is stale, so silence is NOT evidence and nothing may be evicted
 		fx.s.mu.Lock()
 		m := fx.g().branches["m"]
 		m.waitingSince = time.Time{} // the flag went stale exactly as in the race
@@ -1027,18 +984,15 @@ func TestStaleQueueViewNeverIdleEvicts(t *testing.T) {
 	})
 }
 
-// ONE DEPARTURE, ONE BOOKING. A mid-flight branch is MARKED exiting (a state: ExitingMembers
-// and friends, no event), and the departure reaches the exit hook ONCE, at the drain — the
-// mark used to be booked as an exit too, so every mid-flight departure counted twice in the
-// same series. BUG 4(b): a rotation victim is never a branch with something in flight.
+// ONE DEPARTURE, ONE BOOKING.
 func TestExitingIsCountedAndRotationNeverPicksInflight(t *testing.T) {
 	cfg := defaultConfig()
 	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
 		var hooked []string
 		fx.s.onExit = func(engine, reason string, turns int) { hooked = append(hooked, reason) }
-		// a branch filling most of the budget, in flight — and a SIBLING on the SAME engine,
-		// also in flight, so the growth cannot be RULE O's sole oversize resident (that one
-		// is deliberately not a pressure victim at all: see TestRuleOWaitsForTenureNotPressure)
+		// a branch filling most of the budget, in flight — and a SIBLING on the SAME engine, also in
+		// flight, so the growth cannot be RULE O's sole oversize resident (that one is deliberately
+		// not a pressure victim at all: see TestRuleOWaitsForTenureNotPressure)
 		fx.seatOne(t, "run", 800, 5*time.Second)
 		fx.s.Chunk("run") // its prefill landed: the cold valve is free for the sibling
 		fx.closeEnginesExcept(t, fx.ids[0], 950)
@@ -1049,9 +1003,9 @@ func TestExitingIsCountedAndRotationNeverPicksInflight(t *testing.T) {
 		m.waitingSince = time.Time{}
 		m.lastActivity = fx.clock.Add(-time.Hour) // silent, so class 2 has a victim...
 		fx.s.mu.Unlock()
-		// ...but the branch is in flight, so class 2 skips it: force class 4 by taking the
-		// engine over budget with the branch's own next prompt (400 blocks longer), which
-		// sync charges in the same pass enforcement runs in
+		// ...but the branch is in flight, so class 2 skips it: force class 4 by taking the engine
+		// over budget with the branch's own next prompt (400 blocks longer), which sync charges in
+		// the same pass enforcement runs in
 		fx.dispatchBig(t, "run", 1200)
 		fx.s.mu.Lock()
 		fx.s.enforceBudgetLocked(fx.g(), fx.clock)
@@ -1087,24 +1041,22 @@ func TestExitingIsCountedAndRotationNeverPicksInflight(t *testing.T) {
 	})
 }
 
-// dispatchBig serves a branch's next turn whose PROMPT is `blocks` long (the head carries
-// the whole chain, so the growth is whatever the new prompt adds), through the public API.
+// dispatchBig serves a branch's next turn whose PROMPT is `blocks` long (the head carries the
+// whole chain, so the growth is whatever the new prompt adds), through the public API.
 func (fx *engineSet) dispatchBig(t *testing.T, id string, blocks int) {
 	t.Helper()
 	h := head(id, time.Second, blocks)
 	h.ReqID = "r-" + id + "-grow"
-	// the growth is charged at SYNC, inside this pass, so enforcement may already have
-	// condemned the branch by the time the dispatch is chosen — the pass order is
-	// sync → enforce → rotate/seat → dispatch, and a prompt that no longer fits must not
-	// run. The pick's answer is therefore the fixture's to ignore.
+	// the growth is charged at SYNC, inside this pass, so enforcement may already have condemned
+	// the branch by the time the dispatch is chosen — the pass order is sync → enforce →
+	// rotate/seat → dispatch, and a prompt that no longer fits must not run.
 	if i := fx.pick(h); i >= 0 {
 		fx.s.Dispatched(id, h.ReqID, fx.clock)
 	}
 }
 
-// When no branch head is dispatchable, the pass-through fallback serves the OLDEST
-// anonymous (or uncostable) head. The snapshot's head order is the queue iteration order,
-// so taking the first such head would serve an arbitrary one of them.
+// When no branch head is dispatchable, the pass-through fallback serves the OLDEST anonymous
+// (or uncostable) head.
 func TestPassThroughServesTheOldest(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		young := Head{Branch: "", ReqID: "anon-young", Arrival: fx.clock}
@@ -1116,20 +1068,14 @@ func TestPassThroughServesTheOldest(t *testing.T) {
 	})
 }
 
-// SetNumBlocks attaches the measured capacity for the fixture's ONE engine (the ""
-// engine id): the production path names engines, a single-engine test does not have to.
+// SetNumBlocks attaches the measured capacity for the fixture's ONE engine (the "" engine id):
+// the production path names engines, a single-engine test does not have to.
 func (s *Scheduler) SetNumBlocks(blockSizeTokens, numBlocks int) error {
 	return s.SetNumBlocksFor("", blockSizeTokens, numBlocks)
 }
 
 // THE ENGINE-IDLE RULE NEVER FIRES WHILE A BRANCH IS DISPATCHABLE (the must-keep lesson M19/
-// F7 had no regression test). The rule exists to free a seat when the seats are held by
-// branches that cannot use them; a resident with a queued turn that this very pass will
-// dispatch CAN use its seat, so taking it away is the seat-swapping livelock the guard
-// prevents — an eviction followed by the same branch's re-admission, on every pass.
-//
-// The witness is the pass itself: the blocked waiter and the dispatchable resident arrive
-// together, nothing is evicted, and the resident's turn is what goes out.
+// F7 had no regression test).
 func TestEngineIdleNeverFiresWhileABranchIsDispatchable(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		var exits []string

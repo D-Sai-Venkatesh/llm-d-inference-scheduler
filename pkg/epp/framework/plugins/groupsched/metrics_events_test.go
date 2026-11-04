@@ -17,12 +17,6 @@ limitations under the License.
 package groupsched
 
 // EVERY KEPT COUNTER MOVES ON ITS OWN EVENT, and on nothing else.
-//
-// A series is a promise about an EVENT, not about a code path that happens to run: a
-// valve counter that counted loop passes instead of heads waited on, or a metric that is
-// registered and never incremented, reads as a healthy zero and voids every conclusion
-// drawn from it. So each counter here is driven by exactly one event, its delta is read
-// from the registry, and the neighbouring series are checked not to move.
 
 import (
 	"testing"
@@ -37,8 +31,8 @@ import (
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 )
 
-// metricFixture wires the plugin's metric hooks to a fresh registry, so a test can read
-// one series' delta without a scrape.
+// metricFixture wires the plugin's metric hooks to a fresh registry, so a test can read one
+// series' delta without a scrape.
 type metricFixture struct {
 	s   *Scheduler
 	reg *prometheus.Registry
@@ -157,8 +151,8 @@ func TestCounterExitsMovesOnItsEvent(t *testing.T) {
 		t.Fatalf("exits_total{reason=%q} = %v, want 1", reason, got)
 	}
 	// the other reasons are pre-instantiated at 0 (a zero is a fact, an absent series is a
-	// question) — but only the reasons an exit can actually happen for: a stale one would
-	// sit in every scrape as a line that can never move.
+	// question) — but only the reasons an exit can actually happen for: a stale one would sit in
+	// every scrape as a line that can never move.
 	if _, ok := gatherValue(t, f.reg, subsystem+"_exits_total", map[string]string{"engine": "e0", "reason": "quantum-complete"}); !ok {
 		t.Fatal("every live exit reason must be pre-instantiated for a known engine")
 	}
@@ -167,8 +161,8 @@ func TestCounterExitsMovesOnItsEvent(t *testing.T) {
 	}
 }
 
-// cold_valve_held_total moves when the VALVE holds a head — once per pass that holds it,
-// not once per candidate engine and not once per loop iteration.
+// cold_valve_held_total moves when the VALVE holds a head — once per pass that holds it, not
+// once per candidate engine and not once per loop iteration.
 func TestCounterColdValveHeldMovesOnItsEvent(t *testing.T) {
 	f := newMetricFixture(t, "e0")
 	// a resident whose cold charge fills the cap (5 % of 1000 blocks = 3200 tokens)
@@ -214,8 +208,8 @@ func TestCounterEngineGoneMovesOnItsEvent(t *testing.T) {
 	}
 }
 
-// affinity_violations_total and rebinds_total move on an OBSERVED engine that disagrees
-// with the seat.
+// affinity_violations_total and rebinds_total move on an OBSERVED engine that disagrees with
+// the seat.
 func TestCountersAffinityAndRebindMoveOnTheirEvent(t *testing.T) {
 	f := newMetricFixture(t, "e0", "e1")
 	now := time.Unix(1793000000, 0).UTC()
@@ -234,8 +228,8 @@ func TestCountersAffinityAndRebindMoveOnTheirEvent(t *testing.T) {
 }
 
 // and the SERIES covers BOTH sites: a violation whose symptom is the settle (the request ran
-// on an engine other than the one it was charged to, so there is nothing left to rebind)
-// moves the same counter — and must NOT move rebinds_total, because nothing was repaired.
+// on an engine other than the one it was charged to, so there is nothing left to rebind) moves
+// the same counter — and must NOT move rebinds_total, because nothing was repaired.
 func TestCounterAffinityViolationMovesAtTheSettleToo(t *testing.T) {
 	f := newMetricFixture(t, "e0", "e1")
 	now := time.Unix(1793000000, 0).UTC()
@@ -267,8 +261,7 @@ func TestCounterCapacityLearnedMovesOnItsEvent(t *testing.T) {
 }
 
 // anomalies_total is ONE counter for the events the policy cannot act on, and every kind is
-// SHOULD-BE-ZERO. Each kind is driven by its own event here, and the neighbouring kinds are
-// checked not to move — the point of the fold is that a growing kind names its cause.
+// SHOULD-BE-ZERO.
 func TestCounterAnomaliesMoveOnTheirEvent(t *testing.T) {
 	now := time.Unix(1793000000, 0).UTC()
 
@@ -298,8 +291,8 @@ func TestCounterAnomaliesMoveOnTheirEvent(t *testing.T) {
 
 	t.Run("stray_settle", func(t *testing.T) {
 		f := newMetricFixture(t, "e0")
-		// a settle for a request nothing tracks: a late reap, a duplicate callback, or a
-		// branch that has left — it must change state and be counted
+		// a settle for a request nothing tracks: a late reap, a duplicate callback, or a branch that
+		// has left — it must change state and be counted
 		f.s.SettleOnUsage("", "never-released", "", 100, 0, 0, true, now)
 		if got := f.value(t, "anomalies_total", map[string]string{"kind": anomalyStraySettle}); got != 1 {
 			t.Fatalf("anomalies_total{stray_settle}: %v, want 1", got)
@@ -310,10 +303,7 @@ func TestCounterAnomaliesMoveOnTheirEvent(t *testing.T) {
 	})
 }
 
-// THE PRE-CAPACITY WINDOW IS VISIBLE IN dispatches_total. Before an engine's num_gpu_blocks
-// arrives the policy seats nothing and serves every request unseated; that dispatch belongs to
-// no engine, so it is counted under engine="nocapacity". Without it the series reads 0 while
-// requests are served, and nothing distinguishes "serving unseated" from "serving nothing".
+// THE PRE-CAPACITY WINDOW IS VISIBLE IN dispatches_total.
 func TestPreCapacityDispatchIsCountedOnTheNocapacitySeries(t *testing.T) {
 	ctx := t.Context()
 	plugin, err := Factory("gs", nil, nil)

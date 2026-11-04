@@ -16,8 +16,8 @@ limitations under the License.
 
 package groupsched
 
-// PLUGIN-LEVEL TESTS: the framework-facing surface (detector, Filter, capacity
-// learning, the live-metrics rule) plus the config/emitter guard.
+// PLUGIN-LEVEL TESTS: the framework-facing surface (detector, Filter, capacity learning, the
+// live-metrics rule) plus the config/emitter guard.
 
 import (
 	"context"
@@ -33,8 +33,7 @@ import (
 
 // ---- framework test doubles ----
 
-// liveEndpoint is ONE datalayer endpoint (the type the DETECTOR receives). It is a
-// ModelServer, i.e. the mutable object the datastore updates in place.
+// liveEndpoint is ONE datalayer endpoint (the type the DETECTOR receives).
 func liveEndpoint(id string, kv float64, waiting, blockSize, numBlocks int, at time.Time) *fwkdl.ModelServer {
 	meta := &fwkdl.EndpointMetadata{Name: id, Address: id + ":8080",
 		ID: types.NamespacedName{Namespace: "ns", Name: id}}
@@ -44,10 +43,7 @@ func liveEndpoint(id string, kv float64, waiting, blockSize, numBlocks int, at t
 	})
 }
 
-// schedulerEndpoint is the SCHEDULING-layer endpoint (the type the Filter takes). NOTE:
-// fwksched.NewEndpoint CLONES the metrics it is given — which is exactly the property
-// that makes a remembered endpoint handle a FROZEN input (the E-wave latch), and why
-// nothing in the core reads policy inputs from one.
+// schedulerEndpoint is the SCHEDULING-layer endpoint (the type the Filter takes).
 func schedulerEndpoint(id string) fwksched.Endpoint {
 	return fwksched.NewEndpoint(&fwkdl.EndpointMetadata{Name: id, Address: id + ":8080",
 		ID: types.NamespacedName{Namespace: "ns", Name: id}},
@@ -66,11 +62,8 @@ func livePods(eps ...*fwkdl.ModelServer) []fwkdl.Endpoint {
 // podsOf is the Filter's input: scheduling-layer endpoints.
 func podsOf(eps ...fwksched.Endpoint) []fwksched.Endpoint { return eps }
 
-// requestFor builds the request the Filter and PreRequest are handed for a branch's
-// released turn — "" means an untracked (anonymous) request. Its id is the one the queue
-// head carried (head()/headWithChain() mint "r-"+id), because that id is how a hook
-// resolves its branch: the branch attribute rides along exactly as the real request has it,
-// and reading it is what the scoped hooks must NOT need.
+// requestFor builds the request the Filter and PreRequest are handed for a branch's released
+// turn — "" means an untracked (anonymous) request.
 func requestFor(branch string) *fwksched.InferenceRequest {
 	ir := &fwksched.InferenceRequest{RequestID: "r-" + branch, RequestSizeBytes: 4096}
 	if branch != "" {
@@ -79,8 +72,8 @@ func requestFor(branch string) *fwksched.InferenceRequest {
 	return ir
 }
 
-// newTestPlugin builds the plugin around a scheduler with n engines of `blocks`
-// capacity each (no metrics registrar: unit mode).
+// newTestPlugin builds the plugin around a scheduler with n engines of `blocks` capacity each
+// (no metrics registrar: unit mode).
 func newTestPlugin(t *testing.T, cfg Config, n, blocks int) *GroupScheduler {
 	t.Helper()
 	s, err := NewScheduler(cfg)
@@ -95,9 +88,9 @@ func newTestPlugin(t *testing.T, cfg Config, n, blocks int) *GroupScheduler {
 	p := &GroupScheduler{typedName: fwkplugin.TypedName{Type: PluginType, Name: "gs"},
 		cfg: cfg, sched: s, metrics: newGroupMetrics(s), pins: newPinTable(),
 		endpoints: map[string]*endpointState{}, hetero: map[string]struct{}{}}
-	// the pin table follows the seats AND the request identities, exactly as Factory
-	// wires it (a Filter resolves a scoped request's branch from the mirror, not from an
-	// attribute the scope would refuse)
+	// the pin table follows the seats AND the request identities, exactly as Factory wires it (a
+	// Filter resolves a scoped request's branch from the mirror, not from an attribute the scope
+	// would refuse)
 	s.onBind = func(branch, engine string) { p.pins.set(branch, engine) }
 	s.onUnbind = func(branch string) { p.pins.del(branch) }
 	s.onRelease = func(branch, reqID string) { p.pins.setRequest(reqID, branch) }
@@ -105,14 +98,14 @@ func newTestPlugin(t *testing.T, cfg Config, n, blocks int) *GroupScheduler {
 	return p
 }
 
-// engineID is the engine id the core will see for the i-th test endpoint: the
-// endpoint's own datalayer key (namespace/name) — the same value endpointKey yields.
+// engineID is the engine id the core will see for the i-th test endpoint: the endpoint's own
+// datalayer key (namespace/name) — the same value endpointKey yields.
 func engineID(i int) string { return "ns/" + string(rune('a'+i)) }
 
 // ---- the detector ----
 
-// The DEFAULT detector answer is "not saturated": the seat budget is the admission
-// control, so the flow controller's pool gate never closes on this policy.
+// The DEFAULT detector answer is "not saturated": the seat budget is the admission control, so
+// the flow controller's pool gate never closes on this policy.
 func TestDetectorDefaultsToNotSaturated(t *testing.T) {
 	for _, n := range []int{1, 2} {
 		p := newTestPlugin(t, defaultConfig(), n, 1000)
@@ -124,8 +117,8 @@ func TestDetectorDefaultsToNotSaturated(t *testing.T) {
 		if got := p.Saturation(context.Background(), livePods(eps...)); got != 0 {
 			t.Fatalf("N=%d: the default detector must answer 0 (not saturated), got %v", n, got)
 		}
-		// the live candidate set is still remembered on the ticker: it is the capacity
-		// retry's input (a remembered endpoint clone could never see the geometry arrive)
+		// the live candidate set is still remembered on the ticker: it is the capacity retry's input
+		// (a remembered endpoint clone could never see the geometry arrive)
 		p.pushEngineLoad()
 		if got := p.sampleCandidates(); len(got) != n {
 			t.Fatalf("N=%d: the ticker must sample one reading per engine, got %d", n, len(got))
@@ -133,8 +126,8 @@ func TestDetectorDefaultsToNotSaturated(t *testing.T) {
 	}
 }
 
-// The detector CONFLICT guard: a second detector in the same config is announced
-// (exactly one may answer the flow-control gate).
+// The detector CONFLICT guard: a second detector in the same config is announced (exactly one
+// may answer the flow-control gate).
 func TestDetectorIdentityGate(t *testing.T) {
 	p := newTestPlugin(t, defaultConfig(), 1, 1000)
 	if got := p.otherDetectors(); len(got) != 0 {
@@ -142,8 +135,8 @@ func TestDetectorIdentityGate(t *testing.T) {
 	}
 }
 
-// Capacity rides the LIVE path (the event-time copy may carry an empty geometry), and
-// the per-engine liveness alarm is per engine.
+// Capacity rides the LIVE path (the event-time copy may carry an empty geometry), and the per-
+// engine liveness alarm is per engine.
 func TestCapacityLearnedFromLiveSamples(t *testing.T) {
 	p := newTestPlugin(t, defaultConfig(), 0, 0)
 	if p.sched.HasCapacity() {
@@ -162,10 +155,9 @@ func TestCapacityLearnedFromLiveSamples(t *testing.T) {
 	}
 }
 
-// BENCHMARK: the flow controller polls the detector at ~1 kHz, so Saturation must be a
-// couple of loads and NO allocation on the default (noop) path.
-//
-//	go test -run xxx -bench BenchmarkSaturation -benchmem ./pkg/epp/framework/plugins/groupsched/
+// BENCHMARK: the flow controller polls the detector at ~1 kHz, so Saturation must be a couple
+// of loads and NO allocation on the default (noop) path. go test -run xxx -bench
+// BenchmarkSaturation -benchmem ./pkg/epp/framework/plugins/groupsched/
 func BenchmarkSaturationNoop(b *testing.B) {
 	cfg := defaultConfig()
 	s, err := NewScheduler(cfg)

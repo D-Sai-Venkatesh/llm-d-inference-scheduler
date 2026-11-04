@@ -17,29 +17,6 @@ limitations under the License.
 package groupsched
 
 // THE RANDOMIZED INVARIANT TEST.
-//
-// A long random event stream — arrivals, Picks, dispatches, settles, aborts, engines
-// appearing and disappearing — driven through the PUBLIC API at N=1 and N=2, with every
-// invariant the design states checked after EVERY event:
-//
-//	I1/I7  used  = the union of the seated branches' chains (exiting ones included)
-//	       stay  = the union over the branches that are not exiting
-//	       no refcount below zero (the index panics on underflow, so this is the panic)
-//	R4     after every pass: |stay| <= budget, OR no eligible victim was left — always
-//	       one of the two, and it is recorded which. (RULE O's exception: an engine whose
-//	       SOLE staying resident is an oversize seat is over budget BY DESIGN, and pressure
-//	       must not touch it — tenure releases it.)
-//	B2     an engine's cold charge never exceeds its derived cap
-//	B10    every seated branch is bound to EXACTLY ONE engine, and the binding names it
-//	I6     nothing is seated on an engine whose capacity is unknown
-//	I2/F2  strict head-of-line: when the head fits nowhere and has no victim, nothing
-//	       behind it is seated
-//	I3     the whole run is deterministic for a fixed seed (no map-order decision)
-//	I8     the decisions move only on exogenous events and our own model: the test drives
-//	       nothing the scheduler itself pins (no metric reads, no self-reported signal)
-//
-// The trace is a digest of every decision, so determinism is checked on the DECISIONS,
-// not on the counters.
 
 import (
 	"fmt"
@@ -72,11 +49,11 @@ type invStream struct {
 	branches []string
 }
 
-// newInvStream builds a seeded event stream: arrivals grow a branch's prompt (a turn),
-// and every collision of lifetimes is possible. capacity is the per-engine measured block
-// count, so the stream can also produce an OVERSIZE head (a prompt whose exact cost exceeds
-// the seat budget on every engine) — RULE O's trigger, which has to be exercised randomly,
-// not only by the hand-written cases.
+// newInvStream builds a seeded event stream: arrivals grow a branch's prompt (a turn), and
+// every collision of lifetimes is possible. capacity is the per-engine measured block count,
+// so the stream can also produce an OVERSIZE head (a prompt whose exact cost exceeds the seat
+// budget on every engine) — RULE O's trigger, which has to be exercised randomly, not only by
+// the hand-written cases.
 func newInvStream(seed int64, n, capacity int) *invStream {
 	rng := rand.New(rand.NewSource(seed))
 	s := &invStream{}
@@ -89,8 +66,8 @@ func newInvStream(seed int64, n, capacity int) *invStream {
 		switch rng.Intn(20) {
 		case 0, 1, 2, 3, 4: // an arrival: a new turn, a bigger prompt
 			if rng.Intn(6) == 0 {
-				// an OVERSIZE prompt: past the whole seat budget (0.95 of capacity), so it
-				// cannot fit an occupied engine and only RULE O can admit it anywhere
+				// an OVERSIZE prompt: past the whole seat budget (0.95 of capacity), so it cannot fit an
+				// occupied engine and only RULE O can admit it anywhere
 				sizes[b] = capacity + 50 + rng.Intn(capacity/2+1)
 			} else {
 				sizes[b] += 20 + rng.Intn(120)
@@ -112,8 +89,6 @@ func newInvStream(seed int64, n, capacity int) *invStream {
 }
 
 // invRun drives one stream against a fresh scheduler and returns the decision trace.
-// Every invariant is asserted after every event; a violation fails the test with the
-// event index.
 func invRun(t *testing.T, seed int64, engines, capacity int, events int) string {
 	t.Helper()
 	s, err := NewScheduler(defaultConfig())
@@ -176,11 +151,8 @@ func invRun(t *testing.T, seed int64, engines, capacity int, events int) string 
 			if !s.Seated(h.Branch) {
 				t.Fatalf("event %d: %s was dispatched without a seat", i, h.Branch)
 			}
-			// the request left the queue and is NOT yet in flight: PreRequest is the
-			// director's own call, on another goroutine, and the ~1 kHz Pick runs in between
-			// (the released window). So a decision pass happens HERE, on the queue view that
-			// no longer contains the released turn — the step whose absence hid B2, where
-			// every rule read a branch on its way to the pod as idle.
+			// the request left the queue and is NOT yet in flight: PreRequest is the director's own
+			// call, on another goroutine, and the ~1 kHz Pick runs in between (the released window).
 			delete(queued, h.Branch)
 			s.PickFromHeads(nil, clock)
 			trace.WriteString("dispatch " + h.Branch + " " + engine + "\n")
@@ -217,8 +189,8 @@ func invRun(t *testing.T, seed int64, engines, capacity int, events int) string 
 		clock = clock.Add(time.Millisecond)
 		checkInvariants(t, s, i, capacity)
 	}
-	// the whole-policy view has to be self-consistent at the end too: the top-level used side
-	// is the sum of the per-engine ones, and the seats are the bindings
+	// the whole-policy view has to be self-consistent at the end too: the top-level used side is
+	// the sum of the per-engine ones, and the seats are the bindings
 	snap := s.Snapshot()
 	sumNE, sumSeats := 0, 0
 	for id, es := range snap.Engines {
@@ -260,8 +232,8 @@ func checkInvariants(t *testing.T, s *Scheduler, event int, capacity int) {
 			if victim != nil && !s.soleOversizeLocked(g, victim) {
 				t.Fatalf("event %d: %s is %d blocks over its budget with an eligible victim %s (R4)", event, g.id, over, victim.id)
 			}
-			// no victim — or the only candidate is RULE O's sole oversize resident, which
-			// pressure must leave alone: the pass is DONE either way
+			// no victim — or the only candidate is RULE O's sole oversize resident, which pressure must
+			// leave alone: the pass is DONE either way
 		}
 		for id := range g.branches {
 			if prev, dup := seats[id]; dup {
@@ -340,8 +312,8 @@ func TestDecisionStreamIsDeterministic(t *testing.T) {
 	}
 }
 
-// TestStrictHeadOfLineUnderI2: when the head fits nowhere and has no victim, nothing
-// behind it is seated — the head keeps the queue.
+// TestStrictHeadOfLineUnderI2: when the head fits nowhere and has no victim, nothing behind it
+// is seated — the head keeps the queue.
 func TestStrictHeadOfLineUnderI2(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		w := newWorkload(t, fx)
@@ -372,11 +344,9 @@ func TestStrictHeadOfLineUnderI2(t *testing.T) {
 				break
 			}
 		}
-		// EVERY RESIDENT GOES IN FLIGHT and nothing settles again: a branch with a request at
-		// a pod is never evictable, and an engine whose residents are all running is not
-		// engine-idle — the one state in which a head that fits nowhere truly has no victim.
-		// (RULE O grants an EMPTY engine one oversize head, so the strict-head-of-line shape
-		// has to be "no seat can be freed", not "the head is bigger than the budget".)
+		// EVERY RESIDENT GOES IN FLIGHT and nothing settles again: a branch with a request at a pod
+		// is never evictable, and an engine whose residents are all running is not engine-idle — the
+		// one state in which a head that fits nowhere truly has no victim.
 		for _, id := range residents {
 			w.arrive(id, fx.clock.Add(-time.Second))
 		}
@@ -393,9 +363,9 @@ func TestStrictHeadOfLineUnderI2(t *testing.T) {
 				t.Fatalf("fixture: %s must be in flight, so nothing is evictable", id)
 			}
 		}
-		// now a BIG head arrives (three times any seat budget, so it fits no engine even
-		// empty) and a small one behind it: no victim exists anywhere, so the head keeps the
-		// queue and the small one must not be seated
+		// now a BIG head arrives (three times any seat budget, so it fits no engine even empty) and
+		// a small one behind it: no victim exists anywhere, so the head keeps the queue and the
+		// small one must not be seated
 		w.setPromptBytes("big", maxBudget(fx)*3*256)
 		w.arrive("big", fx.clock.Add(-time.Minute))
 		w.arrive("small", fx.clock.Add(-time.Second))

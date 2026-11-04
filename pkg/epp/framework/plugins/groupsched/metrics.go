@@ -25,43 +25,27 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// groupMetrics exports the MINIMAL set an operator needs to see liveness and fairness
-// or to diagnose a known failure class — nineteen names, and nothing else. The test for
-// every one of them: would its absence cost an operator a decision or a diagnosis?
-//
-//	admission state   seats · ne_blocks · budget_blocks · waiters_shared
-//	drain / cascade   exiting_branches · exiting_blocks · exiting_oldest_age_seconds
-//	valve             cold_inflight_tokens · cold_cap_tokens · cold_valve_held_total
-//	startup           capacity_missing · capacity_learned_total
-//	decisions         dispatches_total · exits_total{reason}
-//	fairness          entry_wait_seconds{kind=new|reentry}   (ONE histogram)
-//	lifecycle         engine_gone_total · rebinds_total · affinity_violations_total
-//	integrity         anomalies_total{kind}   (every kind should be 0)
-//
-// EVERY per-engine series carries an `engine` label, whose value is the endpoint id:
-// `sum(llm_d_epp_group_seats)` is the whole-policy seat count with one engine and with N.
+// groupMetrics exports the MINIMAL set an operator needs to see liveness and fairness or to
+// diagnose a known failure class — nineteen names, and nothing else.
 type groupMetrics struct {
 	sched *Scheduler
 
 	seats        *prometheus.GaugeVec
 	neBlocks     *prometheus.GaugeVec
 	budgetBlocks *prometheus.GaugeVec
-	// The EXITING ledger: the enforcement view's inputs, per engine. The used side includes
-	// branches that are already leaving, so "how much of it is leaving" is a first-class
-	// number: without these three, an engine that is busy and an engine whose drains have
-	// stopped look the same in every other series.
+	// The EXITING ledger: the enforcement view's inputs, per engine.
 	exitingBranches *prometheus.GaugeVec
 	exitingBlocks   *prometheus.GaugeVec
 	exitingOldest   *prometheus.GaugeVec
 	coldInFlight    *prometheus.GaugeVec
 	coldCap         *prometheus.GaugeVec
-	// waitersShared is the SHARED waiter queue's size (one number, no engine label,
-	// because a waiter belongs to no engine until one seats it).
+	// waitersShared is the SHARED waiter queue's size (one number, no engine label, because a
+	// waiter belongs to no engine until one seats it).
 	waitersShared prometheus.Gauge
 	exits         *prometheus.CounterVec
-	// entryWait is ONE histogram for BOTH seat waits (newcomer and re-entry), split by
-	// `kind`: they answer the same question (how long did admission make this branch
-	// wait), and two names meant two bucket sets and two queries.
+	// entryWait is ONE histogram for BOTH seat waits (newcomer and re-entry), split by `kind`:
+	// they answer the same question (how long did admission make this branch wait), and two names
+	// meant two bucket sets and two queries.
 	entryWait *prometheus.HistogramVec
 	served    *prometheus.CounterVec
 
@@ -73,14 +57,10 @@ type groupMetrics struct {
 	rebinds            prometheus.Counter
 	engineGone         prometheus.Counter
 	// anomalies is the ONE kept counter for the events the policy cannot act on, by kind
-	// (anomalyKinds). Every kind is SHOULD-BE-ZERO: a lost render, an unnameable request, a
-	// settle for a request nothing tracks. One counter, one question: "is the accounting
-	// intact?"
+	// (anomalyKinds).
 	anomalies *prometheus.CounterVec
-	// coldValveHeld counts heads the cold-entry VALVE held back: the budget would have
-	// admitted the head, the valve refused it, so the head WAITED for the engine's
-	// prefill slot. Nothing is evicted for it (the sizing signal: what the stagger
-	// costs in waiting).
+	// coldValveHeld counts heads the cold-entry VALVE held back: the budget would have admitted
+	// the head, the valve refused it, so the head WAITED for the engine's prefill slot.
 	coldValveHeld *prometheus.CounterVec
 
 	known map[string]struct{}
@@ -144,12 +124,12 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.affinityViolations, g.rebinds, g.engineGone, g.coldValveHeld, g.anomalies,
 	} {
 		if err := reg.Register(c); err != nil {
-			// A SECOND instantiation in one process (a config reload, or a second
-			// plugin config in the same test binary) must not fail startup: the series
-			// exist and belong to the first instance.
+			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
+			// same test binary) must not fail startup: the series exist and belong to the first
+			// instance.
 			if _, dup := err.(prometheus.AlreadyRegisteredError); dup {
-				// One group scheduler per process is the supported configuration; a second
-				// instance would double-register every series.
+				// One group scheduler per process is the supported configuration; a second instance would
+				// double-register every series.
 				log.FromContext(context.Background()).V(logutil.DEFAULT).Info("group-scheduler: WARNING metrics already registered in this process — this instance will not emit its own series")
 				continue
 			}
@@ -159,19 +139,14 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	return nil
 }
 
-// Refresh pushes a scheduler snapshot into the gauges (the ticker calls it every
-// second; the counters and histograms are observed at their events by the
-// scheduler).
+// Refresh pushes a scheduler snapshot into the gauges (the ticker calls it every second; the
+// counters and histograms are observed at their events by the scheduler).
 func (g *groupMetrics) Refresh() {
 	if g == nil || g.seats == nil {
 		return
 	}
 	snap := g.sched.SnapshotLite()
-	// PRE-INSTANTIATE the per-engine counter series for every known engine. A
-	// *CounterVec has no series until its first observation, so before any dispatch a
-	// scrape would carry no llm_d_epp_group_dispatches_total at all — and the deploy
-	// pre-flight (which requires that series) failed on exactly that on the first
-	// live multi-pod stack. A ZERO is a fact; an absent series is a question.
+	// PRE-INSTANTIATE the per-engine counter series for every known engine.
 	seen := make(map[string]struct{}, len(snap.Engines))
 	for label, es := range snap.Engines {
 		seen[label] = struct{}{}
@@ -185,11 +160,7 @@ func (g *groupMetrics) Refresh() {
 		g.exitingBlocks.WithLabelValues(label).Set(float64(es.ExitingBlocks))
 		g.exitingOldest.WithLabelValues(label).Set(es.ExitingOldestAgeS)
 		g.served.WithLabelValues(label).Add(0)
-		// One series per DEPARTURE reason. "exiting" is not one: the mark of a mid-flight
-		// branch is a STATE (exitingBranches / exitingBlocks / exitingOldest), and booking it
-		// as an exit too counted every mid-flight departure twice in this same series.
-		// "budget-exiting" survives only as the name enforcement would use if a marked
-		// branch could not be re-marked — it is never a departure either.
+		// One series per DEPARTURE reason.
 		for _, reason := range []string{"quantum-complete", "idle", "engine-idle",
 			"exiting-drain", "budget-idle", "budget-noqueue", "engine-gone"} {
 			g.exits.WithLabelValues(label, reason).Add(0)
@@ -211,8 +182,8 @@ func (g *groupMetrics) Refresh() {
 	// the pre-capacity bucket exists from the first scrape: a zero is a fact, and this is the
 	// series that says "no request was served before capacity arrived"
 	g.served.WithLabelValues(nocapacityEngine).Add(0)
-	// ONE zero series per anomaly kind: a zero is a fact, an absent series is a question (and
-	// a should-be-zero count with no series is the shape of a bug nobody notices).
+	// ONE zero series per anomaly kind: a zero is a fact, an absent series is a question (and a
+	// should-be-zero count with no series is the shape of a bug nobody notices).
 	for _, kind := range anomalyKinds {
 		g.anomalies.WithLabelValues(kind).Add(0)
 	}
@@ -227,8 +198,7 @@ func (g *groupMetrics) ObserveExit(engine, reason string) {
 }
 
 // ObserveEntry records ONE seat wait, split by kind: "new" for a branch's first turn,
-// "reentry" for a returning branch. Both were separate histograms; they answer the same
-// question.
+// "reentry" for a returning branch.
 func (g *groupMetrics) ObserveEntry(engine, kind string, waitSeconds float64) {
 	if g == nil || g.entryWait == nil {
 		return
@@ -245,8 +215,6 @@ func (g *groupMetrics) ObserveServed(engine string) {
 }
 
 // ObserveAffinityViolation records a request that landed off the engine it was charged to.
-// It is fired from BOTH sites — the PreRequest observation (which also rebinds) and the
-// settle — so the series covers the whole violation class, not half of it.
 func (g *groupMetrics) ObserveAffinityViolation(from, to string) {
 	if g == nil || g.affinityViolations == nil {
 		return
@@ -254,9 +222,7 @@ func (g *groupMetrics) ObserveAffinityViolation(from, to string) {
 	g.affinityViolations.WithLabelValues(from, to).Inc()
 }
 
-// ObserveRebind records the seat MOVE that repaired a violation. Separate from the
-// violation itself: a violation found at the settle repairs nothing, so counting rebinds off
-// the same event would overstate the repairs.
+// ObserveRebind records the seat MOVE that repaired a violation.
 func (g *groupMetrics) ObserveRebind() {
 	if g == nil || g.rebinds == nil {
 		return

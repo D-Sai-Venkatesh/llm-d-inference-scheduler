@@ -25,16 +25,14 @@ import (
 	testutils "github.com/llm-d/llm-d-router/test/utils"
 )
 
-// stubPlugin is a minimal plugin carrying only a TypedName (the startup
-// gate inspects nothing else).
+// stubPlugin is a minimal plugin carrying only a TypedName (the startup gate inspects nothing
+// else).
 type stubPlugin struct{ tn fwkplugin.TypedName }
 
 func (s *stubPlugin) TypedName() fwkplugin.TypedName { return s.tn }
 
-// TestFactoryRequiresTokenProducer: the startup fail-closed gate lives at
-// RegisterDependencies (construction order is not config order; the gate
-// runs after ALL plugins are built). It fails without a token-producer
-// sibling and passes with one.
+// TestFactoryRequiresTokenProducer: the startup fail-closed gate lives at RegisterDependencies
+// (construction order is not config order; the gate runs after ALL plugins are built).
 func TestFactoryRequiresTokenProducer(t *testing.T) {
 	ctx := t.Context()
 

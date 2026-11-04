@@ -16,8 +16,8 @@ limitations under the License.
 
 package groupsched
 
-// THE BLOCK INDEX's own suite: the two refcounts, the exact cost, and the property the
-// binary search rests on (residency is prefix-closed).
+// THE BLOCK INDEX's own suite: the two refcounts, the exact cost, and the property the binary
+// search rests on (residency is prefix-closed).
 
 import (
 	"fmt"
@@ -35,14 +35,14 @@ func newIdx(t *testing.T) *BlockIndex {
 	return idx
 }
 
-// chain is a one-prompt chain of n blocks drawn from a shared or private key space:
-// same seed ⇒ same prefix (the shared-prefix shape), different seed ⇒ no sharing.
+// chain is a one-prompt chain of n blocks drawn from a shared or private key space: same seed
+// ⇒ same prefix (the shared-prefix shape), different seed ⇒ no sharing.
 func chain(seed string, n int) []Chain {
 	return []Chain{{Keys: keys(n, seedFor(seed)), Tokens: n * 64}}
 }
 
-// chainWithPrefix is a chain that REUSES another branch's first prefixBlocks keys: the
-// shape a fork (or a growing turn) has on one engine.
+// chainWithPrefix is a chain that REUSES another branch's first prefixBlocks keys: the shape a
+// fork (or a growing turn) has on one engine.
 func chainWithPrefix(prefix string, prefixBlocks int, own string, ownBlocks int) []Chain {
 	k := append(keys(prefixBlocks, seedFor(prefix)), keys(ownBlocks, seedFor(own))...)
 	return []Chain{{Keys: k, Tokens: (prefixBlocks + ownBlocks) * 64}}
@@ -72,8 +72,8 @@ func TestFailClosedOnUnknownBlockSize(t *testing.T) {
 
 // ---- the exact cost ----
 
-// A head's cost is everything beyond the engine's resident PREFIX: the shared prefix is
-// free, and the partial last block is paid for (it must be computed).
+// A head's cost is everything beyond the engine's resident PREFIX: the shared prefix is free,
+// and the partial last block is paid for (it must be computed).
 func TestCostIsTheColdPartOfTheChain(t *testing.T) {
 	idx := newIdx(t)
 	mustSeat(t, idx, "a", chain("A", 4), 1000)
@@ -96,8 +96,8 @@ func TestCostIsTheColdPartOfTheChain(t *testing.T) {
 	}
 }
 
-// One number, one moment: TrySeat's cost is the same computation the placement module
-// makes, and a rejected seat charges nothing.
+// One number, one moment: TrySeat's cost is the same computation the placement module makes,
+// and a rejected seat charges nothing.
 func TestTrySeatAtomicBudget(t *testing.T) {
 	idx := newIdx(t)
 	mustSeat(t, idx, "a", chain("A", 4), 100)
@@ -120,8 +120,8 @@ func TestTrySeatAtomicBudget(t *testing.T) {
 
 // ---- the two refcounts (R4) ----
 
-// An exiting branch's blocks are still pinned by the engine, so they stay on the USED
-// side and leave the STAY side: that difference is what enforcement acts on.
+// An exiting branch's blocks are still pinned by the engine, so they stay on the USED side and
+// leave the STAY side: that difference is what enforcement acts on.
 func TestExitingMovesStayNotUsed(t *testing.T) {
 	idx := newIdx(t)
 	mustSeat(t, idx, "a", chain("A", 3), 1000)
@@ -155,10 +155,8 @@ func TestExitingDoesNotExcuseASharedBlock(t *testing.T) {
 		t.Fatalf("premise: used %d stay %d, want 5/5", used, stay)
 	}
 	idx.MarkExitingLocked("child")
-	// Only the child's OWN two blocks leave the stay side: the three it shares are still
-	// held by the parent, so they stay. (The excuse-based arithmetic this replaces read
-	// the child's whole set as leaving — used 5 − `exit` 5 = nothing over the budget,
-	// while the parent's three blocks were still pinned.)
+	// Only the child's OWN two blocks leave the stay side: the three it shares are still held by
+	// the parent, so they stay.
 	if got := idx.StayBlocksLocked(); got != 3 {
 		t.Fatalf("stay after the child exits: %d want 3 (the 3 shared blocks stay with the parent)", got)
 	}
@@ -193,8 +191,8 @@ func TestMarkExitingIdempotent(t *testing.T) {
 	idx.mu.Unlock()
 }
 
-// An exiting branch's growth is real KV the engine pins, so it is charged — to the USED
-// side only.
+// An exiting branch's growth is real KV the engine pins, so it is charged — to the USED side
+// only.
 func TestExitingGrowthStaysCharged(t *testing.T) {
 	idx := newIdx(t)
 	mustSeat(t, idx, "a", chain("A", 3), 1000)
@@ -212,13 +210,12 @@ func TestExitingGrowthStaysCharged(t *testing.T) {
 	idx.mu.Unlock()
 }
 
-// Growth replaces the partial tail block: the grown chain's tail is a NEW key, and the
-// old one leaves. The counters follow exactly.
+// Growth replaces the partial tail block: the grown chain's tail is a NEW key, and the old one
+// leaves.
 func TestGrowthReplacesThePartialTail(t *testing.T) {
 	idx := newIdx(t)
-	// 182 tokens is two whole blocks and a partial third; 212 tokens makes that third
-	// whole and adds a partial fourth, so the third block's key CHANGES and a fourth
-	// appears.
+	// 182 tokens is two whole blocks and a partial third; 212 tokens makes that third whole and
+	// adds a partial fourth, so the third block's key CHANGES and a fourth appears.
 	full := keys(2, seedFor("A"))
 	oldTail, newTail, fourth := Hash(0x1001), Hash(0x1002), Hash(0x1003)
 	short := []Chain{{Keys: append(append([]Hash{}, full...), oldTail), Tokens: 182}}
@@ -239,8 +236,8 @@ func TestGrowthReplacesThePartialTail(t *testing.T) {
 	idx.mu.Unlock()
 }
 
-// The record does not outlive the seat: a re-seat costs the branch's chain again,
-// because nothing was remembered between residencies.
+// The record does not outlive the seat: a re-seat costs the branch's chain again, because
+// nothing was remembered between residencies.
 func TestNoResidencyMemoryBetweenSeats(t *testing.T) {
 	idx := newIdx(t)
 	mustSeat(t, idx, "a", chain("A", 4), 1000)
@@ -267,22 +264,16 @@ func TestDoubleUnseatIsSafeNoOp(t *testing.T) {
 
 // ---- R2's property: prefix closure, and the binary search equals a brute-force scan ----
 
-// TestPrefixClosureAndSearchCost runs random seat/grow/exit sequences and checks, after
-// every step, (1) that residency is PREFIX-CLOSED — if block i of a chain is held, every
-// block before it is — and (2) that the O(log n) cost equals the brute-force count of the
-// chain's blocks the engine does not hold. (2) is what the search is worth on; (1) is why
-// it is legal.
-//
-// The chains are built the way production builds them: as prefixhash chains of TOKEN
-// streams, so sharing is a shared token prefix and every key commits to the blocks before
-// it. (Synthetic key lists cannot express that commitment, and a test built from them can
-// "share" a block at two different positions — which no real chain can.)
+// TestPrefixClosureAndSearchCost runs random seat/grow/exit sequences and checks, after every
+// step, (1) that residency is PREFIX-CLOSED — if block i of a chain is held, every block
+// before it is — and (2) that the O(log n) cost equals the brute-force count of the chain's
+// blocks the engine does not hold.
 func TestPrefixClosureAndSearchCost(t *testing.T) {
 	idx := newIdx(t)
 	rng := rand.New(rand.NewSource(42))
 	ids := []string{"s0", "s1", "s2", "s3", "s4"}
-	// three shared prompt prefixes of different lengths: every branch extends one of them
-	// with its own tail, which is the fork/growth shape the engine dedups
+	// three shared prompt prefixes of different lengths: every branch extends one of them with
+	// its own tail, which is the fork/growth shape the engine dedups
 	shared := [][]uint32{}
 	for i := 0; i < 3; i++ {
 		shared = append(shared, tokenRun(1+3*i, 40+i*17))
@@ -365,8 +356,8 @@ func tokenRun(seed, n int) []uint32 {
 	return out
 }
 
-// bruteCost is the cost without the prefix argument: every chain block the engine does
-// not hold.
+// bruteCost is the cost without the prefix argument: every chain block the engine does not
+// hold.
 func bruteCost(idx *BlockIndex, chains []Chain) int {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -421,12 +412,8 @@ func chainsClone(c []Chain) []Chain {
 	return out
 }
 
-// THE GROWTH'S SAME-SHAPE TRAP, pinned: a successor chain of the SAME length and token
-// count but DIFFERENT content is a different chain, and the index must charge it. Branch
-// identity's tolerance allows exactly this (a continuation may differ in its last full
-// block plus the partial block), so a shape-only check kept the OLD keys charged — the next
-// arrival extending the old chain was costed 0 extra (over-admission) and a fork of the new
-// one was costed fully cold (under-utilisation).
+// THE GROWTH'S SAME-SHAPE TRAP, pinned: a successor chain of the SAME length and token count
+// but DIFFERENT content is a different chain, and the index must charge it.
 func TestGrowChargesAnEqualShapeChainWithDifferentContent(t *testing.T) {
 	idx := newIdx(t)
 	old := []Chain{{Keys: []Hash{1, 2}, Tokens: 128}}
@@ -458,8 +445,7 @@ func TestGrowChargesAnEqualShapeChainWithDifferentContent(t *testing.T) {
 }
 
 // COST == CHARGE, the case that used to disagree: a multi-prompt request whose prompts are
-// byte-identical. The charge deduplicated the union; the cost summed per chain, so the fit
-// test saw two prompts' worth of blocks where the seat took one.
+// byte-identical.
 func TestCostEqualsTheChargeForIdenticalPrompts(t *testing.T) {
 	idx := newIdx(t)
 	one := []Chain{{Keys: []Hash{7, 8}, Tokens: 128}}

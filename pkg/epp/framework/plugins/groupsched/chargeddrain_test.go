@@ -17,33 +17,6 @@ limitations under the License.
 package groupsched
 
 // THE CHARGED DRAIN'S RELEASE INVARIANT, ONE TEST PER EXIT PATH.
-//
-// (iii) made an exiting branch's blocks stay on the budget's used side (blocksNE)
-// until it is unseated, because the engine pins them while the request drains. That is
-// sound ONLY if every path that takes a branch out ends at the ONE release point
-// (Unseat/Forget). MarkExiting moves no counter any more, so a branch that becomes
-// exiting and never reaches Unseat/Forget keeps its blocks charged to the budget
-// FOREVER — the engine then looks permanently full, TrySeat refuses every seat, and
-// marking frees nothing, so that engine stops serving: the whole pool, silently.
-// Before (iii) the same lifecycle hole was invisible, because the mark itself dropped
-// the blocks out of NE "by definition".
-//
-// So the inventory has to be exhaustive. A branch becomes EXITING at exactly one site
-// (enforceBudgetLocked's mid-flight class); its in-flight count reaches zero at
-// exactly three (Settle, reapInflightLocked, and nowhere else). Every one of those must
-// end at the release. These tests drive each path for real and assert the same three
-// things every time:
-//
-//	1. the mark moved NO counter (it is a mark, not a release);
-//	2. when the path completes, the exiting branch's charge is GONE — NE is exactly the
-//	   SURVIVING branches' blocks, so the release was neither short nor taken out of
-//	   somebody else's charge (the asymmetry check);
-//	3. the index invariant still holds (blocks == blocksNE here, and nothing
-//	   underflowed — a double release panics).
-//
-// Every test runs at N=1 and N=2 (the twins rule). At N=2 the sibling engine's charge
-// is asserted untouched: a release that reaches across engines is the same class of
-// bug, one engine over.
 
 import (
 	"testing"
@@ -66,15 +39,11 @@ func uniqueOn(fx *engineSet, g *engineGroup) int {
 	return g.index.UniqueBlocksLocked()
 }
 
-// chargedPath runs one path test at N=1 and N=2 with the fixture every path needs:
-// "keep" (a survivor whose charge must never be touched) and "gone" (the branch that
-// becomes exiting), BOTH on the fixture's first engine.
-//
-// fx.tighten closes every other engine with a filler at its whole budget, so both
-// branches land on e0 at N=1 AND at N=2 — the per-engine assertions then mean the same
-// thing at both counts, and the sibling's filler is the cross-engine check. "keep"'s
-// prefill completes (Chunk) so its cold charge is off the valve: otherwise the
-// stagger cap would hold "gone" at the door instead of seating it.
+// chargedPath runs one path test at N=1 and N=2 with the fixture every path needs: "keep" (a
+// survivor whose charge must never be touched) and "gone" (the branch that becomes exiting),
+// BOTH on the fixture's first engine. fx.tighten closes every other engine with a filler at
+// its whole budget, so both branches land on e0 at N=1 AND at N=2 — the per-engine assertions
+// then mean the same thing at both counts, and the sibling's filler is the cross-engine check.
 func chargedPath(t *testing.T, cfg Config, path string, fn func(t *testing.T, fx *engineSet, g *engineGroup)) {
 	t.Helper()
 	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
@@ -95,9 +64,9 @@ func chargedPath(t *testing.T, cfg Config, path string, fn func(t *testing.T, fx
 	})
 }
 
-// markExitingInflight makes "gone" an exiting branch with one in-flight request,
-// exactly as the pressure valve's mid-flight class does, and asserts the mark moved no
-// counter (the whole point of (iii): it is a mark, not a release).
+// markExitingInflight makes "gone" an exiting branch with one in-flight request, exactly as
+// the pressure valve's mid-flight class does, and asserts the mark moved no counter (the whole
+// point of (iii): it is a mark, not a release).
 func markExitingInflight(t *testing.T, fx *engineSet, g *engineGroup, reqID string) {
 	t.Helper()
 	fx.s.mu.Lock()
@@ -121,9 +90,9 @@ func markExitingInflight(t *testing.T, fx *engineSet, g *engineGroup, reqID stri
 	}
 }
 
-// assertReleased is the assertion every path test ends with: "gone" is unseated, its
-// 300 blocks are off the engine's used side, "keep"'s 400 are untouched, the sibling is
-// untouched, and no counter diverged.
+// assertReleased is the assertion every path test ends with: "gone" is unseated, its 300
+// blocks are off the engine's used side, "keep"'s 400 are untouched, the sibling is untouched,
+// and no counter diverged.
 func assertReleased(t *testing.T, fx *engineSet, g *engineGroup, path string) {
 	t.Helper()
 	if fx.s.Seated("gone") {
@@ -157,15 +126,15 @@ func assertReleased(t *testing.T, fx *engineSet, g *engineGroup, path string) {
 func TestChargedDrainSettleReleases(t *testing.T) {
 	chargedPath(t, defaultConfig(), "settle-drain", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-gone")
-		// the request terminates: the finalizer removes the record, sees the branch
-		// exiting and drained, and unseats it.
+		// the request terminates: the finalizer removes the record, sees the branch exiting and
+		// drained, and unseats it.
 		fx.s.SettleOnUsage("gone", "r-gone", g.id, 300, 0, 0, false, fx.clock)
 		assertReleased(t, fx, g, "settle-drain")
 	})
 }
 
-// A settle that does NOT drain the branch (a second request still running) must not
-// release: the blocks are still pinned. Release happens on the LAST drain, once.
+// A settle that does NOT drain the branch (a second request still running) must not release:
+// the blocks are still pinned.
 func TestChargedDrainWaitsForTheLastRequest(t *testing.T) {
 	chargedPath(t, defaultConfig(), "settle-drain-last", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r1")
@@ -186,8 +155,8 @@ func TestChargedDrainWaitsForTheLastRequest(t *testing.T) {
 	})
 }
 
-// A LATE/DUPLICATE settle of an id the record no longer holds is a STRAY: it removes
-// nothing, so it must not be read as a drain (and must not exit anybody).
+// A LATE/DUPLICATE settle of an id the record no longer holds is a STRAY: it removes nothing,
+// so it must not be read as a drain (and must not exit anybody).
 func TestChargedDrainStraySettleDoesNotRelease(t *testing.T) {
 	chargedPath(t, defaultConfig(), "stray-settle", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r1")
@@ -221,15 +190,10 @@ func TestChargedDrainEngineGoneReleases(t *testing.T) {
 }
 
 // ---- path 3: the reap — a termination nobody observed ----
-//
-// This is the class the reviewer pointed at: the settle is NOT the only way an
-// in-flight count reaches zero. reapInflightLocked drops ids whose termination was
-// never observed — a client cancel whose forced EndOfStream never reached the plugin,
-// or a request that errored before its first chunk. Dropping the LAST id IS a drain, so
-// it must finish the exit; the idle exit is not a rescue (its test needs no queued turn,
-// and a branch that still has a head is exactly the branch that is waiting).
-//
-// Idle is pushed out of reach (1e5 s) so the test can only pass on the reap path.
+// This is the class the reviewer pointed at: the settle is NOT the only way an in-flight count
+// reaches zero. reapInflightLocked drops ids whose termination was never observed — a client
+// cancel whose forced EndOfStream never reached the plugin, or a request that errored before
+// its first chunk.
 func TestChargedDrainReapOfCancelledRequestReleases(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.InflightReapSeconds = 60 // the campaign shape's bound, scaled down
@@ -241,12 +205,7 @@ func TestChargedDrainReapOfCancelledRequestReleases(t *testing.T) {
 	})
 }
 
-// A request that died between the RELEASE and PreRequest (an error before the first
-// chunk). Nothing was ever recorded in flight, so there is nothing to drain: the branch is
-// exiting with a live cold charge and no live request. While the window is LIVE it counts as
-// in flight (the branch may be about to run), so nothing happens; once it outlives S it is
-// presumed dead, and the derivation at that decision point releases it — cold charge and
-// all. No timer.
+// A request that died between the RELEASE and PreRequest (an error before the first chunk).
 func TestChargedDrainReleasedWindowReleases(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.IdleSeconds = 5
@@ -277,10 +236,10 @@ func TestChargedDrainReleasedWindowReleases(t *testing.T) {
 	})
 }
 
-// A LEAKED cold charge is recovered by the derivation at the next decision point, and
-// nothing is evicted for it: the engine's valve is closed for everyone while the charge
-// stands, so a charge nobody can explain must go — but a charge a head or a live request
-// explains must stay.
+// A LEAKED cold charge is recovered by the derivation at the next decision point, and nothing
+// is evicted for it: the engine's valve is closed for everyone while the charge stands, so a
+// charge nobody can explain must go — but a charge a head or a live request explains must
+// stay.
 func TestLeakedColdChargeIsReleasedWithoutEvicting(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.IdleSeconds = 1e5
@@ -289,8 +248,8 @@ func TestLeakedColdChargeIsReleasedWithoutEvicting(t *testing.T) {
 		// "keep" is innocent: it holds blocks and nothing else is wrong with it
 		keep := g.branches["keep"]
 		keepCold := keep.coldEntry
-		// "gone" leaked: it was charged at its seat, then its request vanished without a
-		// chunk, a settle or a PreRequest. Nothing explains its charge.
+		// "gone" leaked: it was charged at its seat, then its request vanished without a chunk, a
+		// settle or a PreRequest.
 		m := g.branches["gone"]
 		noInFlightLocked(fx.s, m)
 		m.waitingSince = time.Time{}
@@ -320,14 +279,8 @@ func TestLeakedColdChargeIsReleasedWithoutEvicting(t *testing.T) {
 }
 
 // ---- path 4: TTL, and the idle exit while already exiting ----
-//
-// A branch that is exiting with nothing in flight is NOT a rotation victim: the victim
-// rules skip it (it is already leaving, and marking it again frees nothing). So the TTL
-// sweep is the only thing between it and a permanent charge — and the TTL sweep's own
-// test is "no queued turn". A branch with a queued head keeps its waiting-since fresh
-// on every queue sync, which is the NORMAL state of an oversubscribed engine (measured:
-// 97-112 heads in the shared queue at c128). Hence: the release must not depend on the
-// TTL at all — it must happen the moment the branch is exiting AND drained.
+// A branch that is exiting with nothing in flight is NOT a rotation victim: the victim rules
+// skip it (it is already leaving, and marking it again frees nothing).
 func TestChargedDrainHeadlessIdleReleases(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.InflightReapSeconds = 60
@@ -344,10 +297,8 @@ func TestChargedDrainHeadlessIdleReleases(t *testing.T) {
 	})
 }
 
-// The same branch WITH a queued head still on the books (the common case at c128: it has
-// its next turn waiting). The TTL's idle test never fires for it and rotation and the
-// pressure valve both refuse an exiting branch — so the decision point is the only thing
-// between it and a permanent charge.
+// The same branch WITH a queued head still on the books (the common case at c128: it has its
+// next turn waiting).
 func TestChargedDrainExitingWithQueuedHeadReleases(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.InflightReapSeconds = 60
@@ -367,8 +318,8 @@ func TestChargedDrainExitingWithQueuedHeadReleases(t *testing.T) {
 	})
 }
 
-// ... and while it DOES have a request in flight it must never be dispatched for its
-// queued head: the seat is not being handed out twice on the way out.
+// ... and while it DOES have a request in flight it must never be dispatched for its queued
+// head: the seat is not being handed out twice on the way out.
 func TestChargedDrainExitingIsNeverDispatched(t *testing.T) {
 	chargedPath(t, defaultConfig(), "exiting-no-dispatch", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-gone")
@@ -384,9 +335,9 @@ func TestChargedDrainExitingIsNeverDispatched(t *testing.T) {
 // ---- path 5: the release is exactly once, and a fresh residency starts clean ----
 
 // The release point is UNSET and idempotent: unseating an exiting branch releases both
-// counters (the used side and, for an exiting branch, nothing more on the stay side),
-// a second unseat is a harmless no-op rather than a second release (which would
-// underflow and panic), and the next residency starts non-exiting and charges once.
+// counters (the used side and, for an exiting branch, nothing more on the stay side), a second
+// unseat is a harmless no-op rather than a second release (which would underflow and panic),
+// and the next residency starts non-exiting and charges once.
 func TestChargedDrainUnseatIsExactlyOnce(t *testing.T) {
 	chargedPath(t, defaultConfig(), "unseat-once", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-gone")
@@ -425,10 +376,8 @@ func TestChargedDrainUnseatIsExactlyOnce(t *testing.T) {
 
 // ---- path 6: the other direction — a mark on a branch that holds no charge ----
 
-// MarkExiting refuses an unseated session (a seated branch is the only thing that can
-// be exiting), so no path can release a charge that was never taken. That symmetry is
-// what makes the unconditional release in exitLocked/Forget safe: the counters are
-// rebuilt from the seated sets, so an unseated record contributes nothing to release.
+// MarkExiting refuses an unseated session (a seated branch is the only thing that can be
+// exiting), so no path can release a charge that was never taken.
 func TestChargedDrainMarkOnUnseatedRecordIsANoOp(t *testing.T) {
 	chargedPath(t, defaultConfig(), "mark-unseated", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		fx.s.mu.Lock()
@@ -446,14 +395,11 @@ func TestChargedDrainMarkOnUnseatedRecordIsANoOp(t *testing.T) {
 	})
 }
 
-// TestReapPathsIncrementTheirOwnAnomaly: each reap path (released-window
-// vs in-flight) increments its own anomalies_total kind and only its own.
-// The reap is "the belt that should never fire" — these counters are the
-// production leak signal the handoff relies on.
+// TestReapPathsIncrementTheirOwnAnomaly: each reap path (released-window vs in-flight)
+// increments its own anomalies_total kind and only its own.
 func TestReapPathsIncrementTheirOwnAnomaly(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		// A released-window record: dispatched at Pick but never arrived at a pod.
-		// Age it past inflightReapSeconds on the fixture clock.
 		h1 := head("wbranch", time.Second, 100)
 		if _, i := fx.pickEngine(h1); i < 0 {
 			t.Fatal("the head must be picked")

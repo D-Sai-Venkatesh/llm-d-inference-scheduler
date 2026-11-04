@@ -16,10 +16,9 @@ limitations under the License.
 
 package groupsched
 
-// The flow-controller integration test (the CP3 re-review's requirement):
-// requests driven through the REAL controller (EnqueueAndWait → the
-// queues → this plugin's Pick), proving dispatch, rotation and newcomer
-// entry on the live path — not the unit smoke API.
+// The flow-controller integration test (the CP3 re-review's requirement): requests driven
+// through the REAL controller (EnqueueAndWait → the queues → this plugin's Pick), proving
+// dispatch, rotation and newcomer entry on the live path — not the unit smoke API.
 
 import (
 	"context"
@@ -47,8 +46,8 @@ import (
 	testutils "github.com/llm-d/llm-d-router/test/utils"
 )
 
-// unsaturatedDetector never saturates (the 80% gate is the stack's
-// concern; this test exercises the fairness path only).
+// unsaturatedDetector never saturates (the 80% gate is the stack's concern; this test
+// exercises the fairness path only).
 type unsaturatedDetector struct {
 	flowcontrol.SaturationDetector
 }
@@ -59,8 +58,8 @@ func (d *unsaturatedDetector) TypedName() fwkplugin.TypedName {
 	return fwkplugin.TypedName{Type: "test-detector", Name: "unsaturated"}
 }
 
-// intRequest is a request carrying an agent-identity InferenceRequest
-// (the session) and a wire size (the estimate input).
+// intRequest is a request carrying an agent-identity InferenceRequest (the session) and a wire
+// size (the estimate input).
 type intRequest struct {
 	id     string
 	key    flowcontrol.FlowKey
@@ -80,9 +79,9 @@ func (r *intRequest) InferenceRequest() *fwksched.InferenceRequest { return r.in
 func (r *intRequest) ReceivedTimestamp() time.Time                 { return time.Now() }
 
 // newIntRequest builds a request the way the real stack does: branch identity has already
-// derived the BRANCH id (the queue key), the token producer has already rendered the
-// tokens (the exact chain the scheduler costs), and the client's session rides as an
-// attribute. blocks is the prompt's size in 64-token blocks.
+// derived the BRANCH id (the queue key), the token producer has already rendered the tokens
+// (the exact chain the scheduler costs), and the client's session rides as an attribute.
+// blocks is the prompt's size in 64-token blocks.
 func newIntRequest(branch, id string, blocks uint64) *intRequest {
 	size := blocks * 256 // the wire size a prompt of this length has at 4 bytes/token
 	ir := &fwksched.InferenceRequest{RequestID: id, RequestSizeBytes: int(size), FairnessID: branch}
@@ -99,8 +98,8 @@ func newIntRequest(branch, id string, blocks uint64) *intRequest {
 	return &intRequest{id: id, key: flowcontrol.FlowKey{ID: branch, Priority: 0}, size: size, infReq: ir}
 }
 
-// newIntegrationHarness wires the real controller with the plugin as
-// the band's fairness policy (the integration_helpers pattern, minimal).
+// newIntegrationHarness wires the real controller with the plugin as the band's fairness
+// policy (the integration_helpers pattern, minimal).
 func newIntegrationHarness(t *testing.T, plugin fwkplugin.Plugin) (*controller.FlowController, *registry.FlowRegistry) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -132,8 +131,8 @@ func newIntegrationHarness(t *testing.T, plugin fwkplugin.Plugin) (*controller.F
 			SaturationDetector: &unsaturatedDetector{},
 			EndpointCandidates: &contractmocks.MockEndpointCandidates{},
 			UsageLimitPolicy:   usagelimits.DefaultPolicy(),
-			// The dispatch cycle ranks the bands through the BandSelectionPolicy; the
-			// stock strict policy is what an arm that names no band policy loads.
+			// The dispatch cycle ranks the bands through the BandSelectionPolicy; the stock strict
+			// policy is what an arm that names no band policy loads.
 			BandSelectionPolicy: bandselection.DefaultPolicy(),
 		})
 	t.Cleanup(func() { cancel(); time.Sleep(50 * time.Millisecond) })
@@ -142,9 +141,7 @@ func newIntegrationHarness(t *testing.T, plugin fwkplugin.Plugin) (*controller.F
 }
 
 // enqueueAndDispatch is EnqueueAndWait plus the dispatch-side hook the director runs the
-// moment a request leaves the queue: PreRequest. The flow controller alone is only the
-// RELEASE half of the path — without PreRequest the scheduler correctly sees a request that
-// is neither queued nor in flight.
+// moment a request leaves the queue: PreRequest.
 func enqueueAndDispatch(t *testing.T, fc *controller.FlowController, gs *GroupScheduler, req *intRequest) (fcTypes.QueueOutcome, error) {
 	t.Helper()
 	outcome, err := fc.EnqueueAndWait(context.Background(), req)
@@ -173,10 +170,9 @@ type dispatchResult struct {
 	err     error
 }
 
-// TestIntegrationDispatchThroughRealController: two sessions with sizes
-// that only one fits (the budget); the branch's request dispatches
-// through the REAL controller; after the branch goes quiet, the blocked
-// waiter is rotated in (the engine-idle path) and dispatches too.
+// TestIntegrationDispatchThroughRealController: two sessions with sizes that only one fits
+// (the budget); the branch's request dispatches through the REAL controller; after the branch
+// goes quiet, the blocked waiter is rotated in (the engine-idle path) and dispatches too.
 func TestIntegrationDispatchThroughRealController(t *testing.T) {
 	plugin, err := Factory("gs", nil, nil)
 	require.NoError(t, err)
@@ -187,10 +183,8 @@ func TestIntegrationDispatchThroughRealController(t *testing.T) {
 	fc, reg := newIntegrationHarness(t, plugin)
 
 	results := make(chan dispatchResult, 4)
-	// session "m": 400 blocks; session "w": 600 blocks (400+600 > 950:
-	// w cannot co-fit; it waits until m is rotated out)
-	// m enqueues and dispatches (a branch; the queue is real). The
-	// dispatch is fast — wait on the RESULT, not the queue depth.
+	// session "m": 400 blocks; session "w": 600 blocks (400+600 > 950: w cannot co-fit; it waits
+	// until m is rotated out) m enqueues and dispatches (a branch; the queue is real).
 	go func() {
 		req := newIntRequest("m", "m-1", uint64(400))
 		outcome, err := enqueueAndDispatch(t, fc, gs, req)
@@ -227,9 +221,8 @@ func TestIntegrationDispatchThroughRealController(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 
-	// w is blocked (the budget holds m). m's turn completes and it goes
-	// quiet (nothing waiting, nothing in flight): the engine-idle rule
-	// rotates w in and it dispatches.
+	// w is blocked (the budget holds m). m's turn completes and it goes quiet (nothing waiting,
+	// nothing in flight): the engine-idle rule rotates w in and it dispatches.
 	settle(gs.sched, "m", 400, 0)
 	select {
 	case r := <-results:
@@ -242,8 +235,8 @@ func TestIntegrationDispatchThroughRealController(t *testing.T) {
 	fmt.Println("integration: dispatch, budget hold, and rotation all proved through the real controller")
 }
 
-// TestIntegrationNewcomerEntry: a newcomer's request dispatches through
-// the real controller (the seat + serve path on the live queue).
+// TestIntegrationNewcomerEntry: a newcomer's request dispatches through the real controller
+// (the seat + serve path on the live queue).
 func TestIntegrationNewcomerEntry(t *testing.T) {
 	plugin, err := Factory("gs", nil, nil)
 	require.NoError(t, err)

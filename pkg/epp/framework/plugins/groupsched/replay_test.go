@@ -17,16 +17,6 @@ limitations under the License.
 package groupsched
 
 // THE N-ENGINE SIMULATION — the determinism guard that stands where the goldens did.
-//
-// A deterministic scenario drives the Scheduler through its public API on a virtual
-// clock and records every observable decision (picks, seats, exits with reasons, the
-// seated set) as a trace. There is no committed trace to compare against any more (the
-// goldens were removed with the replay machinery): what this file pins is that the SAME
-// event stream replayed twice produces the SAME decisions, at N=1 and N=2, so no
-// map-order dependence can creep back into the decision path.
-//
-// The scenario is NORMAL-PATH by design (the always-on liveness fixes deliberately
-// alter abnormal paths, and those have their own tests).
 
 import (
 	"fmt"
@@ -42,30 +32,28 @@ var scenarioT0 = time.Unix(1793000000, 0).UTC()
 
 // ---- the scenario model ----
 
-// gsSession is one scripted chain: its turns arrive on a pattern, grow their context,
-// and sometimes go silent or re-enter late.
+// gsSession is one scripted chain: its turns arrive on a pattern, grow their context, and
+// sometimes go silent or re-enter late.
 type gsSession struct {
 	id string
-	// blocks is the context the branch has RUN so far (its chain's length). A turn's
-	// prompt is that plus its own growth, and the prompt is fixed at ARRIVAL: the chain
-	// travels on the head, which is the whole point of taking the cost at the decision.
+	// blocks is the context the branch has RUN so far (its chain's length).
 	blocks   int
 	turn     int
 	kind     string // "main" | "single" | "reentry" | "canceller"
 	nextTurn int    // sim second of the next arrival
 }
 
-// turnChain is the chain the branch's NEXT turn will run: everything the branch has run
-// plus this turn's growth, with the keys ordered so that a later turn extends an earlier
-// one (a branch's turns are a continuation).
+// turnChain is the chain the branch's NEXT turn will run: everything the branch has run plus
+// this turn's growth, with the keys ordered so that a later turn extends an earlier one (a
+// branch's turns are a continuation).
 func (g *gsSession) turnChain() []Chain {
 	n := g.blocks + g.turnBlocks()
 	return []Chain{{Keys: keys(n, seedFor(g.id)), Tokens: n * 64}}
 }
 
-// scenarioSessions builds the scripted session set: 46 sessions over
-// 2,600 sim seconds against a 1000-block capacity (budget 950), enough
-// pressure for seating, rotation, budget-idle exits, TTL and re-entry.
+// scenarioSessions builds the scripted session set: 46 sessions over 2,600 sim seconds against
+// a 1000-block capacity (budget 950), enough pressure for seating, rotation, budget-idle
+// exits, TTL and re-entry.
 func scenarioSessions() []*gsSession {
 	var ss []*gsSession
 	for i := 0; i < 46; i++ {
@@ -88,8 +76,7 @@ func scenarioSessions() []*gsSession {
 	return ss
 }
 
-// turnBlocks is the per-turn context growth (blocks): mains grow
-// steadily; singles stay small.
+// turnBlocks is the per-turn context growth (blocks): mains grow steadily; singles stay small.
 func (g *gsSession) turnBlocks() int {
 	switch g.kind {
 	case "single":
@@ -125,8 +112,8 @@ func (g *scenarioTrace) line(format string, args ...any) {
 	fmt.Fprintf(&g.sb, format+"\n", args...)
 }
 
-// observeState appends the seated set ONLY when it changes (keeps the
-// golden small without losing decisions).
+// observeState appends the seated set ONLY when it changes (keeps the golden small without
+// losing decisions).
 func (g *scenarioTrace) observeState(s *Scheduler) {
 	cur := s.seatedIDs()
 	if len(cur) != len(g.seats) {
@@ -153,21 +140,17 @@ func runScenario(t *testing.T) string {
 	return runScenarioEnd(t, 2600)
 }
 
-// runScenarioCfg is the PARAMETRIZED driver used by the WAVE-1
-// session-ordering equality test: cfg is the scheduler config and sessions
-// maps a scripted chain's id to its SESSION attribute (nil = every head
-// carries none, i.e. session := branch — base mode).
+// runScenarioCfg is the PARAMETRIZED driver used by the WAVE-1 session-ordering equality test:
+// cfg is the scheduler config and sessions maps a scripted chain's id to its SESSION attribute
+// (nil = every head carries none, i.e. session := branch — base mode).
 func runScenarioCfg(t *testing.T, simEnd int, cfg Config) string {
 	return runScenarioFull(t, simEnd, cfg)
 }
 
-// runScenarioEnd drives the scenario truncated at simEnd (the
-// legacy-c57e92ed comparison uses 489 — the pre-C4 code stalls on this
-// scenario shortly after ~500, AND at t=490 the always-on C8 fix
-// deliberately diverges from legacy (a branch with a queued head is no
-// longer idle-evicted — the reviewer's predicted A0 caveat). The 489s
-// prefix is byte-identical; the divergence point is documented, not
-// hidden; S1).
+// runScenarioEnd drives the scenario truncated at simEnd (the legacy-c57e92ed comparison uses
+// 489 — the pre-C4 code stalls on this scenario shortly after ~500, AND at t=490 the always-on
+// C8 fix deliberately diverges from legacy (a branch with a queued head is no longer idle-
+// evicted — the reviewer's predicted A0 caveat).
 func runScenarioEnd(t *testing.T, simEnd int) string {
 	t.Helper()
 	return runScenarioFull(t, simEnd, defaultConfig())
@@ -179,16 +162,16 @@ func runScenarioFull(t *testing.T, simEnd int, cfg Config) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The scenario names its ONE engine: a real discovered engine whose budget is
-	// 950 of 1000 blocks.
+	// The scenario names its ONE engine: a real discovered engine whose budget is 950 of 1000
+	// blocks.
 	if err := s.SetNumBlocksFor("engine-a", 64, 1000); err != nil {
 		t.Fatal(err)
 	}
 	return runScenarioOnSched(t, simEnd, s)
 }
 
-// runScenarioOn replays the golden scenario on an ALREADY-BUILT scheduler (the
-// multi-engine properties are asserted this way).
+// runScenarioOn replays the golden scenario on an ALREADY-BUILT scheduler (the multi-engine
+// properties are asserted this way).
 func runScenarioOn(t *testing.T, s *Scheduler) string {
 	t.Helper()
 	return runScenarioOnSched(t, 2600, s)
@@ -197,13 +180,12 @@ func runScenarioOn(t *testing.T, s *Scheduler) string {
 func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 	tr := &scenarioTrace{seats: map[string]bool{}}
 
-	// exit/entry observation: hook order relative to the op is part of
-	// the trace (the hooks fire inside the op).
+	// exit/entry observation: hook order relative to the op is part of the trace (the hooks fire
+	// inside the op).
 	var exitLog, entryLog []string
-	// The hooks carry the ENGINE label in multi-engine mode; the trace text
-	// is unchanged, so a per-engine replay of this scenario compares against
-	// the same golden file line for line (PREREG-multipod-offload directive
-	// 1: the unit-equivalence gate).
+	// The hooks carry the ENGINE label in multi-engine mode; the trace text is unchanged, so a
+	// per-engine replay of this scenario compares against the same golden file line for line
+	// (PREREG-multipod-offload directive 1: the unit-equivalence gate).
 	s.onExit = func(_ string, reason string, seatTurns int) {
 		exitLog = append(exitLog, fmt.Sprintf("EXIT reason=%s turns=%d", reason, seatTurns))
 	}
@@ -228,8 +210,7 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 		return fmt.Sprintf("%s-r%02d", id, reqSeq[id])
 	}
 
-	// inFlight: the requests dispatched and not yet settled; settle after a decode
-	// period.
+	// inFlight: the requests dispatched and not yet settled; settle after a decode period.
 	type flight struct {
 		sess     *gsSession
 		reqID    string
@@ -250,8 +231,8 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 					ReqID:   fmt.Sprintf("%s-r%02d", g.id, reqSeq[g.id]+1),
 					Arrival: scenarioT0.Add(time.Duration(g.nextTurn) * time.Second),
 					Chains:  g.turnChain(),
-					// the arrival record branch identity publishes: a branch's FIRST turn is a
-					// newcomer, every later one a returner
+					// the arrival record branch identity publishes: a branch's FIRST turn is a newcomer,
+					// every later one a returner
 					Returner: g.turn > 0,
 				})
 			}
@@ -360,16 +341,8 @@ func runScenarioOnSched(t *testing.T, simEnd int, s *Scheduler) string {
 	return tr.sb.String()
 }
 
-// TestDeterminism_OneAndTwoEngines replays the SAME synthetic N=1 and N=2 event
-// streams twice each and requires identical traces. This is the goldens' replacement:
-// with no committed trace to compare against, the property that must still hold is that
-// the decision path has NO map-order dependence — the archive build produced three
-// different traces in four replays of this scenario, and the total victim tie-break
-// (oldest completion, then branch id) is what fixed it.
-//
-// The N=2 stream is the same arrivals against TWO engines, so the cross-engine pass
-// (per-engine dispatch order, the winner key, the engine id as the final tie-break) is
-// exercised too: N must be a case of the code, not a branch of it.
+// TestDeterminism_OneAndTwoEngines replays the SAME synthetic N=1 and N=2 event streams twice
+// each and requires identical traces.
 func TestDeterminism_OneAndTwoEngines(t *testing.T) {
 	for _, n := range []int{1, 2} {
 		first := runScenarioEngines(t, n)
@@ -397,8 +370,8 @@ func TestDeterminism_OneAndTwoEngines(t *testing.T) {
 	}
 }
 
-// runScenarioEngines replays the scenario against n engines of equal capacity: the
-// same event stream, one more placement choice per pass.
+// runScenarioEngines replays the scenario against n engines of equal capacity: the same event
+// stream, one more placement choice per pass.
 func runScenarioEngines(t *testing.T, n int) string {
 	t.Helper()
 	s, err := NewScheduler(defaultConfig())

@@ -16,19 +16,10 @@ limitations under the License.
 
 package groupsched
 
-// THE OBSERVABILITY SUITE — the two series that made a real defect invisible
-// (2026-11-01, reviewer's ask; both observability-only, golden-neutral):
-//
-//  1. cold_valve_held_total was attributed `engine="single"` on a multi-engine stack,
-//     because the admission loop passed an empty engine id. A series whose label is a
-//     LIE at N=2 cannot answer "which engine's prefill slot is the stagger costing?".
-//  2. The C8 guard ("a stale queue view never justifies an eviction") had no clock of
-//     its own: an arm whose queue view is never refreshed and one that is always fresh
-//     looked identical in every series. Now queue_view_age_seconds is the clock and
-//     queue_view_untrusted_passes_total is the count of passes that needed the guard.
-//
-// Both run at N=1 AND N=2, and both assert the WIRE FORM (the Prometheus series), not
-// just the hook: a counter nobody can scrape is not observability.
+// THE OBSERVABILITY SUITE — the two series that made a real defect invisible (2026-11-01,
+// reviewer's ask; both observability-only, golden-neutral): 1. cold_valve_held_total was
+// attributed `engine="single"` on a multi-engine stack, because the admission loop passed an
+// empty engine id.
 
 import (
 	"strings"
@@ -84,23 +75,18 @@ func sampleValue(m *dto.Metric) float64 {
 	return 0
 }
 
-// TestColdValveHeldIsAttributedToTheEngine: the valve-held series must name the engine
-// whose prefill slot the head is waiting for, never "" (which the exporter renders
-// `engine="single"` on a two-engine stack).
-//
-// The scenario holds the head on EVERY engine (each one carries an outstanding cold
-// charge, so the small cap refuses it while its BUDGET would admit it) and gives the
-// engines different free budget, so the assertion can tell the right answer ("the engine
-// placement would have picked") from the wrong one ("the first engine in the loop").
+// TestColdValveHeldIsAttributedToTheEngine: the valve-held series must name the engine whose
+// prefill slot the head is waiting for, never "" (which the exporter renders `engine="single"`
+// on a two-engine stack).
 func TestColdValveHeldIsAttributedToTheEngine(t *testing.T) {
-	// capacity 1,000 blocks: the DERIVED cap is 50 blocks = 3,200 tokens, so a
-	// 300-block resident's cold charge fills it completely
+	// capacity 1,000 blocks: the DERIVED cap is 50 blocks = 3,200 tokens, so a 300-block
+	// resident's cold charge fills it completely
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		var held []string
 		fx.s.onColdValveHeld = func(engine string) { held = append(held, engine) }
 
-		// one cold charge per engine, and the FIRST engine deliberately fuller so the
-		// two engines' free budgets differ (300 blocks used on e0, 200 on e1).
+		// one cold charge per engine, and the FIRST engine deliberately fuller so the two engines'
+		// free budgets differ (300 blocks used on e0, 200 on e1).
 		fx.seatOn(t, fx.ids[0], "cold-0", 300, 3*time.Second)
 		if len(fx.ids) > 1 {
 			fx.seatOn(t, fx.ids[1], "cold-1", 200, 3*time.Second)
@@ -128,9 +114,8 @@ func TestColdValveHeldIsAttributedToTheEngine(t *testing.T) {
 			}
 		}
 		if len(fx.ids) > 1 {
-			// e1 has the most free budget (650 vs 750 blocks free), so it is the engine
-			// the head is actually waiting for: the attribution follows placement's own
-			// order, not the loop's.
+			// e1 has the most free budget (650 vs 750 blocks free), so it is the engine the head is
+			// actually waiting for: the attribution follows placement's own order, not the loop's.
 			if want := fx.ids[1]; held[0] != want {
 				t.Fatalf("valve-held engine = %q, want %q (the engine with the MOST FREE BUDGET among those that fit by budget)", held[0], want)
 			}
@@ -140,11 +125,7 @@ func TestColdValveHeldIsAttributedToTheEngine(t *testing.T) {
 	})
 }
 
-// THE EVENT RING'S COVERAGE IS VISIBLE. The ring is bounded for memory, so on a long
-// window the OLDEST SEAT/EXIT events fall out of the DumpState tail while the stdout
-// stream keeps them. That is fine as long as it is a MEASUREMENT: Snapshot.EventRingDropped
-// says how much of the window lies before the tail (it is NOT a metric any more — the trim
-// keeps nineteen names, and a campaign-only ring diagnostic is not one of them).
+// THE EVENT RING'S COVERAGE IS VISIBLE.
 func TestEventRingWrapIsCounted(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		// push more events than the ring holds through the ordinary seat/exit path
@@ -163,8 +144,8 @@ func TestEventRingWrapIsCounted(t *testing.T) {
 	})
 }
 
-// THE DERIVED VALVE CAP IS SCRAPEABLE PER ENGINE: a scorer that divides the cold charge
-// by its cap must read the cap from the arm, not from a constant copied out of a config.
+// THE DERIVED VALVE CAP IS SCRAPEABLE PER ENGINE: a scorer that divides the cold charge by its
+// cap must read the cap from the arm, not from a constant copied out of a config.
 func TestColdCapIsExportedPerEngine(t *testing.T) {
 	forEnginesCap(t, defaultConfig(), 4000, func(t *testing.T, fx *engineSet) {
 		reg := prometheus.NewRegistry()
@@ -182,16 +163,8 @@ func TestColdCapIsExportedPerEngine(t *testing.T) {
 	})
 }
 
-// THE EXITING LEDGER ON THE WIRE (2026-11-01 late, the reviewer's ask: "this leak class
-// must be visible at T+5"). (iii) made the used side include branches that are already
-// leaving, so "how much of it is leaving, how many are leaving, and how long has the
-// oldest been leaving" are the three numbers that separate an engine that is BUSY from an
-// engine whose drains have stopped — a distinction the batch-1 anchor had to reconstruct
-// from the event log and the residency histogram because no gauge carried it.
-//
-// The gauges must be readable AT THE MOMENT OF THE MARK (before any drain), and must go
-// back to zero when the branch leaves (a gauge that only ever rises is a counter wearing
-// the wrong name).
+// THE EXITING LEDGER ON THE WIRE (2026-11-01 late, the reviewer's ask: "this leak class must
+// be visible at T+5").
 func TestExitingLedgerIsVisiblePerEngine(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.tighten(t)
@@ -244,11 +217,7 @@ func TestExitingLedgerIsVisiblePerEngine(t *testing.T) {
 	})
 }
 
-// THE SEAT/EXIT LINE CARRIES THE CLIENT'S OWN ID. The queue key is the branch, which joins
-// to nothing in the harness's request records; a run's seat membership is only joinable
-// through the client's correlation / request id. Pick reads it (the one unscoped hook), the
-// branch carries it, and both events name it — the EXIT included, which fires long after the
-// head is gone.
+// THE SEAT/EXIT LINE CARRIES THE CLIENT'S OWN ID.
 func TestSeatAndExitCarryTheClientsRequestID(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		h := head("m", time.Second, 100)
@@ -257,8 +226,8 @@ func TestSeatAndExitCarryTheClientsRequestID(t *testing.T) {
 			t.Fatal("m must be seated")
 		}
 		fx.s.Settle("m", h.ReqID, struct{ Prompt, Cached int }{100 * 64, 100 * 64}, true, fx.clock)
-		// the branch leaves (a teardown is the deterministic exit; the id must still be on
-		// the EXIT line, which fires long after the head that carried it is gone)
+		// the branch leaves (a teardown is the deterministic exit; the id must still be on the EXIT
+		// line, which fires long after the head that carried it is gone)
 		fx.s.RemoveEngine(fx.s.bindings["m"], fx.clock)
 
 		var seat, exit string

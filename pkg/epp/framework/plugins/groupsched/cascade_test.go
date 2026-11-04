@@ -17,33 +17,6 @@ limitations under the License.
 package groupsched
 
 // THE ENFORCEMENT CASCADE, and the TWO VIEWS that end it.
-//
-// The charged drain (iii) put an exiting branch's blocks on the budget's used side until
-// it drains — correct, because the engine pins them. What it also did, silently, was make
-// MARKING FREE: a pass that marked a mid-flight victim saw the same over-budget number
-// afterwards, so enforceBudgetLocked marked the next in-flight branch, and the next, on
-// every pass — and passes are every Pick. Behind those marks a perfectly healthy engine
-// churned its whole membership out from under one turn each.
-//
-// The fix keeps (iii) exactly as it is and asks the two questions separately:
-//
-//	ADMISSION  (freeBudgetLocked / TrySeat): exiting blocks are OCCUPIED. A head that
-//	           would only fit if they were free still waits.        → tested below
-//	ENFORCEMENT (overBudgetLocked):           exiting blocks are NOT A REASON TO EVICT
-//	           MORE — they are already leaving.                    → tested below
-//
-// The numbers these tests pin, from the live batch-1 anchor (99a47617 vs 88e74f85, same
-// config, c128) and from the saturated replay arm (then the tier + hrrn-tier build, whose
-// own golden was removed with that module):
-//
-//	                       live: no-fix → cascade        replay arm: cascade → fixed
-//	mid-flight marks        87     → 2,520 (29x)          102   → 36
-//	turns per residency      2.26  → 0.59                  —      —
-//	quantum-complete exits   532   → 44                   13    → 34
-//	dispatches             4,027   → 3,104 (−23%)        1,020 → 1,212 (+19%)
-//	refill share (uncached) 31.7%  → 44.5%                 —      —
-//
-// Every test here runs at N=1 and N=2 (the twins rule).
 
 import (
 	"fmt"
@@ -55,7 +28,7 @@ import (
 // ---- ENFORCEMENT: one exiting branch covering the overage ends the pass ----
 
 // The engine is over budget by (branch's blocks), and that branch is ALREADY exiting:
-// enforcement must mark NOBODY else. This is the cascade's first domino.
+// enforcement must mark NOBODY else.
 func TestEnforcementDoesNotMarkAnotherWhileOneIsLeaving(t *testing.T) {
 	chargedPath(t, defaultConfig(), "no-cascade", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		// three branches in flight on one engine; the engine's budget is exactly full
@@ -65,8 +38,8 @@ func TestEnforcementDoesNotMarkAnotherWhileOneIsLeaving(t *testing.T) {
 		fx.s.mu.Lock()
 		// give the sibling a request too (mid-flight)
 		inFlightLocked(fx.s, g.branches["m2"], fx.clock, "r-m2")
-		// THE OVERAGE IS EXACTLY THE EXITING MEMBER'S OWN FOOTPRINT: 950 total seated
-		// (400 + 300 + 250) against a budget of 100 more... make it precise:
+		// THE OVERAGE IS EXACTLY THE EXITING MEMBER'S OWN FOOTPRINT: 950 total seated (400 + 300 +
+		// 250) against a budget of 100 more... make it precise:
 		g.budgetBlocks = 700 // NE is 950: over by 250, and "gone" (300) already covers it
 		fx.s.mu.Unlock()
 
@@ -83,8 +56,8 @@ func TestEnforcementDoesNotMarkAnotherWhileOneIsLeaving(t *testing.T) {
 	})
 }
 
-// ... and when the overage is LARGER than what is already leaving, the pass takes ONE
-// more victim — not the whole engine: after that mark the pass is done again.
+// ... and when the overage is LARGER than what is already leaving, the pass takes ONE more
+// victim — not the whole engine: after that mark the pass is done again.
 func TestEnforcementTakesOneMoreWhenTheOverageExceedsTheRetirees(t *testing.T) {
 	chargedPath(t, defaultConfig(), "one-more", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		fx.s.Chunk("gone")
@@ -92,10 +65,10 @@ func TestEnforcementTakesOneMoreWhenTheOverageExceedsTheRetirees(t *testing.T) {
 		markExitingInflight(t, fx, g, "r-gone")
 		fx.s.mu.Lock()
 		inFlightLocked(fx.s, g.branches["m2"], fx.clock, "r-m2")
-		// NE 950, budget 300: over by 650; "gone" excuses 300, so 350 is still over —
-		// more than m2's 250, so exactly ONE further mark can be justified... and after
-		// that (250 excused, 100 left) the pass must stop: nobody else may be marked
-		// while the two retirees alone carry the footprint.
+		// NE 950, budget 300: over by 650; "gone" excuses 300, so 350 is still over — more than m2's
+		// 250, so exactly ONE further mark can be justified... and after that (250 excused, 100
+		// left) the pass must stop: nobody else may be marked while the two retirees alone carry the
+		// footprint.
 		g.budgetBlocks = 300
 		fx.s.mu.Unlock()
 
@@ -116,8 +89,8 @@ func TestEnforcementTakesOneMoreWhenTheOverageExceedsTheRetirees(t *testing.T) {
 
 // ---- ADMISSION: the same blocks are still OCCUPIED for a new seat ----
 
-// The heart of the two views: a head that would fit only if the exiting branch's blocks
-// were free must WAIT — and then be admitted the moment that branch actually drains.
+// The heart of the two views: a head that would fit only if the exiting branch's blocks were
+// free must WAIT — and then be admitted the moment that branch actually drains.
 func TestAdmissionRefusesWhatOnlyTheRetireesBlocksWouldMakeRoomFor(t *testing.T) {
 	chargedPath(t, defaultConfig(), "admission-refuses", func(t *testing.T, fx *engineSet, g *engineGroup) {
 		markExitingInflight(t, fx, g, "r-gone") // NE = 700 of a 950 budget
@@ -148,9 +121,9 @@ func TestAdmissionRefusesWhatOnlyTheRetireesBlocksWouldMakeRoomFor(t *testing.T)
 
 // ---- the livelock guard that (iii) added must still work ----
 
-// An engine whose ONLY branch is exiting and in flight, with a queue view too old to
-// trust: the pass must return instead of re-picking the same victim forever (the guard
-// the accounting fix added — the cascade fix must not remove the reason for it).
+// An engine whose ONLY branch is exiting and in flight, with a queue view too old to trust:
+// the pass must return instead of re-picking the same victim forever (the guard the accounting
+// fix added — the cascade fix must not remove the reason for it).
 func TestExitingVictimDoesNotSpinEnforcementAfterTheCascadeFix(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 900, 2*time.Second)
@@ -192,21 +165,8 @@ func exitReasonOf(line string) (string, bool) {
 
 // ---- the replay differential: the EXIT COMPOSITION, not just the dispatch count ----
 
-// TestExitCompositionIsNotACascade REPORTS the replay's exit composition and mid-flight
-// marks per dispatch. It is a report, not the cascade gate.
-//
-// THE GATE IS STRUCTURAL and lives in TestEveryEnforcementMarkReducesTheOverage: every
-// enforcement pass strictly reduces the overage, and a pass ends when the overage is gone
-// or no victim is left — zero no-progress marks, no threshold. That is the cascade's
-// actual definition ("many exits" is not: a busy engine exits constantly).
-//
-// The ratio is REPORTED because it is a property of the ARM's load, not of the design: on
-// the same honest fixture (branch-private, prefix-extending chains, exact wire sizes) the
-// pre-redesign tree reads 7.55 % at a 0.95 budget and 10.48 % at 0.60, and this tree reads
-// 6.82 % and 9.61 % — better on both, so no bound derived from one tree can be an
-// invariant of the other. The cascade's own measured signatures (81 % live, 10 % in the
-// pre-fix replay) are what a ceiling would have to separate, and an order of magnitude is
-// all such a ceiling can honestly claim.
+// TestExitCompositionIsNotACascade REPORTS the replay's exit composition and mid-flight marks
+// per dispatch.
 func TestExitCompositionIsNotACascade(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -240,10 +200,9 @@ func TestExitCompositionIsNotACascade(t *testing.T) {
 			perDispatch := float64(marks) / float64(dispatches)
 			t.Logf("%d exits (%.1f %% exiting-drain), %d dispatches, marks/dispatch %.1f %%",
 				total, 100*float64(marks)/float64(total), dispatches, 100*perDispatch)
-			// A COARSE CEILING only, an order of magnitude below the cascade's own
-			// signature (81 % marks per dispatch live): it catches "enforcement is marking
-			// branches in bulk", not a policy difference between trees. The real gate is
-			// the structural test named above.
+			// A COARSE CEILING only, an order of magnitude below the cascade's own signature (81 %
+			// marks per dispatch live): it catches "enforcement is marking branches in bulk", not a
+			// policy difference between trees.
 			if perDispatch > 0.25 {
 				t.Fatalf("%d mid-flight marks for %d dispatches (%.1f %%): enforcement is marking branches in bulk "+
 					"(the cascade measured 81 %% live)", marks, dispatches, 100*perDispatch)
@@ -254,13 +213,7 @@ func TestExitCompositionIsNotACascade(t *testing.T) {
 
 // ---- R4: THE STAY SIDE, with a SHARED block ----
 
-// TestSharedBlockWithAStayingBranchIsNotExcused is the defect R4 fixes. The old
-// arithmetic excused EVERY block an exiting branch held — `used − |exit|` — so a block
-// an exiting branch SHARES with a staying one was counted as leaving when it is not:
-// enforcement under-evicted by |stay ∩ exit| and the engine could overcommit. Here a
-// fork shares its parent's prefix with the parent that is exiting; the engine is over
-// budget by exactly the shared block, and the pass must evict on that (or mark) rather
-// than declare itself done.
+// TestSharedBlockWithAStayingBranchIsNotExcused is the defect R4 fixes.
 func TestSharedBlockWithAStayingBranchIsNotExcused(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		shared := keys(3, seedFor("fork-shared")) // 3 blocks the parent and the fork both hold
@@ -285,8 +238,8 @@ func TestSharedBlockWithAStayingBranchIsNotExcused(t *testing.T) {
 		if used != 7 || stay != 5 {
 			t.Fatalf("premise: used = %d, stay = %d (want 7 and 5: 3 shared + 2 + 2)", used, stay)
 		}
-		// the budget leaves a 1-block overage on the STAY side, which the old arithmetic
-		// would have excused entirely (|exit| = 5 ≥ overage 1)
+		// the budget leaves a 1-block overage on the STAY side, which the old arithmetic would have
+		// excused entirely (|exit| = 5 ≥ overage 1)
 		fx.s.mu.Lock()
 		g.budgetBlocks = 4
 		over := fx.s.overBudgetLocked(g)
@@ -295,15 +248,14 @@ func TestSharedBlockWithAStayingBranchIsNotExcused(t *testing.T) {
 			t.Fatalf("enforcement's overage = %d, want 1 (stay 5 − budget 4): a shared block an exiting branch holds is NOT a reason to stop evicting", over)
 		}
 
-		// THE OLD FORMULA, for the record: it excused |exit| wholesale —
-		// used (7) − exit (5) = 2 ≤ budget (4) → "nothing to do", and the engine stayed
-		// overcommitted by the shared block. That is the under-eviction this pins.
+		// THE OLD FORMULA, for the record: it excused |exit| wholesale — used (7) − exit (5) = 2 ≤
+		// budget (4) → "nothing to do", and the engine stayed overcommitted by the shared block.
 		exiting := 5
 		if old := int64(used - exiting - 4); old > 0 {
 			t.Fatalf("premise: the excuse-based formula must read <= 0 here, got %d", old)
 		}
-		// and enforcement keeps the overage visible rather than declaring itself done: with
-		// a fresh queue view, a pass over this state does NOT leave |stay| over budget
+		// and enforcement keeps the overage visible rather than declaring itself done: with a fresh
+		// queue view, a pass over this state does NOT leave |stay| over budget
 		fx.s.mu.Lock()
 		staysOver := fx.s.overBudgetLocked(g) > 0
 		fx.s.mu.Unlock()
@@ -315,16 +267,12 @@ func TestSharedBlockWithAStayingBranchIsNotExcused(t *testing.T) {
 
 // ---- THE CASCADE, DEFINED WITHOUT A THRESHOLD ----
 
-// TestEveryEnforcementMarkReducesTheOverage is the property a ratio can only approximate:
-// THE CASCADE IS MARKS THAT FREE NOTHING. The live batch-1 cascade made 2,520 mid-flight
-// marks for 3,104 dispatches because each pass that marked a victim measured the same
-// overage afterwards and marked the next one. So: on every pass of a pressure run, each
-// mark or eviction must STRICTLY reduce the enforcement overage, and the pass must end
-// when the overage is gone or no victim is left. Zero no-progress marks, no constant.
+// TestEveryEnforcementMarkReducesTheOverage is the property a ratio can only approximate: THE
+// CASCADE IS MARKS THAT FREE NOTHING.
 func TestEveryEnforcementMarkReducesTheOverage(t *testing.T) {
 	forEnginesCap(t, defaultConfig(), 1000, func(t *testing.T, fx *engineSet) {
-		// fill the engine to the brim with branches whose blocks are all private, then
-		// squeeze the budget so enforcement has real work to do
+		// fill the engine to the brim with branches whose blocks are all private, then squeeze the
+		// budget so enforcement has real work to do
 		for i := 0; i < 6; i++ {
 			fx.seatOne(t, fmt.Sprintf("b%d", i), 120, time.Duration(5+i)*time.Second)
 			fx.s.Chunk(fmt.Sprintf("b%d", i))

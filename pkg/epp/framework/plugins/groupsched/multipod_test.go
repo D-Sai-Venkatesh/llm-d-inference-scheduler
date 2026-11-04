@@ -16,10 +16,8 @@ limitations under the License.
 
 package groupsched
 
-// THE MULTI-ENGINE SUITE — the SP intent tests (T1-T4) plus the per-engine
-// invariants the multi-pod wave is scored on. Every one runs at N=1 AND N=2 through
-// forEngines, and the ones that are only MEANINGFUL at N=2 say so and assert the
-// engine count explicitly.
+// THE MULTI-ENGINE SUITE — the SP intent tests (T1-T4) plus the per-engine invariants the
+// multi-pod wave is scored on.
 
 import (
 	"fmt"
@@ -27,8 +25,7 @@ import (
 	"time"
 )
 
-// T1: PLACEMENT IS MOST-FREE-BUDGET. Of two engines where the head fits on both,
-// the one with more free budget takes the seat.
+// T1: PLACEMENT IS MOST-FREE-BUDGET.
 func TestT1SeatGoesToTheMostFreeBudget(t *testing.T) {
 	cfg := defaultConfig()
 	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
@@ -42,8 +39,8 @@ func TestT1SeatGoesToTheMostFreeBudget(t *testing.T) {
 		}
 		// engine-a is 300 blocks fuller than engine-b, so b has more free budget
 		fx.seatOn(t, fx.ids[0], "big", 300, 3*time.Second)
-		// the resident's prefill lands, so its engine's cold-entry slot is free again
-		// (the derived cap is 5 % of the engine, and an outstanding prefill owns it)
+		// the resident's prefill lands, so its engine's cold-entry slot is free again (the derived
+		// cap is 5 % of the engine, and an outstanding prefill owns it)
 		fx.s.Chunk("big")
 		h := head("m", time.Second, 100)
 		e, i := fx.pickEngine(h)
@@ -56,8 +53,7 @@ func TestT1SeatGoesToTheMostFreeBudget(t *testing.T) {
 	})
 }
 
-// T2: THE BINDING LASTS ONLY WHILE SEATED. A branch that exits is unbound; when it
-// re-enters it is seated wherever there is room, which may be the OTHER engine.
+// T2: THE BINDING LASTS ONLY WHILE SEATED.
 func TestT2ExitUnbindsAndReentryReseatsAfresh(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		fx.seatOne(t, "m", 300, 3*time.Second)
@@ -93,12 +89,7 @@ func TestT2ExitUnbindsAndReentryReseatsAfresh(t *testing.T) {
 	})
 }
 
-// T3: THE e4 REGRESSION. Four seats, KV at 3 %, MANY queued/held heads: the engine
-// keeps taking seats and NOTHING closes. (The E-wave's defect closed its gate on five
-// waiting requests at 3 % KV — a raw count — and the engine then starved permanently.
-// The queue term is gone (the net itself is gone with the trim), so the property this
-// pins is narrower and still worth pinning: a deep vLLM queue is not a reason to stop
-// seating.)
+// T3: THE e4 REGRESSION.
 func TestT3e4RegressionNoLockInOnQueueDepth(t *testing.T) {
 	cfg := defaultConfig()
 	forEngines(t, cfg, func(t *testing.T, fx *engineSet) {
@@ -121,8 +112,8 @@ func TestT3e4RegressionNoLockInOnQueueDepth(t *testing.T) {
 			if _, j := fx.pickEngine(h); j < 0 {
 				t.Fatalf("head %d must be seated: 3 %% KV and a deep waiting queue are not saturation", i)
 			}
-			// the head is dispatched by the same pass: its prefill lands, which is what
-			// frees the engine's single cold-entry slot for the next newcomer
+			// the head is dispatched by the same pass: its prefill lands, which is what frees the
+			// engine's single cold-entry slot for the next newcomer
 			fx.s.Chunk(id)
 		}
 		after := fx.s.Snapshot()
@@ -132,8 +123,8 @@ func TestT3e4RegressionNoLockInOnQueueDepth(t *testing.T) {
 	})
 }
 
-// PER-ENGINE SIZING: each engine's budget is its OWN capacity × the fraction, shown
-// by two engines with different capacities.
+// PER-ENGINE SIZING: each engine's budget is its OWN capacity × the fraction, shown by two
+// engines with different capacities.
 func TestPerEngineBudgetFromOwnCapacity(t *testing.T) {
 	cfg := defaultConfig()
 	s, err := NewScheduler(cfg)
@@ -155,10 +146,10 @@ func TestPerEngineBudgetFromOwnCapacity(t *testing.T) {
 	}
 }
 
-// PER-ENGINE DEDUP, and (R9) the shared prefix that pulls a branch to the engine which
-// already holds it: the same block keys on two engines are two footprints (a block on A is
-// worthless to B), and a branch whose prompt is already resident somewhere costs nothing
-// there — so it lands THERE, not on the emptier engine.
+// PER-ENGINE DEDUP, and (R9) the shared prefix that pulls a branch to the engine which already
+// holds it: the same block keys on two engines are two footprints (a block on A is worthless
+// to B), and a branch whose prompt is already resident somewhere costs nothing there — so it
+// lands THERE, not on the emptier engine.
 func TestPerEngineDedupAndIndependence(t *testing.T) {
 	cfg := defaultConfig()
 	s, err := NewScheduler(cfg)
@@ -182,9 +173,9 @@ func TestPerEngineDedupAndIndependence(t *testing.T) {
 		s.Dispatched(id, "r-"+id, now)
 		s.Chunk(id) // its prefill lands: the cold charge is released, the valve reopens
 	}
-	// R9: m2 costs 0 on the engine that already holds its blocks and 200 on the other, so
-	// both branches are on ONE engine and its 200 blocks are counted ONCE (dedup within an
-	// engine) — the empty engine holds nothing.
+	// R9: m2 costs 0 on the engine that already holds its blocks and 200 on the other, so both
+	// branches are on ONE engine and its 200 blocks are counted ONCE (dedup within an engine) —
+	// the empty engine holds nothing.
 	snap := s.Snapshot()
 	if len(snap.Engines) != 2 {
 		t.Fatalf("both engines must be tracked, got %d", len(snap.Engines))
@@ -199,10 +190,10 @@ func TestPerEngineDedupAndIndependence(t *testing.T) {
 	if snap.NEBlocks != 200 {
 		t.Fatalf("the whole-policy NE counts the shared chain once (200), got %d", snap.NEBlocks)
 	}
-	// DEDUP IS PER ENGINE: fill engine a, and the same chain must seat on b and count
-	// AGAIN there — the same block keys on two engines are two footprints.
-	// the filler continues the shared chain (200 + 750 of its own), so it costs 750 on the
-	// engine that holds the prefix and 950 on the empty one: it fills a
+	// DEDUP IS PER ENGINE: fill engine a, and the same chain must seat on b and count AGAIN there
+	// — the same block keys on two engines are two footprints. the filler continues the shared
+	// chain (200 + 750 of its own), so it costs 750 on the engine that holds the prefix and 950
+	// on the empty one: it fills a
 	filler := headWithChain("filler", time.Second, []Chain{{
 		Keys: append(append([]Hash{}, shared...), keys(750, 55)...), Tokens: 950 * 64}})
 	if i := s.PickFromHeads([]Head{filler}, now); i != 0 {
@@ -232,9 +223,9 @@ func TestPerEngineDedupAndIndependence(t *testing.T) {
 	}
 }
 
-// R9: PLACEMENT IS DECIDED ON THE FREE BUDGET AFTER THE SEAT, so a fork follows its
-// parent's prefix even when the other engine is emptier BEFORE the seat — no affinity
-// rule, nothing to tune, because the cost of a shared prefix is already zero.
+// R9: PLACEMENT IS DECIDED ON THE FREE BUDGET AFTER THE SEAT, so a fork follows its parent's
+// prefix even when the other engine is emptier BEFORE the seat — no affinity rule, nothing to
+// tune, because the cost of a shared prefix is already zero.
 func TestPlacementIsDedupAware(t *testing.T) {
 	cfg := defaultConfig()
 	s, err := NewScheduler(cfg)
@@ -273,9 +264,7 @@ func TestPlacementIsDedupAware(t *testing.T) {
 		Keys: append(append([]Hash{}, parent...), keys(100, 88)...), Tokens: 400 * 64}}); got != "a" {
 		t.Fatalf("filla must seat on a, it took %q", got)
 	}
-	// now: a 550 free, b 600 free. The fork is the parent's 300 plus 100 of its own, so it
-	// costs 100 on a and 400 on b: a keeps 450, b keeps 200. BEFORE the seat b is emptier
-	// (600 > 550) and the old key would have chosen it.
+	// now: a 550 free, b 600 free.
 	s.mu.Lock()
 	freeA := s.freeBudgetLocked(s.groups["a"])
 	freeB := s.freeBudgetLocked(s.groups["b"])
@@ -289,8 +278,8 @@ func TestPlacementIsDedupAware(t *testing.T) {
 	}
 }
 
-// ENGINE GONE: the engine's branches are exited ("engine-gone") and their heads go
-// back to the SHARED queue, where a survivor seats them.
+// ENGINE GONE: the engine's branches are exited ("engine-gone") and their heads go back to the
+// SHARED queue, where a survivor seats them.
 func TestEngineGoneReleasesMembersToTheSharedQueue(t *testing.T) {
 	cfg := defaultConfig()
 	s, err := NewScheduler(cfg)
@@ -336,8 +325,8 @@ func TestEngineGoneReleasesMembersToTheSharedQueue(t *testing.T) {
 	}
 }
 
-// THE FILTER PINS DISPATCH TO THE SEAT ENGINE: one candidate, never empty, and a
-// pass-through for unseated or anonymous branches.
+// THE FILTER PINS DISPATCH TO THE SEAT ENGINE: one candidate, never empty, and a pass-through
+// for unseated or anonymous branches.
 func TestFilterPinsTheSeatEngine(t *testing.T) {
 	cfg := defaultConfig()
 	plugin := newTestPlugin(t, cfg, 2, 1000)
@@ -360,8 +349,8 @@ func TestFilterPinsTheSeatEngine(t *testing.T) {
 	if got := plugin.Filter(t.Context(), requestFor("stranger"), pods); len(got) != 2 {
 		t.Fatalf("an unseated branch must pass through, got %d", len(got))
 	}
-	// the seat engine is not among the candidates: NEVER empty — pass all through and
-	// let the observed endpoint win
+	// the seat engine is not among the candidates: NEVER empty — pass all through and let the
+	// observed endpoint win
 	onlyOther := podsOf(schedulerEndpoint("zzz"))
 	if got := plugin.Filter(t.Context(), requestFor("m"), onlyOther); len(got) != 1 {
 		t.Fatalf("a missing seat engine must not empty the candidate list, got %d", len(got))
@@ -389,16 +378,7 @@ func TestFilterPinsTheSeatEngine(t *testing.T) {
 	}
 }
 
-// GOLDEN AT N=2. There is no single golden TRACE for two engines (the same scenario
-// legitimately splits), so the two properties the wave actually needs are pinned
-// instead:
-//
-//  1. DETERMINISM: two replays of the golden scenario on a two-engine stack produce
-//     identical traces (the multi-engine path has no map-order decision left).
-//  2. CONSERVATION: the same scenario on two engines of capacity C/2 does not lose or
-//     invent work — the served/dispatch totals stay in the same ballpark as the
-//     single-engine run (seats and blocks are bounded by the same total budget), i.e.
-//     nothing is double-counted across engines.
+// GOLDEN AT N=2.
 func TestMultiEngineGoldenProperties(t *testing.T) {
 	run := func(engines int, capacity int) (string, Snapshot) {
 		cfg := defaultConfig()
@@ -426,8 +406,8 @@ func TestMultiEngineGoldenProperties(t *testing.T) {
 	if twoA != twoB {
 		t.Fatal("the golden scenario must be deterministic at N=2 (no map-order decision left)")
 	}
-	// conservation: two engines of the same size serve MORE (two budgets), never
-	// fewer, and the totals are sane multiples rather than double-counted figures
+	// conservation: two engines of the same size serve MORE (two budgets), never fewer, and the
+	// totals are sane multiples rather than double-counted figures
 	if snapTwo.Served < snapOne.Served {
 		t.Fatalf("N=2 must serve at least as many dispatches as N=1 (%d < %d)", snapTwo.Served, snapOne.Served)
 	}
@@ -437,11 +417,9 @@ func TestMultiEngineGoldenProperties(t *testing.T) {
 	var seats int
 	for _, es := range snapTwo.Engines {
 		seats += es.Seats
-		// THE BUDGET, I1 + R4: admission counts the blocks an exiting branch still pins
-		// (the engine holds them until its drain), so the USED side may exceed the budget
-		// by exactly those and by nothing else. Enforcement acts on the STAY side and
-		// evicts until that is inside the budget, so anything beyond the exiting blocks
-		// here is a real over-commit.
+		// THE BUDGET, I1 + R4: admission counts the blocks an exiting branch still pins (the engine
+		// holds them until its drain), so the USED side may exceed the budget by exactly those and
+		// by nothing else.
 		if es.NEBlocks > es.BudgetBlocks+es.ExitingBlocks {
 			t.Fatalf("engine %s is over its budget at the end of the run: used %d > budget %d + exiting %d",
 				es.ID, es.NEBlocks, es.BudgetBlocks, es.ExitingBlocks)
@@ -459,28 +437,21 @@ func TestMultiEngineGoldenProperties(t *testing.T) {
 	}
 }
 
-// THE COLD VALVE NEVER EVICTS (the defect the core fixes): a head that fits an
-// engine's BUDGET but is held by the cold-entry valve WAITS for the prefill slot.
-// Evicting branches frees budget, never the valve, so every eviction taken on such a
-// pass was wasted — and the engine's seats sat cold-empty until the prefill finished.
-//
-// The cap is derived per engine (5 % of 10,000 blocks = 500 blocks = 32,000 tokens),
-// so a 600-block resident fills its engine's whole cold slot while leaving 8,900
-// blocks of budget free: the valve is the only thing holding the next head.
+// THE COLD VALVE NEVER EVICTS (the defect the core fixes): a head that fits an engine's BUDGET
+// but is held by the cold-entry valve WAITS for the prefill slot.
 func TestColdValveHeldHeadNeverEvicts(t *testing.T) {
 	forEnginesCap(t, defaultConfig(), 10000, func(t *testing.T, fx *engineSet) {
-		// ONE resident per ENGINE seats (its cold charge alone fills the cap, and the
-		// placement spreads them one per engine because a closed valve is not a
-		// candidate), and their prefills stay in flight (no Chunk), so EVERY engine's
-		// valve has no room for another entry
+		// ONE resident per ENGINE seats (its cold charge alone fills the cap, and the placement
+		// spreads them one per engine because a closed valve is not a candidate), and their prefills
+		// stay in flight (no Chunk), so EVERY engine's valve has no room for another entry
 		for i := range fx.ids {
 			id := fmt.Sprintf("res%d", i)
 			fx.seatOne(t, id, 600, time.Duration(5+i)*time.Second)
 		}
 		before := fx.s.Snapshot()
-		// the residents' prefills are RUNNING (in flight, no chunk), which is what keeps
-		// their cold charge live — and a running branch is never a rotation victim, so
-		// nothing can be evicted for the head that waits.
+		// the residents' prefills are RUNNING (in flight, no chunk), which is what keeps their cold
+		// charge live — and a running branch is never a rotation victim, so nothing can be evicted
+		// for the head that waits.
 		for attempt := 0; attempt < 4; attempt++ {
 			h := head(fmt.Sprintf("cold%d", attempt), time.Second, 900)
 			_, i := fx.pickEngine(h)
@@ -506,15 +477,15 @@ func TestColdValveHeldHeadNeverEvicts(t *testing.T) {
 	})
 }
 
-// AT N=2 THE HEAD MOVES TO THE SIBLING rather than waiting: engine A's valve refuses
-// it, engine B both fits by budget AND allows it.
+// AT N=2 THE HEAD MOVES TO THE SIBLING rather than waiting: engine A's valve refuses it,
+// engine B both fits by budget AND allows it.
 func TestColdValveHeldHeadSeatsOnTheSibling(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		if len(fx.ids) < 2 {
 			t.Skip("needs two engines: the sibling is the point")
 		}
-		// one engine takes the first cold entry (fits AND allowed: nothing cold in
-		// flight there), so ITS valve is now closed while the sibling's is open
+		// one engine takes the first cold entry (fits AND allowed: nothing cold in flight there), so
+		// ITS valve is now closed while the sibling's is open
 		fx.seatOne(t, "coldA", 300, 5*time.Second)
 		engA := fx.s.bindings["coldA"]
 		// the next head fits the budget on both; A's valve refuses it and B's allows

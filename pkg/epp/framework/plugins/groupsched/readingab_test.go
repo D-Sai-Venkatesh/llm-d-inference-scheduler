@@ -16,31 +16,8 @@ limitations under the License.
 
 package groupsched
 
-// THE EXACTNESS REPLAY: every cost the scheduler takes is the request's own prefill
-// chain, on the wave's real prompt-size distribution.
-//
-// THE QUESTION IT ANSWERS. The admission cost used to be an ESTIMATE — the branch's
-// remembered set plus ceil(wire bytes / 4B) — which measured 0.895 of the true block
-// count on the campaign's traffic (n = 1,206, p05 0.848 / p95 0.909), i.e. the budget
-// ran ~10 % short at admission and was corrected only at PreRequest. With the engine
-// tokens attached at arrival there is nothing left to estimate: the chain is hashed from
-// the prompt itself, so the cost is exact at the first Pick.
-//
-// THE REPLAY. For every request in the corpus distribution below (the wave's own 2,450
-// records, sampled every 5th percentile) it builds the token stream, hashes it exactly
-// as production does (prefixhash at the engine block size), and checks the three
-// numbers the budget depends on:
-//
-//	cost      the cold part of the chain — must be ceil(tokens / 64)
-//	cold tok  the valve's charge — must be the prompt's own token count
-//	charged   what the seat puts on the used side — must be the same as the cost
-//
-// PROVENANCE of promptSizeQuantiles: records/profile_export.jsonl of
-// results/exp-ops/mp-q4-c64 (2,450 rows), input_sequence_length, sampled at every 5th
-// percentile:
-//
-//	tar xzOf records/*.tar.gz --wildcards '*/profile_export.jsonl' \
-//	  | python3 -c 'import sys,json;v=sorted(int(json.loads(l)["metrics"]["input_sequence_length"]["value"]) for l in sys.stdin);n=len(v);print([v[min(n-1,round(p/100*(n-1)))] for p in range(0,101,5)])'
+// THE EXACTNESS REPLAY: every cost the scheduler takes is the request's own prefill chain, on
+// the wave's real prompt-size distribution.
 
 import (
 	"fmt"
@@ -48,8 +25,8 @@ import (
 	"testing"
 )
 
-// promptSizeQuantiles is the wave's own prompt-token distribution (p0..p100, step 5);
-// mean of the full set is 74,493 tokens, p50 71,489, max 209,035.
+// promptSizeQuantiles is the wave's own prompt-token distribution (p0..p100, step 5); mean of
+// the full set is 74,493 tokens, p50 71,489, max 209,035.
 var promptSizeQuantiles = []int{
 	264, 2954, 20936, 31358, 41983, 46500, 50930, 56435, 62381, 66565, 71487,
 	75933, 81134, 86547, 91884, 98033, 104611, 115559, 131899, 157181, 209035,
@@ -144,9 +121,9 @@ func TestAdmissionCostIsExactOnTheCorpus(t *testing.T) {
 	}
 }
 
-// THE TRAILING PARTIAL BLOCK: the engine allocates a block for the last tokens of a
-// prompt whether or not they fill it, so the chain counts it — and the valve's charge,
-// which is in tokens, does not.
+// THE TRAILING PARTIAL BLOCK: the engine allocates a block for the last tokens of a prompt
+// whether or not they fill it, so the chain counts it — and the valve's charge, which is in
+// tokens, does not.
 func TestPartialBlockIsCountedInTheChain(t *testing.T) {
 	s, err := NewScheduler(defaultConfig())
 	if err != nil {

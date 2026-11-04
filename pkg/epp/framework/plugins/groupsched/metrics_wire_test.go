@@ -16,11 +16,7 @@ limitations under the License.
 
 package groupsched
 
-// THE METRIC SURFACE, AS SCRAPED. The trim keeps EIGHTEEN names (nineteen minus
-// queue_view_untrusted_passes_total, which R5 deletes with the C8 guard); this file pins that
-// each one reaches Prometheus under its documented name and labels — and that the ones
-// the trim dropped are gone (a deleted series that still registers is a promise the
-// dashboard still believes).
+// THE METRIC SURFACE, AS SCRAPED.
 
 import (
 	"sort"
@@ -56,10 +52,9 @@ var droppedMetrics = []string{
 	"tier_shadow_blocks", "tier_shadow_capacity_blocks", "tier_shadow_pairs_total",
 }
 
-// TestMetricSurfaceIsExactlyTheKeptSet drives one seat, one wait, one dispatch, one
-// exit and one cold-valve hold through the real hooks, then scrapes: every kept name is
-// present, every dropped name is absent, and the engine label carries the endpoint id
-// (not "single", not "").
+// TestMetricSurfaceIsExactlyTheKeptSet drives one seat, one wait, one dispatch, one exit and
+// one cold-valve hold through the real hooks, then scrapes: every kept name is present, every
+// dropped name is absent, and the engine label carries the endpoint id (not "single", not "").
 func TestMetricSurfaceIsExactlyTheKeptSet(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		reg := prometheus.NewRegistry()

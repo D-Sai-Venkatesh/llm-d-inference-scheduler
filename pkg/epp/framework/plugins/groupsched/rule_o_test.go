@@ -17,36 +17,6 @@ limitations under the License.
 package groupsched
 
 // RULE O — THE EMPTY ENGINE ADMITS ONE (the oversize-request liveness fix).
-//
-// A head whose EXACT cost exceeds every engine's seat budget cannot fit an engine that is
-// empty, because the budget is 0.95 of the engine's cache. The 0.95 margin is a safety
-// margin on CONCURRENT residency, not a statement that one request is inadmissible: vLLM
-// refuses to start unless the model's max-model-len fits its own KV capacity, so any request
-// the engine accepts physically fits its WHOLE cache. Without this rule such a head waited
-// for ever — a permanent stall of one branch, and (strict head-of-line) of every branch
-// behind it.
-//
-// The rule, in the order the code applies it:
-//
-//  1. TRIGGER — the head's cost exceeds the budget on EVERY engine. Otherwise placement is
-//     exactly what it was.
-//  2. An EMPTY engine takes it, subject to the cold valve as usual (an empty engine holds no
-//     charge, and a capped charge always fits the cap, so the valve is never the blocker).
-//  3. With no empty engine, the ordinary demand-driven rotation runs on the engine placement
-//     would pick anyway (most free budget, then id), and it CONVERGES on that one engine:
-//     every eviction raises its free budget, so it stays the pick until it is empty — never a
-//     spread of evictions across the pool.
-//  4. The seat charges the FULL exact chain (the index stays exact; the engine reads over
-//     budget, which is the truth — the branch uses nearly the whole GPU).
-//  5. NO THRASH: enforcement never takes an engine's SOLE staying resident as a pressure
-//     victim when its own footprint exceeds the budget. It leaves by TENURE (Q busy periods,
-//     or S of silence when a waiter needs the room), like everyone else.
-//  6. While it is seated the engine's free budget is negative, so nothing else seats there —
-//     conservative, and exactly what the accounting should say.
-//
-// These tests are the six families: the empty-engine admit at N=1 and N=2, the convergence on
-// one engine, the no-thrash passes, the tenure release when a waiter exists, and (in
-// invariant_test.go) the randomized stream with oversize heads in it.
 
 import (
 	"fmt"
@@ -162,8 +132,8 @@ func TestRuleOEvictionsConvergeOnOneEngine(t *testing.T) {
 		if got := fx.s.bindings["big"]; got != engine {
 			t.Fatalf("the head seated on %s, but placement picked %s", got, engine)
 		}
-		// CONVERGENCE: every eviction happened on the engine that took the head, and it is now
-		// empty of incumbents. Nothing was taken from another engine for this one head.
+		// CONVERGENCE: every eviction happened on the engine that took the head, and it is now empty
+		// of incumbents.
 		for _, e := range exits {
 			if e.engine != engine {
 				t.Fatalf("an eviction for ONE oversize head landed on %s, not on the engine that took it (%s): the order did not converge", e.engine, engine)
@@ -186,8 +156,7 @@ func TestRuleOEvictionsConvergeOnOneEngine(t *testing.T) {
 
 // TestRuleOWaitsForTenureNotPressure is family 5: once the oversize branch holds its engine,
 // no amount of pressure passes touches it — not the enforcement sweep, not a waiting small
-// head — and it is not even MARKED. Pressure would free the engine and admit nothing (the head
-// it was admitted for is gone), so the pass is done; tenure is how it leaves.
+// head — and it is not even MARKED.
 func TestRuleOWaitsForTenureNotPressure(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
 		budget := int64(fx.g().budgetBlocks)
@@ -196,8 +165,8 @@ func TestRuleOWaitsForTenureNotPressure(t *testing.T) {
 		if !fx.s.Seated("big") {
 			t.Fatal("fixture: the oversize branch must be seated")
 		}
-		// the other engines are FULL, so a waiting head cannot escape to one of them (at N=1
-		// there is none): the pressure this test applies is pressure on the oversize engine
+		// the other engines are FULL, so a waiting head cannot escape to one of them (at N=1 there
+		// is none): the pressure this test applies is pressure on the oversize engine
 		fx.closeEnginesExcept(t, engine, 950)
 
 		var exits int
@@ -257,8 +226,7 @@ func TestRuleOTenureFreesTheEngineForAWaiter(t *testing.T) {
 			t.Fatal("the small head cannot be seated beside the oversize resident")
 		}
 
-		// the entry turn completes, then Q further busy periods make the resident
-		// rotation-eligible
+		// the entry turn completes, then Q further busy periods make the resident rotation-eligible
 		settleTurn(fx, "big", big.ReqID, int(budget)+250)
 		for turn := 1; turn <= fx.s.cfg.Quantum; turn++ {
 			h := headWithChain("big", time.Second, chainOf("big", int(budget)+250))
@@ -324,56 +292,50 @@ func TestRuleOIsDeterministic(t *testing.T) {
 	}
 }
 
-// TestSoleOversizeStaysSeatedWithoutWaiters: the (b) fix — the sole-oversize
-// guard runs BEFORE the rotation-victim class. A sole oversize branch past Q
-// with NO waiters stays seated across many passes (enforcement never takes
-// it); a waiter arrives and it rotates out by tenure, making room.
+// TestSoleOversizeStaysSeatedWithoutWaiters: the (b) fix — the sole-oversize guard runs BEFORE
+// the rotation-victim class.
 func TestSoleOversizeStaysSeatedWithoutWaiters(t *testing.T) {
 	forEngines(t, defaultConfig(), func(t *testing.T, fx *engineSet) {
-			budget := int64(fx.g().budgetBlocks)
-			// Seat the oversize branch by Rule O and run it past Q busy periods.
-			h := head("big", time.Second, int(budget)+250)
-			engine, i := fx.pickEngine(h)
-			if i < 0 {
-				t.Fatal("Rule O did not seat the oversize head")
+		budget := int64(fx.g().budgetBlocks)
+		// Seat the oversize branch by Rule O and run it past Q busy periods.
+		h := head("big", time.Second, int(budget)+250)
+		engine, i := fx.pickEngine(h)
+		if i < 0 {
+			t.Fatal("Rule O did not seat the oversize head")
+		}
+		fx.s.DispatchedOn("", h.ReqID, engine, nil, fx.clock)
+		for j := 0; j < 5; j++ { // Q + 1 busy periods
+			settleTurn(fx, "big", h.ReqID, int(budget)+250)
+			h = head("big", time.Second, int(budget)+250)
+			if _, k := fx.pickEngine(h); k < 0 {
+				t.Fatalf("turn %d: the oversize branch lost its seat mid-residency", j)
 			}
 			fx.s.DispatchedOn("", h.ReqID, engine, nil, fx.clock)
-			for j := 0; j < 5; j++ { // Q + 1 busy periods
-				settleTurn(fx, "big", h.ReqID, int(budget)+250)
-				h = head("big", time.Second, int(budget)+250)
-				if _, k := fx.pickEngine(h); k < 0 {
-					t.Fatalf("turn %d: the oversize branch lost its seat mid-residency", j)
-				}
-				fx.s.DispatchedOn("", h.ReqID, engine, nil, fx.clock)
+		}
+		// Settle the final turn: the branch must be idle (not in flight) for the tenure rule to see
+		// it as eligible.
+		settleTurn(fx, "big", h.ReqID, int(budget)+250)
+		// Many Pick passes with NO waiters: the branch must stay seated.
+		small := head("small", 500*time.Millisecond, 100)
+		for p := 0; p < 20; p++ {
+			if i := fx.pick(); i != -1 {
+				t.Fatalf("pass %d: something was dispatched with no waiters (index %d)", p, i)
 			}
-			// Settle the final turn: the branch must be idle (not in flight) for the
-			// tenure rule to see it as eligible.
-			settleTurn(fx, "big", h.ReqID, int(budget)+250)
-			// Many Pick passes with NO waiters: the branch must stay seated.
-			small := head("small", 500*time.Millisecond, 100)
-			for p := 0; p < 20; p++ {
-				if i := fx.pick(); i != -1 {
-					t.Fatalf("pass %d: something was dispatched with no waiters (index %d)", p, i)
-				}
-				if !fx.s.Seated("big") {
-					t.Fatalf("pass %d: the sole oversize branch was evicted with no waiters", p)
-				}
+			if !fx.s.Seated("big") {
+				t.Fatalf("pass %d: the sole oversize branch was evicted with no waiters", p)
 			}
-			// A waiter arrives: tenure rotation makes room for it.
+		}
+		// A waiter arrives: tenure rotation makes room for it.
+		fx.pick(small)
+		for p := 0; p < 3 && !fx.s.Seated("small"); p++ {
 			fx.pick(small)
-			for p := 0; p < 3 && !fx.s.Seated("small"); p++ {
-				fx.pick(small)
-			}
-			if !fx.s.Seated("small") {
-				t.Fatal("the waiter never seated — the oversize branch did not rotate out by tenure")
-			}
-			// At N=1 the waiter must take the oversize branch's engine (it rotated out
-			// by tenure). At N=2 the waiter may seat on the other engine — in that case
-			// the oversize branch keeps its seat, which is correct: nobody needed the
-			// room. The assertion is: the waiter is seated, and if it took the same
-			// engine, the oversize branch is gone.
-			if smallEngine := fx.s.bindings["small"]; smallEngine == engine && fx.s.Seated("big") {
-				t.Fatal("the waiter took the oversize engine but the oversize branch is still seated")
-			}
+		}
+		if !fx.s.Seated("small") {
+			t.Fatal("the waiter never seated — the oversize branch did not rotate out by tenure")
+		}
+		// At N=1 the waiter must take the oversize branch's engine (it rotated out by tenure).
+		if smallEngine := fx.s.bindings["small"]; smallEngine == engine && fx.s.Seated("big") {
+			t.Fatal("the waiter took the oversize engine but the oversize branch is still seated")
+		}
 	})
 }

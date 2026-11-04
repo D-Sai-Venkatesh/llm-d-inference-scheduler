@@ -17,25 +17,6 @@ limitations under the License.
 package groupsched
 
 // THE PRODUCTION-SHAPED ARRIVAL FIXTURE.
-//
-// The tests that measure the ENTRY ORDER need a queue-shaped like production's, and
-// the cheap fixture (a hand-written Head per branch, re-stamped every pass) is not
-// that shape. It has two fictions that change the order itself:
-//
-//   - arrivals stamped with the wall clock while the decision clock is the fixture's
-//     virtual one, so every head arrived "in the future" and a wait was negative;
-//   - the between-cycle enforcement pass run with an EMPTY head list, which reads as
-//     "every waiter vanished": the shared queue was deleted and re-created with new
-//     stamps, so there was no order to be fair about.
-//
-// This fixture keeps the shape production has:
-//   - a head exists from its ARRIVAL until it is DISPATCHED, then it is gone until the
-//     branch's next turn arrives (a seated branch between turns has no head);
-//   - an unserved branch keeps its head, unchanged, however long it waits (TTL 0);
-//   - the fairness class is the ARRIVAL RECORD branch identity publishes — turn 1 for a
-//     branch's first request, n for its n-th — read by the same function the plugin uses
-//     (arrivalIsNewcomer), so the class is not restated here;
-//   - every instant is the fixture's own clock.
 
 import (
 	"context"
@@ -59,30 +40,28 @@ import (
 )
 
 const (
-	// promptBytes is the system prompt the fixture gives every branch: at four bytes
-	// per token that is ~300 blocks of 64 tokens, the seat the budget arithmetic here
-	// uses (three seats inside a 950-block budget).
+	// promptBytes is the system prompt the fixture gives every branch: at four bytes per token
+	// that is ~300 blocks of 64 tokens, the seat the budget arithmetic here uses (three seats
+	// inside a 950-block budget).
 	promptBytes = 76_700
-	// turnTokens is roughly what each further turn appends, so a long residency grows
-	// its chain by a couple of blocks and does not perturb the budget shape.
+	// turnTokens is roughly what each further turn appends, so a long residency grows its chain
+	// by a couple of blocks and does not perturb the budget shape.
 	turnTokens = 8
-	// thinkGap is the fixture's inter-turn gap: a seated branch is headless for this
-	// long between turns, which is what makes its waiting stamp mean something.
+	// thinkGap is the fixture's inter-turn gap: a seated branch is headless for this long between
+	// turns, which is what makes its waiting stamp mean something.
 	thinkGap = 200 * time.Millisecond
-	// roundStep is one decision pass's time step. It is SHORTER than the think gap on
-	// purpose: a served branch stays headless for several passes, so the dispatch pass
-	// visits the other engines instead of re-serving the branchiest one forever.
+	// roundStep is one decision pass's time step.
 	roundStep = thinkGap / 10
-	// prefillTime is when a dispatched turn's first token arrives (the cold charge is
-	// released there), and serviceTime when it ends: a turn OCCUPIES its branch, which
-	// is what keeps a resident from looking idle between passes.
+	// prefillTime is when a dispatched turn's first token arrives (the cold charge is released
+	// there), and serviceTime when it ends: a turn OCCUPIES its branch, which is what keeps a
+	// resident from looking idle between passes.
 	prefillTime = 40 * time.Millisecond
 	serviceTime = 120 * time.Millisecond
 )
 
-// renderTokenIDs is the render backend's tokenizer: one token per FOUR bytes, with the
-// token's id derived from its bytes, so a longer prompt EXTENDS the stream (the property
-// branch identity's chain relies on).
+// renderTokenIDs is the render backend's tokenizer: one token per FOUR bytes, with the token's
+// id derived from its bytes, so a longer prompt EXTENDS the stream (the property branch
+// identity's chain relies on).
 func renderTokenIDs(s string) []uint32 {
 	out := make([]uint32, 0, len(s)/4+1)
 	for i := 0; i < len(s); i += 4 {
@@ -109,9 +88,8 @@ func roleTokenID(role string) uint32 {
 	return 1004
 }
 
-// newRenderBackend serves vLLM's /render route for the fixture: it reads the chat
-// messages and answers with token ids. Every other route answers the same way, because
-// the token producer's warm-up probes three of them.
+// newRenderBackend serves vLLM's /render route for the fixture: it reads the chat messages and
+// answers with token ids.
 func newRenderBackend(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -140,8 +118,7 @@ func newRenderBackend(t *testing.T) *httptest.Server {
 }
 
 // newBranchIdentity builds the REAL branch-identity plugin against the fixture's render
-// backend. The fixture therefore gets genuine branch ids and genuine arrival records
-// rather than a restatement of the rule under test.
+// backend.
 func newBranchIdentity(t *testing.T) *branchidentity.Plugin {
 	t.Helper()
 	srv := newRenderBackend(t)
@@ -155,9 +132,9 @@ func newBranchIdentity(t *testing.T) *branchidentity.Plugin {
 	return built.(*branchidentity.Plugin)
 }
 
-// chainsOfTokens is the exact chain set of one prompt, hashed by the SAME function
-// production uses (prefixhash at the engine block size): the last block partial, each
-// prompt independently seeded.
+// chainsOfTokens is the exact chain set of one prompt, hashed by the SAME function production
+// uses (prefixhash at the engine block size): the last block partial, each prompt
+// independently seeded.
 func chainsOfTokens(tokens []uint32, blockSize int) []Chain {
 	req := &fwksched.InferenceRequest{
 		RequestID: "chain-of-tokens",
@@ -195,8 +172,8 @@ func chainsOfRequest(req *fwksched.InferenceRequest, blockSize int) []Chain {
 	return chains
 }
 
-// queuedTurn is ONE arrival sitting in the queue: its request (branch identity has
-// already run on it) and the head the plugin would build from it.
+// queuedTurn is ONE arrival sitting in the queue: its request (branch identity has already run
+// on it) and the head the plugin would build from it.
 type queuedTurn struct {
 	logical string
 	req     *fwksched.InferenceRequest
@@ -204,8 +181,8 @@ type queuedTurn struct {
 	tokens  []uint32
 }
 
-// flyingTurn is a dispatched turn in flight: its prefill completes at chunkAt (the cold
-// charge is released there) and the response ends at settleAt.
+// flyingTurn is a dispatched turn in flight: its prefill completes at chunkAt (the cold charge
+// is released there) and the response ends at settleAt.
 type flyingTurn struct {
 	q        *queuedTurn
 	chunkAt  time.Time
@@ -213,8 +190,8 @@ type flyingTurn struct {
 	chunked  bool
 }
 
-// workload is the arrival model: when each branch's next turn arrives, and what BI made
-// of it when it did.
+// workload is the arrival model: when each branch's next turn arrives, and what BI made of it
+// when it did.
 type workload struct {
 	t       *testing.T
 	fx      *engineSet
@@ -242,9 +219,8 @@ func newWorkload(t *testing.T, fx *engineSet) *workload {
 		flying:  map[string]*flyingTurn{},
 		retired: map[string]bool{},
 	}
-	// the seat is the only event that says a branch HELD one: a seat taken and given
-	// back inside one pass is still a seat, and a test that sampled between passes
-	// would miss it
+	// the seat is the only event that says a branch HELD one: a seat taken and given back inside
+	// one pass is still a seat, and a test that sampled between passes would miss it
 	fx.s.onBind = func(branch, _ string) { w.binds[branch]++ }
 	return w
 }
@@ -262,20 +238,20 @@ func (w *workload) arrive(logical string, at time.Time) {
 	w.due[logical] = at
 }
 
-// setPromptBytes overrides the branch's system prompt length (blocks × 256, the
-// four-bytes-per-token convention the estimate and the renderer share).
+// setPromptBytes overrides the branch's system prompt length (blocks × 256, the four-bytes-
+// per-token convention the estimate and the renderer share).
 func (w *workload) setPromptBytes(logical string, bytes int) { w.bytes[logical] = bytes }
 
-// retire drops a branch's queued head and its schedule: from here on it holds its
-// seat without ever asking to run again (the closed-engine filler).
+// retire drops a branch's queued head and its schedule: from here on it holds its seat without
+// ever asking to run again (the closed-engine filler).
 func (w *workload) retire(logical string) {
 	w.retired[logical] = true
 	delete(w.queued, logical)
 	delete(w.due, logical)
 }
 
-// chatRequest builds turn n of a branch: a fixed system prompt (unique to the branch,
-// so two branches never share a chain) plus the turn's own messages.
+// chatRequest builds turn n of a branch: a fixed system prompt (unique to the branch, so two
+// branches never share a chain) plus the turn's own messages.
 func chatRequest(logical string, turn, promptLen int) *fwksched.InferenceRequest {
 	system := logical + ":" + strings.Repeat(string(rune('a'+len(logical)%26)), promptLen)
 	msgs := []any{map[string]any{"role": "system", "content": system}}
@@ -295,8 +271,8 @@ func chatRequest(logical string, turn, promptLen int) *fwksched.InferenceRequest
 	}
 }
 
-// materialize turns every branch whose turn is due into a queued head, running branch
-// identity on it at ARRIVAL time exactly as the request path does.
+// materialize turns every branch whose turn is due into a queued head, running branch identity
+// on it at ARRIVAL time exactly as the request path does.
 func (w *workload) materialize(now time.Time) {
 	logicals := make([]string, 0, len(w.due))
 	for logical := range w.due {
@@ -350,8 +326,8 @@ func (w *workload) materialize(now time.Time) {
 	}
 }
 
-// heads is the queue-head snapshot as the plugin builds it: one head per branch whose
-// turn has arrived and not been dispatched, in a stable order.
+// heads is the queue-head snapshot as the plugin builds it: one head per branch whose turn has
+// arrived and not been dispatched, in a stable order.
 func (w *workload) heads(now time.Time) ([]Head, []string) {
 	w.materialize(now)
 	logicals := make([]string, 0, len(w.queued))
@@ -368,8 +344,8 @@ func (w *workload) heads(now time.Time) ([]Head, []string) {
 	return hs, ids
 }
 
-// dispatchTurn puts one queued turn in flight: the exact chain from the request's own
-// tokens at PreRequest, then the response timeline (first token, end of stream).
+// dispatchTurn puts one queued turn in flight: the exact chain from the request's own tokens
+// at PreRequest, then the response timeline (first token, end of stream).
 func (w *workload) dispatchTurn(logical string) {
 	w.t.Helper()
 	q, ok := w.queued[logical]
@@ -378,9 +354,9 @@ func (w *workload) dispatchTurn(logical string) {
 	}
 	delete(w.queued, logical)
 	branch := q.head.Branch
-	// the released WINDOW: a decision pass runs while the turn is on its way to the pod
-	// (in production the ~1 kHz Pick lands here), so the workload model sees the same
-	// order the live path does
+	// the released WINDOW: a decision pass runs while the turn is on its way to the pod (in
+	// production the ~1 kHz Pick lands here), so the workload model sees the same order the live
+	// path does
 	w.fx.s.PickFromHeads(nil, w.fx.clock)
 	w.fx.s.Dispatched(branch, q.req.RequestID, w.fx.clock)
 	if err := w.bi.PreRequest(context.Background(), q.req, nil); err != nil {
@@ -389,10 +365,9 @@ func (w *workload) dispatchTurn(logical string) {
 	w.flying[logical] = &flyingTurn{q: q, chunkAt: w.fx.clock.Add(prefillTime), settleAt: w.fx.clock.Add(serviceTime)}
 }
 
-// settleDue completes every turn whose timeline reached the fixture's clock: the first
-// chunk (prefill done, the cold charge released), then the end of stream, then the
-// branch's next turn a think gap later. It runs BEFORE the pass's decision, so a Pick
-// sees the state that pass's clock justifies.
+// settleDue completes every turn whose timeline reached the fixture's clock: the first chunk
+// (prefill done, the cold charge released), then the end of stream, then the branch's next
+// turn a think gap later.
 func (w *workload) settleDue() {
 	now := w.fx.clock
 	logicals := make([]string, 0, len(w.flying))
@@ -421,23 +396,21 @@ func (w *workload) settleDue() {
 	}
 }
 
-// step is one decision pass: settle what is due, then the ~1s ticker. It takes NO head
-// list and makes no decision (R5) — the Pick that follows carries the queue view.
+// step is one decision pass: settle what is due, then the ~1s ticker.
 func (w *workload) step(d time.Duration) {
 	w.settleDue()
 	w.fx.advance(d)
 }
 
-// advance moves the fixture's clock by d and runs the ~1s ticker. It takes NO head list
-// and makes no decision: that is what a tick does (R5).
+// advance moves the fixture's clock by d and runs the ~1s ticker.
 func (fx *engineSet) advance(d time.Duration) {
 	fx.clock = fx.clock.Add(d)
 	fx.s.Tick(fx.clock)
 }
 
-// seatStatic seats one branch of a chosen size on a NAMED engine and retires it: the
-// fixture's way of shaping an engine (an anchor that leaves exactly the room a later
-// group needs, or a filler that closes it).
+// seatStatic seats one branch of a chosen size on a NAMED engine and retires it: the fixture's
+// way of shaping an engine (an anchor that leaves exactly the room a later group needs, or a
+// filler that closes it).
 func (w *workload) seatStatic(t *testing.T, logical, engine string, blocks int) {
 	t.Helper()
 	w.setPromptBytes(logical, blocks*256)
@@ -458,11 +431,9 @@ func (w *workload) seatStatic(t *testing.T, logical, engine string, blocks int) 
 	w.retire(logical)
 }
 
-// TestIsReturnerFromTheArrivalRecord pins the fairness class's SOURCE: branch
-// identity's arrival record, whose turn number is 1 for a branch's first request and n
-// for its n-th (branchidentity's own tests pin the number; this pins the mapping). A
-// request with no record is a NEWCOMER — a failure to classify must never demote a
-// branch behind incumbents.
+// TestIsReturnerFromTheArrivalRecord pins the fairness class's SOURCE: branch identity's
+// arrival record, whose turn number is 1 for a branch's first request and n for its n-th
+// (branchidentity's own tests pin the number; this pins the mapping).
 func TestIsReturnerFromTheArrivalRecord(t *testing.T) {
 	withRecord := func(turn int) *fwksched.InferenceRequest {
 		req := &fwksched.InferenceRequest{RequestID: "r", Headers: map[string]string{}}
@@ -484,8 +455,8 @@ func TestIsReturnerFromTheArrivalRecord(t *testing.T) {
 	if isReturner(nil) {
 		t.Fatal("no request is a newcomer, not a returner")
 	}
-	// and the head the plugin builds carries it: a Head built without the field is a
-	// newcomer by construction, which is the property the fixtures rely on
+	// and the head the plugin builds carries it: a Head built without the field is a newcomer by
+	// construction, which is the property the fixtures rely on
 	var h Head
 	if h.Returner {
 		t.Fatal("the zero Head must be a newcomer")

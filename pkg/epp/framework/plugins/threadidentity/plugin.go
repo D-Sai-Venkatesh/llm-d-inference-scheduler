@@ -171,6 +171,13 @@ type Parameters struct {
 	// LogHeaderNames extends the logHeaders whitelist. A pure observer: no header
 	// here is read by the identity, the scope or any decision.
 	LogHeaderNames []string `json:"logHeaderNames,omitempty"`
+	// AllowKeyConsumers permits plugins that CONSUME the flow-key attribute
+	// (e.g. thunder-agent's ledger) to run alongside this plugin. The ownership
+	// check stays fail-closed for PRODUCERS — a second writer of the flow key
+	// is refused regardless of this flag. Default FALSE: unchanged behaviour.
+	// The consumer must be understood to key on THREAD ids (sub-session
+	// branches), not session ids.
+	AllowKeyConsumers bool `json:"allowKeyConsumers,omitempty"`
 }
 
 // loggedHeaderNames is the built-in logHeaders whitelist: the client's
@@ -271,6 +278,9 @@ type Plugin struct {
 	sticky         bool
 	retry          bool
 	logRequests    bool
+	// allowKeyConsumers gates only the CONSUMER half of the flow-key ownership
+	// check (see Parameters.AllowKeyConsumers). Default false = fail-closed.
+	allowKeyConsumers bool
 	logHeaders     bool
 	logHeadersList []string
 	// now is the clock seam: the stage-0c replay drives recorded arrival /
@@ -349,6 +359,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		sticky:         params.StickyBusyGuard == nil || *params.StickyBusyGuard,
 		retry:          params.RetryRule == nil || *params.RetryRule,
 		logRequests:    params.LogRequests,
+		allowKeyConsumers: params.AllowKeyConsumers,
 		logHeaders:     params.LogRequests && params.LogHeaders,
 		logHeadersList: loggedHeaderList(params.LogHeaderNames),
 		logger:         log.FromContext(ctx).WithName(PluginType + "/" + name),
@@ -455,7 +466,7 @@ func (p *Plugin) refuseForeignFlowKeyUsers() error {
 				conflicts = append(conflicts, other.TypedName().String()+" produces it")
 			}
 		}
-		if consumer, ok := other.(fwkplugin.ConsumerPlugin); ok {
+		if consumer, ok := other.(fwkplugin.ConsumerPlugin); ok && !p.allowKeyConsumers {
 			deps := consumer.Consumes()
 			_, required := deps.Required[agentidentity.AgentIdentityKey]
 			_, optional := deps.Optional[agentidentity.AgentIdentityKey]

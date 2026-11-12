@@ -175,7 +175,7 @@ func (r *GroupScheduler) ResponseBody(_ context.Context, request *fwksched.Infer
 	if target != nil && target.ID.String() != "" {
 		engine = target.ID.String()
 	}
-	r.sched.Settle(request.RequestID, engine, r.now())
+	r.sched.Settle(request.RequestID, engine, response.Usage, r.now())
 }
 
 // RequestAbandoned ends the record of a request that left the request path without reaching

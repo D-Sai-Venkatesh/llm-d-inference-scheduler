@@ -26,6 +26,7 @@ import (
 	"time"
 
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	fwkrequest "github.com/llm-d/llm-d-router/pkg/epp/framework/common/request"
 )
 
 // A request leaves the queue at Pick and comes back to the scheduler only through hooks the
@@ -41,9 +42,11 @@ type dispatchObservables struct {
 	promptTokens    int64
 }
 
-// release opens one request's record: the thread that dispatched it, the chains it was charged
-// with, and the observables PreRequest may put on the span.
-func (s *Scheduler) release(m *thread, reqID string, chains []Chain, now time.Time, obs dispatchObservables) {
+// release opens one request's record: the thread that dispatched it, the engine it was dispatched on,
+// the head it was released for (its id, its exact chains, and its fairness class), and the
+// observables PreRequest may put on the span.
+func (s *Scheduler) release(g *engineGroup, m *thread, h Head, now time.Time, obs dispatchObservables) {
+	reqID, chains := h.ReqID, h.Chains
 	if reqID == "" {
 		// An id-less request cannot be tracked: nothing names it, so no window opens and the thread
 		// is not held busy by it.
@@ -56,11 +59,15 @@ func (s *Scheduler) release(m *thread, reqID string, chains []Chain, now time.Ti
 		// turn.
 		s.dropRequest(reqID, now)
 	}
-	s.reqs[reqID] = &reqRec{thread: m.id, chains: chains, released: now,
+	rec := &reqRec{thread: m.id, chains: chains, released: now, returner: h.Returner,
 		queueWait: obs.queueWait, predictedCached: obs.predictedCached, promptTokens: obs.promptTokens,
 		counted: true}
+	s.reqs[reqID] = rec
+	// TIER 2 OPENS HERE, with the seat's own Grow and in the same critical section: the request is in
+	// flight on the engine the decision put it on from this moment, not from its PreRequest.
+	s.chargeRunning(g, rec)
 	m.pending++
-	m.windows = append(m.windows, s.reqs[reqID])
+	m.windows = append(m.windows, rec)
 }
 
 // expireWindows drops the thread's windows that have outlived S from its count, and forgets the
@@ -80,6 +87,12 @@ func (s *Scheduler) expireWindows(m *thread, now time.Time) {
 		if rec.counted && now.Sub(rec.released) > time.Duration(s.cfg.IdleSeconds*float64(time.Second)) {
 			rec.counted = false
 			m.pending = max(m.pending-1, 0)
+			// A WINDOW THAT OUTLIVED S IS NOT IN FLIGHT ANY MORE, by the same liveness rule that just
+			// stopped counting it as work: the framework's own path from Pick to PreRequest is
+			// milliseconds, so a record still pending after S will never reach a pod. Its running slot
+			// goes back here or this engine's dispatch gate waits for the reap (inflightReapSeconds,
+			// hours) on a request nothing will ever run (running.go).
+			s.unchargeRunning(rec)
 		}
 		kept = append(kept, rec)
 	}
@@ -162,6 +175,9 @@ func (s *Scheduler) dropRequest(reqID string, now time.Time) {
 		return
 	}
 	delete(s.reqs, reqID)
+	// TIER 2 CLOSES WHERE THE RECORD ENDS: a settle, an abandon, a reap, a thread's exit sweep and a
+	// re-release all come through here, so the running set cannot outlive the request that held it.
+	s.unchargeRunning(rec)
 	// The nil guard STAYS, and it is not defensiveness for a state that cannot happen: exit
 	// deletes the thread's binding BEFORE sweepThread drops its records, so during an exit a
 	// record briefly names a thread that is no longer seated. The counts are being discarded with
@@ -239,7 +255,11 @@ func (s *Scheduler) AtPod(reqID, engine string, now time.Time) dispatchObservabl
 		// the observed endpoint is authoritative
 		s.rebind(id, engine, now)
 	}
-	return s.atPod(rec, s.groups[s.bindings[id]].threads[id], engine, now)
+	g := s.groups[s.bindings[id]]
+	// THE OBSERVED ENGINE WINS, and the RUNNING charge follows it: the record was opened on the seat
+	// engine at its release, and a request that landed elsewhere is in flight THERE (running.go).
+	s.moveRunning(rec, g)
+	return s.atPod(rec, g.threads[id], engine, now)
 }
 
 // Abandon ends a request's record from OUTSIDE the decision path: the request is gone before a
@@ -285,8 +305,10 @@ func (s *Scheduler) releaseCold(g *engineGroup, id string) {
 
 // Settle finalises a request at the end of its stream: the thread comes from the request's
 // record (the scoped hook cannot read the thread id out of the request), so a settle that names no
-// record ends a turn this policy never took on, and there is nothing to close.
-func (s *Scheduler) Settle(reqID, engine string, now time.Time) {
+// record ends a turn this policy never took on, and there is nothing to close. The response's OWN
+// usage rides along: it feeds the member-return hit histogram and nothing else — no decision reads it
+// (metrics.go).
+func (s *Scheduler) Settle(reqID, engine string, usage fwkrequest.Usage, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := s.threadOfRequest(reqID)
@@ -314,6 +336,13 @@ func (s *Scheduler) Settle(reqID, engine string, now time.Time) {
 	}
 	// THE RECORD ENDS HERE, and the counts follow the map (derive-don't-accumulate).
 	m := g.threads[id]
+	// THE MEMBER-RETURN HIT, measured before the record goes: this turn belongs to a MEMBER (the
+	// thread holds a seat) and is not its thread's first turn (returner), so the engine's own
+	// cached / prompt IS the "warm by construction" claim's live check — the member came back after a
+	// gap and found its history where it left it.
+	if rec != nil && rec.returner && m != nil {
+		s.metrics.ObserveMemberReturn(engineLabel(landed), usage)
+	}
 	s.dropRequest(reqID, now)
 	m.lastActivity = now
 	s.releaseCold(g, id) // any termination releases the charge
@@ -411,6 +440,7 @@ func (s *Scheduler) reapRequests(now time.Time) {
 				// which the thread reads not-busy and is rotated (or exits) early.
 				rec.counted = false
 				s.unlinkWindow(m, rec)
+				s.unchargeRunning(rec) // tier 2: the reap is this record's last owner
 				delete(s.reqs, rid)
 				s.noteAnomaly(anomalyReapedWindow)
 				continue
@@ -419,12 +449,21 @@ func (s *Scheduler) reapRequests(now time.Time) {
 			if rec.counted && m != nil {
 				m.pending++
 			}
+			if !rec.counted {
+				// A WINDOW THAT OUTLIVED S IS NOT IN FLIGHT ANY MORE — the same liveness this loop
+				// just re-derived. The framework's path from Pick to PreRequest is milliseconds, so a
+				// record still pending after S will never reach a pod, and its running slot belongs
+				// back to the engine's dispatch gate rather than being held until this record outlives
+				// the reap bound (hours).
+				s.unchargeRunning(rec)
+			}
 			continue
 		}
 		rec.counted = false
 		if now.Sub(rec.pod) > limit {
 			// nothing to unlink: atPod closed the window when this record reached a pod, so m.windows
 			// has not held it since. The delete is the whole removal.
+			s.unchargeRunning(rec) // tier 2: a running record the reap had to close
 			delete(s.reqs, rid)
 			reaped[rec.thread] = m
 			s.noteAnomaly(anomalyReaped)

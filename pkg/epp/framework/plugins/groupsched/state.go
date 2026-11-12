@@ -138,6 +138,14 @@ type reqRec struct {
 	// when the record is opened, and corrected by the SAME liveness test at every decrement, so
 	// pending is always exactly "the records that counted at their last evaluation".
 	counted bool
+	// returner is the fairness class of the head this record was released for (thread identity says
+	// whether it is its thread's first turn): the member-return hit histogram's predicate.
+	returner bool
+	// runningOn is the engine this request is IN FLIGHT on (tier 2) and runSet is the deduplicated
+	// block set it holds there — the same chains the seat side is grown with. The pair lives exactly
+	// as long as the record does (running.go).
+	runningOn *engineGroup
+	runSet    map[Hash]struct{}
 	// the OBSERVABLES of this turn, captured at dispatch for the span PreRequest may set. Nothing
 	// in a decision reads them: the queue wait is dispatch − arrival, and the predicted cache is
 	// the resident prefix read BEFORE the charge (after it, it would always be everything).
@@ -169,10 +177,19 @@ type engineGroup struct {
 	id string
 
 	index *BlockIndex // attached at creation (block size from config)
-	// budgetBlocks is what this engine may seat, in blocks: groupBudgetFraction x THIS engine's
-	// measured capacity. 0 until THIS engine's num_gpu_blocks arrives.
+	// running is TIER 2: the in-flight requests' blocks, deduplicated and refcounted. It is never in
+	// the group's own index (see running.go).
+	running *runningIndex
+	// budgetBlocks is what this engine may SEAT, in blocks — TIER 1, MEMBERSHIP. Without a CPU tier it
+	// is groupBudgetFraction x THIS engine's measured capacity, exactly as before the two tiers
+	// existed; under groupBudgetSource = max it is max(that, cpuTierTokens / blockSize). 0 until THIS
+	// engine's num_gpu_blocks arrives.
 	budgetBlocks int
-	numBlocks    int
+	// runningCapBlocks is what this engine may have IN FLIGHT, in blocks — TIER 2, RUNNING. It is
+	// always groupBudgetFraction x num_gpu_blocks: the GPU sizes what runs (A1, amended), the CPU
+	// tier only sizes how much may stay WARM.
+	runningCapBlocks int
+	numBlocks        int
 	// blockSizeMismatch is the loud per-engine wiring failure (a measured CacheBlockSize that
 	// differs from the config's BlockSizeTokens).
 	blockSizeMismatch error
@@ -191,6 +208,10 @@ type engineGroup struct {
 // coldCapTokens is THIS engine's cold-ENTRY stagger cap, in tokens. It is NOT a knob: it is the
 // seat budget's own headroom — floor((1 - groupBudgetFraction) x num_gpu_blocks) blocks x
 // blockSizeTokens — so the valve can only ever spend the margin the budget already reserved.
+//
+// It is computed from the engine's MEASURED capacity, never from the seat budget, and that is
+// deliberate: the headroom belongs to the GPU (the prefill stagger it serialises is GPU work), so a
+// CPU-sized group does not enlarge it (A1, amended).
 func (g *engineGroup) coldCapTokens(fraction float64, blockSize int) int64 {
 	if g.numBlocks <= 0 || blockSize <= 0 {
 		return 0
@@ -205,7 +226,7 @@ func newEngineGroup(id string, blockSizeTokens int) (*engineGroup, error) {
 	if err != nil {
 		return nil, err
 	}
-	g := &engineGroup{id: id, index: idx,
+	g := &engineGroup{id: id, index: idx, running: newRunningIndex(),
 		threads: map[string]*thread{}}
 	g.counters.exits = map[string]int64{}
 	return g, nil
@@ -343,9 +364,20 @@ func (s *Scheduler) SetNumBlocksFor(engine string, blockSizeTokens, numBlocks in
 		return nil // first capacity wins, PER ENGINE
 	}
 	g.numBlocks = numBlocks
-	// The seat budget: the deployment's own statement about how much of this engine's KV one
-	// group may hold.
-	g.budgetBlocks = int(s.cfg.GroupBudgetFraction * float64(numBlocks))
+	// TIER 2's cap: the RUNNING set's ceiling, always the GPU's own share of this engine (A1,
+	// amended) — the number the policy would have seated if the CPU tier did not exist.
+	g.runningCapBlocks = int(s.cfg.GroupBudgetFraction * float64(numBlocks))
+	// TIER 1's budget: MEMBERSHIP. Without a CPU tier it IS the running cap, so the two tiers
+	// coincide and the policy is exactly the one-tier policy.
+	g.budgetBlocks = g.runningCapBlocks
+	if s.cfg.GroupBudgetSource == budgetSourceMax {
+		// NOT additive: the CPU tier's copy CONTAINS the GPU's (write-through), so the pool is the
+		// larger capacity, never the sum. The tier is a deployment fact in TOKENS, quantised here
+		// to the engine's own blocks.
+		if cpuBlocks := int(s.cfg.CpuTierTokens / int64(s.blockSize)); cpuBlocks > g.budgetBlocks {
+			g.budgetBlocks = cpuBlocks
+		}
+	}
 	return nil
 }
 
@@ -479,8 +511,8 @@ type Snapshot struct {
 	Anomalies map[string]int64 `json:"anomalies,omitempty"`
 }
 
-// EngineSnapshot is ONE engine's group state: seats, the budget, the exit mix and the exiting
-// ledger.
+// EngineSnapshot is ONE engine's group state: seats, the budget, the running side, the exit mix and
+// the exiting ledger.
 type EngineSnapshot struct {
 	ID    string `json:"id"`
 	Seats int    `json:"seats"`
@@ -489,6 +521,12 @@ type EngineSnapshot struct {
 	BudgetBlocks int   `json:"budgetBlocks"`
 	NumBlocks    int   `json:"numBlocks"`
 	ColdInFlight int64 `json:"coldInFlightTokens"`
+	// RunningSeqs and RunningBlocks are TIER 2: the requests in flight on this engine and the distinct
+	// blocks they hold; RunningCapBlocks is the cap the gate tests them against
+	// (groupBudgetFraction x num_gpu_blocks).
+	RunningSeqs      int `json:"runningSeqs"`
+	RunningBlocks    int `json:"runningBlocks"`
+	RunningCapBlocks int `json:"runningCapBlocks"`
 	// ColdCapTokens is the DERIVED cold-entry stagger cap (the budget's own headroom, in tokens).
 	ColdCapTokens int64 `json:"coldCapTokens"`
 	// The EXITING ledger (the enforcement view's own inputs, per engine): threads on their way
@@ -547,7 +585,9 @@ func (s *Scheduler) snapshot(now time.Time) Snapshot {
 			ExitingOldestAgeS: exitingOldest.Seconds(),
 			NEBlocks:          g.index.UniqueBlocks(),
 			BudgetBlocks:      g.budgetBlocks, NumBlocks: g.numBlocks,
-			ColdInFlight: g.coldInFlight, Served: g.counters.served,
+			RunningSeqs: g.running.Seqs(), RunningBlocks: g.running.Blocks(),
+			RunningCapBlocks: g.runningCapBlocks,
+			ColdInFlight:     g.coldInFlight, Served: g.counters.served,
 			ColdCapTokens: g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize),
 		}
 		if g.blockSizeMismatch != nil {

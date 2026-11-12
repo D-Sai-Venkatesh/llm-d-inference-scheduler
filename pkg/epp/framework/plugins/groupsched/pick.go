@@ -175,8 +175,18 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 			continue
 		}
 		sort.SliceStable(cands, func(x, y int) bool { return cands[x].h.Arrival.Before(cands[y].h.Arrival) })
-		// FIFO: the candidates are oldest-first, so the head is the first one
+		// FIFO: the candidates are oldest-first, so the head is the first one. v1 keeps it: NO
+		// SKIP-AHEAD. A head the gate holds blocks its engine's smaller followers too, and that
+		// head-of-line blocking is MEASURED (dispatch_gate_held_total), not fixed here.
 		chosen := &cands[0]
+		// TIER 2: THE DISPATCH GATE, in this pass's own critical section (A7) — the same moment the
+		// charge below is taken, so the gate and the charge can never disagree.
+		if reason := s.dispatchGate(g, chosen.h); reason != "" {
+			// A PASS count, not a head count: Pick runs about a thousand times a second, so a head
+			// the gate holds for a second counts about a thousand times.
+			s.metrics.ObserveDispatchGateHeld(engineLabel(g.id), reason)
+			continue
+		}
 		score := s.queuedPerSeat(g)
 		if winner == nil || score > winner.score ||
 			(score == winner.score && chosen.h.Arrival.Before(winner.c.h.Arrival)) ||
@@ -196,9 +206,10 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		if len(winner.c.h.Chains) > 0 {
 			g.index.Grow(m.id, winner.c.h.Chains)
 		}
-		// The request is RELEASED: it is neither queued nor in flight until PreRequest records it,
-		// and the record written here is what every later hook resolves it by.
-		s.release(m, winner.c.h.ReqID, winner.c.h.Chains, now, obs)
+		// The request is RELEASED: it leaves the queue here, tier 2's running charge opens with it in
+		// this same critical section, and the record written here is what every later hook resolves it
+		// by.
+		s.release(g, m, winner.c.h, now, obs)
 		m.lastActivity = now
 		g.counters.served++
 		s.counters.served++

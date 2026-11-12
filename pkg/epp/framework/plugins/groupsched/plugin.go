@@ -18,6 +18,14 @@ limitations under the License.
 // seat held by each thread of requests while it runs. A thread is a chain of requests in which each
 // one extends the previous; it is the fairness unit, the queue key and the thing that holds a seat.
 //
+// It has TWO TIERS, and they answer different questions. TIER 1, MEMBERSHIP, is who may stay WARM: the
+// seat budget is groupBudgetFraction × the engine's num_gpu_blocks, or — with a CPU KV-offload tier
+// configured (groupBudgetSource: max) — max(that, cpuTierTokens ÷ blockSizeTokens), because the CPU
+// tier's copy contains the GPU's (write-through), so the pool is the larger capacity and never the
+// sum. TIER 2, RUNNING, is what actually occupies the GPU: a member's head is dispatched only while the
+// engine's in-flight requests stay inside groupBudgetFraction × num_gpu_blocks (and below maxNumSeqs),
+// so a bigger group buys warm returns, never a bigger running set.
+//
 // Every cost here is KV BLOCKS of a request's prompt, and this policy never hashes one: thread
 // identity renders the request once at arrival, hashes it once, derives the thread from those
 // blocks, and PUBLISHES the same per-prompt blocks (ThreadBlocksKey). One render and one hash per
@@ -34,8 +42,9 @@ limitations under the License.
 //	eviction.go       who loses a seat, and when
 //	requests.go       request records: released → at a pod → done
 //	state.go          the data, its life cycle, and the lock convention
-//	blockindex.go     the cache accounting: distinct blocks, their refcounts, the exact cost
-//	config.go         the six knobs, their defaults and their validation
+//	blockindex.go     the SEAT side's cache accounting: distinct blocks, their refcounts, the exact cost
+//	running.go        the RUNNING side: what is in flight, and the dispatch gate (tier 2)
+//	config.go         the knobs, their defaults and their validation
 //	metrics.go        what an operator sees: the counters at their events, the gauges at scrape
 //
 // THE ROUTER'S CALLS, and where each one goes:

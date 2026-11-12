@@ -23,6 +23,8 @@ package groupsched
 import (
 	"testing"
 	"time"
+
+	fwkrequest "github.com/llm-d/llm-d-router/pkg/epp/framework/common/request"
 )
 
 // epoch is the fixture's own clock: the policy measures everything in the units its passes are
@@ -61,7 +63,7 @@ func seat(t *testing.T, s *Scheduler, id string, blocks int) {
 func settle(t *testing.T, s *Scheduler, id string) {
 	t.Helper()
 	s.FirstChunk("r-"+id, epoch)
-	s.Settle("r-"+id, "", epoch)
+	s.Settle("r-"+id, "", fwkrequest.Usage{}, epoch)
 }
 
 // seated is "this thread holds a seat", read straight off the binding the policy keeps.

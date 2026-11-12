@@ -22,6 +22,7 @@ import (
 
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 
+	fwkrequest "github.com/llm-d/llm-d-router/pkg/epp/framework/common/request"
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -55,6 +56,12 @@ type groupMetrics struct {
 	// coldValveHeld counts heads the cold-entry VALVE held back: the budget would have admitted
 	// the head, the valve refused it, so the head WAITED for the engine's prefill slot.
 	coldValveHeld *prometheus.CounterVec
+	// dispatchGateHeld counts heads TIER 2's DISPATCH GATE held back, by the half that held them:
+	// the running set is the GPU-sized one, the membership is not.
+	dispatchGateHeld *prometheus.CounterVec
+	// memberReturnHit is the MEMBER-RETURN HIT: for a member's later turn, the engine's own
+	// cached ÷ prompt from the response. It is the live check of "warm by construction".
+	memberReturnHit *prometheus.HistogramVec
 }
 
 // subsystem namespaces every series (llm_d_epp_group_*).
@@ -96,6 +103,15 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "should-be-zero events the policy could not act on, by kind. no_tokens_head = a RENDER FAILURE: one Pick pass saw a thread head with no rendered tokens, so it could not be seated or charged (served last, unseated) — a PASS rate, not a request count, because Pick runs at ~1 kHz. no_request_id = a boundary guard: a turn was released for a request with no id, and the router gives every request one, so this reads 0 in practice. reaped_inflight / reaped_window = THE LEAK SIGNALS: a request (or a released window) outlived the reap and had to be closed by it — the thread's accounting is only right because the reap closed it"}, []string{"kind"})
 	g.coldValveHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "cold_valve_held_total",
 		Help: "Pick passes in which the queue head was held by this engine's cold-entry valve (the budget would have admitted it; it WAITS, nothing is evicted). A PASS count, not a head count: Pick runs at ~1 kHz, so a head held for a second counts about a thousand times"}, engineLabels)
+	// TIER 2. Both halves are PASS counts for the same reason as the cold valve's, and `reason` is
+	// which half held the head: seqs = the engine already has maxNumSeqs requests in flight, memory =
+	// the head's chain does not fit beside the in-flight blocks inside groupBudgetFraction x
+	// num_gpu_blocks.
+	g.dispatchGateHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "dispatch_gate_held_total",
+		Help: "Pick passes in which a member's head was held at the DISPATCH GATE, by reason: seqs (maxNumSeqs requests already in flight on this engine) or memory (the in-flight requests' deduplicated blocks plus this head's chain would exceed groupBudgetFraction x num_gpu_blocks). A PASS count, not a head count: Pick runs at ~1 kHz. Always 0 under groupBudgetSource=gpu with maxNumSeqs 0, where the seats already bound the running set"}, []string{"engine", "reason"})
+	g.memberReturnHit = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "member_return_hit_ratio",
+		Help:    "MEMBER-RETURN HIT: for a settled turn of a SEATED thread that is not its first turn, the response's prompt_tokens_details.cached_tokens / prompt_tokens — how much of the returning member's prompt the engine already held. Requires vLLM --enable-prompt-tokens-details; turns whose response carries no prompt-token details are not observable and are not counted",
+		Buckets: prometheus.LinearBuckets(0, 0.05, 21)}, engineLabels)
 
 	// The GLOBAL zero series: a zero is a fact, an absent series is a question (and a
 	// should-be-zero count with no series is the shape of a bug nobody notices).
@@ -105,7 +121,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	}
 	for _, c := range []prometheus.Collector{g.gauges,
 		g.exits, g.entryWait, g.served, g.queueWait, g.predictedCached, g.dispatchedPrompt,
-		g.affinityViolations, g.engineGone, g.coldValveHeld, g.anomalies,
+		g.affinityViolations, g.engineGone, g.coldValveHeld, g.dispatchGateHeld, g.memberReturnHit, g.anomalies,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
@@ -140,6 +156,9 @@ func (g *groupMetrics) preInstantiateEngine(engine string) {
 	g.served.WithLabelValues(label).Add(0)
 	for _, reason := range exitReasons {
 		g.exits.WithLabelValues(label, reason).Add(0)
+	}
+	for _, reason := range gateReasons {
+		g.dispatchGateHeld.WithLabelValues(label, reason).Add(0)
 	}
 }
 
@@ -221,6 +240,37 @@ func (g *groupMetrics) ObserveColdValveHeld(engine string) {
 	g.coldValveHeld.WithLabelValues(engineLabel(engine)).Inc()
 }
 
+// ObserveDispatchGateHeld counts one pass in which TIER 2's dispatch gate held a member's head on
+// this engine, by the half that held it.
+func (g *groupMetrics) ObserveDispatchGateHeld(engine, reason string) {
+	if g == nil || g.dispatchGateHeld == nil {
+		return
+	}
+	g.dispatchGateHeld.WithLabelValues(engineLabel(engine), reason).Inc()
+}
+
+// ObserveMemberReturn records the member-return hit of one settled turn: the response's own cached ÷
+// prompt. A response without prompt-token details (vLLM's --enable-prompt-tokens-details off) does
+// not carry the number, and a zero-prompt response would make the ratio meaningless: neither is
+// observed, so the histogram's count is the number of MEASURED member returns, not of member
+// returns.
+func (g *groupMetrics) ObserveMemberReturn(engine string, usage fwkrequest.Usage) {
+	if g == nil || g.memberReturnHit == nil {
+		return
+	}
+	if usage.PromptTokenDetails == nil || usage.PromptTokens <= 0 {
+		return
+	}
+	cached := usage.PromptTokenDetails.CachedTokens
+	if cached < 0 {
+		cached = 0
+	}
+	if cached > usage.PromptTokens {
+		cached = usage.PromptTokens
+	}
+	g.memberReturnHit.WithLabelValues(engineLabel(engine)).Observe(float64(cached) / float64(usage.PromptTokens))
+}
+
 // ---- the gauges: rendered from ONE Snapshot at scrape time ----
 
 // stateGauges renders every per-engine GAUGE from ONE Snapshot at scrape time, so a scrape sees the
@@ -244,6 +294,12 @@ type stateGauges struct {
 	coldCap         *prometheus.Desc
 	capacityMissing *prometheus.Desc
 	waiters         *prometheus.Desc
+	// the TIER 2 pair: what is IN FLIGHT, which is the GPU's business whatever sizes membership.
+	runningSeqs   *prometheus.Desc
+	runningBlocks *prometheus.Desc
+	// budgetSource is which tier sizes membership (groupBudgetSource): one series per source, 1 for
+	// the one in force, 0 for the other, so a dashboard can chart the mode a run was in.
+	budgetSource *prometheus.Desc
 }
 
 // gaugeDesc builds one per-engine gauge descriptor under the plugin's subsystem.
@@ -274,6 +330,12 @@ func newStateGauges(r *GroupScheduler) *stateGauges {
 			"DERIVED cold-entry stagger cap in tokens: floor((1-groupBudgetFraction) x this engine's num_gpu_blocks) x blockSizeTokens"),
 		capacityMissing: gaugeDesc("capacity_missing",
 			"1 while this engine's num_gpu_blocks is unknown"),
+		runningSeqs: gaugeDesc("running_seqs",
+			"requests IN FLIGHT on this engine (dispatched, not yet settled): tier 2's sequence count, the number maxNumSeqs bounds"),
+		runningBlocks: gaugeDesc("running_blocks",
+			"distinct blocks of this engine's in-flight requests, deduplicated and refcounted: tier 2's memory side, the number groupBudgetFraction x num_gpu_blocks bounds"),
+		budgetSource: prometheus.NewDesc(prometheus.BuildFQName("", subsystem, "budget_source"),
+			"which tier sizes the GROUP (membership): gpu = groupBudgetFraction x num_gpu_blocks, max = max(that, cpuTierTokens / blockSizeTokens). 1 for the source in force, 0 for the other", []string{"source"}, nil),
 		waiters: prometheus.NewDesc(prometheus.BuildFQName("", subsystem, "waiters_shared"),
 			"heads waiting in the ONE shared admission queue", nil, nil),
 	}
@@ -282,7 +344,8 @@ func newStateGauges(r *GroupScheduler) *stateGauges {
 // Describe sends every descriptor this collector can produce.
 func (c *stateGauges) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{c.seats, c.neBlocks, c.budgetBlocks, c.exiting,
-		c.exitingBlks, c.exitingAge, c.coldInFlight, c.coldCap, c.capacityMissing, c.waiters} {
+		c.exitingBlks, c.exitingAge, c.coldInFlight, c.coldCap, c.capacityMissing, c.waiters,
+		c.runningSeqs, c.runningBlocks, c.budgetSource} {
 		ch <- d
 	}
 }
@@ -310,6 +373,8 @@ func (c *stateGauges) Collect(ch chan<- prometheus.Metric) {
 		gauge(c.exitingAge, es.ExitingOldestAgeS, es.ID)
 		gauge(c.coldInFlight, float64(es.ColdInFlight), es.ID)
 		gauge(c.coldCap, float64(es.ColdCapTokens), es.ID)
+		gauge(c.runningSeqs, float64(es.RunningSeqs), es.ID)
+		gauge(c.runningBlocks, float64(es.RunningBlocks), es.ID)
 	}
 	// capacity_missing: every KNOWN endpoint whose geometry the scheduler has not measured. An engine
 	// counts as measured only once it has blocks; one with no group at all is the pre-capacity case.
@@ -323,4 +388,12 @@ func (c *stateGauges) Collect(ch chan<- prometheus.Metric) {
 		gauge(c.capacityMissing, v, label)
 	}
 	gauge(c.waiters, float64(snap.WaitersShared))
+	// budget_source is a policy-wide fact, rendered from the config the scheduler is RUNNING with.
+	for _, source := range []string{budgetSourceGPU, budgetSourceMax} {
+		v := 0.0
+		if c.sched.cfg.GroupBudgetSource == source {
+			v = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.budgetSource, prometheus.GaugeValue, v, source)
+	}
 }

@@ -140,7 +140,10 @@ func (r *GroupScheduler) learnCapacity(engine string, m *fwkdl.Metrics) error {
 	r.logger.V(logutil.DEFAULT).Info("group-scheduler: capacity learned",
 		"engine", r.sched.GroupLabel(engine),
 		"cacheBlockSize", m.CacheBlockSize, "numGpuBlocks", m.CacheNumBlocks,
-		"budgetBlocks", int(r.cfg.GroupBudgetFraction*float64(m.CacheNumBlocks)))
+		"budgetSource", r.cfg.GroupBudgetSource,
+		"budgetBlocks", int(r.cfg.GroupBudgetFraction*float64(m.CacheNumBlocks)),
+		"cpuTierTokens", r.cfg.CpuTierTokens,
+		"maxNumSeqs", r.cfg.MaxNumSeqs)
 	return nil
 }
 

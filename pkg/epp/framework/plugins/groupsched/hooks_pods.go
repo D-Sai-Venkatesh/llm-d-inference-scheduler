@@ -137,13 +137,24 @@ func (r *GroupScheduler) learnCapacity(engine string, m *fwkdl.Metrics) error {
 		r.logBlockSizeMismatches()
 		return err
 	}
+	// THE LOG REPORTS WHAT THE SCHEDULER DERIVED, never a second computation of the same number: the
+	// membership budget (which `max` may have taken from the CPU tier) and the running cap (always the GPU
+	// share) are two different numbers from here on, and a log that printed f x num_gpu_blocks as
+	// "budgetBlocks" would hide the CPU tier whenever it was in force.
+	budget, runningCap, _ := r.sched.Budgets(engine)
 	r.logger.V(logutil.DEFAULT).Info("group-scheduler: capacity learned",
 		"engine", r.sched.GroupLabel(engine),
 		"cacheBlockSize", m.CacheBlockSize, "numGpuBlocks", m.CacheNumBlocks,
 		"budgetSource", r.cfg.GroupBudgetSource,
-		"budgetBlocks", int(r.cfg.GroupBudgetFraction*float64(m.CacheNumBlocks)),
+		"budgetBlocks", budget, "runningCapBlocks", runningCap,
 		"cpuTierTokens", r.cfg.CpuTierTokens,
 		"maxNumSeqs", r.cfg.MaxNumSeqs)
+	// A `max` that resolves to the GPU share is a CPU tier configured to do nothing: loud, because it
+	// looks like a two-tier arm in the echo and is a one-tier arm in every decision.
+	if r.cfg.GroupBudgetSource == budgetSourceMax && budget == runningCap {
+		r.logger.V(logutil.DEFAULT).Info("group-scheduler: WARNING groupBudgetSource=max but the CPU tier does NOT enlarge the group — cpuTierTokens / blockSizeTokens is not above groupBudgetFraction x num_gpu_blocks, so membership is the GPU share (this is the one-tier policy)",
+			"engine", r.sched.GroupLabel(engine), "budgetBlocks", budget, "runningCapBlocks", runningCap)
+	}
 	return nil
 }
 

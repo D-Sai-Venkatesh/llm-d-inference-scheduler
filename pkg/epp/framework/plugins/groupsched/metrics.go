@@ -100,7 +100,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.engineGone = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: subsystem, Name: "engine_gone_total",
 		Help: "engines torn down by an endpoint delete"})
 	g.anomalies = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "anomalies_total",
-		Help: "should-be-zero events the policy could not act on, by kind. no_tokens_head = a RENDER FAILURE: one Pick pass saw a thread head with no rendered tokens, so it could not be seated or charged (served last, unseated) — a PASS rate, not a request count, because Pick runs at ~1 kHz. no_request_id = a boundary guard: a turn was released for a request with no id, and the router gives every request one, so this reads 0 in practice. reaped_inflight / reaped_window = THE LEAK SIGNALS: a request (or a released window) outlived the reap and had to be closed by it — the thread's accounting is only right because the reap closed it"}, []string{"kind"})
+		Help: "should-be-zero events the policy could not act on, by kind. no_tokens_head = a RENDER FAILURE: one Pick pass saw a thread head with no rendered tokens, so it could not be seated or charged (served last, unseated) — a PASS rate, not a request count, because Pick runs at ~1 kHz. no_request_id = a boundary guard: a turn was released for a request with no id, and the router gives every request one, so this reads 0 in practice. reaped_inflight / reaped_window = THE LEAK SIGNALS: a request (or a released window) outlived the reap and had to be closed by it — the thread's accounting is only right because the reap closed it. late_prerequest = a released request reached its pod after its S = 20 s window had died, so the policy had already given its running slot back (the charge is re-opened; if the thread's exit had already swept the record the request runs untracked — v1's limit). running_underflow = a running-index release with nothing charged, i.e. a double release; should be 0"}, []string{"kind"})
 	g.coldValveHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "cold_valve_held_total",
 		Help: "Pick passes in which the queue head was held by this engine's cold-entry valve (the budget would have admitted it; it WAITS, nothing is evicted). A PASS count, not a head count: Pick runs at ~1 kHz, so a head held for a second counts about a thousand times"}, engineLabels)
 	// TIER 2. Both halves are PASS counts for the same reason as the cold valve's, and `reason` is
@@ -109,9 +109,13 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	// num_gpu_blocks.
 	g.dispatchGateHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "dispatch_gate_held_total",
 		Help: "Pick passes in which a member's head was held at the DISPATCH GATE, by reason: seqs (maxNumSeqs requests already in flight on this engine) or memory (the in-flight requests' deduplicated blocks plus this head's chain would exceed groupBudgetFraction x num_gpu_blocks). A PASS count, not a head count: Pick runs at ~1 kHz. Always 0 under groupBudgetSource=gpu with maxNumSeqs 0, where the seats already bound the running set"}, []string{"engine", "reason"})
+	// member_return_hit_ratio is split by `kind`, because two different turns were being averaged into one
+	// claim: `member` is a turn dispatched on a residency that was already there (the "warm by
+	// construction" check), `reentry` is the FIRST turn of a new residency (the seat was granted at that
+	// pass, so its history is gone by design — the re-entry's own hit is the measure of what an exit costs).
 	g.memberReturnHit = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "member_return_hit_ratio",
-		Help:    "MEMBER-RETURN HIT: for a settled turn of a SEATED thread that is not its first turn, the response's prompt_tokens_details.cached_tokens / prompt_tokens — how much of the returning member's prompt the engine already held. Requires vLLM --enable-prompt-tokens-details; turns whose response carries no prompt-token details are not observable and are not counted",
-		Buckets: prometheus.LinearBuckets(0, 0.05, 21)}, engineLabels)
+		Help:    "MEMBER-RETURN HIT: for a settled turn of a SEATED thread that is not its first turn, the response's prompt_tokens_details.cached_tokens / prompt_tokens — how much of the prompt the engine already held. kind=member: the turn ran on a residency that was already there (THE warm-by-construction check). kind=reentry: the first turn of a NEW seat, cold by design. Requires vLLM --enable-prompt-tokens-details; a response without prompt-token details is not observable and is not counted",
+		Buckets: prometheus.LinearBuckets(0, 0.05, 21)}, []string{"engine", "kind"})
 
 	// The GLOBAL zero series: a zero is a fact, an absent series is a question (and a
 	// should-be-zero count with no series is the shape of a bug nobody notices).
@@ -249,12 +253,19 @@ func (g *groupMetrics) ObserveDispatchGateHeld(engine, reason string) {
 	g.dispatchGateHeld.WithLabelValues(engineLabel(engine), reason).Inc()
 }
 
+// memberReturnMember and memberReturnReentry are the histogram's kinds: a turn on a residency that was
+// already there, and the first turn of a new one (cold by design).
+const (
+	memberReturnMember  = "member"
+	memberReturnReentry = "reentry"
+)
+
 // ObserveMemberReturn records the member-return hit of one settled turn: the response's own cached ÷
 // prompt. A response without prompt-token details (vLLM's --enable-prompt-tokens-details off) does
 // not carry the number, and a zero-prompt response would make the ratio meaningless: neither is
 // observed, so the histogram's count is the number of MEASURED member returns, not of member
 // returns.
-func (g *groupMetrics) ObserveMemberReturn(engine string, usage fwkrequest.Usage) {
+func (g *groupMetrics) ObserveMemberReturn(kind, engine string, usage fwkrequest.Usage) {
 	if g == nil || g.memberReturnHit == nil {
 		return
 	}
@@ -268,7 +279,7 @@ func (g *groupMetrics) ObserveMemberReturn(engine string, usage fwkrequest.Usage
 	if cached > usage.PromptTokens {
 		cached = usage.PromptTokens
 	}
-	g.memberReturnHit.WithLabelValues(engineLabel(engine)).Observe(float64(cached) / float64(usage.PromptTokens))
+	g.memberReturnHit.WithLabelValues(engineLabel(engine), kind).Observe(float64(cached) / float64(usage.PromptTokens))
 }
 
 // ---- the gauges: rendered from ONE Snapshot at scrape time ----

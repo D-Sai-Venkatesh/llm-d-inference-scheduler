@@ -337,6 +337,7 @@ func (s *Scheduler) observablesFor(g *engineGroup, h Head, now time.Time) dispat
 		// the turn that SEATED this thread: its prediction was measured at the seat, before the
 		// reservation. Consume it — every later turn measures the index directly.
 		obs.predictedCached, obs.promptTokens = m.seatObs.predictedCached, m.seatObs.promptTokens
+		obs.seatEntry = true // the FIRST dispatch of this residency: a re-entry turn, cold by design
 		m.seatObs = nil
 		s.metrics.ObserveQueueWait(queueWaitKind(h), nonNegative(obs.queueWait))
 		s.metrics.ObservePredictedCache(engineLabel(g.id), obs.predictedCached, obs.promptTokens)

@@ -383,6 +383,107 @@ func TestAbandonReapAndExpiredWindowCleanTheRunningIndex(t *testing.T) {
 	})
 }
 
+// TestLatePreRequestReopensItsRunningSlot: a released request whose window outlived S gave its slot back
+// (decision: a dead window is not in flight). If the request reaches its pod anyway it IS in flight, so the
+// slot is re-opened UNGATED — over-counting a real request is safe, under-counting it is not — and the
+// event is counted, because it means Pick->PreRequest took longer than S.
+func TestLatePreRequestReopensItsRunningSlot(t *testing.T) {
+	s := tierSched(t, func(c *Config) { c.MaxNumSeqs = 1 })
+	if i := s.Pass([]Head{head("late", time.Second, 600)}, epoch); i != 0 {
+		t.Fatalf("the head must dispatch, got %d", i)
+	}
+	// the pass at t+21 s: the window is dead, so the slot comes back
+	later := epoch.Add(21 * time.Second)
+	s.Pass(nil, later)
+	if seqs, _, _ := running(s, ""); seqs != 0 {
+		t.Fatalf("a dead window must not hold a slot: %d", seqs)
+	}
+	// ... and then the request arrives after all
+	s.AtPod("r-late", "", later)
+	if seqs, blocks, _ := running(s, ""); seqs != 1 || blocks != 600 {
+		t.Fatalf("the late arrival must be charged again: seqs=%d blocks=%d, want 1/600", seqs, blocks)
+	}
+	s.mu.Lock()
+	if got := s.counters.anomalies[anomalyLatePreRequest]; got != 1 {
+		t.Fatalf("the late arrival must be counted once, got %d", got)
+	}
+	s.mu.Unlock()
+	// and the seq gate holds the next head again: the re-opened charge is real
+	if i := s.Pass([]Head{head("next", time.Second, 100)}, later); i != -1 {
+		t.Fatalf("the re-opened charge must close the sequence gate, got %d", i)
+	}
+}
+
+// TestLatePreRequestAfterTheSweepIsCounted: the residual v1 cannot fix — the thread's exit swept the record
+// before the request arrived, so the request runs untracked. The sweep is where it is counted, because after
+// that delete no hook can see it.
+func TestLatePreRequestAfterTheSweepIsCounted(t *testing.T) {
+	s := tierSched(t, func(c *Config) { c.MaxNumSeqs = 2 })
+	if i := s.Pass([]Head{head("gone", time.Second, 100)}, epoch); i != 0 {
+		t.Fatalf("the head must dispatch, got %d", i)
+	}
+	later := epoch.Add(21 * time.Second)
+	s.Pass(nil, later) // the window dies
+	if n := s.RemoveEngine("", later); n != 1 {
+		t.Fatalf("the engine teardown must exit its thread, got %d", n)
+	}
+	s.mu.Lock()
+	late := s.counters.anomalies[anomalyLatePreRequest]
+	s.mu.Unlock()
+	if late != 1 {
+		t.Fatalf("the swept dead window must be counted once, got %d", late)
+	}
+}
+
+// TestTheGateIsExactAtTheCap: the boundary itself. A head that brings the running set EXACTLY to the cap is
+// dispatched; one block more is held (an off-by-one here would either waste the last slot or over-admit).
+func TestTheGateIsExactAtTheCap(t *testing.T) {
+	s := cpuTierSched(t) // running cap 950, membership 1,900
+	if i := s.Pass([]Head{head("a", 3*time.Second, 700)}, epoch); i != 0 {
+		t.Fatalf("the first head must dispatch, got %d", i)
+	}
+	inFlight(t, s, "", "r-a")
+	// b's chain grows out of a's, so it adds exactly 250 blocks: 700 + 250 = 950 = the cap
+	if i := s.Pass([]Head{turn("a", "r-a2", 2*time.Second, 950)}, epoch); i != 0 {
+		t.Fatalf("a head that lands EXACTLY on the cap must be dispatched, got %d", i)
+	}
+	if seqs, blocks, cap := running(s, ""); seqs != 2 || blocks != 950 || cap != 950 {
+		t.Fatalf("running must be exactly at the cap: seqs=%d blocks=%d cap=%d", seqs, blocks, cap)
+	}
+	// one more block anywhere is over
+	if i := s.Pass([]Head{turn("b", "r-b", time.Second, 1)}, epoch); i != -1 {
+		t.Fatalf("one block past the cap must be held, got %d", i)
+	}
+}
+
+// TestRunningUnderflowIsCountedNotMasked: a double release cannot happen through the public entry points, so
+// it is provoked at the index: the counter still clamps (the process must not die under the scheduler's mutex
+// for an accounting bug) but the event is counted, never silently swallowed.
+func TestRunningUnderflowIsCountedNotMasked(t *testing.T) {
+	s := cpuTierSched(t)
+	r := newRunningIndex()
+	set := chargeSet(chain("x", 10))
+	r.add(set)
+	if !r.release(set) {
+		t.Fatal("a matching release must report clean")
+	}
+	if r.release(set) {
+		t.Fatal("a second release must report the underflow")
+	}
+	if r.Seqs() != 0 || r.Blocks() != 0 {
+		t.Fatalf("the counters still clamp: seqs=%d blocks=%d", r.Seqs(), r.Blocks())
+	}
+	// the scheduler books it
+	rec := &reqRec{chains: chain("x", 10), runSet: set, runningOn: s.groups[""]}
+	s.mu.Lock()
+	s.unchargeRunning(rec)
+	got := s.counters.anomalies[anomalyRunningUnderflow]
+	s.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("the masked underflow must be counted once, got %d", got)
+	}
+}
+
 // TestRunningIndexIsDedupedAndRefcounted: the running set counts BLOCKS, not charges — two requests
 // of one thread share their prefix, and the shared keys stay while either of them is in flight.
 func TestRunningIndexIsDedupedAndRefcounted(t *testing.T) {
@@ -480,12 +581,24 @@ func TestTwoTierSeriesAreExported(t *testing.T) {
 	s.Settle("r-m", "e0", fwkrequest.Usage{PromptTokens: 2000,
 		PromptTokenDetails: &fwkrequest.PromptTokenDetails{CachedTokens: 1000}}, epoch)
 
+	// a SECOND turn of the same member, this time NOT a seat entry: kind=member
+	third := turn("m", "r-m-3", time.Second, 300)
+	third.Returner = true
+	if i := s.Pass([]Head{third}, epoch); i != 0 {
+		t.Fatalf("the third turn must dispatch once the gate frees, got %d", i)
+	}
+	s.AtPod("r-m-3", "e0", epoch)
+	s.FirstChunk("r-m-3", epoch)
+	s.Settle("r-m-3", "e0", fwkrequest.Usage{PromptTokens: 400,
+		PromptTokenDetails: &fwkrequest.PromptTokenDetails{CachedTokens: 400}}, epoch)
+
 	mfs, err := reg.Gather()
 	if err != nil {
 		t.Fatal(err)
 	}
 	found := map[string]bool{}
-	var gateHeld, memberSamples, memberSum float64
+	var gateHeld float64
+	kinds := map[string][2]float64{} // kind -> {samples, sum}
 	for _, mf := range mfs {
 		found[mf.GetName()] = true
 		switch mf.GetName() {
@@ -499,8 +612,16 @@ func TestTwoTierSeriesAreExported(t *testing.T) {
 			}
 		case "llm_d_epp_group_member_return_hit_ratio":
 			for _, m := range mf.GetMetric() {
-				memberSamples += float64(m.GetHistogram().GetSampleCount())
-				memberSum += m.GetHistogram().GetSampleSum()
+				kind := ""
+				for _, l := range m.GetLabel() {
+					if l.GetName() == "kind" {
+						kind = l.GetValue()
+					}
+				}
+				k := kinds[kind]
+				k[0] += float64(m.GetHistogram().GetSampleCount())
+				k[1] += m.GetHistogram().GetSampleSum()
+				kinds[kind] = k
 			}
 		}
 	}
@@ -516,7 +637,12 @@ func TestTwoTierSeriesAreExported(t *testing.T) {
 	if gateHeld < 1 {
 		t.Fatalf("the memory half of the gate must be counted, got %v", gateHeld)
 	}
-	if memberSamples != 1 || memberSum != 0.5 {
-		t.Fatalf("the member-return hit is cached/prompt of the settled turn: %v samples, sum %v (want 1 and 0.5)", memberSamples, memberSum)
+	// the FIRST settled turn was dispatched on a seat granted in that same pass: a RE-ENTRY (0.5 cached)
+	// the THIRD ran on a residency that was already there: a MEMBER turn (1.0)
+	if got := kinds[memberReturnReentry]; got[0] != 1 || got[1] != 0.5 {
+		t.Fatalf("kind=reentry must carry the seat-entry turn: %v samples, sum %v (want 1 and 0.5)", got[0], got[1])
+	}
+	if got := kinds[memberReturnMember]; got[0] != 1 || got[1] != 1 {
+		t.Fatalf("kind=member must carry the resident turn: %v samples, sum %v (want 1 and 1)", got[0], got[1])
 	}
 }

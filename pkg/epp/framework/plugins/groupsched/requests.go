@@ -40,6 +40,9 @@ type dispatchObservables struct {
 	queueWait       time.Duration
 	predictedCached int64
 	promptTokens    int64
+	// seatEntry is true when this dispatch was the FIRST of a residency (the thread was seated in the same
+	// pass), i.e. the turn cannot be warm: the member-return histogram's kind.
+	seatEntry bool
 }
 
 // release opens one request's record: the thread that dispatched it, the engine it was dispatched on,
@@ -60,8 +63,8 @@ func (s *Scheduler) release(g *engineGroup, m *thread, h Head, now time.Time, ob
 		s.dropRequest(reqID, now)
 	}
 	rec := &reqRec{thread: m.id, chains: chains, released: now, returner: h.Returner,
-		queueWait: obs.queueWait, predictedCached: obs.predictedCached, promptTokens: obs.promptTokens,
-		counted: true}
+		seatEntry: obs.seatEntry, queueWait: obs.queueWait,
+		predictedCached: obs.predictedCached, promptTokens: obs.promptTokens, counted: true}
 	s.reqs[reqID] = rec
 	// TIER 2 OPENS HERE, with the seat's own Grow and in the same critical section: the request is in
 	// flight on the engine the decision put it on from this moment, not from its PreRequest.
@@ -201,11 +204,19 @@ func (s *Scheduler) dropRequest(reqID string, now time.Time) {
 // sweepThread drops every record a thread owns: they name a seat that no longer exists,
 // so no later hook could act on them (and a settle for one closes nothing, not a mis-charged
 // engine).
+//
+// A record that never reached a pod AND whose window had already died is the v1 limit of the running
+// index: if the request still arrives, nothing tracks it any more. That case is counted here, because
+// after this delete no hook can see it (late_prerequest; see anomalyKinds).
 func (s *Scheduler) sweepThread(id string, now time.Time) {
 	for reqID, rec := range s.reqs {
-		if rec.thread == id {
-			s.dropRequest(reqID, now)
+		if rec.thread != id {
+			continue
 		}
+		if rec.pod.IsZero() && !s.windowLive(rec, now) {
+			s.noteAnomaly(anomalyLatePreRequest)
+		}
+		s.dropRequest(reqID, now)
 	}
 }
 
@@ -258,7 +269,18 @@ func (s *Scheduler) AtPod(reqID, engine string, now time.Time) dispatchObservabl
 	g := s.groups[s.bindings[id]]
 	// THE OBSERVED ENGINE WINS, and the RUNNING charge follows it: the record was opened on the seat
 	// engine at its release, and a request that landed elsewhere is in flight THERE (running.go).
-	s.moveRunning(rec, g)
+	if rec.runningOn == nil && rec.pod.IsZero() {
+		// A LATE ARRIVAL. Its window outlived S, so the pass gave its running slot back (that is what
+		// keeps a request the framework never brought to a pod from holding a slot for the whole reap
+		// bound) — but the request IS in flight from here on, so the slot is re-opened, UNGATED: holding
+		// a genuine request out of the account is unsafe, counting it twice is merely conservative. If the
+		// thread's exit had already swept the record, AtPod above returns early and the request runs
+		// untracked — v1's documented limit, counted at the sweep as late_prerequest.
+		s.noteAnomaly(anomalyLatePreRequest)
+		s.chargeRunning(g, rec)
+	} else {
+		s.moveRunning(rec, g)
+	}
 	return s.atPod(rec, g.threads[id], engine, now)
 }
 
@@ -336,12 +358,17 @@ func (s *Scheduler) Settle(reqID, engine string, usage fwkrequest.Usage, now tim
 	}
 	// THE RECORD ENDS HERE, and the counts follow the map (derive-don't-accumulate).
 	m := g.threads[id]
-	// THE MEMBER-RETURN HIT, measured before the record goes: this turn belongs to a MEMBER (the
-	// thread holds a seat) and is not its thread's first turn (returner), so the engine's own
-	// cached / prompt IS the "warm by construction" claim's live check — the member came back after a
-	// gap and found its history where it left it.
+	// THE MEMBER-RETURN HIT, measured before the record goes: a turn of a SEATED thread that is not its
+	// thread's first, split by kind. A turn dispatched on a seat the thread had just been given is a
+	// RE-ENTRY — the seat is new, the old residency's copy is gone — so it can never be warm by
+	// construction and it is its own kind. `member` is the "warm by construction" live check: the turn ran
+	// on a residency that was already there and found its history where it left it.
 	if rec != nil && rec.returner && m != nil {
-		s.metrics.ObserveMemberReturn(engineLabel(landed), usage)
+		kind := memberReturnMember
+		if rec.seatEntry {
+			kind = memberReturnReentry
+		}
+		s.metrics.ObserveMemberReturn(kind, engineLabel(landed), usage)
 	}
 	s.dropRequest(reqID, now)
 	m.lastActivity = now

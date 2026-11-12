@@ -43,7 +43,10 @@ func newRunningIndex() *runningIndex {
 	return &runningIndex{blocks: make(map[Hash]int)}
 }
 
-// add charges one request's deduplicated block set.
+// add charges one request's deduplicated block set, and ONE sequence for it. One record is one sequence:
+// a multi-prompt request (len(chains) > 1) is n sequences inside vLLM, so the gate's sequence half reads
+// one lower than the engine's own count for those requests. Rare (one prompt per request in every cell so
+// far), and it errs toward admitting, never toward holding.
 func (r *runningIndex) add(set map[Hash]struct{}) {
 	r.seqs++
 	for h := range set {
@@ -51,16 +54,30 @@ func (r *runningIndex) add(set map[Hash]struct{}) {
 	}
 }
 
-// release returns one request's deduplicated block set and its sequence.
-func (r *runningIndex) release(set map[Hash]struct{}) {
-	r.seqs = max(r.seqs-1, 0)
+// release returns one request's deduplicated block set and its sequence. It reports false when it had
+// to MASK an underflow — a sequence with nothing charged, or a block that is not held — which means the
+// same request was released twice. The counter is still clamped (a panic under s.mu would take the whole
+// scheduler down for an accounting bug), but the caller books an anomaly: an underflow that nobody counts
+// is a running set that silently under-admits, which is exactly the failure the gate exists to prevent.
+func (r *runningIndex) release(set map[Hash]struct{}) bool {
+	ok := true
+	if r.seqs > 0 {
+		r.seqs--
+	} else {
+		ok = false
+	}
 	for h := range set {
-		if c, held := r.blocks[h]; held && c > 1 {
+		c, held := r.blocks[h]
+		switch {
+		case !held:
+			ok = false
+		case c > 1:
 			r.blocks[h] = c - 1
-		} else {
+		default:
 			delete(r.blocks, h)
 		}
 	}
+	return ok
 }
 
 // Seqs is how many requests are in flight on this engine (the gate's sequence half).
@@ -100,13 +117,15 @@ var gateReasons = []string{gateReasonSeqs, gateReasonMemory}
 // otherwise the half that held it. It is read in the SAME critical section as the dispatch, so the
 // gate and the charge can never disagree (A7).
 //
-// The MEMORY half is armed exactly while the group's seat budget EXCEEDS the running cap — the case
-// the gate exists for. When the two are equal (no CPU tier: the GPU-sized group), the seats already
-// bound the running set, exactly as they did before the gate existed: gsch never dispatched more than
-// its seat budget, so the gate could only ever read a transient over-count of one partial tail block
-// per in-flight request and hold a head the policy used to dispatch. Arming it there would change the
-// one-tier policy's decisions without adding a bound it did not already have, which is also why OFF
-// mode is decision-identical to the commit this branch was cut from.
+// The MEMORY half is armed exactly while the group's seat budget EXCEEDS the running cap — the case the
+// gate exists for. When the two are equal (no CPU tier: the GPU-sized group) the seat budget IS the
+// bound, and the one-tier policy already lived with a running set that transiently exceeds it: a turn's
+// chain is charged at dispatch and enforcement runs at the START of the next pass, and a marked-exiting
+// member keeps running (its blocks are off the STAY side but its request is still in flight). Arming the
+// gate there would hold heads the one-tier policy used to dispatch, for an over-count the seat side
+// already tolerates — a decision change with no bound behind it. That is also why OFF mode is
+// decision-identical to the commit this branch was cut from (verified: arming it under gpu moves the
+// pinned digest).
 //
 // An engine with NOTHING in flight runs one head whatever its size: the dispatch twin of RULE O (A8).
 // Without it a single member whose chain exceeds the running cap — a head RULE O itself seated on an
@@ -149,7 +168,9 @@ func (s *Scheduler) unchargeRunning(rec *reqRec) {
 	if rec == nil || rec.runningOn == nil {
 		return
 	}
-	rec.runningOn.running.release(rec.runSet)
+	if !rec.runningOn.running.release(rec.runSet) {
+		s.noteAnomaly(anomalyRunningUnderflow)
+	}
 	rec.runningOn = nil
 }
 
@@ -160,7 +181,9 @@ func (s *Scheduler) moveRunning(rec *reqRec, to *engineGroup) {
 	if rec == nil || rec.runningOn == nil || rec.runningOn == to {
 		return
 	}
-	rec.runningOn.running.release(rec.runSet)
+	if !rec.runningOn.running.release(rec.runSet) {
+		s.noteAnomaly(anomalyRunningUnderflow)
+	}
 	if to != nil {
 		to.running.add(rec.runSet)
 	}

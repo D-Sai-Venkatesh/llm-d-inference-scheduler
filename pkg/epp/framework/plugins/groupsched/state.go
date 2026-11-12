@@ -141,6 +141,10 @@ type reqRec struct {
 	// returner is the fairness class of the head this record was released for (thread identity says
 	// whether it is its thread's first turn): the member-return hit histogram's predicate.
 	returner bool
+	// seatEntry reports whether this turn was dispatched on a seat the thread had JUST been given — the
+	// first dispatch of a residency. Such a turn is cold BY DESIGN (a re-entry's history was never in this
+	// residency), so the member-return histogram splits it off under its own kind.
+	seatEntry bool
 	// runningOn is the engine this request is IN FLIGHT on (tier 2) and runSet is the deduplicated
 	// block set it holds there — the same chains the seat side is grown with. The pair lives exactly
 	// as long as the record does (running.go).
@@ -381,6 +385,19 @@ func (s *Scheduler) SetNumBlocksFor(engine string, blockSizeTokens, numBlocks in
 	return nil
 }
 
+// Budgets is ONE engine's derived budgets in blocks: the MEMBERSHIP budget (tier 1, which `max` may have
+// taken from the CPU tier) and the RUNNING cap (tier 2, always the GPU share). ok is false when the engine
+// has no measured capacity yet.
+func (s *Scheduler) Budgets(engine string) (budgetBlocks, runningCapBlocks int, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, found := s.groups[engine]
+	if !found || g.numBlocks <= 0 {
+		return 0, 0, false
+	}
+	return g.budgetBlocks, g.runningCapBlocks, true
+}
+
 // HasCapacity reports whether ANY engine has a measured num_gpu_blocks (the pre-capacity FCFS
 // pass-through's whole-stack condition).
 func (s *Scheduler) HasCapacity() bool {
@@ -463,11 +480,22 @@ const (
 	anomalyNoRequestID  = "no_request_id"
 	anomalyReaped       = "reaped_inflight"
 	anomalyReapedWindow = "reaped_window"
+	// anomalyLatePreRequest: the policy had given a released request's running slot back (its window
+	// outlived S = 20 s without the request reaching a pod), and the request arrived anyway. The charge is
+	// re-opened when the record still exists; when the thread's exit had already swept it (v1 keeps no
+	// detached record for a released-but-never-at-a-pod request) the request runs UNTRACKED, and this
+	// counter is the only signal of it. Either way it means Pick→PreRequest took longer than S, which no
+	// measured pass ever does; a run where it reads 0 has had neither case.
+	anomalyLatePreRequest = "late_prerequest"
+	// anomalyRunningUnderflow: a running-index release that had to MASK an underflow — the same request
+	// was released twice. Should be 0; a nonzero value means the running set under-admits.
+	anomalyRunningUnderflow = "running_underflow"
 )
 
 // anomalyKinds is every kind, in a fixed order (the metric pre-instantiates one zero series
 // per kind: a zero is a fact, an absent series is a question).
-var anomalyKinds = []string{anomalyNoTokens, anomalyNoRequestID, anomalyReaped, anomalyReapedWindow}
+var anomalyKinds = []string{anomalyNoTokens, anomalyNoRequestID, anomalyReaped, anomalyReapedWindow,
+	anomalyLatePreRequest, anomalyRunningUnderflow}
 
 // noteAnomaly books one anomaly and tells the observer.
 func (s *Scheduler) noteAnomaly(kind string) {

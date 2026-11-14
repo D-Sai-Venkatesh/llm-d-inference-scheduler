@@ -123,9 +123,6 @@ type nca2Entry struct {
 	lastTouch time.Time
 }
 
-// nca2PodOf is a group's line, or nil when the group predates nca2 (a group created in OFF).
-func nca2PodOf(g *engineGroup) *nca2Pod { return g.nca2 }
-
 // ---- the line's geometry ----
 
 // nca2PositionOn is one entry's POSITION on this pod: the sum of the entry tokens from the head

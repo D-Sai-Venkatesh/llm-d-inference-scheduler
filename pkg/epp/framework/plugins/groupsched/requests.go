@@ -151,7 +151,14 @@ func (s *Scheduler) atPod(rec *reqRec, m *thread, engine string, now time.Time) 
 			m.lastActivity = now
 		}
 		rec.engine = engine
-		// the decision's own observability still rides back: a repeated PreRequest is the same turn
+		if s.nca2 == nil {
+			// OFF IS THE BASE, BYTE FOR BYTE: the shipped atPod returns the zero observables for a
+			// request that already reached a pod, and the span attributes it leaves alone are part of the
+			// shipped behaviour (nca2 spec §1).
+			return dispatchObservables{}
+		}
+		// nca2: the decision's own observability still rides back — a repeated PreRequest is the same
+		// turn, and its span must not lose the class, the path, the waits or the client's request id.
 		return dispatchObservables{queueWait: rec.queueWait, predictedCached: rec.predictedCached,
 			promptTokens: rec.promptTokens, nca2: rec.nca2}
 	}
@@ -282,7 +289,7 @@ func (s *Scheduler) AtPod(reqID, engine string, now time.Time) dispatchObservabl
 	}
 	// L1/L3 for the CPU tier: the request REACHED a pod, which is the router-visible truth about
 	// what that pod's CPU tier now holds for this thread (nca2 only; nil in OFF).
-	posAtTouch, warm := s.nca2AtPod(id, engine, rec.promptTokens, now)
+	posAtTouch, warm := s.nca2AtPod(rec, engine, now)
 	obs := s.atPod(rec, s.groups[s.bindings[id]].threads[id], engine, now)
 	if s.nca2 != nil {
 		// THE DECISION'S FACTS COME FROM THE RECORD (release stored them); the LINE's facts belong to

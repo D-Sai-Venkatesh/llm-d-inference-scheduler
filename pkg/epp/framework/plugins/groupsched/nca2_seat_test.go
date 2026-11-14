@@ -798,6 +798,59 @@ func TestAReturnerIsSeatedFromSurplusBeyondTheReservation(t *testing.T) {
 	}
 }
 
+// TestTheReservationIsDroppedWhenTheRoomShrinks: A9's third drop condition (the gate's MAJOR-1). The
+// pod holds a reservation for the outside head; then a deep admitted entry's thread comes back, the
+// LAA deepens, the room falls below the head's own f — and the hold must be released, or a returner
+// that fits the freed space stays unseated for as long as that head is the head.
+func TestTheReservationIsDroppedWhenTheRoomShrinks(t *testing.T) {
+	returners := map[string]int{"ret": 300}
+	f, big := budgetFixture(t, returners)
+	heads := append([]Head{big}, returnerHeads(f, returners)...)
+	f.now = f.now.Add(time.Second)
+	if i := f.s.Pass(heads, f.now); i != -1 {
+		t.Fatalf("pass 1 must decide nothing (the head needs two seats), got %d", i)
+	}
+	f.s.mu.Lock()
+	reserved := f.s.groups["p0"].nca2.reservedBlocks
+	f.s.mu.Unlock()
+	if reserved <= 0 {
+		t.Fatalf("fixture: the head's budget must be outstanding after pass 1, got %d", reserved)
+	}
+	if seated(f.s, "ret") {
+		t.Fatal("fixture: the returner must be held out in pass 1")
+	}
+	// a DEEP admitted entry's thread returns: it is admitted and waiting, so it becomes the LAA and the
+	// room falls below the head's f (320 tokens)
+	f.s.mu.Lock()
+	f.s.nca2.homes["deep"] = "p0"
+	f.s.nca2.admitted["deep"] = true
+	f.s.nca2.ever["deep"] = true
+	// appended at the TAIL: deep becomes the LAA at position 2860 (room 180 < f 320) without pushing the
+	// few shallow entries past the line
+	f.s.groups["p0"].nca2.line = append(f.s.groups["p0"].nca2.line, nca2Entry{thread: "deep", tokens: 1900})
+	f.s.waiters["deep"] = &waiter{id: "deep", since: f.now.Add(-time.Second)}
+	f.s.mu.Unlock()
+	deep := f.hdHeavy("deep", 5, 320)
+	f.now = f.now.Add(time.Second)
+	heads2 := append([]Head{big, deep}, returnerHeads(f, returners)...)
+	if i := f.s.Pass(heads2, f.now); i < 0 {
+		t.Fatal("the returner must be seated once the reservation is released")
+	}
+	f.s.mu.Lock()
+	room := f.s.nca2View(f.s.groups["p0"]).room(f.s.nca2.AdmitLineTokens)
+	after := f.s.groups["p0"].nca2.reservedBlocks
+	f.s.mu.Unlock()
+	if room >= 320 {
+		t.Fatalf("fixture: the room must be below the head's f (320), got %d", room)
+	}
+	if after != 0 {
+		t.Fatalf("A9: the reservation must be dropped when the head no longer fits the room, got %d", after)
+	}
+	if !seated(f.s, "ret") {
+		t.Fatal("the freed space belongs to the pod's returners once the hold is dropped")
+	}
+}
+
 // TestTheDecisionCapIsWaitersPlusFourPods: A1 — the cap's own arithmetic (a pure function so the rule
 // is checkable) and the pass's report that it never exceeded it.
 func TestTheDecisionCapIsWaitersPlusFourPods(t *testing.T) {

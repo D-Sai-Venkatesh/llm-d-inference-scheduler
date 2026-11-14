@@ -541,7 +541,7 @@ func TestOneEntryPerThreadAcrossPods(t *testing.T) {
 	}
 	// a move: still ONE entry, on the pod that served the request
 	s.mu.Lock()
-	s.nca2AtPod("a", "p1", 4*64, epoch.Add(2*time.Second))
+	s.nca2AtPod(&reqRec{thread: "a", promptTokens: 4 * 64, released: epoch, pod: epoch, engine: "p0"}, "p1", epoch.Add(2*time.Second))
 	s.mu.Unlock()
 	if got := entriesOf(s, "a"); got != 1 {
 		t.Fatalf("a move must leave one entry across every pod: %d", got)
@@ -557,7 +557,7 @@ func TestMoveTransfersTheAdmission(t *testing.T) {
 	s := newNCA2(t, []string{"p0", "p1"})
 	admit(t, s, "p0", "a", 10)
 	s.mu.Lock()
-	_, warm := s.nca2AtPod("a", "p1", 5*64, epoch.Add(time.Second))
+	_, warm := s.nca2AtPod(&reqRec{thread: "a", promptTokens: 5 * 64, released: epoch, pod: epoch, engine: "p0"}, "p1", epoch.Add(time.Second))
 	s.mu.Unlock()
 	if warm {
 		t.Fatal("the prediction is read BEFORE the write (a fresh entry is not warm)")

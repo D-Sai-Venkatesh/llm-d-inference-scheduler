@@ -75,14 +75,12 @@ type nca2Policy struct {
 	// has been the head. Written by the pass, only READ by the Snapshot (I9).
 	blockedHead  string
 	blockedSince time.Time
-	// passMemo / candTokens / warm are the PASS's own caches (V2): a candidate's exact cost per pod
-	// (keyed by the pod's generation), its own prompt size, and each pod's warm-returner list sorted
-	// deepest-first. They are rebuilt at the start of every pass; a pod's index change advances its
-	// generation, which retires that pod's cost entries.
+	// passMemo / cand / warm are the PASS's own caches (V2): a candidate's exact cost per pod, its own
+	// prompt size, and each pod's warm-returner list sorted deepest-first. They are rebuilt at the
+	// start of every pass — one entry per (pod, candidate), which is what makes the exact accounting
+	// affordable — and nothing in them survives a pass.
 	passMemo map[fitKey]fitFacts
 	cand     map[string]nca2Cand
-	// passSeq numbers the passes: the per-pod entry maps are built once per sequence number
-	passSeq int
 	// warmBuilt is "the warm-returner lists of this pass have been built" (lazily: a pass that never
 	// reaches phase 2, or has no waiters, must not pay for them)
 	warmBuilt bool
@@ -125,8 +123,9 @@ func (s *Scheduler) initNCA2() {
 type nca2Pod struct {
 	// line is the ordered entries, the MOST RECENT TOUCH FIRST.
 	line []nca2Entry
-	// inflight is the number of requests IN FLIGHT on this pod: A5's first sort key. Derived every
-	// pass from the request records (and maintained at the pod hook for a between-pass read).
+	// inflight is the number of requests IN FLIGHT on this pod: A5's first sort key. It is written by
+	// nca2Derive at the top of every pass and cleared by nca2ResetPod; the only reader, A5, runs later
+	// in the same pass.
 	inflight int
 
 	// ---- A9: the ADMISSION BUDGET ----
@@ -137,14 +136,6 @@ type nca2Pod struct {
 	// changes, is admitted, loses its place, or the pod's room cannot take it.
 	reservedHead   string
 	reservedBlocks int64
-
-	// entries is the line as thread → tokens, built at most ONCE PER PASS (entriesPass holds the pass
-	// sequence it was built for): the cheap fit test needs the tokens this pod already holds for a
-	// thread, without walking the line per candidate. Within a pass it can be stale after an admission
-	// (a missing entry, which is conservative) or after a push-out (a stale entry, which can only make
-	// the cheap test optimistic — and the seat re-checks the exact cost).
-	entries     map[string]int64
-	entriesPass int
 }
 
 // nca2Entry is one thread's place in a pod's CPU line.
@@ -419,9 +410,17 @@ func (s *Scheduler) nca2Pushout(g *engineGroup, id, reason string, now time.Time
 // the authoritative moment (the base's at-pod hook). It returns the span's own line facts:
 // positionAtTouch (the entry's position AFTER the write) and predictedWarm (its position ≤ L_t
 // BEFORE it).
-func (s *Scheduler) nca2AtPod(id, engine string, tokens int64, now time.Time) (positionAtTouch int64, predictedWarm bool) {
-	if s.nca2 == nil || id == "" || engine == "" {
+func (s *Scheduler) nca2AtPod(rec *reqRec, engine string, now time.Time) (positionAtTouch int64, predictedWarm bool) {
+	if s.nca2 == nil || rec == nil || rec.thread == "" || engine == "" {
 		return 0, false
+	}
+	id, tokens := rec.thread, rec.promptTokens
+	// ONE WRITE PER (REQUEST, POD). The framework can hand the same request to PreRequest twice; the
+	// entry move is idempotent, but the write counter is not (it is the CPU write rate §7 reports) and
+	// the pre-touch prediction is not (a second touch would read the post-touch position). The facts of
+	// the first write are kept on the record and handed back.
+	if rec.touchPod == engine {
+		return rec.touchPos, rec.touchWarm
 	}
 	g, ok := s.groups[engine]
 	if !ok || g.nca2 == nil {
@@ -443,6 +442,7 @@ func (s *Scheduler) nca2AtPod(id, engine string, tokens int64, now time.Time) (p
 	s.nca2LineSet(g, id, tokens, now, pushoutTouch)
 	s.nca2m.ObserveLineTouch(engineLabel(g.id), tokens)
 	positionAtTouch, _ = s.nca2PositionOn(g, id)
+	rec.touchPod, rec.touchPos, rec.touchWarm = engine, positionAtTouch, predictedWarm
 	return positionAtTouch, predictedWarm
 }
 
@@ -585,35 +585,10 @@ func (s *Scheduler) nca2ResetPod(g *engineGroup, now time.Time) {
 	}
 }
 
-// nca2EntryTokens is the tokens this pod's line already holds for the thread (0 when it has no entry).
-// The map is rebuilt only when the line changed, so a sweep over many candidates is one walk.
-func (s *Scheduler) nca2EntryTokens(g *engineGroup, id string) int64 {
-	if s.nca2 == nil || g == nil || g.nca2 == nil {
-		return 0
-	}
-	p := g.nca2
-	if p.entriesPass != s.nca2.passSeq || p.entries == nil {
-		// REUSED, not reallocated: an admission or an eviction retires the map on every decision, and
-		// a fresh map per decision is a per-pass allocation the benchmars see
-		if p.entries == nil {
-			p.entries = make(map[string]int64, len(p.line))
-		} else {
-			clear(p.entries)
-		}
-		for _, e := range p.line {
-			p.entries[e.thread] = e.tokens
-		}
-		p.entriesPass = s.nca2.passSeq
-	}
-	return p.entries[id]
-}
-
-// nca2Cand is a candidate's own size, cached for the pass (a waiter's chains are immutable):
-// Tokens is its prompt total, Keys the block keys it names. Both are read without touching the
-// pod's block index, which is what makes the cheap fit test cheap.
+// nca2Cand is a candidate's own size, cached for the pass (a waiter's chains are immutable): its
+// prompt total, which A2.1 compares against the pod's room and nothing else reads.
 type nca2Cand struct {
 	tokens int64
-	keys   int64
 }
 
 // nca2CandOf is the candidate's size.
@@ -625,9 +600,6 @@ func (s *Scheduler) nca2CandOf(w *waiter) nca2Cand {
 		return c
 	}
 	c := nca2Cand{tokens: PromptTokens(w.chains)}
-	for _, ch := range w.chains {
-		c.keys += int64(len(ch.Keys))
-	}
 	if s.nca2.cand != nil {
 		s.nca2.cand[w.id] = c
 	}

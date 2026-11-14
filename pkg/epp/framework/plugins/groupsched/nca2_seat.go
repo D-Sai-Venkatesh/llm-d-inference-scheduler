@@ -48,7 +48,6 @@ func (s *Scheduler) ncaV2SeatWaiters(now time.Time) {
 	s.nca2.cand = map[string]nca2Cand{}
 	s.nca2.warm = map[string][]*waiter{}
 	s.nca2.warmBuilt = false
-	s.nca2.passSeq++
 	limit := ncaV2DecisionCap(len(s.waiters), len(s.groups))
 	s.nca2.passDecisions, s.nca2.capHit = 0, false
 	decisions := 0
@@ -135,7 +134,12 @@ func (s *Scheduler) ncaV2DecideOnce(now time.Time) bool {
 			}
 			if f > p.room {
 				// f(X) ≤ room(P): the provisional entry must fit the space this pod has. A pod that
-				// cannot take the head in SPACE is not asked to hold seats for it either.
+				// cannot take the head in SPACE is not asked to hold seats for it either — A9's
+				// reservation is DROPPED with the room (the spec's third drop condition): the space it
+				// was holding belongs to the pod's returners again.
+				if p.g.nca2 != nil {
+					p.g.nca2.reservedHead, p.g.nca2.reservedBlocks = "", 0
+				}
 				continue
 			}
 			if !s.ncaV2AdmissionBudget(p.g, head, now, memo) {

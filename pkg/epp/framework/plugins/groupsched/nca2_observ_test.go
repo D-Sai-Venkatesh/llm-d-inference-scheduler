@@ -447,6 +447,47 @@ func TestTheWarmPredictionIsTheThreadsDataOnThePod(t *testing.T) {
 	}
 }
 
+// TestARepeatedPreRequestTouchesTheLineOnce: G4 — the framework can hand the same request to
+// PreRequest twice. The entry move is idempotent, but the CPU WRITE RATE (§7) and the pre-touch
+// prediction are not: the line must be written once, the counter incremented once, and the second
+// call must hand back the FIRST call's facts (so predictedWarm is not replaced by a post-touch read).
+func TestARepeatedPreRequestTouchesTheLineOnce(t *testing.T) {
+	f := newFixture(t, "p0")
+	metrics := newNCA2Metrics()
+	reg := prometheus.NewRegistry()
+	for _, c := range metrics.collectors() {
+		require.NoError(t, reg.Register(c))
+	}
+	f.s.nca2m = metrics
+	f.now = f.now.Add(time.Second)
+	head := f.hd("a", 10)
+	if i := f.s.Pass([]Head{head}, f.now); i != 0 {
+		t.Fatalf("the head must be admitted and served, got %d", i)
+	}
+	first := f.s.AtPod(head.ReqID, "p0", f.now)
+	again := f.s.AtPod(head.ReqID, "p0", f.now.Add(time.Millisecond))
+	fams, err := reg.Gather()
+	require.NoError(t, err)
+	touched := -1.0
+	for _, fam := range fams {
+		if fam.GetName() != "llm_d_epp_nca2_line_touch_tokens_total" {
+			continue
+		}
+		for _, m := range fam.GetMetric() {
+			touched = m.GetCounter().GetValue()
+		}
+	}
+	if touched != 640 {
+		t.Fatalf("one touch of a 640-token prompt is one write (the CPU write rate), got %v", touched)
+	}
+	if again.nca2.positionAtTouch != first.nca2.positionAtTouch || again.nca2.predictedWarm != first.nca2.predictedWarm {
+		t.Fatalf("a repeated at-pod hands back the FIRST write's facts: %+v vs %+v", again.nca2, first.nca2)
+	}
+	if !again.nca2.valid || again.nca2.class != nca2ClassAdmittedNow || again.nca2.clientRequestID != head.ClientReqID {
+		t.Fatalf("the repeated at-pod still annotates the span on the production path: %+v", again.nca2)
+	}
+}
+
 // TestSpanHasNoNCA2AttributesWhenTheTurnIsNotNCA2s: OFF's span keeps exactly the shipped attributes.
 func TestSpanHasNoNCA2AttributesWhenTheTurnIsNotNCA2s(t *testing.T) {
 	recorder := tracetestRecorder(t)

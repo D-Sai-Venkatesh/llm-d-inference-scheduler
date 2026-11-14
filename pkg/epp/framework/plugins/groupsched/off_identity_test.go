@@ -99,6 +99,7 @@ func offTrace(t *testing.T) []string {
 		t.Fatalf("pass 1 must serve the only head, got %d", i)
 	}
 	at("a", "p0")
+	at("a", "p0") // a REPEATED PreRequest: the shipped at-pod is a no-op, and the digest must say so
 	first("a")
 	done("a", "p0")
 
@@ -112,6 +113,7 @@ func offTrace(t *testing.T) []string {
 	pass(3, []Head{{Thread: "a", ReqID: "r-a", Arrival: now.Add(-time.Second), Returner: true,
 		FairnessID: "f-a", WireID: "w-a", Chains: chain("a", 100)}, head("d", 4*time.Second, 400)})
 	at("a", "p0")
+	at("a", "p0") // a REPEATED PreRequest: the shipped at-pod is a no-op, and the digest must say so
 	first("a")
 	done("a", "p0")
 
@@ -162,6 +164,33 @@ func offTrace(t *testing.T) []string {
 	pass(31, nil)
 	pass(32, nil)
 	return trace
+}
+
+// TestOFFRepeatedAtPodIsTheBasesZeros: a request that already reached a pod and is handed to
+// PreRequest AGAIN is the base's no-op: the shipped atPod returns the zero observables, so the span
+// keeps whatever it had. OFF must do exactly that — the nca2 ride-back is gated behind the mode.
+// (This file compiles against fb57f538 unchanged, so the assertion is the base's own behaviour.)
+func TestOFFRepeatedAtPodIsTheBasesZeros(t *testing.T) {
+	s, err := NewScheduler(defaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNumBlocksFor("p0", 64, 1000); err != nil {
+		t.Fatal(err)
+	}
+	now := epoch
+	head := Head{Thread: "m", ReqID: "r-m", Arrival: now.Add(-time.Second), Chains: chain("m", 10)}
+	if i := s.Pass([]Head{head}, now); i != 0 {
+		t.Fatalf("the head must be seated and served, got %d", i)
+	}
+	first := s.AtPod("r-m", "p0", now)
+	if first.promptTokens == 0 {
+		t.Fatal("fixture: the first at-pod carries the turn's observables")
+	}
+	again := s.AtPod("r-m", "p0", now)
+	if again.queueWait != 0 || again.predictedCached != 0 || again.promptTokens != 0 {
+		t.Fatalf("OFF must return the base's zero observables on a repeated at-pod, got %+v", again)
+	}
 }
 
 // TestOFFIdentityIsTheBase pins the shipped decision stream: OFF (no mode) must decide exactly what

@@ -149,6 +149,12 @@ type reqRec struct {
 	// when the record is opened, and corrected by the SAME liveness test at every decrement, so
 	// pending is always exactly "the records that counted at their last evaluation".
 	counted bool
+	// touchPod / touchPos / touchWarm are the FIRST at-pod write of this request (nca2 only): a repeated
+	// PreRequest is the same touch, so it must not write the line again, count the write again, or
+	// re-read the pre-touch prediction.
+	touchPod  string
+	touchPos  int64
+	touchWarm bool
 	// leaked marks a request that has been in flight longer than nca2's maxInflightSeconds: it stops
 	// holding its thread ACTIVE and is counted once, in leaked_requests_total. It is nca2's own
 	// flag and is never read in OFF.

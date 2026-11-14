@@ -54,6 +54,9 @@ type Head struct {
 	// x-request-id): the one field that joins a SEAT/EXIT line to the client's own request records,
 	// whatever the queue key turned out to be.
 	WireID string
+	// ClientReqID is the client's x-request-id specifically (nca2 §7's client_request_id): the EXACT
+	// join between a span and the client's records, when the client sent that header.
+	ClientReqID string
 	// Returner reports whether this request is NOT its thread's first turn — the fairness class,
 	// from thread identity's arrival record.
 	Returner bool
@@ -107,8 +110,9 @@ type thread struct {
 	// its SEAT/EXIT events name (see Head.FairnessID).
 	fairnessID string
 	// wireID is the last client request id this thread was seen with: the field a SEAT/EXIT line
-	// joins a request record on (see Head.WireID).
-	wireID string
+	// joins a request record on (see Head.WireID). clientReqID is its x-request-id (nca2's span join).
+	wireID      string
+	clientReqID string
 	// nca2Class is the class of the turn that SEATED this thread (admitted_now | returner): its first
 	// dispatch reports it, later turns report "seated". nca2Room is the pod's room at the decision
 	// that seated it, and nca2Pushed whether the thread had been pushed out before it. They are the
@@ -170,6 +174,9 @@ type waiter struct {
 	// own request record (see Head.WireID).
 	fairnessID string
 	wireID     string
+	// clientReqID is the client's own x-request-id (see Head.ClientReqID): it rides with the head so a
+	// SEAT's observability can name the request that WON the admission.
+	clientReqID string
 }
 
 // engineGroup is everything that is a fact about ONE engine's HBM: its block index (dedup is per

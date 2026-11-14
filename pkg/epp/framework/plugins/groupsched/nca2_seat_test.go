@@ -280,6 +280,40 @@ func TestOutsiderFirstThenTheReturner(t *testing.T) {
 	f.s.onEvent = nil
 }
 
+// TestHeadIsTriedOverTheFleetBeforeAnyReturnerSeat: R2 — the outside head is tried on EVERY pod
+// before A2.2 seats anybody: here it cannot fit its own (A4-preferred) pod but fits another, and the
+// preferred pod's warm returner gets the NEXT repetition.
+func TestHeadIsTriedOverTheFleetBeforeAnyReturnerSeat(t *testing.T) {
+	f := newFixture(t, "p0", "p1")
+	// warm lives on p0, admitted, and its head is waiting (a warm returner)
+	f.s.mu.Lock()
+	f.s.nca2.homes["warm"] = "p0"
+	f.s.nca2.admitted["warm"] = true
+	f.s.nca2.ever["warm"] = true
+	f.s.groups["p0"].nca2.line = []nca2Entry{{thread: "warm", tokens: 640}}
+	// big was pushed out of p0 and still has an entry there: A4 prefers p0 for it
+	f.s.nca2.homes["big"] = "p0"
+	f.s.nca2.ever["big"] = true
+	f.s.groups["p0"].nca2.line = append(f.s.groups["p0"].nca2.line, nca2Entry{thread: "big", tokens: 320})
+	f.s.mu.Unlock()
+	head := Head{Thread: "big", ReqID: "r-big", Arrival: f.now.Add(-10 * time.Second), Chains: chain("big", 40)}
+	waitingHead := f.hd("warm", 10)
+	f.now = f.now.Add(time.Second)
+	if i := f.s.Pass([]Head{head, waitingHead}, f.now); i < 0 {
+		t.Fatal("the pass must decide")
+	}
+	// p0's room is 2400 (warm's 640 occupies the line): 40 blocks = 2560 tokens cannot fit it
+	if got := f.homeOf("big"); got != "p1" {
+		t.Fatalf("the head must be admitted on the pod that can take it, got %q", got)
+	}
+	if !f.admitted("big") {
+		t.Fatal("the head is admitted (A2.1 on p1)")
+	}
+	if !seated(f.s, "warm") || f.homeOf("warm") != "p0" {
+		t.Fatal("the preferred pod's warm returner takes the next repetition (A2.2, on its home)")
+	}
+}
+
 // TestPodOrderIsInFlightThenRoom: A5 — the pod whose GPU is the least busy goes first, then the pod
 // with the most free CPU, then the id.
 func TestPodOrderIsInFlightThenRoom(t *testing.T) {
@@ -301,10 +335,10 @@ func TestPodOrderIsInFlightThenRoom(t *testing.T) {
 		other = "p0"
 	}
 	f.s.mu.Lock()
-	order := f.s.ncaV2PodOrder()
+	order := f.s.ncaV2PodOrder(f.s.nca2OutsideHead())
 	f.s.mu.Unlock()
-	if len(order) == 0 || order[0].id != other {
-		t.Fatalf("the pod with fewer requests in flight goes first: order starts %v (in flight on %s)", order[0].id, home)
+	if len(order) == 0 || order[0].g.id != other {
+		t.Fatalf("the pod with fewer requests in flight goes first: order starts %v (in flight on %s)", order[0].g.id, home)
 	}
 	// and the admission follows the order
 	if i := f.step(f.hd("b", 5)); i != 0 {

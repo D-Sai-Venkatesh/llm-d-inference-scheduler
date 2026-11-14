@@ -62,22 +62,24 @@ func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccess
 			return true
 		}
 		thread := ""
-		reqID, fid, wire := "", "", ""
+		reqID, fid, wire, clientReq := "", "", "", ""
 		returner := false
 		var chains []Chain
 		if req := h.OriginalRequest(); req != nil {
 			if ir := req.InferenceRequest(); ir != nil {
 				thread = r.threadOf(ir)
 				reqID = ir.RequestID
-				fid = ir.FairnessID // the queue key (the thread, unless a header named one)
-				wire = wireID(ir)   // the client's own id — the join to its request record
+				fid = ir.FairnessID             // the queue key (the thread, unless a header named one)
+				wire = wireID(ir)               // the client's own id — the join to its request record
+				clientReq = clientRequestID(ir) // the client's x-request-id (nca2's span join)
 				returner = isReturner(ir)
 				chains = chargeChains(ir)
 			}
 		}
 		queues = append(queues, q)
 		heads = append(heads, Head{Thread: thread, Returner: returner,
-			FairnessID: fid, WireID: wire, ReqID: reqID, Arrival: h.EnqueueTime(), Chains: chains,
+			FairnessID: fid, WireID: wire, ClientReqID: clientReq, ReqID: reqID,
+			Arrival: h.EnqueueTime(), Chains: chains,
 		})
 		return true
 	})
@@ -228,6 +230,18 @@ func wireID(request *fwksched.InferenceRequest) string {
 	return ""
 }
 
+// clientRequestID is the client's own x-request-id header ("" when it sent none): nca2's
+// client_request_id span attribute, the EXACT join between a span and the client's records.
+func clientRequestID(request *fwksched.InferenceRequest) string {
+	if request == nil {
+		return ""
+	}
+	if v, ok := metadata.GetLowerCaseHeaderValue(request.Headers, reqcommon.RequestIDHeaderKey); ok && v != "" {
+		return v
+	}
+	return ""
+}
+
 // readID is the string attribute at key ("" when it is absent).
 func readID(request *fwksched.InferenceRequest, key fwkplugin.DataKey) string {
 	if request == nil {
@@ -282,12 +296,34 @@ func annotateSpan(ctx context.Context, engine string, obs dispatchObservables) {
 	if !span.IsRecording() {
 		return
 	}
-	span.SetAttributes(
+	attrs := []attribute.KeyValue{
 		attribute.Float64(spanQueueWaitMs, float64(obs.queueWait.Microseconds())/1000),
 		attribute.Int64(spanPredictedCached, obs.predictedCached),
 		attribute.Int64(spanPromptTokens, obs.promptTokens),
 		attribute.String(spanSeatEngine, engine),
-	)
+	}
+	if obs.nca2.valid {
+		// the nca2 turn's own facts (nca2 §7): the class the primary metric's population is built
+		// from, the path, the line's geometry at the decision and at the touch, the two waits, and the
+		// client's own request id — the EXACT join with the client's records
+		n := obs.nca2
+		attrs = append(attrs,
+			attribute.String(spanNCA2Class, n.class),
+			attribute.String(spanNCA2Path, n.path),
+			attribute.String(spanNCA2HomePod, n.homePod),
+			attribute.String(spanNCA2DispatchPod, n.dispatchPod),
+			attribute.Int64(spanNCA2PositionAtTouch, n.positionAtTouch),
+			attribute.Bool(spanNCA2PredictedWarm, n.predictedWarm),
+			attribute.Int64(spanNCA2RoomAtDecision, n.room),
+			attribute.Float64(spanNCA2DoorWaitMs, float64(n.doorWait.Microseconds())/1000),
+			attribute.Float64(spanNCA2SeatWaitMs, float64(n.seatWait.Microseconds())/1000),
+			attribute.Bool(spanNCA2PushedOutBefore, n.pushedOutBefore),
+			attribute.String(spanNCA2ClientRequestID, n.clientRequestID),
+			attribute.String(spanNCA2Thread, n.threadID),
+			attribute.String(spanNCA2WireID, n.wireID),
+		)
+	}
+	span.SetAttributes(attrs...)
 }
 
 // spanQueueWaitMs and its neighbours are the span attribute names, in the plugin's namespace.
@@ -296,4 +332,22 @@ const (
 	spanPredictedCached = "llm_d.epp.group.predicted_cached_tokens"
 	spanPromptTokens    = "llm_d.epp.group.prompt_tokens"
 	spanSeatEngine      = "llm_d.epp.group.seat_engine"
+)
+
+// The nca2 span attributes (nca2 §7): set only in nca2, only for a turn a decision took, and only on a
+// recording span.
+const (
+	spanNCA2Class           = "llm_d.nca2.class"
+	spanNCA2Path            = "llm_d.nca2.path"
+	spanNCA2HomePod         = "llm_d.nca2.home_pod"
+	spanNCA2DispatchPod     = "llm_d.nca2.dispatch_pod"
+	spanNCA2PositionAtTouch = "llm_d.nca2.position_at_touch"
+	spanNCA2PredictedWarm   = "llm_d.nca2.predicted_warm"
+	spanNCA2RoomAtDecision  = "llm_d.nca2.room_at_decision"
+	spanNCA2DoorWaitMs      = "llm_d.nca2.door_wait_ms"
+	spanNCA2SeatWaitMs      = "llm_d.nca2.seat_wait_ms"
+	spanNCA2PushedOutBefore = "llm_d.nca2.pushed_out_before"
+	spanNCA2ClientRequestID = "llm_d.nca2.client_request_id"
+	spanNCA2Thread          = "llm_d.nca2.thread"
+	spanNCA2WireID          = "llm_d.nca2.wire_id"
 )

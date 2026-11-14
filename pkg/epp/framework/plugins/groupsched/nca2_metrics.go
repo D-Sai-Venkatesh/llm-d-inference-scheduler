@@ -24,6 +24,8 @@ package groupsched
 // cannot reach it at all.
 
 import (
+	"sort"
+
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -85,20 +87,22 @@ func newNCA2Metrics() *nca2Metrics {
 	}
 }
 
-// register installs the nca2 series (called only when nca2 runs) and pre-instantiates the global
-// zero series: a zero is a fact, an absent series is a question.
-func (m *nca2Metrics) register(reg prometheus.Registerer) error {
+// collectors is every nca2 series to register, in one list: the plugin's register installs them
+// (and the gauges collector) ONLY when nca2 runs, so OFF's metric surface gains nothing.
+func (m *nca2Metrics) collectors() []prometheus.Collector {
 	if m == nil {
 		return nil
 	}
-	for _, c := range []prometheus.Collector{m.admissions, m.returnerSeats, m.decisions, m.pushouts,
-		m.activePushouts, m.moves, m.lineTouchTokens, m.leakedRequests, m.doorWait, m.seatWait} {
-		if err := reg.Register(c); err != nil {
-			return err
-		}
-	}
+	// the global zero series: a zero is a fact, an absent series is a question
 	m.leakedRequests.Add(0)
-	return nil
+	for _, path := range []string{pathPriority, pathNewcomer} {
+		m.doorWait.WithLabelValues(path) // creates the series; no observation
+	}
+	for _, class := range []string{nca2ClassReturner, nca2ClassAdmittedNow} {
+		m.seatWait.WithLabelValues(class)
+	}
+	return []prometheus.Collector{m.admissions, m.returnerSeats, m.decisions, m.pushouts,
+		m.activePushouts, m.moves, m.lineTouchTokens, m.leakedRequests, m.doorWait, m.seatWait}
 }
 
 // preInstantiatePod creates this pod's zero-valued counter series when its group is created: "no
@@ -197,4 +201,118 @@ func nonNegativeSeconds(v float64) float64 {
 		return 0
 	}
 	return v
+}
+
+// ---- the gauges: ONE Snapshot per scrape, nothing written back (I9) ----
+
+// nca2Gauges renders every nca2 GAUGE from ONE Snapshot at scrape time. A gauge read never changes a
+// decision — the state is only read, and the ages it reports take the caller's clock, because the
+// scheduler's own clock only advances when its pass runs.
+type nca2Gauges struct {
+	r     *GroupScheduler
+	sched *Scheduler
+
+	room             *prometheus.Desc
+	laaPosition      *prometheus.Desc
+	lineTokens       *prometheus.Desc
+	admitted         *prometheus.Desc
+	admittedActive   *prometheus.Desc
+	admittedThreads  *prometheus.Desc
+	activeThreads    *prometheus.Desc
+	warmReturners    *prometheus.Desc
+	pendingHeads     *prometheus.Desc
+	seatsInflight    *prometheus.Desc
+	seatsReclaimable *prometheus.Desc
+	idleWithWaiters  *prometheus.Desc
+
+	priorityWaiting    *prometheus.Desc
+	newcomerWaiting    *prometheus.Desc
+	headBlockedSeconds *prometheus.Desc
+}
+
+// nca2GaugeDesc is one per-pod nca2 gauge descriptor (the pod label is the endpoint id).
+func nca2GaugeDesc(name, help string) *prometheus.Desc {
+	return prometheus.NewDesc(prometheus.BuildFQName("", nca2Subsystem, name), help, []string{"pod"}, nil)
+}
+
+// newNCA2Gauges builds the collector for one plugin instance.
+func newNCA2Gauges(r *GroupScheduler) *nca2Gauges {
+	return &nca2Gauges{
+		r:     r,
+		sched: r.sched,
+		room: nca2GaugeDesc("room_tokens",
+			"the space an admission on this pod may consume: the admission line minus the position of the LOWEST admitted active entry (the whole line when there is none)"),
+		laaPosition: nca2GaugeDesc("laa_position_tokens",
+			"the position of the LOWEST admitted active entry (the LAA): the entry the room is measured below"),
+		lineTokens: nca2GaugeDesc("line_tokens",
+			"this pod's CPU line: the router's model of the pod's CPU KV tier, in tokens"),
+		admitted: nca2GaugeDesc("admitted_tokens",
+			"the tokens of this pod's ADMITTED entries that sit inside the admission line"),
+		admittedActive: nca2GaugeDesc("admitted_active_tokens",
+			"the part of admitted_tokens that belongs to ACTIVE threads (the tokens an admission has to protect)"),
+		admittedThreads: nca2GaugeDesc("admitted_threads",
+			"the threads admitted on this pod (the STATE, granted at A2.1 and lost at a push-out)"),
+		activeThreads: nca2GaugeDesc("active_threads",
+			"the threads with an entry on this pod that are ACTIVE (waiting or in flight)"),
+		warmReturners: nca2GaugeDesc("warm_returners_waiting",
+			"A2.2's list: this pod's admitted threads that are waiting with no seat"),
+		pendingHeads: nca2GaugeDesc("pending_heads",
+			"the demand this pod's own threads are holding back: its warm returners plus its seated threads with a queued head"),
+		seatsInflight: nca2GaugeDesc("seats_inflight",
+			"seats on this pod whose thread has a request in flight (a seat no rotation may take)"),
+		seatsReclaimable: nca2GaugeDesc("seats_reclaimable",
+			"seats on this pod the shipped rotation would accept as a victim right now (Q completed periods, or idleSeconds of silence)"),
+		idleWithWaiters: nca2GaugeDesc("idle_with_waiters",
+			"1 when this pod has nothing in flight while an outside head or one of its warm returners waits — the shape a liveness bug has on a dashboard"),
+		priorityWaiting: prometheus.NewDesc(prometheus.BuildFQName("", nca2Subsystem, "priority_waiting"),
+			"the GLOBAL priority list: threads waiting outside with no admission that had one before", nil, nil),
+		newcomerWaiting: prometheus.NewDesc(prometheus.BuildFQName("", nca2Subsystem, "newcomer_waiting"),
+			"the GLOBAL newcomer queue: threads waiting outside that were never admitted", nil, nil),
+		headBlockedSeconds: prometheus.NewDesc(prometheus.BuildFQName("", nca2Subsystem, "head_blocked_seconds"),
+			"how long the CURRENT outside head has been the head without fitting any pod (0 when the queue is empty)", nil, nil),
+	}
+}
+
+// Describe sends every descriptor this collector can produce.
+func (c *nca2Gauges) Describe(ch chan<- *prometheus.Desc) {
+	for _, d := range []*prometheus.Desc{c.room, c.laaPosition, c.lineTokens, c.admitted,
+		c.admittedActive, c.admittedThreads, c.activeThreads, c.warmReturners, c.pendingHeads,
+		c.seatsInflight, c.seatsReclaimable, c.idleWithWaiters, c.priorityWaiting,
+		c.newcomerWaiting, c.headBlockedSeconds} {
+		ch <- d
+	}
+}
+
+// Collect reads ONE snapshot and emits const gauges from it.
+func (c *nca2Gauges) Collect(ch chan<- prometheus.Metric) {
+	snap := c.sched.Snapshot(c.r.now()).NCA2
+	if snap == nil {
+		return
+	}
+	gauge := func(d *prometheus.Desc, v float64, labels ...string) {
+		ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, v, labels...)
+	}
+	pods := make([]string, 0, len(snap.Engines))
+	for id := range snap.Engines {
+		pods = append(pods, id)
+	}
+	sort.Strings(pods) // deterministic emit order: a scraper compares two scrapes row by row
+	for _, id := range pods {
+		p := snap.Engines[id]
+		gauge(c.room, float64(p.RoomTokens), p.ID)
+		gauge(c.laaPosition, float64(p.LAAPositionTokens), p.ID)
+		gauge(c.lineTokens, float64(p.LineTokens), p.ID)
+		gauge(c.admitted, float64(p.AdmittedTokens), p.ID)
+		gauge(c.admittedActive, float64(p.AdmittedActiveTokens), p.ID)
+		gauge(c.admittedThreads, float64(p.AdmittedThreads), p.ID)
+		gauge(c.activeThreads, float64(p.ActiveThreads), p.ID)
+		gauge(c.warmReturners, float64(p.WarmReturnersWaiting), p.ID)
+		gauge(c.pendingHeads, float64(p.PendingHeads), p.ID)
+		gauge(c.seatsInflight, float64(p.SeatsInflight), p.ID)
+		gauge(c.seatsReclaimable, float64(p.SeatsReclaimable), p.ID)
+		gauge(c.idleWithWaiters, float64(p.IdleWithWaiters), p.ID)
+	}
+	gauge(c.priorityWaiting, float64(snap.PriorityWaiting))
+	gauge(c.newcomerWaiting, float64(snap.NewcomerWaiting))
+	gauge(c.headBlockedSeconds, snap.HeadBlockedSeconds)
 }

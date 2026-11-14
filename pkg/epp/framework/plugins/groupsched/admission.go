@@ -177,6 +177,7 @@ func (s *Scheduler) seat(g *engineGroup, w *waiter, coldTokens int64, now time.T
 		waitingSince: w.since,
 		fairnessID:   w.fairnessID,
 		wireID:       w.wireID,
+		clientReqID:  w.clientReqID,
 		headChains:   w.chains,
 		headReturner: w.returner,
 		seatObs:      &seatObs,

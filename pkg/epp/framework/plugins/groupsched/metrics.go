@@ -55,6 +55,10 @@ type groupMetrics struct {
 	// coldValveHeld counts heads the cold-entry VALVE held back: the budget would have admitted
 	// the head, the valve refused it, so the head WAITED for the engine's prefill slot.
 	coldValveHeld *prometheus.CounterVec
+	// nca2 and nca2Gauges are the CPU tier's own surface, built ONLY when nca2 runs and registered
+	// with it: OFF's metric surface is the shipped one, unchanged.
+	nca2       *nca2Metrics
+	nca2Gauges *nca2Gauges
 }
 
 // subsystem namespaces every series (llm_d_epp_group_*).
@@ -66,7 +70,14 @@ var engineLabels = []string{"engine"}
 // newPluginMetrics is the metric surface, built on the plugin: the gauges are rendered from a
 // Snapshot at scrape time and capacity_missing from the plugin's known endpoints.
 func newPluginMetrics(r *GroupScheduler) *groupMetrics {
-	return &groupMetrics{sched: r.sched, gauges: newStateGauges(r)}
+	gm := &groupMetrics{sched: r.sched, gauges: newStateGauges(r)}
+	if r.sched.nca2 != nil {
+		gm.nca2 = newNCA2Metrics()
+		gm.nca2Gauges = newNCA2Gauges(r)
+		// the scheduler's own observer: nil-safe, and non-nil exactly when nca2 runs
+		r.sched.nca2m = gm.nca2
+	}
+	return gm
 }
 
 // register creates every series and installs the global zero series (the pre-capacity dispatch label
@@ -103,10 +114,16 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	for _, kind := range anomalyKinds {
 		g.anomalies.WithLabelValues(kind).Add(0)
 	}
-	for _, c := range []prometheus.Collector{g.gauges,
+	collectors := []prometheus.Collector{g.gauges,
 		g.exits, g.entryWait, g.served, g.queueWait, g.predictedCached, g.dispatchedPrompt,
 		g.affinityViolations, g.engineGone, g.coldValveHeld, g.anomalies,
-	} {
+	}
+	if g.nca2 != nil {
+		// nca2's own series, counters and gauges, ONLY here: OFF gains no series at all
+		collectors = append(collectors, g.nca2.collectors()...)
+		collectors = append(collectors, g.nca2Gauges)
+	}
+	for _, c := range collectors {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
 			// same test binary) must not fail startup: the series exist and belong to the first

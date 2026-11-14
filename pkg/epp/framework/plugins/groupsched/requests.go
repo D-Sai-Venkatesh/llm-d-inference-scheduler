@@ -67,8 +67,11 @@ type nca2Obs struct {
 	seatWait        time.Duration
 	pushedOutBefore bool
 	// clientRequestID is the client's own x-request-id header: the EXACT join between a span and the
-	// client's records.
+	// client's records. threadID and wireID are the ids the shipped span already carries, repeated
+	// here so one query answers the join without a second resource.
 	clientRequestID string
+	threadID        string
+	wireID          string
 	// valid reports that this turn is nca2's to describe (it was taken by a decision, or its thread
 	// is in nca2's state). OFF never sets it.
 	valid bool
@@ -276,8 +279,16 @@ func (s *Scheduler) AtPod(reqID, engine string, now time.Time) dispatchObservabl
 	}
 	// L1/L3 for the CPU tier: the request REACHED a pod, which is the router-visible truth about
 	// what that pod's CPU tier now holds for this thread (nca2 only; nil in OFF).
-	s.nca2AtPod(id, engine, rec.promptTokens, now)
-	return s.atPod(rec, s.groups[s.bindings[id]].threads[id], engine, now)
+	posAtTouch, warm := s.nca2AtPod(id, engine, rec.promptTokens, now)
+	obs := s.atPod(rec, s.groups[s.bindings[id]].threads[id], engine, now)
+	if s.nca2 != nil {
+		// the span's line facts belong to THIS moment: the write has happened, the prediction is what
+		// the position said before it
+		obs.nca2.dispatchPod = engine
+		obs.nca2.positionAtTouch, obs.nca2.predictedWarm = posAtTouch, warm
+		obs.nca2.homePod = s.nca2.homes[id]
+	}
+	return obs
 }
 
 // Abandon ends a request's record from OUTSIDE the decision path: the request is gone before a

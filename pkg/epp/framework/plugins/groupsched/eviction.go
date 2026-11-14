@@ -230,7 +230,7 @@ func (s *Scheduler) exit(g *engineGroup, m *thread, reason string, now time.Time
 	if !m.waitingSince.IsZero() {
 		s.waiters[m.id] = &waiter{id: m.id, since: m.waitingSince,
 			returner: m.headReturner, chains: m.headChains,
-			fairnessID: m.fairnessID, wireID: m.wireID}
+			fairnessID: m.fairnessID, wireID: m.wireID, clientReqID: m.clientReqID}
 	}
 }
 

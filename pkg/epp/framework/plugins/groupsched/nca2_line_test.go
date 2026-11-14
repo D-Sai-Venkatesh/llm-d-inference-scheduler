@@ -37,13 +37,13 @@ const (
 )
 
 // newNCA2 is a scheduler in nca2 with a small, exact CPU tier and one 1000-block engine per pod id.
-func newNCA2(t *testing.T, pods []string) *Scheduler {
+func newNCA2(t testing.TB, pods []string) *Scheduler {
 	t.Helper()
 	return newNCA2Tuned(t, nil, pods)
 }
 
 // newNCA2Tuned is the same with one knob the test is about (the cold valve's cap, for instance).
-func newNCA2Tuned(t *testing.T, tune func(*Config), pods []string) *Scheduler {
+func newNCA2Tuned(t testing.TB, tune func(*Config), pods []string) *Scheduler {
 	t.Helper()
 	cfg := defaultConfig()
 	cfg.Mode = modeNCA2

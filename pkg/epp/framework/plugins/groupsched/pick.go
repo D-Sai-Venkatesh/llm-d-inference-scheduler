@@ -94,6 +94,9 @@ func (s *Scheduler) syncQueue(heads []Head, now time.Time) {
 				if h.WireID != "" {
 					m.wireID = h.WireID
 				}
+				if h.ClientReqID != "" {
+					m.clientReqID = h.ClientReqID
+				}
 				if m.waitingSince.IsZero() || h.Arrival.Before(m.waitingSince) {
 					m.waitingSince = h.Arrival
 				}
@@ -114,6 +117,7 @@ func (s *Scheduler) syncQueue(heads []Head, now time.Time) {
 		w.returner = h.Returner
 		w.fairnessID = h.FairnessID
 		w.wireID = h.WireID
+		w.clientReqID = h.ClientReqID
 		w.chains = h.Chains
 		// the oldest arrival is what the wait is measured from: a fan-out re-arrival does not reset
 		// it
@@ -327,16 +331,38 @@ func nonNegative(d time.Duration) float64 {
 	return d.Seconds()
 }
 
+// nca2DispatchObs is one dispatched turn's nca2 span facts, read at the decision (nca2 §7): the
+// class, the path, the home, the pod's room, the ids. The line facts that only the pod hook can know
+// (the position at the touch, the warm prediction) are filled there.
+func (s *Scheduler) nca2DispatchObs(g *engineGroup, h Head) nca2Obs {
+	o := nca2Obs{valid: true, class: nca2ClassSeated, path: pathNone,
+		threadID: h.Thread, wireID: h.WireID, clientRequestID: h.ClientReqID,
+		pushedOutBefore: s.nca2.pushed[h.Thread], homePod: s.nca2.homes[h.Thread],
+		room: s.nca2View(g).room(s.nca2.AdmitLineTokens)}
+	return o
+}
+
 // observablesFor is one dispatched turn's observability: the queue wait it just served, and how
 // many of its prompt tokens the engine is PREDICTED to hold as a resident prefix. It READS the
 // index and writes nothing to it, and the caller runs it BEFORE the charge — after the charge the
 // prediction would always be the whole prompt.
 func (s *Scheduler) observablesFor(g *engineGroup, h Head, now time.Time) dispatchObservables {
 	obs := dispatchObservables{queueWait: now.Sub(h.Arrival)}
+	if s.nca2 != nil {
+		obs.nca2 = s.nca2DispatchObs(g, h)
+	}
 	if m := g.threads[h.Thread]; m != nil && m.seatObs != nil {
 		// the turn that SEATED this thread: its prediction was measured at the seat, before the
 		// reservation. Consume it — every later turn measures the index directly.
 		obs.predictedCached, obs.promptTokens = m.seatObs.predictedCached, m.seatObs.promptTokens
+		if s.nca2 != nil {
+			// the turn that SEATED this thread: its class and the room it was decided on are the seat's
+			// own facts, not a post-insert view of the same numbers
+			seat := m.seatObs.nca2
+			obs.nca2.class, obs.nca2.path = seat.class, seat.path
+			obs.nca2.room, obs.nca2.doorWait, obs.nca2.seatWait = seat.room, seat.doorWait, seat.seatWait
+			obs.nca2.pushedOutBefore = seat.pushedOutBefore
+		}
 		m.seatObs = nil
 		s.metrics.ObserveQueueWait(queueWaitKind(h), nonNegative(obs.queueWait))
 		s.metrics.ObservePredictedCache(engineLabel(g.id), obs.predictedCached, obs.promptTokens)

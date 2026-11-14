@@ -262,7 +262,13 @@ func (s *Scheduler) nca2Admit(g *engineGroup, w *waiter, f, room int64, now time
 	if s.nca2.ever[w.id] {
 		path = pathPriority
 	}
-	if !s.ncaV2Seat(g, w, class, path, room, now) {
+	// THE WARM PREDICTION FOR AN ADMISSION IS READ AT THE DECISION, BEFORE L0 (§7, the owner's
+	// intent: "is the thread's data already on that pod's CPU tier"): a priority thread re-admitted at
+	// its old pod whose entry is still inside the trust line is warm; a newcomer, or an entry past
+	// L_t, is not. L0's provisional entry must not answer this — it is the request's own tokens, not
+	// data the pod holds.
+	warm := s.nca2PreTouchWarm(g, w.id)
+	if !s.ncaV2Seat(g, w, class, path, room, warm, now) {
 		return false
 	}
 	// L0: the provisional entry at the HOME's head with tokens = f. The home is this pod (A4 let it
@@ -278,11 +284,21 @@ func (s *Scheduler) nca2Admit(g *engineGroup, w *waiter, f, room int64, now time
 	return true
 }
 
+// nca2PreTouchWarm is §7's predicted_warm for an A2.1 admission: the thread's OWN entry, already on
+// this pod (a priority thread re-admitted at its old pod), at a position inside the trust line. No
+// entry — or one past L_t — means the pod does not hold the thread's data warmly.
+func (s *Scheduler) nca2PreTouchWarm(g *engineGroup, id string) bool {
+	pos, has := s.nca2PositionOn(g, id)
+	return has && pos <= s.nca2.TrustLineTokens
+}
+
 // nca2SeatReturner is A2.2: the pod's admitted thread takes the freed seat. Nothing about the line
 // changes here — its entry is already inside the line, and L1 moves it to the head when its request
 // reaches the pod.
 func (s *Scheduler) nca2SeatReturner(g *engineGroup, w *waiter, room int64, now time.Time) bool {
-	if !s.ncaV2Seat(g, w, nca2ClassReturner, pathNone, room, now) {
+	// a returner's prediction is the position its entry holds when its request REACHES the pod (the
+	// at-pod hook reads it before the touch, and this seat changes nothing on the line)
+	if !s.ncaV2Seat(g, w, nca2ClassReturner, pathNone, room, false, now) {
 		return false
 	}
 	s.nca2m.ObserveReturnerSeat(engineLabel(g.id))
@@ -293,7 +309,7 @@ func (s *Scheduler) nca2SeatReturner(g *engineGroup, w *waiter, room int64, now 
 // ncaV2Seat takes the GPU seat through the BASE's own seat path (the same TrySeat, Rule O, cold
 // charge, SEAT event and entry histogram a shipped seat takes) and stamps the turn's nca2 class, path
 // and the room it was decided on, for the span PreRequest sets.
-func (s *Scheduler) ncaV2Seat(g *engineGroup, w *waiter, class, path string, room int64, now time.Time) bool {
+func (s *Scheduler) ncaV2Seat(g *engineGroup, w *waiter, class, path string, room int64, warm bool, now time.Time) bool {
 	tokens := g.index.ColdTokens(w.chains)
 	if !s.seat(g, w, tokens, now) {
 		return false
@@ -302,6 +318,7 @@ func (s *Scheduler) ncaV2Seat(g *engineGroup, w *waiter, class, path string, roo
 		m.nca2Class, m.nca2Room = class, room
 		if m.seatObs != nil {
 			m.seatObs.nca2 = nca2Obs{class: class, path: path, room: room,
+				predictedWarm:   warm,
 				pushedOutBefore: s.nca2.pushed[w.id],
 				doorWait:        now.Sub(w.since), seatWait: now.Sub(w.since),
 				clientRequestID: w.clientReqID, wireID: w.wireID, threadID: w.id, valid: true}

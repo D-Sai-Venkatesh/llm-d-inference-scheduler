@@ -290,7 +290,13 @@ func (s *Scheduler) AtPod(reqID, engine string, now time.Time) dispatchObservabl
 		// valid is set HERE, on the production path: it is what makes annotateSpan emit the nca2
 		// attributes at all.
 		obs.nca2.dispatchPod = engine
-		obs.nca2.positionAtTouch, obs.nca2.predictedWarm = posAtTouch, warm
+		obs.nca2.positionAtTouch = posAtTouch
+		// an ADMISSION's prediction was read at the decision, before L0 wrote the provisional entry
+		// (§7: "is the thread's data already on that pod"); every other class takes the position its
+		// own entry held here, before this request's touch
+		if obs.nca2.class != nca2ClassAdmittedNow {
+			obs.nca2.predictedWarm = warm
+		}
 		obs.nca2.homePod = s.nca2.homes[id]
 		obs.nca2.threadID, obs.nca2.wireID = id, rec.nca2.wireID
 		obs.nca2.valid = true

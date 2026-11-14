@@ -384,17 +384,66 @@ func TestTheSpanGetsTheDecisionsOwnObservability(t *testing.T) {
 	if got[spanNCA2PositionAtTouch] != "640" {
 		t.Fatalf("the position at the touch: %q", got[spanNCA2PositionAtTouch])
 	}
-	// predicted_warm is §7's literal rule: the entry's position BEFORE the touch was inside the trust
-	// line. For an A2.1 admission that position is L0's provisional entry (f = 640 ≤ L_t), so the
-	// prediction is "warm" by construction — see the limitation noted in IMPL-NOTES.
-	if got[spanNCA2PredictedWarm] != "true" {
-		t.Fatalf("the literal pre-touch prediction (L0's provisional entry): %q", got[spanNCA2PredictedWarm])
+	// §7's intent (the owner, 2026-11-14): "is the thread's data already on that pod's CPU tier". A
+	// newcomer's admission is read BEFORE L0 writes anything, and the pod holds none of its data.
+	if got[spanNCA2PredictedWarm] != "false" {
+		t.Fatalf("a newcomer's admission is not predicted warm: %q", got[spanNCA2PredictedWarm])
 	}
 	if got[spanNCA2SeatWaitMs] == "" || got[spanNCA2SeatWaitMs] == "0" {
 		t.Fatalf("the seat wait must be measured from the arrival: %q", got[spanNCA2SeatWaitMs])
 	}
 	if got[spanNCA2Thread] != "a" || got[spanNCA2WireID] != "wire-7" {
 		t.Fatalf("the ids: %q / %q", got[spanNCA2Thread], got[spanNCA2WireID])
+	}
+}
+
+// TestTheWarmPredictionIsTheThreadsDataOnThePod: §7, the owner's intent — for an A2.1 admission the
+// prediction is read AT THE DECISION, BEFORE L0: the thread's own entry already on that pod, inside the
+// trust line. A newcomer is not warm; a priority thread re-admitted over a warm entry is; one whose
+// entry sits past L_t is not.
+func TestTheWarmPredictionIsTheThreadsDataOnThePod(t *testing.T) {
+	// newcomer: nothing of it is on the pod
+	f := newFixture(t, "p0")
+	f.now = f.now.Add(time.Second)
+	head := f.hd("new", 10)
+	if i := f.s.Pass([]Head{head}, f.now); i != 0 {
+		t.Fatalf("the newcomer must be admitted, got %d", i)
+	}
+	if obs := f.s.AtPod(head.ReqID, f.homeOf("new"), f.now); obs.nca2.predictedWarm {
+		t.Fatal("a newcomer's admission is not warm: the pod holds none of its data")
+	}
+	// a priority thread re-admitted at its old pod, its entry INSIDE the trust line
+	for _, c := range []struct {
+		name   string
+		tokens int
+		warm   bool
+	}{
+		{"inside L_t", 3000, true},
+		{"past L_t", 3100, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, "p0")
+			f.s.mu.Lock()
+			f.s.nca2.homes["prio"] = "p0"
+			f.s.nca2.ever["prio"] = true
+			f.s.nca2.pushed["prio"] = true
+			f.s.groups["p0"].nca2.line = []nca2Entry{{thread: "prio", tokens: int64(c.tokens)}}
+			f.s.waiters["prio"] = &waiter{id: "prio", since: f.now.Add(-time.Second)}
+			f.s.mu.Unlock()
+			f.wait(time.Second)
+			head := f.hd("prio", 5)
+			if i := f.s.Pass([]Head{head}, f.now); i != 0 {
+				t.Fatalf("the priority thread must be re-admitted at its old pod, got %d", i)
+			}
+			obs := f.s.AtPod(head.ReqID, f.homeOf("prio"), f.now)
+			if obs.nca2.predictedWarm != c.warm {
+				t.Fatalf("predicted_warm = %v, want %v (its entry was at %d tokens, trust line %d)",
+					obs.nca2.predictedWarm, c.warm, c.tokens, f.s.nca2.TrustLineTokens)
+			}
+			if obs.nca2.class != nca2ClassAdmittedNow {
+				t.Fatalf("the class: %q", obs.nca2.class)
+			}
+		})
 	}
 }
 

@@ -362,6 +362,9 @@ func (s *Scheduler) observablesFor(g *engineGroup, h Head, now time.Time) dispat
 			obs.nca2.class, obs.nca2.path = seat.class, seat.path
 			obs.nca2.room, obs.nca2.doorWait, obs.nca2.seatWait = seat.room, seat.doorWait, seat.seatWait
 			obs.nca2.pushedOutBefore = seat.pushedOutBefore
+			// an admission's warm prediction is the DECISION's (§7): it was read before L0 wrote the
+			// provisional entry, so the seat's own value wins here
+			obs.nca2.predictedWarm = seat.predictedWarm
 		}
 		m.seatObs = nil
 		s.metrics.ObserveQueueWait(queueWaitKind(h), nonNegative(obs.queueWait))

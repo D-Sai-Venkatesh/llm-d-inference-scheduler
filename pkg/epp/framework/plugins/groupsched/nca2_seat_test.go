@@ -629,6 +629,59 @@ func TestPushedOutActiveThreadLeavesTheGpuAndReturnsAsPriority(t *testing.T) {
 	}
 }
 
+// TestTheAdmissionBudgetGathersSeatsAcrossPasses: A9 — the X3 door freeze (verifier 2). A prompt
+// bigger than one seat needs SEVERAL seats freed, and they become reclaimable one quantum at a time.
+// The pod frees what it can for the outside head and HOLDS it (the head's admission budget), so a
+// returner cannot take the space in the same pass; the next pass finishes the job and admits the head.
+// Without the budget the first freed seat went to the returner every time and the head never fit.
+func TestTheAdmissionBudgetGathersSeatsAcrossPasses(t *testing.T) {
+	f := newFixture(t, "p0")
+	// two seats of 400 blocks in the 950-block budget: A is idle, B is running
+	f.running("p0", "A", 400, 320)
+	f.s.Settle("rq-A", "p0", f.now)
+	f.running("p0", "B", 400, 320)
+	f.s.mu.Lock()
+	f.s.nca2.homes["ret"] = "p0"
+	f.s.nca2.admitted["ret"] = true
+	f.s.nca2.ever["ret"] = true
+	f.s.groups["p0"].nca2.line = append(f.s.groups["p0"].nca2.line, nca2Entry{thread: "ret", tokens: 320})
+	f.s.waiters["ret"] = &waiter{id: "ret", since: f.now.Add(-time.Minute)}
+	f.s.mu.Unlock()
+	f.wait(10 * time.Second) // A is silent: reclaimable
+	big := f.hdHeavy("big", 700, 320)
+	ret := f.hdHeavy("ret", 100, 320)
+	f.now = f.now.Add(time.Second)
+	if i := f.s.Pass([]Head{big, ret}, f.now); i != -1 {
+		t.Fatalf("nothing can be served yet (the head needs two seats), got %d", i)
+	}
+	if seated(f.s, "big") {
+		t.Fatal("one freed seat is not enough for a 700-block prompt")
+	}
+	if seated(f.s, "ret") {
+		t.Fatal("A9: the seat freed for the head must not go to a returner")
+	}
+	if seated(f.s, "A") {
+		t.Fatal("A was the reclaimable seat the budget spent")
+	}
+	if !seated(f.s, "B") {
+		t.Fatal("B has a request in flight: never a victim")
+	}
+	// the second seat becomes reclaimable: the reservation from the FIRST pass is still the head's
+	f.s.FirstChunk("rq-B", f.now)
+	f.s.Settle("rq-B", "p0", f.now)
+	f.wait(10 * time.Second)
+	f.now = f.now.Add(time.Second)
+	if i := f.s.Pass([]Head{big, ret}, f.now); i < 0 {
+		t.Fatal("the head must be admitted once the budget has gathered both seats")
+	}
+	if !f.admitted("big") || !seated(f.s, "big") {
+		t.Fatal("A9: the head is admitted after accumulating across passes")
+	}
+	if !seated(f.s, "ret") {
+		t.Fatal("with the budget settled the returner takes its seat (A2.2 untouched)")
+	}
+}
+
 // TestTheDecisionCapIsWaitersPlusFourPods: A1 — the cap's own arithmetic (a pure function so the rule
 // is checkable) and the pass's report that it never exceeded it.
 func TestTheDecisionCapIsWaitersPlusFourPods(t *testing.T) {

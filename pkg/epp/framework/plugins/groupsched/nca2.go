@@ -75,6 +75,18 @@ type nca2Policy struct {
 	// has been the head. Written by the pass, only READ by the Snapshot (I9).
 	blockedHead  string
 	blockedSince time.Time
+	// passMemo / candTokens / warm are the PASS's own caches (V2): a candidate's exact cost per pod
+	// (keyed by the pod's generation), its own prompt size, and each pod's warm-returner list sorted
+	// deepest-first. They are rebuilt at the start of every pass; a pod's index change advances its
+	// generation, which retires that pod's cost entries.
+	passMemo map[fitKey]fitFacts
+	cand     map[string]nca2Cand
+	// passSeq numbers the passes: the per-pod entry maps are built once per sequence number
+	passSeq int
+	// warmBuilt is "the warm-returner lists of this pass have been built" (lazily: a pass that never
+	// reaches phase 2, or has no waiters, must not pay for them)
+	warmBuilt bool
+	warm      map[string][]*waiter
 	// passDecisions and capHit are the LAST pass's own report: how many decisions it took, and whether
 	// the safety cap (waiters + 4 × pods) is what stopped it — two facts a run must be able to tell
 	// apart (a cap hit is a capacity signal, not a work-conservation gap).
@@ -104,15 +116,35 @@ func (s *Scheduler) initNCA2() {
 	s.nca2.ever = map[string]bool{}
 	s.nca2.pushed = map[string]bool{}
 	s.nca2.inf = map[string]int{}
+	s.nca2.passMemo = map[fitKey]fitFacts{}
+	s.nca2.cand = map[string]nca2Cand{}
+	s.nca2.warm = map[string][]*waiter{}
 }
 
-// nca2Pod is ONE pod's CPU line and the per-pod number the pass maintains on it.
+// nca2Pod is ONE pod's CPU line and the per-pod numbers the pass maintains on it.
 type nca2Pod struct {
 	// line is the ordered entries, the MOST RECENT TOUCH FIRST.
 	line []nca2Entry
 	// inflight is the number of requests IN FLIGHT on this pod: A5's first sort key. Derived every
 	// pass from the request records (and maintained at the pod hook for a between-pass read).
 	inflight int
+
+	// ---- A9: the ADMISSION BUDGET ----
+	// reservedHead is the outside head this pod is currently freeG seats FOR, and reservedBlocks how
+	// many blocks it has already freed for it. While the reservation stands, this pod's freed space
+	// belongs to that head: A2.2 does not seat returners on it, so the head can accumulate across
+	// passes (a prompt bigger than one seat can only ever fit that way). It is dropped when the head
+	// changes, is admitted, loses its place, or the pod's room cannot take it.
+	reservedHead   string
+	reservedBlocks int64
+
+	// entries is the line as thread → tokens, built at most ONCE PER PASS (entriesPass holds the pass
+	// sequence it was built for): the cheap fit test needs the tokens this pod already holds for a
+	// thread, without walking the line per candidate. Within a pass it can be stale after an admission
+	// (a missing entry, which is conservative) or after a push-out (a stale entry, which can only make
+	// the cheap test optimistic — and the seat re-checks the exact cost).
+	entries     map[string]int64
+	entriesPass int
 }
 
 // nca2Entry is one thread's place in a pod's CPU line.
@@ -551,6 +583,81 @@ func (s *Scheduler) nca2ResetPod(g *engineGroup, now time.Time) {
 		g.nca2.line = nil
 		g.nca2.inflight = 0
 	}
+}
+
+// nca2EntryTokens is the tokens this pod's line already holds for the thread (0 when it has no entry).
+// The map is rebuilt only when the line changed, so a sweep over many candidates is one walk.
+func (s *Scheduler) nca2EntryTokens(g *engineGroup, id string) int64 {
+	if s.nca2 == nil || g == nil || g.nca2 == nil {
+		return 0
+	}
+	p := g.nca2
+	if p.entriesPass != s.nca2.passSeq || p.entries == nil {
+		// REUSED, not reallocated: an admission or an eviction retires the map on every decision, and
+		// a fresh map per decision is a per-pass allocation the benchmars see
+		if p.entries == nil {
+			p.entries = make(map[string]int64, len(p.line))
+		} else {
+			clear(p.entries)
+		}
+		for _, e := range p.line {
+			p.entries[e.thread] = e.tokens
+		}
+		p.entriesPass = s.nca2.passSeq
+	}
+	return p.entries[id]
+}
+
+// nca2Cand is a candidate's own size, cached for the pass (a waiter's chains are immutable):
+// Tokens is its prompt total, Keys the block keys it names. Both are read without touching the
+// pod's block index, which is what makes the cheap fit test cheap.
+type nca2Cand struct {
+	tokens int64
+	keys   int64
+}
+
+// nca2CandOf is the candidate's size.
+func (s *Scheduler) nca2CandOf(w *waiter) nca2Cand {
+	if s.nca2 == nil || w == nil {
+		return nca2Cand{}
+	}
+	if c, ok := s.nca2.cand[w.id]; ok {
+		return c
+	}
+	c := nca2Cand{tokens: PromptTokens(w.chains)}
+	for _, ch := range w.chains {
+		c.keys += int64(len(ch.Keys))
+	}
+	if s.nca2.cand != nil {
+		s.nca2.cand[w.id] = c
+	}
+	return c
+}
+
+// ncaV2CheapFits is the CHEAP POSITIVE fit test (V2). The pod's line holds the thread's last request,
+// so it already covers the first floor(entry/blockSize) blocks of this candidate's chain: the new
+// blocks it can need are at most keys − that, and the cold tokens at most tokens − entry. When both
+// upper bounds are inside the pod's free budget and the valve's headroom the answer is YES without a
+// single block-index lookup. Every upper bound is SOUND (so a "yes" is a real yes), and the seat
+// re-checks the exact cost anyway, so an optimistic answer would cost a repeat, never a wrong seat.
+func (s *Scheduler) ncaV2CheapFits(g *engineGroup, w *waiter) bool {
+	if s.nca2 == nil || g == nil || g.nca2 == nil || w == nil || s.blockSize <= 0 {
+		return false
+	}
+	cand := s.nca2CandOf(w)
+	entry := s.nca2EntryTokens(g, w.id)
+	cold := cand.tokens - entry
+	if cold < 0 {
+		cold = 0
+	}
+	if !s.coldAllowsTokens(g, cold) {
+		return false
+	}
+	blocks := cand.keys - entry/int64(s.blockSize)
+	if blocks < 0 {
+		blocks = 0
+	}
+	return blocks <= s.freeBudget(g)
 }
 
 // nca2WarmReturners is A2.2's list: this pod's ADMITTED threads that are WAITING and hold NO seat

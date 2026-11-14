@@ -87,6 +87,82 @@ func benchFixture(b *testing.B, blocked bool) (*Scheduler, []Head) {
 	return s, heads
 }
 
+// benchRealistic is the c192-fidelity state the adversarial review measures: prompts of ~130k tokens
+// (2,031 blocks of 64), a pod whose CPU line holds ~41 of them, an 8,000-block GPU budget, 60 warm
+// returners (their entries ARE their prompts, so they are warm) and 300 outsiders whose prompts are
+// bigger than one seat — the case the strict head-of-line has to survive.
+func benchRealistic(b *testing.B, blocked bool) (*Scheduler, []Head) {
+	b.Helper()
+	const (
+		blocks = 2031 // ~130k tokens
+		seats  = 8000 // num_gpu_blocks; the 0.95 budget is 7,600 blocks
+		tier   = defaultCPUTierTokens
+	)
+	s := newNCA2Tuned(b, func(c *Config) {
+		c.CPUTierTokens = i64(tier)
+		c.Quantum = 8
+		c.IdleSeconds = 5
+	}, []string{"p0", "p1", "p2"})
+	for _, pod := range []string{"p0", "p1", "p2"} {
+		if err := s.SetNumBlocksFor(pod, 64, seats); err != nil {
+			b.Fatal(err)
+		}
+	}
+	now := epoch
+	s.mu.Lock()
+	for _, pod := range []string{"p0", "p1", "p2"} {
+		g := s.groups[pod]
+		// 41 entries: the line as the CPU tier really fills at this prompt size
+		for i := 0; i < 41; i++ {
+			id := fmt.Sprintf("%s-t%d", pod, i)
+			g.nca2.line = append(g.nca2.line, nca2Entry{thread: id, tokens: blocks * 64, lastTouch: now})
+			if i < 20 { // 60 warm returners in the fleet: admitted, waiting, no seat
+				s.nca2.homes[id] = pod
+				s.nca2.admitted[id] = true
+				s.nca2.ever[id] = true
+				s.nca2.inf[id] = 1
+			}
+		}
+	}
+	s.mu.Unlock()
+	heads := make([]Head, 0, 360)
+	for i := 0; i < 300; i++ {
+		id := fmt.Sprintf("out%d", i)
+		heads = append(heads, Head{Thread: id, ReqID: "r-" + id,
+			Arrival: now.Add(-time.Duration(i) * time.Millisecond), Chains: chain(id, blocks)})
+	}
+	for _, pod := range []string{"p0", "p1", "p2"} {
+		for i := 0; i < 20; i++ {
+			id := fmt.Sprintf("%s-t%d", pod, i)
+			heads = append(heads, Head{Thread: id, ReqID: "r-" + id,
+				Arrival: now.Add(-time.Duration(1000+i) * time.Millisecond), Chains: chain(id, blocks)})
+		}
+	}
+	return s, heads
+}
+
+// BenchmarkNCA2PassRealistic is one pass at c192 fidelity: 300 outsiders of ~130k tokens, 60 warm
+// returners whose entries are their prompts, 41-entry lines.
+func BenchmarkNCA2PassRealistic(b *testing.B) {
+	b.ReportAllocs()
+	var total, worst time.Duration
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		s, heads := benchRealistic(b, false)
+		b.StartTimer()
+		start := time.Now()
+		s.Pass(heads, epoch.Add(time.Second))
+		d := time.Since(start)
+		total += d
+		if d > worst {
+			worst = d
+		}
+	}
+	b.ReportMetric(float64(total.Nanoseconds())/float64(b.N), "ns/pass")
+	b.ReportMetric(float64(worst.Nanoseconds())/1e6, "worst-ms")
+}
+
 // BenchmarkNCA2Pass is one nca2 pass over the heavy state (an admission burst: ~57 admissions, then
 // the sweep that ends the pass).
 func BenchmarkNCA2Pass(b *testing.B) {

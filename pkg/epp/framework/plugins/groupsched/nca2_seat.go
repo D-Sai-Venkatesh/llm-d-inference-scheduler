@@ -40,6 +40,15 @@ func (s *Scheduler) ncaV2SeatWaiters(now time.Time) {
 	if s.nca2 == nil {
 		return
 	}
+	// THE PASS'S OWN CACHES (V2): a candidate's prompt size, each pod's warm-returner list sorted
+	// deepest-first, and the exact-cost memo. The lists are built once here; their ORDER survives the
+	// pass because an admission shifts every remaining entry by the same f, and a returner that is
+	// seated leaves the waiter queue (the list entry is re-checked before use).
+	s.nca2.passMemo = map[fitKey]fitFacts{}
+	s.nca2.cand = map[string]nca2Cand{}
+	s.nca2.warm = map[string][]*waiter{}
+	s.nca2.warmBuilt = false
+	s.nca2.passSeq++
 	limit := ncaV2DecisionCap(len(s.waiters), len(s.groups))
 	s.nca2.passDecisions, s.nca2.capHit = 0, false
 	decisions := 0
@@ -83,11 +92,19 @@ type podState struct {
 
 // fitKey / fitFacts memoize one candidate's cost ON ONE POD for the span of one repetition: the block
 // index cannot change inside a repetition except by a reclaim, and a reclaim ends the repetition.
+// fitKey keys the PASS's cost memo (V2). One entry per (pod, candidate) for the whole pass: the index
+// changes inside a pass only when a seat is taken or a victim is evicted, and both directions of the
+// resulting staleness are safe — a stale HIGH cost makes a head wait one pass, a stale LOW cost is
+// caught by the seat's own exact TrySeat/cold charge before anything is granted.
 type fitKey struct{ pod, thread string }
 
 type fitFacts struct {
 	cost int64 // the head's exact cost in blocks on that pod
 	cold int64 // the same cost in tokens (the valve's unit)
+	// costKnown / coldKnown: the two numbers are computed LAZILY and independently (each is a walk of
+	// the candidate's block keys), so a valve-blocked head never pays for the block cost and a
+	// budget-blocked one never pays for the tokens.
+	costKnown, coldKnown bool
 }
 
 // ncaV2DecideOnce is ONE repetition of A1, in the contract's OWN order: the outside head is tried
@@ -97,25 +114,32 @@ type fitFacts struct {
 func (s *Scheduler) ncaV2DecideOnce(now time.Time) bool {
 	head := s.nca2OutsideHead()
 	pods := s.ncaV2PodOrder(head)
-	memo := map[fitKey]fitFacts{}
+	memo := s.nca2.passMemo
+	// A9: a reservation belongs to ONE head. When the head changes (admitted, gone, replaced) every
+	// pod's budget is released with it.
+	headID := ""
+	if head != nil {
+		headID = head.id
+	}
+	for _, p := range pods {
+		if p.g.nca2 != nil && p.g.nca2.reservedHead != headID {
+			p.g.nca2.reservedHead, p.g.nca2.reservedBlocks = "", 0
+		}
+	}
 	// PHASE 1 — A2.1: the outside head, the pods in the A5 order (A4's old pod first).
 	if head != nil {
-		f := PromptTokens(head.chains)
+		f := s.nca2CandOf(head).tokens
 		for _, p := range pods {
 			if p.g.numBlocks <= 0 {
 				continue // no measured capacity: the pod cannot be costed (the base's rule)
 			}
 			if f > p.room {
-				continue // f(X) ≤ room(P): the provisional entry must fit the space this pod has
-			}
-			if !s.ncaV2Fits(p.g, head, now, memo) {
+				// f(X) ≤ room(P): the provisional entry must fit the space this pod has. A pod that
+				// cannot take the head in SPACE is not asked to hold seats for it either.
 				continue
 			}
-			if !s.ncaV2Reclaim(p.g, head, now, memo) {
-				// the evictions fell short (shared blocks): this pod cannot take the head, and the
-				// seats it did not need stay in place
-				clear(memo)
-				continue
+			if !s.ncaV2AdmissionBudget(p.g, head, now, memo) {
+				continue // the pod is now holding what it freed for the head (A9)
 			}
 			if s.nca2Admit(p.g, head, f, p.room, now) {
 				return true
@@ -123,16 +147,31 @@ func (s *Scheduler) ncaV2DecideOnce(now time.Time) bool {
 		}
 	}
 	// PHASE 2 — A2.2: the warm returners of each pod in the same order, the deepest position first.
+	// A pod that is budgeting for the head does not seat returners: the space it freed is the head's.
 	for _, p := range pods {
 		if p.g.numBlocks <= 0 {
 			continue
 		}
-		for _, w := range s.nca2WarmReturners(p.g) {
+		if p.g.nca2 != nil && p.g.nca2.reservedBlocks > 0 && p.g.nca2.reservedHead == headID && headID != "" {
+			continue // this pod is holding seats for the head (A9)
+		}
+		if !s.nca2.warmBuilt {
+			// built ONCE per pass, on the first phase-2 visit: a pass that never gets there pays nothing
+			for _, g := range s.activeGroups() {
+				if g.nca2 != nil && g.numBlocks > 0 {
+					s.nca2.warm[g.id] = s.nca2WarmReturners(g)
+				}
+			}
+			s.nca2.warmBuilt = true
+		}
+		for _, w := range s.nca2.warm[p.g.id] {
+			if _, live := s.waiters[w.id]; !live {
+				continue // seated by an earlier decision in this pass
+			}
 			if !s.ncaV2Fits(p.g, w, now, memo) {
 				continue
 			}
 			if !s.ncaV2Reclaim(p.g, w, now, memo) {
-				clear(memo)
 				continue
 			}
 			if s.nca2SeatReturner(p.g, w, p.room, now) {
@@ -141,6 +180,49 @@ func (s *Scheduler) ncaV2DecideOnce(now time.Time) bool {
 		}
 	}
 	return false
+}
+
+// ncaV2AdmissionBudget is A9, the ADMISSION BUDGET of the outside head on one pod: the pod evicts its
+// reclaimable seats (the base rotation order) FOR THIS HEAD, records how many blocks it freed on the
+// head's behalf, and reports whether the head fits now.
+//
+// The recorded blocks are what makes the rule work across passes: a prompt larger than one seat needs
+// several seats freed, and they become reclaimable one quantum at a time. Without the reservation the
+// space freed in one pass was taken by a returner in the same pass (A2.2's phase runs right after),
+// the head restarted from zero every ~20 ms, and the whole outside line froze behind it (the X3
+// freeze, verifier 2). While the reservation stands this pod's phase 2 is skipped, so the head
+// accumulates until it fits. A3 (strict head-of-line) and A2.2's own eligibility are untouched.
+//
+// The cold valve is checked FIRST: it is not budget, so no eviction can change its answer (C9).
+func (s *Scheduler) ncaV2AdmissionBudget(g *engineGroup, head *waiter, now time.Time, memo map[fitKey]fitFacts) bool {
+	if s.ncaV2CheapFits(g, head) {
+		return true // the cheap upper bound already fits: no index walk, no eviction
+	}
+	// THE VALVE FIRST and alone (C9), and only the token cost it needs: a head the valve holds never
+	// pays for the block walk.
+	if !s.coldAllowsTokens(g, s.ncaV2Cold(g, head, memo).cold) {
+		return false
+	}
+	budget := int64(g.budgetBlocks)
+	var facts fitFacts
+	for {
+		facts = s.ncaV2Cost(g, head, memo)
+		if facts.cost <= s.freeBudget(g) || (len(g.threads) == 0 && facts.cost > budget) {
+			return true
+		}
+		reason, victim := s.rotationVictim(g, now)
+		if victim == nil {
+			return false // nothing reclaimable right now: the budget keeps what it freed, for the next pass
+		}
+		freed := int64(g.index.ChargedBlocks(victim.id))
+		s.exit(g, victim, reason, now)
+		if g.nca2 != nil {
+			// THE RESERVATION STARTS AT THE FIRST SEAT THIS POD FREES FOR THE HEAD: a pod that freed
+			// nothing has nothing to hold, and must keep seating its returners (A2.2 untouched)
+			g.nca2.reservedHead = head.id
+			g.nca2.reservedBlocks += freed
+		}
+	}
 }
 
 // ncaV2PodOrder is A5, plus A4's preference: the fewest requests IN FLIGHT first (the pod whose GPU
@@ -185,15 +267,32 @@ func (s *Scheduler) ncaV2PodOrder(head *waiter) []podState {
 	return pods
 }
 
-// ncaV2Cost is one candidate's cost on one pod, memoized for the repetition (the block index is the
-// expensive read: it walks the candidate's keys).
+// ncaV2Cost is one candidate's exact block cost on one pod, memoized for the PASS (the block index is
+// the expensive read: it walks every key of the candidate's chains).
 func (s *Scheduler) ncaV2Cost(g *engineGroup, w *waiter, memo map[fitKey]fitFacts) fitFacts {
 	key := fitKey{pod: g.id, thread: w.id}
-	if f, ok := memo[key]; ok {
-		return f
+	f, ok := memo[key]
+	if !ok {
+		f = fitFacts{}
 	}
-	f := fitFacts{cost: int64(g.index.Cost(w.chains)), cold: g.index.ColdTokens(w.chains)}
-	memo[key] = f
+	if !f.costKnown {
+		f.cost, f.costKnown = int64(g.index.Cost(w.chains)), true
+		memo[key] = f
+	}
+	return f
+}
+
+// ncaV2Cold is the same cost in TOKENS (the cold valve's unit), computed only when the valve is asked.
+func (s *Scheduler) ncaV2Cold(g *engineGroup, w *waiter, memo map[fitKey]fitFacts) fitFacts {
+	key := fitKey{pod: g.id, thread: w.id}
+	f, ok := memo[key]
+	if !ok {
+		f = fitFacts{}
+	}
+	if !f.coldKnown {
+		f.cold, f.coldKnown = g.index.ColdTokens(w.chains), true
+		memo[key] = f
+	}
 	return f
 }
 
@@ -204,19 +303,22 @@ func (s *Scheduler) ncaV2Cost(g *engineGroup, w *waiter, memo map[fitKey]fitFact
 // The valve is checked FIRST and alone: it is not budget, so no eviction can change its answer, and a
 // head it holds must WAIT (C9).
 func (s *Scheduler) ncaV2Fits(g *engineGroup, w *waiter, now time.Time, memo map[fitKey]fitFacts) bool {
+	if s.ncaV2CheapFits(g, w) {
+		return true // the cheap upper bound fits: no index walk
+	}
 	// THE VALVE FIRST, and alone: it is not budget, so no eviction could ever change its answer (C9),
 	// and a head it refuses must WAIT rather than take a seat from somebody.
-	facts := s.ncaV2Cost(g, w, memo)
-	if !s.coldAllowsTokens(g, facts.cold) {
+	if !s.coldAllowsTokens(g, s.ncaV2Cold(g, w, memo).cold) {
 		return false
 	}
-	if facts.cost <= s.freeBudget(g) {
+	if facts := s.ncaV2Cost(g, w, memo); facts.cost <= s.freeBudget(g) {
 		return true
 	}
-	if len(g.threads) == 0 && facts.cost > int64(g.budgetBlocks) {
+	cost := s.ncaV2Cost(g, w, memo).cost
+	if len(g.threads) == 0 && cost > int64(g.budgetBlocks) {
 		return true // RULE O: an empty pod admits one oversize head
 	}
-	return facts.cost <= s.freeBudget(g)+s.ncaV2ReclaimableBlocks(g, now)
+	return cost <= s.freeBudget(g)+s.ncaV2ReclaimableBlocks(g, now)
 }
 
 // ncaV2ReclaimableBlocks is the most this pod can free WITHOUT touching a thread with work in flight
@@ -240,9 +342,9 @@ func (s *Scheduler) ncaV2ReclaimableBlocks(g *engineGroup, now time.Time) int64 
 // candidate the fit test already accepted (R1). If the evictions fall short — seats that SHARE blocks
 // free less than their own footprint — it stops and leaves the rest in place.
 func (s *Scheduler) ncaV2Reclaim(g *engineGroup, w *waiter, now time.Time, memo map[fitKey]fitFacts) bool {
-	facts := s.ncaV2Cost(g, w, memo)
 	budget := int64(g.budgetBlocks)
 	for {
+		facts := s.ncaV2Cost(g, w, memo)
 		if facts.cost <= s.freeBudget(g) || (len(g.threads) == 0 && facts.cost > budget) {
 			return true
 		}

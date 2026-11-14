@@ -141,6 +141,80 @@ func benchRealistic(b *testing.B, blocked bool) (*Scheduler, []Head) {
 	return s, heads
 }
 
+// benchRealScale is the adversarial re-check's own scale (RECHECK-closedloop.md): 3 pods of 39,845
+// blocks with a 0.80 budget, chains of ~3,000 blocks (~192k tokens), a CPU line that holds ~27 of them,
+// 60 warm returners and 300 outsiders. The point is not the shape of one pass but the ORDER of its cost
+// with the state the cluster will actually run.
+func benchRealScale(b *testing.B) (*Scheduler, []Head) {
+	b.Helper()
+	const (
+		blocks = 3000 // ~192k tokens, inside the re-check's 2,000-4,500 range
+		gpu    = 39845
+	)
+	s := newNCA2Tuned(b, func(c *Config) {
+		c.CPUTierTokens = i64(defaultCPUTierTokens)
+		c.GroupBudgetFraction = 0.80
+		c.Quantum = 8
+		c.IdleSeconds = 5
+	}, []string{"p0", "p1", "p2"})
+	for _, pod := range []string{"p0", "p1", "p2"} {
+		if err := s.SetNumBlocksFor(pod, 64, gpu); err != nil {
+			b.Fatal(err)
+		}
+	}
+	now := epoch
+	s.mu.Lock()
+	for _, pod := range []string{"p0", "p1", "p2"} {
+		g := s.groups[pod]
+		for i := 0; i < 27; i++ {
+			id := fmt.Sprintf("%s-t%d", pod, i)
+			g.nca2.line = append(g.nca2.line, nca2Entry{thread: id, tokens: blocks * 64, lastTouch: now})
+			if i < 20 {
+				s.nca2.homes[id] = pod
+				s.nca2.admitted[id] = true
+				s.nca2.ever[id] = true
+				s.nca2.inf[id] = 1
+			}
+		}
+	}
+	s.mu.Unlock()
+	heads := make([]Head, 0, 360)
+	for i := 0; i < 300; i++ {
+		id := fmt.Sprintf("out%d", i)
+		heads = append(heads, Head{Thread: id, ReqID: "r-" + id,
+			Arrival: now.Add(-time.Duration(i) * time.Millisecond), Chains: chain(id, blocks)})
+	}
+	for _, pod := range []string{"p0", "p1", "p2"} {
+		for i := 0; i < 20; i++ {
+			id := fmt.Sprintf("%s-t%d", pod, i)
+			heads = append(heads, Head{Thread: id, ReqID: "r-" + id,
+				Arrival: now.Add(-time.Duration(1000+i) * time.Millisecond), Chains: chain(id, blocks)})
+		}
+	}
+	return s, heads
+}
+
+// BenchmarkNCA2PassRealScale is one pass at the re-check's scale.
+func BenchmarkNCA2PassRealScale(b *testing.B) {
+	b.ReportAllocs()
+	var total, worst time.Duration
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		s, heads := benchRealScale(b)
+		b.StartTimer()
+		start := time.Now()
+		s.Pass(heads, epoch.Add(time.Second))
+		d := time.Since(start)
+		total += d
+		if d > worst {
+			worst = d
+		}
+	}
+	b.ReportMetric(float64(total.Nanoseconds())/float64(b.N), "ns/pass")
+	b.ReportMetric(float64(worst.Nanoseconds())/1e6, "worst-ms")
+}
+
 // BenchmarkNCA2PassRealistic is one pass at c192 fidelity: 300 outsiders of ~130k tokens, 60 warm
 // returners whose entries are their prompts, 41-entry lines.
 func BenchmarkNCA2PassRealistic(b *testing.B) {

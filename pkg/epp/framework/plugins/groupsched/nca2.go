@@ -653,32 +653,6 @@ func (s *Scheduler) ncaV2FreeFor(g *engineGroup, w *waiter) int64 {
 	return free - held
 }
 
-// ncaV2CheapFits is the CHEAP POSITIVE fit test (V2). The pod's line holds the thread's last request,
-// so it already covers the first floor(entry/blockSize) blocks of this candidate's chain: the new
-// blocks it can need are at most keys − that, and the cold tokens at most tokens − entry. When both
-// upper bounds are inside the pod's free budget and the valve's headroom the answer is YES without a
-// single block-index lookup. Every upper bound is SOUND (so a "yes" is a real yes), and the seat
-// re-checks the exact cost anyway, so an optimistic answer would cost a repeat, never a wrong seat.
-func (s *Scheduler) ncaV2CheapFits(g *engineGroup, w *waiter) bool {
-	if s.nca2 == nil || g == nil || g.nca2 == nil || w == nil || s.blockSize <= 0 {
-		return false
-	}
-	cand := s.nca2CandOf(w)
-	entry := s.nca2EntryTokens(g, w.id)
-	cold := cand.tokens - entry
-	if cold < 0 {
-		cold = 0
-	}
-	if !s.coldAllowsTokens(g, cold) {
-		return false
-	}
-	blocks := cand.keys - entry/int64(s.blockSize)
-	if blocks < 0 {
-		blocks = 0
-	}
-	return blocks <= s.ncaV2FreeFor(g, w)
-}
-
 // nca2WarmReturners is A2.2's list: this pod's ADMITTED threads that are WAITING and hold NO seat
 // (a waiter is unseated by construction), the entry NEAREST THE TAIL first — the DEEPEST position,
 // which is the LOWEST line in the list the line is drawn as (the head at the top, the tail at the

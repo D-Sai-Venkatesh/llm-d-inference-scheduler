@@ -528,6 +528,57 @@ func TestFitsIsPure(t *testing.T) {
 	}
 }
 
+// TestTheFitTestIsTheExactAccounting: C1 (the re-check's disagreement). The CPU line's entry is a
+// CLAIM about what the pod holds, and it can over-claim — a stale entry after a rebind, a trim, or a
+// thread whose next prompt does not extend the previous one exactly. A fit test derived from that
+// claim (keys − entry/blockSize) therefore UNDER-estimates the cost, and a decision that trusted it
+// would evict seats for a candidate whose exact cost refuses the seat (the re-check's
+// eviction-without-a-seat). The fit test is the block index's own accounting: a pod whose entry claims
+// far more than the index holds must answer NO, whatever the line says.
+func TestTheFitTestIsTheExactAccounting(t *testing.T) {
+	s := newNCA2(t, []string{"p0"})
+	s.mu.Lock()
+	// the line claims 4,000 tokens of residence (62 blocks) for the thread ...
+	s.groups["p0"].nca2.line = []nca2Entry{{thread: "t", tokens: 4000}}
+	s.nca2.homes["t"] = "p0"
+	s.nca2.ever["t"] = true
+	// ... and the GPU has 30 free blocks of its 950-block budget, while the thread's 40-block chain is
+	// NOT in the index: the exact cost is 40 blocks, which does not fit
+	g := s.groups["p0"]
+	// 920 blocks of somebody else's footprint, so free = 30
+	if ok, _ := g.index.TrySeat("filler", []Chain{{Keys: keys(920, seedFor("filler")), Tokens: 1000}}, g.budgetBlocks); !ok {
+		s.mu.Unlock()
+		t.Fatal("fixture: the filler must take 920 blocks")
+	}
+	w := &waiter{id: "t", since: epoch, chains: []Chain{{Keys: keys(40, seedFor("t")), Tokens: 2560}}}
+	free := s.freeBudget(g)
+	exact := int64(g.index.Cost(w.chains))
+	fits := s.ncaV2Fits(g, w, epoch, map[fitKey]fitFacts{})
+	s.mu.Unlock()
+	if free != 30 || exact != 40 {
+		t.Fatalf("fixture: free %d blocks, exact cost %d (want 30 / 40)", free, exact)
+	}
+	if fits {
+		t.Fatalf("the fit test must be the exact accounting: cost %d > free %d, and the line's claim "+
+			"(entry 4000 tokens) must not be believed over the index", exact, free)
+	}
+	// and the decision agrees: nothing is seated, nobody is evicted for it
+	f := &fixture{t: t, s: s, now: epoch}
+	f.s.mu.Lock()
+	exitsBefore := len(s.counters.exits)
+	f.s.mu.Unlock()
+	f.now = f.now.Add(time.Second)
+	if i := f.step(f.hdHeavy("t", 40, 2560)); i != -1 {
+		t.Fatalf("a candidate the exact cost refuses is not seated, got %d", i)
+	}
+	f.s.mu.Lock()
+	exitsAfter := len(s.counters.exits)
+	s.mu.Unlock()
+	if exitsAfter != exitsBefore {
+		t.Fatalf("no seat may be taken for a candidate the exact cost refuses: %v -> %v", exitsBefore, exitsAfter)
+	}
+}
+
 // TestPushedOutThreadPrefersItsOldPod: A4 — a priority thread whose old entry still exists on its old
 // pod is admitted THERE, when BOTH A5 keys prefer another pod (p0 is running a request and has the
 // smaller room; p1 is idle).

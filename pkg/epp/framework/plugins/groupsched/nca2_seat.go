@@ -192,9 +192,6 @@ func (s *Scheduler) ncaV2DecideOnce(now time.Time) bool {
 //
 // The cold valve is checked FIRST: it is not budget, so no eviction can change its answer (C9).
 func (s *Scheduler) ncaV2AdmissionBudget(g *engineGroup, head *waiter, now time.Time, memo map[fitKey]fitFacts) bool {
-	if s.ncaV2CheapFits(g, head) {
-		return true // the cheap upper bound already fits: no index walk, no eviction
-	}
 	// THE VALVE FIRST and alone (C9), and only the token cost it needs: a head the valve holds never
 	// pays for the block walk.
 	if !s.coldAllowsTokens(g, s.ncaV2Cold(g, head, memo).cold) {
@@ -306,9 +303,6 @@ func (s *Scheduler) ncaV2Cold(g *engineGroup, w *waiter, memo map[fitKey]fitFact
 // The valve is checked FIRST and alone: it is not budget, so no eviction can change its answer, and a
 // head it holds must WAIT (C9).
 func (s *Scheduler) ncaV2Fits(g *engineGroup, w *waiter, now time.Time, memo map[fitKey]fitFacts) bool {
-	if s.ncaV2CheapFits(g, w) {
-		return true // the cheap upper bound fits: no index walk
-	}
 	// THE VALVE FIRST, and alone: it is not budget, so no eviction could ever change its answer (C9),
 	// and a head it refuses must WAIT rather than take a seat from somebody.
 	if !s.coldAllowsTokens(g, s.ncaV2Cold(g, w, memo).cold) {

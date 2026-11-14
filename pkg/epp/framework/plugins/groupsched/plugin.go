@@ -177,6 +177,10 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		handle: handle,
 	}
 	r.metrics = newPluginMetrics(r)
+	if r.sched.nca2 != nil {
+		// the nca2 surface exists only in nca2 (it is registered below, in the handle's registry)
+		r.sched.nca2m = newNCA2Metrics()
+	}
 	// The decoded config is echoed at the DEFAULT level, always: a run's configuration must be
 	// verifiable from its own log.
 	r.logger.V(logutil.DEFAULT).Info("group-scheduler: effective config " + configEcho(cfg))

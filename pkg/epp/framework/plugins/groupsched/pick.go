@@ -55,6 +55,10 @@ func (s *Scheduler) Pass(heads []Head, now time.Time) int {
 // state the next one reads.
 func (s *Scheduler) tidy(now time.Time) {
 	s.derive()
+	// nca2's derived aggregates ride the same derive: the ACTIVITY counts (in flight per thread and
+	// per pod) are recomputed from the request records before anything reads them, and the leak
+	// bound is applied here — once per record, which is what leaked_requests_total counts.
+	s.nca2Derive(now)
 	s.reapRequests(now)
 	s.drainExiting(now)
 }

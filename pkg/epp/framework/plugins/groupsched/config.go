@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 )
 
 // Config is the plugin's decoded parameters. One code path for one engine and for N: a single-pod
@@ -139,35 +138,6 @@ const (
 	defaultLostRequestSeconds = 300
 )
 
-// nca2Config is the RESOLVED nca2 policy: the numbers the decision reads, after the defaults and
-// the range checks. It is nil when the mode is OFF, and every nca2 path is gated on that nil.
-//
-// CPU-tier token counts are derived from C once, here: the policy compares token positions against
-// them on every decision and a multiplication per comparison would drift with the float's rounding.
-type nca2Config struct {
-	// CPUTierTokens is C: the pod's CPU KV tier, in tokens.
-	CPUTierTokens int64
-	// AdmitLine is L_a = admitLine x C: the admission line, in tokens.
-	AdmitLineTokens int64
-	// TrustLine is L_t = trustLine x C: the line the WARM PREDICTION trusts, in tokens.
-	TrustLineTokens int64
-	// MaxInflightSeconds is the ACTIVITY bound: a request in flight longer than this is leaked and
-	// stops holding its thread active.
-	MaxInflightSeconds float64
-	// LostRequestSeconds is the released-window liveness bound (S2).
-	LostRequestSeconds float64
-}
-
-// maxInflightWindow is MaxInflightSeconds as a duration.
-func (n *nca2Config) maxInflightWindow() time.Duration {
-	return time.Duration(n.MaxInflightSeconds * float64(time.Second))
-}
-
-// lostRequestWindow is LostRequestSeconds as a duration.
-func (n *nca2Config) lostRequestWindow() time.Duration {
-	return time.Duration(n.LostRequestSeconds * float64(time.Second))
-}
-
 // nca2KeyNames lists the parameters that only mean something in nca2, in the order the refusal
 // names them: a config that carries one without mode: nca2 is refused rather than run.
 func (c Config) nca2KeyNames() []string {
@@ -194,7 +164,7 @@ func (c Config) nca2KeyNames() []string {
 // resolved numbers for nca2, and an error for everything else (fail closed — an unknown mode, or
 // an nca2 key that would otherwise sit in the config looking effective while the shipped policy
 // runs underneath it).
-func (c Config) resolveNCA2() (*nca2Config, error) {
+func (c Config) resolveNCA2() (*nca2Policy, error) {
 	keys := c.nca2KeyNames()
 	if c.Mode != modeNCA2 {
 		if c.Mode != modeOff {
@@ -205,7 +175,7 @@ func (c Config) resolveNCA2() (*nca2Config, error) {
 		}
 		return nil, nil
 	}
-	n := &nca2Config{
+	n := &nca2Policy{
 		CPUTierTokens:      defaultCPUTierTokens,
 		MaxInflightSeconds: defaultMaxInflightSeconds,
 		LostRequestSeconds: defaultLostRequestSeconds,

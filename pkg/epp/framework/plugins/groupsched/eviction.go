@@ -305,6 +305,10 @@ func (s *Scheduler) RemoveEngine(engine string, now time.Time) int {
 	if !ok {
 		return 0
 	}
+	// S5: the CPU tier's side of the same event — the line is reset and its admitted threads lose
+	// their admission (counted as push-outs, reason restart). The seats are this function's own
+	// business below (they exit as engine-gone: that is the GPU layer's reason, not the CPU tier's).
+	s.nca2ResetPod(g, now)
 	// deterministic order: the teardown writes one EXIT event per thread and a torn-down group's
 	// event order must be reproducible in the artifacts
 	ids := make([]string, 0, len(g.threads))

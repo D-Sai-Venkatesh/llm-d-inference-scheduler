@@ -241,6 +241,9 @@ func (s *Scheduler) AtPod(reqID, engine string, now time.Time) dispatchObservabl
 		// the observed endpoint is authoritative
 		s.rebind(id, engine, now)
 	}
+	// L1/L3 for the CPU tier: the request REACHED a pod, which is the router-visible truth about
+	// what that pod's CPU tier now holds for this thread (nca2 only; nil in OFF).
+	s.nca2AtPod(id, engine, rec.promptTokens, now)
 	return s.atPod(rec, s.groups[s.bindings[id]].threads[id], engine, now)
 }
 

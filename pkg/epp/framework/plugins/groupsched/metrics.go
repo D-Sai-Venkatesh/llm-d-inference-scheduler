@@ -123,6 +123,11 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	return nil
 }
 
+// exitReasonPushout is nca2's own departure reason: L4 pushed an INACTIVE seat holder past the
+// admission line, so it no longer owns the seat it was holding. It joins the shipped exit series
+// only in nca2 (preInstantiateEngine).
+const exitReasonPushout = "pushout"
+
 // exitReasons is one series per DEPARTURE reason, pre-instantiated per engine. "budget-exiting" is
 // absent on purpose: the valve RETURNS it for a class-4 victim but the exit is booked later, as
 // "exiting-drain" when the thread actually leaves.
@@ -140,6 +145,11 @@ func (g *groupMetrics) preInstantiateEngine(engine string) {
 	g.served.WithLabelValues(label).Add(0)
 	for _, reason := range exitReasons {
 		g.exits.WithLabelValues(label, reason).Add(0)
+	}
+	if g.sched.nca2 != nil {
+		// nca2's own exit reason (L4's inactive push-out). It is pre-instantiated ONLY in nca2: the
+		// shipped series must not gain a zero-valued label.
+		g.exits.WithLabelValues(label, exitReasonPushout).Add(0)
 	}
 }
 

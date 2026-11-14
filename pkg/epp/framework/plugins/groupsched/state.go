@@ -138,6 +138,10 @@ type reqRec struct {
 	// when the record is opened, and corrected by the SAME liveness test at every decrement, so
 	// pending is always exactly "the records that counted at their last evaluation".
 	counted bool
+	// leaked marks a request that has been in flight longer than nca2's maxInflightSeconds: it stops
+	// holding its thread ACTIVE and is counted once, in leaked_requests_total. It is nca2's own
+	// flag and is never read in OFF.
+	leaked bool
 	// the OBSERVABLES of this turn, captured at dispatch for the span PreRequest may set. Nothing
 	// in a decision reads them: the queue wait is dispatch − arrival, and the predicted cache is
 	// the resident prefix read BEFORE the charge (after it, it would always be everything).
@@ -186,6 +190,10 @@ type engineGroup struct {
 		served int64 // dispatches served on this engine
 		exits  map[string]int64
 	}
+
+	// nca2 is this pod's CPU line (the router's model of vLLM's CPU LRU) and the per-pod numbers
+	// the nca2 decision and its gauges read. It is nil in OFF and created with the group in nca2.
+	nca2 *nca2Pod
 }
 
 // coldCapTokens is THIS engine's cold-ENTRY stagger cap, in tokens. It is NOT a knob: it is the
@@ -250,15 +258,18 @@ type Scheduler struct {
 	// decision entry point).
 	now time.Time
 
-	// nca2 is the RESOLVED nca2 policy, or nil when the mode is OFF. Every nca2 code path is gated
-	// on that nil: with it nil this scheduler runs exactly the shipped policy, and the extra state
-	// below is neither allocated nor read.
-	nca2 *nca2Config
+	// nca2 is the RESOLVED nca2 policy and its state, or nil when the mode is OFF. Every nca2 code
+	// path is gated on that nil: with it nil this scheduler runs exactly the shipped policy, and none
+	// of the nca2 state is allocated or read.
+	nca2 *nca2Policy
 	// lostWindow is the released-window liveness bound (S2): the base's idleSeconds in OFF,
 	// nca2's lostRequestSeconds in nca2. It is a CONSTRUCTOR-SET field, resolved once, so the two
 	// window tests cannot disagree about which bound they mean — and so OFF keeps the base value
 	// by construction.
 	lostWindow time.Duration
+	// nca2m is the nca2 metric surface: nil in OFF, and every method on it is nil-safe, so an nca2
+	// decision in a bare Scheduler (the unit tests) records nothing without any wiring.
+	nca2m *nca2Metrics
 
 	counters struct {
 		// anomalies counts the EVENTS THE POLICY CANNOT ACT ON, by kind (anomalyKinds).
@@ -297,6 +308,7 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 	s.lostWindow = time.Duration(cfg.IdleSeconds * float64(time.Second))
 	if n2 != nil {
 		s.lostWindow = n2.lostRequestWindow()
+		s.initNCA2()
 	}
 	s.counters.exits = map[string]int64{}
 	s.counters.anomalies = map[string]int64{}
@@ -312,11 +324,19 @@ func (s *Scheduler) groupFor(id string) (*engineGroup, error) {
 	if err != nil {
 		return nil, err
 	}
+	if s.nca2 != nil {
+		// the pod's CPU line exists with the group in nca2: it is created here, never lazily, so no
+		// read path (a DumpState, a scrape) ever writes state (I9)
+		g.nca2 = &nca2Pod{}
+	}
 	s.groups[id] = g
 	s.rebuildGroupOrder()
 	// this engine's zero-valued COUNTER series exist from its first scrape, whatever its capacity
 	// turns out to be (a budgetless or block-size-mismatched group included)
 	s.metrics.preInstantiateEngine(id)
+	if g.nca2 != nil {
+		s.nca2m.preInstantiatePod(engineLabel(id))
+	}
 	return g, nil
 }
 

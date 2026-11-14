@@ -39,6 +39,39 @@ type dispatchObservables struct {
 	queueWait       time.Duration
 	predictedCached int64
 	promptTokens    int64
+	// nca2 carries the nca2 span attributes of the turn (nil-valued in OFF: the struct is only ever
+	// built when a decision took it).
+	nca2 nca2Obs
+}
+
+// nca2Obs is ONE turn's nca2 observability, from the decision that took it to the pod hook that
+// completes it (nca2 spec §7). Nothing in a decision reads it.
+type nca2Obs struct {
+	// class is seated | returner | admitted_now: the class of the turn (the primary metric's own
+	// population, §8).
+	class string
+	// path is priority | newcomer | none: the outside class that won the admission.
+	path string
+	// homePod is the thread's home when the decision was taken, dispatchPod the pod the request
+	// actually reached (the at-pod hook's observation).
+	homePod     string
+	dispatchPod string
+	// positionAtTouch is the entry's position AFTER the at-pod write; predictedWarm is whether its
+	// position before the write was inside the trust line.
+	positionAtTouch int64
+	predictedWarm   bool
+	// room is the pod's room at the decision, doorWait the arrival → admission, seatWait the
+	// arrival → seat, pushedOutBefore whether the thread had lost an admission before this one.
+	room            int64
+	doorWait        time.Duration
+	seatWait        time.Duration
+	pushedOutBefore bool
+	// clientRequestID is the client's own x-request-id header: the EXACT join between a span and the
+	// client's records.
+	clientRequestID string
+	// valid reports that this turn is nca2's to describe (it was taken by a decision, or its thread
+	// is in nca2's state). OFF never sets it.
+	valid bool
 }
 
 // release opens one request's record: the thread that dispatched it, the chains it was charged

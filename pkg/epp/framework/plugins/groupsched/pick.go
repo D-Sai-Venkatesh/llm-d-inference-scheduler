@@ -246,7 +246,14 @@ func (s *Scheduler) queuedPerSeat(g *engineGroup) float64 {
 
 // seatWaiters is the admission loop: hand the shared queue's head to the engine admission chooses,
 // until nothing more can be seated.
+//
+// In nca2 the loop is REPLACED (A0: seatWaiters is the one step of the pass nca2 owns; every other
+// step, and dispatch itself, is the shipped policy) by the CPU-tier admission.
 func (s *Scheduler) seatWaiters(now time.Time) {
+	if s.nca2 != nil {
+		s.ncaV2SeatWaiters(now)
+		return
+	}
 	if len(s.waiters) == 0 {
 		return
 	}

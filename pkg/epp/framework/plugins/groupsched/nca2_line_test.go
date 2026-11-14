@@ -39,12 +39,21 @@ const (
 // newNCA2 is a scheduler in nca2 with a small, exact CPU tier and one 1000-block engine per pod id.
 func newNCA2(t *testing.T, pods []string) *Scheduler {
 	t.Helper()
+	return newNCA2Tuned(t, nil, pods)
+}
+
+// newNCA2Tuned is the same with one knob the test is about (the cold valve's cap, for instance).
+func newNCA2Tuned(t *testing.T, tune func(*Config), pods []string) *Scheduler {
+	t.Helper()
 	cfg := defaultConfig()
 	cfg.Mode = modeNCA2
 	cfg.IdleSeconds = 5
 	cfg.CPUTierTokens = i64(lineC)
 	cfg.AdmitLine = f64(0.95)
 	cfg.TrustLine = f64(0.95)
+	if tune != nil {
+		tune(&cfg)
+	}
 	s, err := NewScheduler(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -338,8 +347,8 @@ func TestWarmReturnersNearestTheTailFirst(t *testing.T) {
 	}
 	got := s.nca2WarmReturners(g)
 	s.mu.Unlock()
-	if len(got) != 3 || got[0].id != "head" || got[1].id != "mid" || got[2].id != "tail" {
-		t.Fatalf("the returner nearest the tail goes first, and only this pod's: %v", ids(got))
+	if len(got) != 3 || got[0].id != "tail" || got[1].id != "mid" || got[2].id != "head" {
+		t.Fatalf("the returner nearest the tail (the deepest position) goes first, and only this pod's: %v", ids(got))
 	}
 }
 

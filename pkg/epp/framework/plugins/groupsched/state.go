@@ -109,6 +109,13 @@ type thread struct {
 	// wireID is the last client request id this thread was seen with: the field a SEAT/EXIT line
 	// joins a request record on (see Head.WireID).
 	wireID string
+	// nca2Class is the class of the turn that SEATED this thread (admitted_now | returner): its first
+	// dispatch reports it, later turns report "seated". nca2Room is the pod's room at the decision
+	// that seated it, and nca2Pushed whether the thread had been pushed out before it. They are the
+	// span's nca2 attributes (nca2 spec §7) and nothing in a decision reads them.
+	nca2Class  string
+	nca2Room   int64
+	nca2Pushed bool
 }
 
 // busy reports whether the thread has work in progress: a request at a pod, or a LIVE released

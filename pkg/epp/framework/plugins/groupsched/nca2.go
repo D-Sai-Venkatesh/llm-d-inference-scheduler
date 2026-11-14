@@ -502,8 +502,10 @@ func (s *Scheduler) nca2ResetPod(g *engineGroup, now time.Time) {
 }
 
 // nca2WarmReturners is A2.2's list: this pod's ADMITTED threads that are WAITING and hold NO seat
-// (a waiter is unseated by construction), LOWEST position first — the nearest the tail, whose
-// service moves it to the head and hands the space below it to the room.
+// (a waiter is unseated by construction), the entry NEAREST THE TAIL first — the DEEPEST position,
+// which is the LOWEST line in the list the line is drawn as (the head at the top, the tail at the
+// bottom, positions growing downward). Serving it moves it to the head, so the inactive entries
+// below it are the block the next space accounting sees.
 //
 // The order is total (position, then the oldest arrival, then the id): map iteration never reaches a
 // decision.
@@ -529,7 +531,7 @@ func (s *Scheduler) nca2WarmReturners(g *engineGroup) []*waiter {
 	sort.Slice(found, func(i, j int) bool {
 		a, b := found[i], found[j]
 		if a.pos != b.pos {
-			return a.pos < b.pos
+			return a.pos > b.pos // nearest the tail = the deepest position
 		}
 		if !a.w.since.Equal(b.w.since) {
 			return a.w.since.Before(b.w.since)

@@ -359,6 +359,37 @@ func TestEngineRemovalResetsTheLineAndKeepsThePriorityClass(t *testing.T) {
 	}
 }
 
+// TestALeakedRequestReleasesTheMarkedSeat: V4 — a pushed-out ACTIVE thread is marked exiting and the
+// base's drain waits for its request to end. A request that never ends (nca2 leaked it at
+// maxInflightSeconds) must NOT pin the seat until the base's 9,300 s reap: nca2's own activity verdict
+// releases it.
+func TestALeakedRequestReleasesTheMarkedSeat(t *testing.T) {
+	s := newNCA2(t, []string{"p0"})
+	admit(t, s, "p0", "a", 10)
+	// a request of a's is at the pod, and a is on its way out (marked exiting)
+	s.mu.Lock()
+	s.reqs["r-a"] = &reqRec{thread: "a", released: epoch, pod: epoch, engine: "p0", counted: true}
+	g := s.groups["p0"]
+	g.index.MarkExiting("a")
+	g.threads["a"].exitingSince = epoch
+	// 100 s later the request is still in flight by nca2's own rule: the seat stays
+	s.nca2Derive(epoch.Add(100 * time.Second))
+	stillSeated := g.threads["a"] != nil
+	// past maxInflightSeconds it is LEAKED: nca2 sees nothing in flight, so the seat goes
+	s.nca2Derive(epoch.Add(2 * defaultMaxInflightSeconds * time.Second))
+	gone, exited := g.threads["a"] == nil, s.counters.exits["exiting-drain"]
+	s.mu.Unlock()
+	if !stillSeated {
+		t.Fatal("a live request must keep the seat")
+	}
+	if !gone {
+		t.Fatal("V4: a leaked request must not pin an exiting seat until the base reap")
+	}
+	if exited == 0 {
+		t.Fatal("the release is a booked departure")
+	}
+}
+
 // TestActivityAndTheLeakBound: §2 — a thread is ACTIVE while a head is queued or a request is in
 // flight; a released request that never arrives stops counting at lostRequestSeconds, an at-pod one
 // is LEAKED at maxInflightSeconds (counted once), and both stop holding the thread active.

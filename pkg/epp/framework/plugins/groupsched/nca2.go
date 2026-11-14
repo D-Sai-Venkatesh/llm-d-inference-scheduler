@@ -476,6 +476,30 @@ func (s *Scheduler) nca2Derive(now time.Time) {
 			g.nca2.inflight++
 		}
 	}
+	// THE LEAK ALSO RELEASES THE SEAT (V4). A marked-exiting thread waits for the BASE's drainExiting,
+	// which asks whether the base still has a request in flight — and a request nobody will ever
+	// settle keeps that count up until inflightReapSeconds (9,300 s), so nca2 counting it inactive at
+	// 1,200 s would leave the seat pinned for two hours. The seat is released here, in the ONE place
+	// nca2 decides what "in flight" means for its own policy: an exiting thread that nca2 sees as
+	// inactive holds a seat it cannot use.
+	for _, g := range s.activeGroups() {
+		if g.nca2 == nil {
+			continue
+		}
+		var ready []string
+		for id := range g.threads {
+			if !g.index.Exiting(id) || s.nca2Active(id) {
+				continue
+			}
+			ready = append(ready, id)
+		}
+		sort.Strings(ready) // deterministic order: this writes EXIT events
+		for _, id := range ready {
+			if m, ok := g.threads[id]; ok {
+				s.exit(g, m, "exiting-drain", now)
+			}
+		}
+	}
 }
 
 // nca2HomeMove puts the thread's home on `engine` and its entry with every other pod: ONE entry per

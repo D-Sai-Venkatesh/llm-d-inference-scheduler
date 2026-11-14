@@ -71,6 +71,41 @@ Consider a pool of two model servers and a workload of multi-turn conversations 
 
 The parameters are decoded **strictly**: an unknown key fails the startup instead of being ignored.
 
+### The CPU-tier admission (`mode: nca2`)
+
+`mode: "nca2"` replaces the admission step with the CPU-tier policy: each pod's CPU line is modelled
+from the prompts its requests bring, a thread is admitted when its prompt fits the space below the
+admission line, and the threads that do not fit wait outside on a global priority list. Everything
+else — the seated threads' dispatch, the budget valve, the quantum, the cold valve — is the policy
+above, unchanged. An absent or `""` mode is the shipped policy; an unknown mode, or any `nca2` key
+without `mode: nca2`, refuses the startup.
+
+```yaml
+- type: group-scheduler
+  name: group
+  parameters:
+    mode: nca2
+    cpuTierTokens: 5592405   # C: the pod's CPU KV tier, in tokens
+    admitLine: 0.95          # L_a = admitLine x C
+    trustLine: 0.95          # L_t = trustLine x C (the warm prediction only)
+    idleSeconds: 5           # the INACTIVE grace a seat holder gets
+    quantum: 8               # the seat's tenure, in completed busy periods
+    lostRequestSeconds: 300  # a released request that never reached a pod
+    maxInflightSeconds: 1200 # an at-pod request older than this is leaked (activity only)
+```
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `mode` | string | `""` | `""` is the shipped policy; `"nca2"` is the CPU-tier admission. Anything else refuses the startup. |
+| `cpuTierTokens` | int | `5592405` | C: one pod's CPU KV tier, in tokens. |
+| `admitLine` | float | `0.95` | L_a, as a fraction of C: an admitted entry's position must stay inside it. |
+| `trustLine` | float | `0.95` | L_t, as a fraction of C: only the `predicted_warm` span attribute reads it. |
+| `lostRequestSeconds` | float | `300` | A RELEASED request that never reached a pod stops counting as in flight (the base's released-window bound; `idleSeconds` in the shipped mode). |
+| `maxInflightSeconds` | float | `1200` | An at-pod request older than this is treated as leaked for the activity test, and counted in `leaked_requests_total`. |
+
+`idleSeconds` becomes the INACTIVE grace (a seat holder with no head and nothing in flight is
+rotation-eligible after it) and `quantum` the seat's tenure, so both are worth setting with the mode.
+
 ### Which parameters to set
 
 Most deployments set **one** of these.

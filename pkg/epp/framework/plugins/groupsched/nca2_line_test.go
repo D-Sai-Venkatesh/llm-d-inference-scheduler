@@ -276,6 +276,27 @@ func TestPushoutOfAnActiveSeatHolderKeepsTheSeat(t *testing.T) {
 	}
 }
 
+// TestPushoutByATouchOfAnInactiveEntryIsGrowth: L4 with an INACTIVE pushed entry and a TOUCH as the
+// cause: the reason is growth (another thread's touch moved it past the line), and because it is
+// inactive it loses its seat at once (I3).
+func TestPushoutByATouchOfAnInactiveEntryIsGrowth(t *testing.T) {
+	s := newNCA2(t, []string{"p0"})
+	admit(t, s, "p0", "a", 10) // 640, INACTIVE
+	admit(t, s, "p0", "b", 30) // 1920: a is at 2560, inside the line
+	s.mu.Lock()
+	s.nca2LineSet(s.groups["p0"], "b", 40*64, epoch.Add(time.Second), pushoutTouch) // a → 3200
+	s.mu.Unlock()
+	if admittedNow(s, "a") {
+		t.Fatal("the touch pushed a past the line")
+	}
+	if seated(s, "a") {
+		t.Fatal("I3: an INACTIVE pushed-out thread loses the seat it is not using")
+	}
+	if !admittedNow(s, "b") {
+		t.Fatal("the touching thread stays admitted")
+	}
+}
+
 // TestActivityAndTheLeakBound: §2 — a thread is ACTIVE while a head is queued or a request is in
 // flight; a released request that never arrives stops counting at lostRequestSeconds, an at-pod one
 // is LEAKED at maxInflightSeconds (counted once), and both stop holding the thread active.

@@ -72,6 +72,15 @@ type nca2Policy struct {
 	// has been the head. Written by the pass, only READ by the Snapshot (I9).
 	blockedHead  string
 	blockedSince time.Time
+	// passDecisions and capHit are the LAST pass's own report: how many decisions it took, and whether
+	// the safety cap (waiters + 4 × pods) is what stopped it — two facts a run must be able to tell
+	// apart (a cap hit is a capacity signal, not a work-conservation gap).
+	passDecisions int
+	capHit        bool
+	// onPushout is a TEST-ONLY seam: nil in production, called at every L4 push-out with the reason and
+	// the pushed thread's activity. It is how the invariant tests check that an ACTIVE entry is only
+	// ever pushed by a touch (I2/A6) — the state alone cannot say which event pushed it.
+	onPushout func(reason string, active bool)
 }
 
 // maxInflightWindow is MaxInflightSeconds as a duration.
@@ -353,11 +362,15 @@ func (s *Scheduler) nca2Pushout(g *engineGroup, id, reason string, now time.Time
 	s.nca2.admitted[id] = false
 	s.nca2.pushed[id] = true
 	s.nca2m.ObservePushout(engineLabel(g.id), reason)
+	active := s.nca2Active(id)
+	if s.nca2.onPushout != nil {
+		s.nca2.onPushout(reason, active)
+	}
 	m := g.threads[id]
 	if m == nil {
 		return // not seated: nothing on the GPU layer follows from it
 	}
-	if s.nca2Active(id) {
+	if active {
 		s.nca2m.ObserveActivePushout(engineLabel(g.id))
 		if !g.index.Exiting(id) {
 			g.index.MarkExiting(id)
@@ -622,6 +635,11 @@ type NCA2Snapshot struct {
 	// pod, and BlockedHead names it ("" when the queue is empty).
 	HeadBlockedSeconds float64 `json:"headBlockedSeconds"`
 	BlockedHead        string  `json:"blockedHead,omitempty"`
+	// DecisionsThisPass and DecisionCapHit are the last pass's own report: how many decisions it took,
+	// and whether the A1 safety cap (waiters + 4 × pods) stopped it rather than the absence of a
+	// candidate. A cap hit is a capacity signal; a no-candidate end with capacity is a bug (I7).
+	DecisionsThisPass int  `json:"decisionsThisPass"`
+	DecisionCapHit    bool `json:"decisionCapHit,omitempty"`
 }
 
 // NCA2PodSnapshot is ONE pod's CPU line as a scraped reader sees it: the geometry the decision uses
@@ -659,7 +677,8 @@ func (s *Scheduler) nca2Snapshot(now time.Time) *NCA2Snapshot {
 	if s.nca2 == nil {
 		return nil
 	}
-	snap := &NCA2Snapshot{Engines: map[string]NCA2PodSnapshot{}}
+	snap := &NCA2Snapshot{Engines: map[string]NCA2PodSnapshot{},
+		DecisionsThisPass: s.nca2.passDecisions, DecisionCapHit: s.nca2.capHit}
 	for id := range s.waiters {
 		if s.nca2.admitted[id] {
 			continue // a warm returner, not an outside thread

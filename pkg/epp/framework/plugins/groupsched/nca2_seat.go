@@ -40,11 +40,20 @@ func (s *Scheduler) ncaV2SeatWaiters(now time.Time) {
 	if s.nca2 == nil {
 		return
 	}
-	cap := len(s.waiters) + 4*len(s.groups)
-	for i := 0; i < cap && len(s.waiters) > 0; i++ {
+	limit := len(s.waiters) + 4*len(s.groups)
+	s.nca2.passDecisions, s.nca2.capHit = 0, false
+	decisions := 0
+	for ; decisions < limit && len(s.waiters) > 0; decisions++ {
 		if !s.ncaV2DecideOnce(now) {
 			break
 		}
+		s.nca2.passDecisions++
+	}
+	// the CAP was the reason the pass stopped, not the absence of a candidate: the value is reported so
+	// a run can tell the two apart (and the invariant test can tell a real work-conservation gap from a
+	// cap that was doing its job)
+	if decisions >= limit && len(s.waiters) > 0 {
+		s.nca2.capHit = true
 	}
 	// nothing more could be seated: if the outside head is held by an engine's cold-entry valve (it
 	// would fit the budget, the valve refuses it), that is the shipped valve counter's event

@@ -53,6 +53,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"time"
@@ -179,6 +180,16 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// The decoded config is echoed at the DEFAULT level, always: a run's configuration must be
 	// verifiable from its own log.
 	r.logger.V(logutil.DEFAULT).Info("group-scheduler: effective config " + configEcho(cfg))
+	// THE nca2 ECHO, when nca2 runs: the spec's own list (mode, C, both lines, the three time
+	// bounds, the quantum, the budget fraction) plus the commit the binary was built from — the one
+	// field a run's artifacts cannot recover from anywhere else. OFF prints no such line, and its
+	// echo is the base's byte for byte.
+	if n2 := r.sched.nca2; n2 != nil {
+		r.logger.V(logutil.DEFAULT).Info(fmt.Sprintf(
+			"group-scheduler: nca2 config mode=%s cpuTierTokens=%d admitLineTokens=%d trustLineTokens=%d idleSeconds=%v lostRequestSeconds=%v maxInflightSeconds=%v quantum=%d groupBudgetFraction=%v commit=%s",
+			modeNCA2, n2.CPUTierTokens, n2.AdmitLineTokens, n2.TrustLineTokens, cfg.IdleSeconds,
+			n2.LostRequestSeconds, n2.MaxInflightSeconds, cfg.Quantum, cfg.GroupBudgetFraction, buildCommit()))
+	}
 
 	// The observation wiring is TWO assignments: the core calls the metrics directly (every method
 	// is nil-safe, so a unit-mode run records the same accounting as a live one — the affinity and
@@ -288,4 +299,18 @@ func (r *GroupScheduler) TypedName() fwkplugin.TypedName { return r.typedName }
 // DumpState reports the group snapshot.
 func (r *GroupScheduler) DumpState() (json.RawMessage, error) {
 	return json.Marshal(r.sched.Snapshot(r.now()))
+}
+
+// buildCommit is the VCS revision the binary was built from, as the Go toolchain stamped it (""
+// when the build carried no VCS information: a container build from a source tarball). The nca2
+// startup echo prints it: a run's artifacts must name the code that decided, not just the config.
+func buildCommit() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" {
+				return s.Value
+			}
+		}
+	}
+	return "unknown"
 }

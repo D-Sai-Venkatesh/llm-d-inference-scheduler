@@ -77,7 +77,9 @@ func (s *Scheduler) expireWindows(m *thread, now time.Time) {
 		if !rec.pod.IsZero() {
 			continue // it reached a pod: not a window any more
 		}
-		if rec.counted && now.Sub(rec.released) > time.Duration(s.cfg.IdleSeconds*float64(time.Second)) {
+		// THE WINDOW BOUND IS THE CONSTRUCTOR'S (S2): the base's idleSeconds in OFF, nca2's
+		// lostRequestSeconds in nca2 — one field, so the two window tests cannot disagree.
+		if rec.counted && now.Sub(rec.released) > s.lostWindow {
 			rec.counted = false
 			m.pending = max(m.pending-1, 0)
 		}
@@ -92,7 +94,7 @@ func (s *Scheduler) windowLive(rec *reqRec, now time.Time) bool {
 	if rec == nil || !rec.pod.IsZero() {
 		return false
 	}
-	return now.Sub(rec.released) <= time.Duration(s.cfg.IdleSeconds*float64(time.Second))
+	return now.Sub(rec.released) <= s.lostWindow
 }
 
 // atPod closes the released window: the request is running on an engine.

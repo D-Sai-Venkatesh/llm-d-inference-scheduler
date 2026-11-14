@@ -250,6 +250,16 @@ type Scheduler struct {
 	// decision entry point).
 	now time.Time
 
+	// nca2 is the RESOLVED nca2 policy, or nil when the mode is OFF. Every nca2 code path is gated
+	// on that nil: with it nil this scheduler runs exactly the shipped policy, and the extra state
+	// below is neither allocated nor read.
+	nca2 *nca2Config
+	// lostWindow is the released-window liveness bound (S2): the base's idleSeconds in OFF,
+	// nca2's lostRequestSeconds in nca2. It is a CONSTRUCTOR-SET field, resolved once, so the two
+	// window tests cannot disagree about which bound they mean — and so OFF keeps the base value
+	// by construction.
+	lostWindow time.Duration
+
 	counters struct {
 		// anomalies counts the EVENTS THE POLICY CANNOT ACT ON, by kind (anomalyKinds).
 		anomalies map[string]int64
@@ -269,11 +279,25 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	// the selector AFTER the gate: validate has already refused an unknown mode and an nca2 key
+	// without mode: nca2, so this can only be the resolved policy (or nil for OFF)
+	n2, err := cfg.resolveNCA2()
+	if err != nil {
+		return nil, err
+	}
 	s := &Scheduler{cfg: cfg, logger: logr.Discard(), blockSize: cfg.BlockSizeTokens,
 		groups:   map[string]*engineGroup{},
 		bindings: map[string]string{},
 		reqs:     map[string]*reqRec{},
-		waiters:  map[string]*waiter{}}
+		waiters:  map[string]*waiter{},
+		nca2:     n2}
+	// THE RELEASED-WINDOW BOUND, resolved once: OFF keeps the base's idleSeconds (so the shipped
+	// behaviour is byte-identical), nca2 uses its own lostRequestSeconds (a released turn is IN
+	// FLIGHT until it reaches a pod: the 5 s idle grace must not sever it).
+	s.lostWindow = time.Duration(cfg.IdleSeconds * float64(time.Second))
+	if n2 != nil {
+		s.lostWindow = n2.lostRequestWindow()
+	}
 	s.counters.exits = map[string]int64{}
 	s.counters.anomalies = map[string]int64{}
 	return s, nil

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Config is the plugin's decoded parameters. One code path for one engine and for N: a single-pod
@@ -51,6 +52,29 @@ type Config struct {
 	// the turn and ended at its settle, its abandon, its thread's exit — so a record that
 	// outlives this bound has no owner left).
 	InflightReapSeconds float64 `json:"inflightReapSeconds"`
+
+	// ---- the nca2 selector (nca2 spec §1) ----
+	//
+	// The nca2 keys decode as POINTERS: presence is the fact the fail-closed rule needs (an nca2
+	// key without mode: nca2 refuses the startup), and a value that was never set must not be
+	// distinguishable from a zero. They are omitted from the echo while nil, so a config that
+	// names none of them echoes exactly the shipped parameter set.
+	//
+	// Mode selects the policy: "" (the absent value) is the shipped behaviour, "nca2" is the
+	// CPU-tier admission of the nca2 spec. Any other value is refused.
+	Mode string `json:"mode,omitempty"`
+	// CPUTierTokens is C: the pod's CPU KV tier, in tokens.
+	CPUTierTokens *int64 `json:"cpuTierTokens,omitempty"`
+	// AdmitLine and TrustLine are the two fractions of C (the same number for now): the admission
+	// line L_a and the prediction line L_t.
+	AdmitLine *float64 `json:"admitLine,omitempty"`
+	TrustLine *float64 `json:"trustLine,omitempty"`
+	// MaxInflightSeconds bounds one request's in-flight age for the ACTIVITY test: an older record
+	// is treated as leaked and stops holding its thread active.
+	MaxInflightSeconds *float64 `json:"maxInflightSeconds,omitempty"`
+	// LostRequestSeconds is the released-window liveness bound (the base's expireWindows /
+	// windowLive): a request that never reached a pod is lost after this long.
+	LostRequestSeconds *float64 `json:"lostRequestSeconds,omitempty"`
 }
 
 // defaultConfig is what a config that omits every key gets: the shipped arm's own numbers.
@@ -86,12 +110,141 @@ func (c Config) validate() error {
 	if c.InflightReapSeconds < 60 {
 		return fmt.Errorf("inflightReapSeconds must be >= 60 (it is the belt over an unobserved termination, not a timeout: it must sit above the client's own request timeout; got %v)", c.InflightReapSeconds)
 	}
+	// the selector's own gate: an unknown mode, or an nca2 key without mode: nca2, refuses the
+	// startup here (the same call NewScheduler makes: one rule, one place)
+	if _, err := c.resolveNCA2(); err != nil {
+		return err
+	}
 	return nil
 }
 
 // defaultInflightReapSeconds is the reap bound a config that omits the key gets: above any client
 // request timeout the deployment uses, with headroom, so the belt can only ever cut a leak.
 const defaultInflightReapSeconds = 9300
+
+// The policy selector: OFF is the shipped behaviour and the absent value, and "nca2" is the only
+// mode that changes anything.
+const (
+	modeOff  = ""
+	modeNCA2 = "nca2"
+)
+
+// The nca2 defaults: the numbers the spec names, so a deployment that sets only mode: nca2 and a
+// tier size runs the policy the spec describes.
+const (
+	defaultCPUTierTokens      = 5592405
+	defaultAdmitLine          = 0.95
+	defaultTrustLine          = 0.95
+	defaultMaxInflightSeconds = 1200
+	defaultLostRequestSeconds = 300
+)
+
+// nca2Config is the RESOLVED nca2 policy: the numbers the decision reads, after the defaults and
+// the range checks. It is nil when the mode is OFF, and every nca2 path is gated on that nil.
+//
+// CPU-tier token counts are derived from C once, here: the policy compares token positions against
+// them on every decision and a multiplication per comparison would drift with the float's rounding.
+type nca2Config struct {
+	// CPUTierTokens is C: the pod's CPU KV tier, in tokens.
+	CPUTierTokens int64
+	// AdmitLine is L_a = admitLine x C: the admission line, in tokens.
+	AdmitLineTokens int64
+	// TrustLine is L_t = trustLine x C: the line the WARM PREDICTION trusts, in tokens.
+	TrustLineTokens int64
+	// MaxInflightSeconds is the ACTIVITY bound: a request in flight longer than this is leaked and
+	// stops holding its thread active.
+	MaxInflightSeconds float64
+	// LostRequestSeconds is the released-window liveness bound (S2).
+	LostRequestSeconds float64
+}
+
+// maxInflightWindow is MaxInflightSeconds as a duration.
+func (n *nca2Config) maxInflightWindow() time.Duration {
+	return time.Duration(n.MaxInflightSeconds * float64(time.Second))
+}
+
+// lostRequestWindow is LostRequestSeconds as a duration.
+func (n *nca2Config) lostRequestWindow() time.Duration {
+	return time.Duration(n.LostRequestSeconds * float64(time.Second))
+}
+
+// nca2KeyNames lists the parameters that only mean something in nca2, in the order the refusal
+// names them: a config that carries one without mode: nca2 is refused rather than run.
+func (c Config) nca2KeyNames() []string {
+	var out []string
+	if c.CPUTierTokens != nil {
+		out = append(out, "cpuTierTokens")
+	}
+	if c.AdmitLine != nil {
+		out = append(out, "admitLine")
+	}
+	if c.TrustLine != nil {
+		out = append(out, "trustLine")
+	}
+	if c.MaxInflightSeconds != nil {
+		out = append(out, "maxInflightSeconds")
+	}
+	if c.LostRequestSeconds != nil {
+		out = append(out, "lostRequestSeconds")
+	}
+	return out
+}
+
+// resolveNCA2 is the ONE place the selector becomes policy: nil for the shipped behaviour, the
+// resolved numbers for nca2, and an error for everything else (fail closed — an unknown mode, or
+// an nca2 key that would otherwise sit in the config looking effective while the shipped policy
+// runs underneath it).
+func (c Config) resolveNCA2() (*nca2Config, error) {
+	keys := c.nca2KeyNames()
+	if c.Mode != modeNCA2 {
+		if c.Mode != modeOff {
+			return nil, fmt.Errorf("unknown mode %q: the modes are %q (the absent value too: the shipped behaviour) and %q", c.Mode, modeOff, modeNCA2)
+		}
+		if len(keys) > 0 {
+			return nil, fmt.Errorf("the nca2 parameters (%s) require mode: %q — without it the shipped behaviour runs and these would look effective while changing nothing", strings.Join(keys, ", "), modeNCA2)
+		}
+		return nil, nil
+	}
+	n := &nca2Config{
+		CPUTierTokens:      defaultCPUTierTokens,
+		MaxInflightSeconds: defaultMaxInflightSeconds,
+		LostRequestSeconds: defaultLostRequestSeconds,
+	}
+	admit, trust := defaultAdmitLine, defaultTrustLine
+	if c.CPUTierTokens != nil {
+		n.CPUTierTokens = *c.CPUTierTokens
+	}
+	if c.AdmitLine != nil {
+		admit = *c.AdmitLine
+	}
+	if c.TrustLine != nil {
+		trust = *c.TrustLine
+	}
+	if c.MaxInflightSeconds != nil {
+		n.MaxInflightSeconds = *c.MaxInflightSeconds
+	}
+	if c.LostRequestSeconds != nil {
+		n.LostRequestSeconds = *c.LostRequestSeconds
+	}
+	if n.CPUTierTokens <= 0 {
+		return nil, fmt.Errorf("cpuTierTokens must be > 0 (it is the pod's CPU KV tier in tokens), got %d", n.CPUTierTokens)
+	}
+	if admit <= 0 || admit > 1 {
+		return nil, fmt.Errorf("admitLine must be in (0,1] (a fraction of cpuTierTokens), got %v", admit)
+	}
+	if trust <= 0 || trust > 1 {
+		return nil, fmt.Errorf("trustLine must be in (0,1] (a fraction of cpuTierTokens), got %v", trust)
+	}
+	if n.MaxInflightSeconds <= 0 {
+		return nil, fmt.Errorf("maxInflightSeconds must be > 0 (it is the in-flight age after which a record is leaked), got %v", n.MaxInflightSeconds)
+	}
+	if n.LostRequestSeconds <= 0 {
+		return nil, fmt.Errorf("lostRequestSeconds must be > 0 (it is the released-window liveness bound), got %v", n.LostRequestSeconds)
+	}
+	n.AdmitLineTokens = int64(admit * float64(n.CPUTierTokens))
+	n.TrustLineTokens = int64(trust * float64(n.CPUTierTokens))
+	return n, nil
+}
 
 // configEcho renders the config as sorted key=value pairs (the startup echo's form).
 func configEcho(cfg Config) string {

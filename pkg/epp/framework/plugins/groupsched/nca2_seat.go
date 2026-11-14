@@ -152,9 +152,6 @@ func (s *Scheduler) ncaV2DecideOnce(now time.Time) bool {
 		if p.g.numBlocks <= 0 {
 			continue
 		}
-		if p.g.nca2 != nil && p.g.nca2.reservedBlocks > 0 && p.g.nca2.reservedHead == headID && headID != "" {
-			continue // this pod is holding seats for the head (A9)
-		}
 		if !s.nca2.warmBuilt {
 			// built ONCE per pass, on the first phase-2 visit: a pass that never gets there pays nothing
 			for _, g := range s.activeGroups() {
@@ -207,12 +204,18 @@ func (s *Scheduler) ncaV2AdmissionBudget(g *engineGroup, head *waiter, now time.
 	var facts fitFacts
 	for {
 		facts = s.ncaV2Cost(g, head, memo)
-		if facts.cost <= s.freeBudget(g) || (len(g.threads) == 0 && facts.cost > budget) {
+		free := s.freeBudget(g)
+		if facts.cost <= free || (len(g.threads) == 0 && facts.cost > budget) {
 			return true
 		}
 		reason, victim := s.rotationVictim(g, now)
 		if victim == nil {
-			return false // nothing reclaimable right now: the budget keeps what it freed, for the next pass
+			// nothing reclaimable right now: the budget keeps what it freed for the head — capped at
+			// what the head still needs, so that the SURPLUS stays available to the pod's returners
+			if g.nca2 != nil && g.nca2.reservedBlocks > facts.cost-free {
+				g.nca2.reservedBlocks = facts.cost - free
+			}
+			return false
 		}
 		freed := int64(g.index.ChargedBlocks(victim.id))
 		s.exit(g, victim, reason, now)
@@ -311,14 +314,14 @@ func (s *Scheduler) ncaV2Fits(g *engineGroup, w *waiter, now time.Time, memo map
 	if !s.coldAllowsTokens(g, s.ncaV2Cold(g, w, memo).cold) {
 		return false
 	}
-	if facts := s.ncaV2Cost(g, w, memo); facts.cost <= s.freeBudget(g) {
+	if facts := s.ncaV2Cost(g, w, memo); facts.cost <= s.ncaV2FreeFor(g, w) {
 		return true
 	}
 	cost := s.ncaV2Cost(g, w, memo).cost
 	if len(g.threads) == 0 && cost > int64(g.budgetBlocks) {
 		return true // RULE O: an empty pod admits one oversize head
 	}
-	return cost <= s.freeBudget(g)+s.ncaV2ReclaimableBlocks(g, now)
+	return cost <= s.ncaV2FreeFor(g, w)+s.ncaV2ReclaimableBlocks(g, now)
 }
 
 // ncaV2ReclaimableBlocks is the most this pod can free WITHOUT touching a thread with work in flight
@@ -345,7 +348,7 @@ func (s *Scheduler) ncaV2Reclaim(g *engineGroup, w *waiter, now time.Time, memo 
 	budget := int64(g.budgetBlocks)
 	for {
 		facts := s.ncaV2Cost(g, w, memo)
-		if facts.cost <= s.freeBudget(g) || (len(g.threads) == 0 && facts.cost > budget) {
+		if facts.cost <= s.ncaV2FreeFor(g, w) || (len(g.threads) == 0 && facts.cost > budget) {
 			return true
 		}
 		reason, victim := s.rotationVictim(g, now)

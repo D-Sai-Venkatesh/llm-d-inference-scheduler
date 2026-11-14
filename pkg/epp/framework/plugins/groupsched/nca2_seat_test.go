@@ -22,6 +22,7 @@ package groupsched
 // it (A2/S1) and the cold valve never evicting for (C9), and the room consumed at the decision (L0).
 
 import (
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -629,36 +630,66 @@ func TestPushedOutActiveThreadLeavesTheGpuAndReturnsAsPriority(t *testing.T) {
 	}
 }
 
-// TestTheAdmissionBudgetGathersSeatsAcrossPasses: A9 — the X3 door freeze (verifier 2). A prompt
-// bigger than one seat needs SEVERAL seats freed, and they become reclaimable one quantum at a time.
-// The pod frees what it can for the outside head and HOLDS it (the head's admission budget), so a
-// returner cannot take the space in the same pass; the next pass finishes the job and admits the head.
-// Without the budget the first freed seat went to the returner every time and the head never fit.
-func TestTheAdmissionBudgetGathersSeatsAcrossPasses(t *testing.T) {
+// budgetFixture builds A9's state: two 400-block seats in the 950-block budget — A idle (so its seat
+// becomes reclaimable), B running (never a victim) — one outside head of 900 blocks (it needs BOTH
+// seats), and the given warm returners waiting on p0.
+func budgetFixture(t *testing.T, returners map[string]int) (*fixture, Head) {
+	t.Helper()
 	f := newFixture(t, "p0")
-	// two seats of 400 blocks in the 950-block budget: A is idle, B is running
 	f.running("p0", "A", 400, 320)
 	f.s.Settle("rq-A", "p0", f.now)
 	f.running("p0", "B", 400, 320)
+	ids := make([]string, 0, len(returners))
+	for id := range returners {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids) // deterministic setup order
 	f.s.mu.Lock()
-	f.s.nca2.homes["ret"] = "p0"
-	f.s.nca2.admitted["ret"] = true
-	f.s.nca2.ever["ret"] = true
-	f.s.groups["p0"].nca2.line = append(f.s.groups["p0"].nca2.line, nca2Entry{thread: "ret", tokens: 320})
-	f.s.waiters["ret"] = &waiter{id: "ret", since: f.now.Add(-time.Minute)}
+	for _, id := range ids {
+		f.s.nca2.homes[id] = "p0"
+		f.s.nca2.admitted[id] = true
+		f.s.nca2.ever[id] = true
+		f.s.groups["p0"].nca2.line = append(f.s.groups["p0"].nca2.line, nca2Entry{thread: id, tokens: 320})
+		f.s.waiters[id] = &waiter{id: id, since: f.now.Add(-time.Minute)}
+	}
 	f.s.mu.Unlock()
 	f.wait(10 * time.Second) // A is silent: reclaimable
-	big := f.hdHeavy("big", 700, 320)
-	ret := f.hdHeavy("ret", 100, 320)
+	return f, f.hdHeavy("big", 900, 320)
+}
+
+// returnerHeads is one head per waiting returner, in a stable order (they must be offered every pass,
+// or the queue drops them).
+func returnerHeads(f *fixture, returners map[string]int) []Head {
+	ids := make([]string, 0, len(returners))
+	for id := range returners {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]Head, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, f.hdHeavy(id, returners[id], 320))
+	}
+	return out
+}
+
+// TestTheAdmissionBudgetGathersSeatsAcrossPasses: A9 — the X3 door freeze (verifier 2). A prompt bigger
+// than one seat needs SEVERAL seats freed, and they become reclaimable one quantum at a time. The pod
+// frees what it can for the outside head and HOLDS it (the head's admission budget), so a returner
+// that would need the reserved space cannot take it in the same pass; the next pass finishes the job
+// and admits the head.
+func TestTheAdmissionBudgetGathersSeatsAcrossPasses(t *testing.T) {
+	returners := map[string]int{"ret": 300}
+	f, big := budgetFixture(t, returners)
+	heads := append([]Head{big}, returnerHeads(f, returners)...)
 	f.now = f.now.Add(time.Second)
-	if i := f.s.Pass([]Head{big, ret}, f.now); i != -1 {
+	if i := f.s.Pass(heads, f.now); i != -1 {
 		t.Fatalf("nothing can be served yet (the head needs two seats), got %d", i)
 	}
 	if seated(f.s, "big") {
-		t.Fatal("one freed seat is not enough for a 700-block prompt")
+		t.Fatal("one freed seat is not enough for a 900-block prompt")
 	}
 	if seated(f.s, "ret") {
-		t.Fatal("A9: the seat freed for the head must not go to a returner")
+		t.Fatal("A9: a returner must not take the space the head's budget is holding")
 	}
 	if seated(f.s, "A") {
 		t.Fatal("A was the reclaimable seat the budget spent")
@@ -671,14 +702,48 @@ func TestTheAdmissionBudgetGathersSeatsAcrossPasses(t *testing.T) {
 	f.s.Settle("rq-B", "p0", f.now)
 	f.wait(10 * time.Second)
 	f.now = f.now.Add(time.Second)
-	if i := f.s.Pass([]Head{big, ret}, f.now); i < 0 {
+	if i := f.s.Pass(heads, f.now); i < 0 {
 		t.Fatal("the head must be admitted once the budget has gathered both seats")
 	}
 	if !f.admitted("big") || !seated(f.s, "big") {
 		t.Fatal("A9: the head is admitted after accumulating across passes")
 	}
-	if !seated(f.s, "ret") {
-		t.Fatal("with the budget settled the returner takes its seat (A2.2 untouched)")
+}
+
+// TestAReturnerIsSeatedFromSurplusBeyondTheReservation: A9's OTHER half (the owner's clarification) —
+// the reservation protects only the blocks the head still needs. The surplus beyond it is the pod's,
+// so a returner that fits INSIDE the surplus is seated in the very pass that budgets for the head.
+// A total ban would stall it for no benefit to the head.
+func TestAReturnerIsSeatedFromSurplusBeyondTheReservation(t *testing.T) {
+	returners := map[string]int{"small": 150, "too-big": 300}
+	f, big := budgetFixture(t, returners)
+	heads := append([]Head{big}, returnerHeads(f, returners)...)
+	f.now = f.now.Add(time.Second)
+	f.s.mu.Lock()
+	free := f.s.freeBudget(f.s.groups["p0"])
+	f.s.mu.Unlock()
+	if free != 150 {
+		t.Fatalf("fixture: the pod must have 150 free blocks before the budget acts, got %d", free)
+	}
+	if i := f.s.Pass(heads, f.now); i < 0 {
+		t.Fatal("a returner must be seated from the surplus")
+	}
+	// after A's eviction free = 550 and the head still needs 350: the surplus is 200, so the 150-block
+	// returner fits and the 300-block one does not
+	if !seated(f.s, "small") {
+		t.Fatal("A9: the surplus beyond the reservation belongs to the pod: a fitting returner is seated")
+	}
+	if seated(f.s, "too-big") {
+		t.Fatal("a returner larger than the surplus may not eat the head's budget")
+	}
+	if seated(f.s, "big") {
+		t.Fatal("the head still needs the next pass's seat")
+	}
+	f.s.mu.Lock()
+	reserved := f.s.groups["p0"].nca2.reservedBlocks
+	f.s.mu.Unlock()
+	if reserved <= 0 {
+		t.Fatal("the head's budget must still be outstanding for the next pass")
 	}
 }
 

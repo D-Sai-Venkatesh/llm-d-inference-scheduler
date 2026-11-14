@@ -634,6 +634,25 @@ func (s *Scheduler) nca2CandOf(w *waiter) nca2Cand {
 	return c
 }
 
+// ncaV2FreeFor is the free budget a CANDIDATE may spend on this pod: the pod's free blocks minus what
+// the outside head's admission budget is holding (A9). The head itself sees the whole free budget —
+// the reservation is its own — and a returner may still be seated from the surplus BEYOND the
+// reservation, so a pod with spare capacity never stalls its returners for the head's sake.
+func (s *Scheduler) ncaV2FreeFor(g *engineGroup, w *waiter) int64 {
+	free := s.freeBudget(g)
+	if s.nca2 == nil || g == nil || g.nca2 == nil || w == nil || g.nca2.reservedBlocks <= 0 {
+		return free
+	}
+	if w.id == g.nca2.reservedHead {
+		return free // the head's own budget
+	}
+	held := g.nca2.reservedBlocks
+	if held > free {
+		held = free
+	}
+	return free - held
+}
+
 // ncaV2CheapFits is the CHEAP POSITIVE fit test (V2). The pod's line holds the thread's last request,
 // so it already covers the first floor(entry/blockSize) blocks of this candidate's chain: the new
 // blocks it can need are at most keys − that, and the cold tokens at most tokens − entry. When both
@@ -657,7 +676,7 @@ func (s *Scheduler) ncaV2CheapFits(g *engineGroup, w *waiter) bool {
 	if blocks < 0 {
 		blocks = 0
 	}
-	return blocks <= s.freeBudget(g)
+	return blocks <= s.ncaV2FreeFor(g, w)
 }
 
 // nca2WarmReturners is A2.2's list: this pod's ADMITTED threads that are WAITING and hold NO seat

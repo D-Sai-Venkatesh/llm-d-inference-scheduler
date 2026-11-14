@@ -192,6 +192,40 @@ func TestTheGaugesReadTheSnapshot(t *testing.T) {
 	require.Equal(t, first, second, "a scrape must not change what the next one reports (I9)")
 }
 
+// TestAScrapeNeverWritesTheBlockedHeadState: I9 at the field level — head_blocked_seconds is the pass's
+// report and the Snapshot's read. A snapshot that CLEARED it (the M20 break) would report a blocked
+// head once and then zero for ever, which the second read catches.
+func TestAScrapeNeverWritesTheBlockedHeadState(t *testing.T) {
+	f := newFixture(t, "p0")
+	// a head that fits no pod: 48 blocks = 3072 tokens > the room after an admission
+	f.step(f.hd("sitter", 40)) // admitted (2560 tokens), so the room is 480
+	f.atPod("sitter", "p0")
+	f.s.mu.Lock()
+	f.s.nca2.ever["huge"] = true // a PRIORITY outsider: it is the outside head
+	f.s.waiters["huge"] = &waiter{id: "huge", since: f.now}
+	f.s.mu.Unlock()
+	// one pass that cannot admit it: the head's tenure starts
+	f.step(Head{Thread: "huge", ReqID: "r-huge", Arrival: f.now, Chains: chain("huge", 48)})
+	first := f.s.Snapshot(f.now).NCA2
+	if first == nil || first.BlockedHead != "huge" || first.HeadBlockedSeconds < 0 {
+		t.Fatalf("the blocked head must be reported: %+v", first)
+	}
+	// a second read, one simulated second later: SAME head, MORE tenure, and the state still says so
+	second := f.s.Snapshot(f.now.Add(time.Second)).NCA2
+	if second.BlockedHead != "huge" {
+		t.Fatalf("a scrape cleared the blocked head (I9/M20): second read reports %q", second.BlockedHead)
+	}
+	if second.HeadBlockedSeconds <= first.HeadBlockedSeconds {
+		t.Fatalf("the tenure must keep growing: %v then %v", first.HeadBlockedSeconds, second.HeadBlockedSeconds)
+	}
+	f.s.mu.Lock()
+	blocked := f.s.nca2.blockedHead
+	f.s.mu.Unlock()
+	if blocked != "huge" {
+		t.Fatalf("the state itself must be untouched by the reads, got %q", blocked)
+	}
+}
+
 // labelsOf renders one metric's label set canonically, for the value map above.
 func labelsOf(m *dto.Metric) string {
 	if len(m.GetLabel()) == 0 {
@@ -301,6 +335,66 @@ func TestSpanCarriesTheClientRequestID(t *testing.T) {
 		if got[key] != want {
 			t.Fatalf("span attribute %s = %q, want %q (all: %v)", key, got[key], want, got)
 		}
+	}
+}
+
+// TestTheSpanGetsTheDecisionsOwnObservability: F1 — the DECISION's facts must reach the span on the
+// production path, not by a hand-built struct: Pass releases the turn (the decision's nca2Obs goes into
+// the request record), AtPod brings it back with the line facts, and annotateSpan emits it. If release
+// drops the observables, `class` and `path` are empty here — which is exactly the M16 break.
+func TestTheSpanGetsTheDecisionsOwnObservability(t *testing.T) {
+	f := newFixture(t, "p0")
+	recorder := tracetestRecorder(t)
+	ctx, span := tracerStart(t, "request_orchestration")
+	f.now = f.now.Add(time.Second)
+	head := f.hd("a", 10)
+	head.Arrival = f.now.Add(-2 * time.Second) // it waited two seconds for its admission
+	head.ClientReqID = "x-req-7"
+	head.WireID = "wire-7"
+	if i := f.s.Pass([]Head{head}, f.now); i != 0 {
+		t.Fatalf("the head must be admitted and served, got %d", i)
+	}
+	// the request reaches the pod: the hook that annotates the span
+	obs := f.s.AtPod(head.ReqID, f.homeOf("a"), f.now)
+	annotateSpan(ctx, f.homeOf("a"), obs)
+	span.End()
+	ended := recorder.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("one span, got %d", len(ended))
+	}
+	got := map[string]string{}
+	for _, kv := range ended[0].Attributes() {
+		got[string(kv.Key)] = kv.Value.Emit()
+	}
+	if got[spanNCA2Class] != nca2ClassAdmittedNow {
+		t.Fatalf("the span lost the decision's class (empty means the record dropped the observables): %v", got)
+	}
+	if got[spanNCA2Path] != pathNewcomer {
+		t.Fatalf("the span lost the decision's path: %q", got[spanNCA2Path])
+	}
+	if got[spanNCA2ClientRequestID] != "x-req-7" {
+		t.Fatalf("the client_request_id join: %q", got[spanNCA2ClientRequestID])
+	}
+	if got[spanNCA2HomePod] != "p0" || got[spanNCA2DispatchPod] != "p0" {
+		t.Fatalf("home/dispatch pod: %q / %q", got[spanNCA2HomePod], got[spanNCA2DispatchPod])
+	}
+	if got[spanNCA2RoomAtDecision] != "3040" {
+		t.Fatalf("the room at the decision: %q", got[spanNCA2RoomAtDecision])
+	}
+	if got[spanNCA2PositionAtTouch] != "640" {
+		t.Fatalf("the position at the touch: %q", got[spanNCA2PositionAtTouch])
+	}
+	// predicted_warm is §7's literal rule: the entry's position BEFORE the touch was inside the trust
+	// line. For an A2.1 admission that position is L0's provisional entry (f = 640 ≤ L_t), so the
+	// prediction is "warm" by construction — see the limitation noted in IMPL-NOTES.
+	if got[spanNCA2PredictedWarm] != "true" {
+		t.Fatalf("the literal pre-touch prediction (L0's provisional entry): %q", got[spanNCA2PredictedWarm])
+	}
+	if got[spanNCA2SeatWaitMs] == "" || got[spanNCA2SeatWaitMs] == "0" {
+		t.Fatalf("the seat wait must be measured from the arrival: %q", got[spanNCA2SeatWaitMs])
+	}
+	if got[spanNCA2Thread] != "a" || got[spanNCA2WireID] != "wire-7" {
+		t.Fatalf("the ids: %q / %q", got[spanNCA2Thread], got[spanNCA2WireID])
 	}
 }
 

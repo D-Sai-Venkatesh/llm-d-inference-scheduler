@@ -256,11 +256,17 @@ func TestPushoutOfAnActiveSeatHolderKeepsTheSeat(t *testing.T) {
 	admit(t, s, "p0", "a", 10) // 640
 	admit(t, s, "p0", "b", 30) // 1920 — a is at 2560, inside the line, admitted
 	waiting(s, "a")            // a's next head is queued: ACTIVE
+	var got []pushoutEvent
 	s.mu.Lock()
+	s.nca2.onPushout = func(reason string, active bool) { got = append(got, pushoutEvent{reason, active}) }
 	s.nca2LineSet(s.groups["p0"], "b", 40*64, epoch.Add(time.Second), pushoutTouch) // a → 3200
 	s.mu.Unlock()
 	if admittedNow(s, "a") {
 		t.Fatal("b's touch of its own size pushed a past the line: a is not admitted any more")
+	}
+	// A6/C13: an ACTIVE entry pushed by a touch is OVERFLOW, and that is the whole of A6
+	if len(got) != 1 || got[0].reason != pushoutOverflow || !got[0].active {
+		t.Fatalf("an active entry pushed by a touch is an overflow push-out, got %v", got)
 	}
 	if !seated(s, "a") {
 		t.Fatal("an ACTIVE pushed-out thread keeps its seat for its in-flight request (I3)")
@@ -283,17 +289,73 @@ func TestPushoutByATouchOfAnInactiveEntryIsGrowth(t *testing.T) {
 	s := newNCA2(t, []string{"p0"})
 	admit(t, s, "p0", "a", 10) // 640, INACTIVE
 	admit(t, s, "p0", "b", 30) // 1920: a is at 2560, inside the line
+	var got []pushoutEvent
 	s.mu.Lock()
+	s.nca2.onPushout = func(reason string, active bool) { got = append(got, pushoutEvent{reason, active}) }
 	s.nca2LineSet(s.groups["p0"], "b", 40*64, epoch.Add(time.Second), pushoutTouch) // a → 3200
 	s.mu.Unlock()
 	if admittedNow(s, "a") {
 		t.Fatal("the touch pushed a past the line")
+	}
+	// A6/L4: an INACTIVE entry pushed by a TOUCH is GROWTH (the overflow class is the ACTIVE one)
+	if len(got) != 1 || got[0].reason != pushoutGrowth || got[0].active {
+		t.Fatalf("an inactive entry pushed by a touch is a growth push-out, got %v", got)
 	}
 	if seated(s, "a") {
 		t.Fatal("I3: an INACTIVE pushed-out thread loses the seat it is not using")
 	}
 	if !admittedNow(s, "b") {
 		t.Fatal("the touching thread stays admitted")
+	}
+}
+
+// TestEngineRemovalResetsTheLineAndKeepsThePriorityClass: S5 — an engine removal resets that pod's CPU
+// line, its threads LOSE their admission (booked as push-outs with reason restart), their homes are
+// gone, and the priority class survives (they were admitted before).
+func TestEngineRemovalResetsTheLineAndKeepsThePriorityClass(t *testing.T) {
+	s := newNCA2(t, []string{"p0", "p1"})
+	admit(t, s, "p0", "a", 10)
+	admit(t, s, "p0", "b", 5)
+	var got []pushoutEvent
+	s.mu.Lock()
+	s.nca2.onPushout = func(reason string, active bool) { got = append(got, pushoutEvent{reason, active}) }
+	s.groups["p0"].threads["a"].waitingSince = epoch // ACTIVE: a restart push-out of an active thread
+	s.mu.Unlock()
+	s.RemoveEngine("p0", epoch)
+	s.mu.Lock()
+	gone := s.groups["p0"] == nil
+	lineGone := true
+	for _, g := range s.groups {
+		if g.nca2 != nil && len(g.nca2.line) != 0 {
+			lineGone = false
+		}
+	}
+	aAdmitted, aEver, aHome := s.nca2.admitted["a"], s.nca2.ever["a"], s.nca2.homes["a"]
+	s.mu.Unlock()
+	if !gone {
+		t.Fatal("the group must be torn down")
+	}
+	if !lineGone {
+		t.Fatal("S5: the removed pod's line is reset (no other line carries its entries)")
+	}
+	if aAdmitted {
+		t.Fatal("S5: its threads lose their admission")
+	}
+	if aHome != "" {
+		t.Fatalf("S5: no home on a pod that no longer exists, got %q", aHome)
+	}
+	if !aEver {
+		t.Fatal("S5: the thread WAS admitted, so it is the PRIORITY class when it comes back")
+	}
+	restart := 0
+	for _, ev := range got {
+		if ev.reason != pushoutRestart {
+			t.Fatalf("S5 books a restart push-out, got %v", ev)
+		}
+		restart++
+	}
+	if restart != 2 {
+		t.Fatalf("both admitted threads lose their admission, got %d restart push-outs", restart)
 	}
 }
 

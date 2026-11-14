@@ -53,6 +53,28 @@ func (f *fixture) hdHeavy(id string, blocks, tokens int) Head {
 		Chains: []Chain{{Keys: keys(blocks, seedFor(id)), Tokens: tokens}}}
 }
 
+// running seats the thread on pod and puts a REAL request of it in flight, with its CPU entry: the
+// state a decision sees for a thread that is holding a seat while it runs. It is built from the
+// scheduler's own parts (seat + release + the at-pod hook), so the derived counts the pass uses are
+// the ones a run would have.
+func (f *fixture) running(pod, id string, blocks int, tokens int64) {
+	f.t.Helper()
+	f.s.mu.Lock()
+	g := f.s.groups[pod]
+	w := &waiter{id: id, since: f.now, chains: []Chain{{Keys: keys(blocks, seedFor(id)), Tokens: int(tokens)}}}
+	if !f.s.seat(g, w, 0, f.now) {
+		f.s.mu.Unlock()
+		f.t.Fatalf("fixture: %s must be seated on %s", id, pod)
+	}
+	m := g.threads[id]
+	f.s.nca2.homes[id], f.s.nca2.admitted[id], f.s.nca2.ever[id] = pod, true, true
+	f.s.nca2LineSet(g, id, tokens, f.now, pushoutRoom)
+	req := "rq-" + id
+	f.s.release(m, req, w.chains, f.now, dispatchObservables{promptTokens: tokens})
+	f.s.mu.Unlock()
+	f.s.AtPod(req, pod, f.now)
+}
+
 // step runs one pass, a second after the last one.
 func (f *fixture) step(heads ...Head) int {
 	f.t.Helper()
@@ -349,6 +371,36 @@ func TestPodOrderIsInFlightThenRoom(t *testing.T) {
 	}
 }
 
+// TestTheInFlightKeyBeatsTheRoomKey: A5 — the pod with FEWER REQUESTS IN FLIGHT wins even when the
+// other pod has more free CPU. Both numbers are live: the in-flight count is derived from the request
+// records at the pass, the room from the admitted active entries.
+func TestTheInFlightKeyBeatsTheRoomKey(t *testing.T) {
+	f := newFixture(t, "p0", "p1")
+	// p0: ONE request in flight behind a 2000-token entry → room 1040
+	f.running("p0", "w0", 5, 2000)
+	// p1: TWO requests in flight behind 320-token entries → room 2400
+	f.running("p1", "w1", 5, 320)
+	f.running("p1", "w2", 5, 320)
+	f.s.mu.Lock()
+	f.s.nca2Derive(f.now)
+	rooms := map[string]int64{}
+	for _, p := range []string{"p0", "p1"} {
+		rooms[p] = f.s.nca2View(f.s.groups[p]).room(f.s.nca2.AdmitLineTokens)
+	}
+	inflight := map[string]int{"p0": f.s.groups["p0"].nca2.inflight, "p1": f.s.groups["p1"].nca2.inflight}
+	f.s.mu.Unlock()
+	if !(inflight["p0"] < inflight["p1"] && rooms["p0"] < rooms["p1"]) {
+		t.Fatalf("fixture: p0 must have fewer in flight and LESS room (in flight %v, rooms %v)", inflight, rooms)
+	}
+	f.wait(time.Second)
+	if i := f.s.Pass([]Head{f.hd("new", 5)}, f.now); i != 0 {
+		t.Fatalf("the newcomer must be admitted, got %d", i)
+	}
+	if got := f.homeOf("new"); got != "p0" {
+		t.Fatalf("A5: the idler GPU wins over the larger room (in flight %v, rooms %v), got %q", inflight, rooms, got)
+	}
+}
+
 // TestReclaimableSeatsAreEvictedForAFittingHead: A2/S1 — when the budget is the blocker, the pod's
 // RECLAIMABLE seats (quantum-complete or silent past idleSeconds) are evicted until the head fits.
 func TestReclaimableSeatsAreEvictedForAFittingHead(t *testing.T) {
@@ -416,42 +468,97 @@ func TestTheColdValveNeverEvicts(t *testing.T) {
 	}
 }
 
+// TestFitsIsPure: A2/R1 — the fit test answers a question and changes NOTHING. The state here makes
+// BOTH blockers true at once: the budget needs a reclaim, and the cold valve refuses the head. A fit
+// test that evicted first (the M5 break) would take the reclaimable seat for a candidate it then
+// refuses.
+func TestFitsIsPure(t *testing.T) {
+	// fraction 0.99 on 1000 blocks: the stagger cap is 640 tokens
+	s := newNCA2Tuned(t, func(c *Config) { c.GroupBudgetFraction = 0.99 }, []string{"p0"})
+	f := &fixture{t: t, s: s, now: epoch}
+	// a RECLAIMABLE seat: settled, then silent past idleSeconds (5 s)
+	if i := f.step(f.hdHeavy("filler", 400, 100)); i != 0 {
+		t.Fatalf("the filler must be seated, got %d", i)
+	}
+	f.atPod("filler", "p0")
+	f.s.FirstChunk("r-filler", f.now)
+	f.done("filler", "p0")
+	f.wait(10 * time.Second)
+	// a seat whose cold charge FILLS the valve, still in flight (so it is not reclaimable)
+	if i := f.step(f.hdHeavy("cold", 400, 700)); i != 0 {
+		t.Fatalf("the cold thread must be seated, got %d", i)
+	}
+	f.atPod("cold", "p0")
+	s.mu.Lock()
+	g := s.groups["p0"]
+	cold := g.coldInFlight
+	capTokens := g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize)
+	free := s.freeBudget(g)
+	seatsBefore := len(g.threads)
+	exitsBefore := len(s.counters.exits)
+	reclaimable := s.ncaV2ReclaimableBlocks(g, f.now)
+	s.mu.Unlock()
+	// THE FIXTURE'S OWN FACTS FIRST: a mutated fits() cannot pollute what these assert
+	if cold != capTokens || reclaimable == 0 || free >= 300 {
+		t.Fatalf("fixture: valve full (%d/%d), a reclaimable seat (%d blocks), free %d < 300", cold, capTokens, reclaimable, free)
+	}
+	// a head that needs 300 blocks: more than the free budget, and the valve refuses it too
+	head := &waiter{id: "big", since: f.now, chains: []Chain{{Keys: keys(300, seedFor("big")), Tokens: 320}}}
+	s.mu.Lock()
+	fits := s.ncaV2Fits(g, head, f.now, map[fitKey]fitFacts{})
+	seatsAfter := len(g.threads)
+	exitsAfter := len(s.counters.exits)
+	s.mu.Unlock()
+	if fits {
+		t.Fatal("the valve refuses this head on this pod")
+	}
+	if seatsAfter != seatsBefore {
+		t.Fatalf("fits() took a seat: %d before, %d after", seatsBefore, seatsAfter)
+	}
+	if exitsAfter != exitsBefore {
+		t.Fatalf("fits() booked a departure: %v -> %v", exitsBefore, exitsAfter)
+	}
+	// and through the DECISION it is the same: nothing is admitted, nobody leaves
+	if i := f.step(f.hdHeavy("big", 300, 320)); i != -1 {
+		t.Fatalf("the pass must decide nothing, got %d", i)
+	}
+	if !seated(f.s, "filler") || !seated(f.s, "cold") {
+		t.Fatal("no seat may be taken for a valve-held head")
+	}
+}
+
 // TestPushedOutThreadPrefersItsOldPod: A4 — a priority thread whose old entry still exists on its old
-// pod is admitted THERE, even when the A5 order puts another pod first.
+// pod is admitted THERE, when BOTH A5 keys prefer another pod (p0 is running a request and has the
+// smaller room; p1 is idle).
 func TestPushedOutThreadPrefersItsOldPod(t *testing.T) {
 	f := newFixture(t, "p0", "p1")
-	// a lives on p0 and is admitted; b follows it on p0 and is active
-	if i := f.step(f.hd("a", 5)); i != 0 {
-		t.Fatalf("a must be seated, got %d", i)
-	}
-	f.atPod("a", f.homeOf("a"))
-	homeA := f.homeOf("a")
+	f.running("p0", "warm", 5, 640) // p0: one request in flight, room 2400
 	f.s.mu.Lock()
-	g := f.s.groups[homeA]
-	f.s.exit(g, g.threads["a"], "idle", f.now) // unseated, still admitted (S4)
-	f.s.nca2.admitted["a"] = false             // and pushed out: it is a PRIORITY thread now
-	f.s.mu.Unlock()
-	if f.homeOf("a") != homeA {
-		t.Fatal("fixture: the home survives the push-out (A4's old pod)")
+	// a was pushed out of p0 and its entry is still in p0's line: A4 prefers p0 for it
+	f.s.nca2.homes["a"] = "p0"
+	f.s.nca2.ever["a"] = true
+	f.s.nca2.pushed["a"] = true
+	f.s.groups["p0"].nca2.line = append(f.s.groups["p0"].nca2.line, nca2Entry{thread: "a", tokens: 320})
+	f.s.waiters["a"] = &waiter{id: "a", since: f.now.Add(-2 * time.Minute)}
+	f.s.nca2Derive(f.now)
+	rooms := map[string]int64{}
+	for _, p := range []string{"p0", "p1"} {
+		rooms[p] = f.s.nca2View(f.s.groups[p]).room(f.s.nca2.AdmitLineTokens)
 	}
-	// the A5 order: give the OTHER pod more room and fewer in-flight requests
-	idle := "p1"
-	if homeA == "p1" {
-		idle = "p0"
-	}
-	f.s.mu.Lock()
-	f.s.groups[idle].nca2.inflight = 0
-	f.s.groups[homeA].nca2.inflight = 3
+	inflight := map[string]int{"p0": f.s.groups["p0"].nca2.inflight, "p1": f.s.groups["p1"].nca2.inflight}
 	f.s.mu.Unlock()
+	if !(inflight["p0"] > inflight["p1"] && rooms["p0"] < rooms["p1"]) {
+		t.Fatalf("fixture: BOTH A5 keys must prefer p1 (in flight %v, rooms %v)", inflight, rooms)
+	}
 	f.wait(time.Second)
 	if i := f.s.Pass([]Head{f.hd("a", 5)}, f.now); i != 0 {
 		t.Fatalf("the priority thread must be admitted on its old pod, got %d", i)
 	}
-	if got := f.homeOf("a"); got != homeA {
-		t.Fatalf("A4: the old pod wins over the A5 order, got %q want %q", got, homeA)
+	if got := f.homeOf("a"); got != "p0" {
+		t.Fatalf("A4: the old pod must win over the A5 order (p1 is idler and roomier), got %q", got)
 	}
-	if got := f.classOf("a"); got != nca2ClassAdmittedNow {
-		t.Fatalf("the class of a re-admission is admitted_now, got %q", got)
+	if f.classOf("a") != nca2ClassAdmittedNow {
+		t.Fatalf("the class of a re-admission is admitted_now, got %q", f.classOf("a"))
 	}
 }
 
@@ -519,6 +626,28 @@ func TestPushedOutActiveThreadLeavesTheGpuAndReturnsAsPriority(t *testing.T) {
 	f.s.mu.Unlock()
 	if !ever {
 		t.Fatal("a was admitted before: it is the PRIORITY class when outside")
+	}
+}
+
+// TestTheDecisionCapIsWaitersPlusFourPods: A1 — the cap's own arithmetic (a pure function so the rule
+// is checkable) and the pass's report that it never exceeded it.
+func TestTheDecisionCapIsWaitersPlusFourPods(t *testing.T) {
+	for _, c := range []struct{ waiters, pods, want int }{
+		{0, 1, 4}, {10, 3, 22}, {500, 3, 512},
+	} {
+		if got := ncaV2DecisionCap(c.waiters, c.pods); got != c.want {
+			t.Fatalf("cap(%d waiters, %d pods) = %d, want %d (= waiters + 4 x pods)", c.waiters, c.pods, got, c.want)
+		}
+	}
+	f := newFixture(t, "p0", "p1")
+	var heads []Head
+	for i := 0; i < 30; i++ {
+		heads = append(heads, f.hdHeavy(string(rune('a'+i)), 20, 100))
+	}
+	f.step(heads...)
+	snap := f.s.Snapshot(f.now).NCA2
+	if snap.DecisionsThisPass > ncaV2DecisionCap(30, 2) {
+		t.Fatalf("the pass took %d decisions, past its own cap %d", snap.DecisionsThisPass, ncaV2DecisionCap(30, 2))
 	}
 }
 

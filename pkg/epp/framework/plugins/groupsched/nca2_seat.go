@@ -40,7 +40,7 @@ func (s *Scheduler) ncaV2SeatWaiters(now time.Time) {
 	if s.nca2 == nil {
 		return
 	}
-	limit := len(s.waiters) + 4*len(s.groups)
+	limit := ncaV2DecisionCap(len(s.waiters), len(s.groups))
 	s.nca2.passDecisions, s.nca2.capHit = 0, false
 	decisions := 0
 	for ; decisions < limit && len(s.waiters) > 0; decisions++ {
@@ -66,6 +66,12 @@ func (s *Scheduler) ncaV2SeatWaiters(now time.Time) {
 	// only read by the Snapshot (I9).
 	s.nca2TrackHead(now)
 }
+
+// ncaV2DecisionCap is A1's safety cap, as a function because the RULE is the function: a pass takes at
+// most (waiters + 4 × pods) decisions. It only ever binds when a pass's own evictions re-queue waiters
+// (a pathological loop); in every ordinary pass each decision removes one waiter, so the cap cannot be
+// reached. It is reported (`decisionCapHit`) rather than silently truncating.
+func ncaV2DecisionCap(waiters, pods int) int { return waiters + 4*pods }
 
 // podState is ONE pod's facts for ONE repetition (I8/R3): its A5 keys and its room, computed once,
 // so a decision costs O(pods × (line + warm returners)) and the same number is never computed twice.
@@ -198,6 +204,8 @@ func (s *Scheduler) ncaV2Cost(g *engineGroup, w *waiter, memo map[fitKey]fitFact
 // The valve is checked FIRST and alone: it is not budget, so no eviction can change its answer, and a
 // head it holds must WAIT (C9).
 func (s *Scheduler) ncaV2Fits(g *engineGroup, w *waiter, now time.Time, memo map[fitKey]fitFacts) bool {
+	// THE VALVE FIRST, and alone: it is not budget, so no eviction could ever change its answer (C9),
+	// and a head it refuses must WAIT rather than take a seat from somebody.
 	facts := s.ncaV2Cost(g, w, memo)
 	if !s.coldAllowsTokens(g, facts.cold) {
 		return false

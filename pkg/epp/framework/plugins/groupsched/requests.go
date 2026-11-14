@@ -94,7 +94,7 @@ func (s *Scheduler) release(m *thread, reqID string, chains []Chain, now time.Ti
 	}
 	s.reqs[reqID] = &reqRec{thread: m.id, chains: chains, released: now,
 		queueWait: obs.queueWait, predictedCached: obs.predictedCached, promptTokens: obs.promptTokens,
-		counted: true}
+		nca2: obs.nca2, counted: true}
 	m.pending++
 	m.windows = append(m.windows, s.reqs[reqID])
 }
@@ -151,7 +151,9 @@ func (s *Scheduler) atPod(rec *reqRec, m *thread, engine string, now time.Time) 
 			m.lastActivity = now
 		}
 		rec.engine = engine
-		return dispatchObservables{}
+		// the decision's own observability still rides back: a repeated PreRequest is the same turn
+		return dispatchObservables{queueWait: rec.queueWait, predictedCached: rec.predictedCached,
+			promptTokens: rec.promptTokens, nca2: rec.nca2}
 	}
 	live := rec.counted
 	rec.counted = false
@@ -171,7 +173,8 @@ func (s *Scheduler) atPod(rec *reqRec, m *thread, engine string, now time.Time) 
 		}
 		m.inflight++
 	}
-	return dispatchObservables{queueWait: rec.queueWait, predictedCached: rec.predictedCached, promptTokens: rec.promptTokens}
+	return dispatchObservables{queueWait: rec.queueWait, predictedCached: rec.predictedCached,
+		promptTokens: rec.promptTokens, nca2: rec.nca2}
 }
 
 // unlinkWindow forgets a record's entry in its thread's window slice. The slice is the thread's own
@@ -282,11 +285,16 @@ func (s *Scheduler) AtPod(reqID, engine string, now time.Time) dispatchObservabl
 	posAtTouch, warm := s.nca2AtPod(id, engine, rec.promptTokens, now)
 	obs := s.atPod(rec, s.groups[s.bindings[id]].threads[id], engine, now)
 	if s.nca2 != nil {
-		// the span's line facts belong to THIS moment: the write has happened, the prediction is what
-		// the position said before it
+		// THE DECISION'S FACTS COME FROM THE RECORD (release stored them); the LINE's facts belong to
+		// THIS moment — the write has happened, and the prediction is what the position said before it.
+		// valid is set HERE, on the production path: it is what makes annotateSpan emit the nca2
+		// attributes at all.
 		obs.nca2.dispatchPod = engine
 		obs.nca2.positionAtTouch, obs.nca2.predictedWarm = posAtTouch, warm
 		obs.nca2.homePod = s.nca2.homes[id]
+		obs.nca2.threadID, obs.nca2.wireID = id, rec.nca2.wireID
+		obs.nca2.valid = true
+		rec.nca2 = obs.nca2
 	}
 	return obs
 }

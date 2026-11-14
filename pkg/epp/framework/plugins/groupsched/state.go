@@ -159,6 +159,10 @@ type reqRec struct {
 	queueWait       time.Duration
 	predictedCached int64
 	promptTokens    int64
+	// nca2 is the DECISION's own observability for this request (class, path, room, waits, the
+	// client's request id), written at the release and completed at the pod hook. Nothing in a
+	// decision reads it.
+	nca2 nca2Obs
 }
 
 // waiter is one head in the SHARED waiter queue.

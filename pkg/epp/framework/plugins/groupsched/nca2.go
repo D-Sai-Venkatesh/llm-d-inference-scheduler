@@ -39,6 +39,9 @@ import (
 type nca2Policy struct {
 	// CPUTierTokens is C: the pod's CPU KV tier, in tokens. The trim drops an entry past it.
 	CPUTierTokens int64
+	// AdmitLine and TrustLine are the FRACTIONS of C the deployment set (the echo names them).
+	AdmitLine float64
+	TrustLine float64
 	// AdmitLineTokens is L_a = admitLine x C: the admission line, a POSITION.
 	AdmitLineTokens int64
 	// TrustLineTokens is L_t = trustLine x C: the line the WARM PREDICTION trusts (position ≤ L_t
@@ -497,12 +500,21 @@ func (s *Scheduler) nca2ResetPod(g *engineGroup, now time.Time) {
 		return
 	}
 	if g.nca2 != nil {
-		for admitted := range s.nca2AdmittedSet(g) {
-			s.nca2.admitted[admitted] = false
-			s.nca2.pushed[admitted] = true
+		admitted := make([]string, 0, len(g.nca2.line))
+		for id := range s.nca2AdmittedSet(g) {
+			admitted = append(admitted, id)
+		}
+		sort.Strings(admitted) // deterministic: one counter event per thread, in id order
+		for _, id := range admitted {
+			active := s.nca2Active(id)
+			s.nca2.admitted[id] = false
+			s.nca2.pushed[id] = true
 			s.nca2m.ObservePushout(engineLabel(g.id), pushoutRestart)
-			if s.nca2Active(admitted) {
+			if active {
 				s.nca2m.ObserveActivePushout(engineLabel(g.id))
+			}
+			if s.nca2.onPushout != nil {
+				s.nca2.onPushout(pushoutRestart, active)
 			}
 		}
 	}

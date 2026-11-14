@@ -186,8 +186,8 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// echo is the base's byte for byte.
 	if n2 := r.sched.nca2; n2 != nil {
 		r.logger.V(logutil.DEFAULT).Info(fmt.Sprintf(
-			"group-scheduler: nca2 config mode=%s cpuTierTokens=%d admitLineTokens=%d trustLineTokens=%d idleSeconds=%v lostRequestSeconds=%v maxInflightSeconds=%v quantum=%d groupBudgetFraction=%v commit=%s",
-			modeNCA2, n2.CPUTierTokens, n2.AdmitLineTokens, n2.TrustLineTokens, cfg.IdleSeconds,
+			"group-scheduler: nca2 config mode=%s cpuTierTokens=%d admitLine=%v trustLine=%v admitLineTokens=%d trustLineTokens=%d idleSeconds=%v lostRequestSeconds=%v maxInflightSeconds=%v quantum=%d groupBudgetFraction=%v commit=%s",
+			modeNCA2, n2.CPUTierTokens, n2.AdmitLine, n2.TrustLine, n2.AdmitLineTokens, n2.TrustLineTokens, cfg.IdleSeconds,
 			n2.LostRequestSeconds, n2.MaxInflightSeconds, cfg.Quantum, cfg.GroupBudgetFraction, buildCommit()))
 	}
 

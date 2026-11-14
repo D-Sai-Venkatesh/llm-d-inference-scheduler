@@ -211,6 +211,7 @@ func (c Config) resolveNCA2() (*nca2Policy, error) {
 	if n.LostRequestSeconds <= 0 {
 		return nil, fmt.Errorf("lostRequestSeconds must be > 0 (it is the released-window liveness bound), got %v", n.LostRequestSeconds)
 	}
+	n.AdmitLine, n.TrustLine = admit, trust
 	n.AdmitLineTokens = int64(admit * float64(n.CPUTierTokens))
 	n.TrustLineTokens = int64(trust * float64(n.CPUTierTokens))
 	return n, nil

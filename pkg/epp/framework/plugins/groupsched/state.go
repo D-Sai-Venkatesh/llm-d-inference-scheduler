@@ -528,6 +528,9 @@ type Snapshot struct {
 	// Anomalies is the should-be-zero ledger, by kind (anomalyKinds): every entry is an event the
 	// policy could not act on.
 	Anomalies map[string]int64 `json:"anomalies,omitempty"`
+	// NCA2 is the CPU tier's section: nil in OFF (the shipped snapshot's shape, byte for byte), and
+	// the whole-policy view of the line, the rooms and the outside lists in nca2.
+	NCA2 *NCA2Snapshot `json:"nca2,omitempty"`
 }
 
 // EngineSnapshot is ONE engine's group state: seats, the budget, the exit mix and the exiting
@@ -617,5 +620,6 @@ func (s *Scheduler) snapshot(now time.Time) Snapshot {
 	}
 	snap.Seats, snap.NEBlocks = seats, ne
 	snap.WaitersShared = len(s.waiters)
+	snap.NCA2 = s.nca2Snapshot(now)
 	return snap
 }

@@ -61,6 +61,9 @@ type nca2Policy struct {
 	// ever is "admitted at some point": it separates the PRIORITY class (pushed out) from the
 	// NEWCOMER class (never admitted) among the outside threads.
 	ever map[string]bool
+	// pushed records that the thread has LOST an admission (L4). It is the span's
+	// pushed_out_before and nothing in a decision reads it.
+	pushed map[string]bool
 	// inf is the in-flight request count per thread (§2): a request RELEASED by dispatch that has
 	// not completed, the leak rule applied. It is re-derived from the request records every pass
 	// (derive-don't-accumulate) and maintained at the request hooks.
@@ -87,6 +90,7 @@ func (s *Scheduler) initNCA2() {
 	s.nca2.homes = map[string]string{}
 	s.nca2.admitted = map[string]bool{}
 	s.nca2.ever = map[string]bool{}
+	s.nca2.pushed = map[string]bool{}
 	s.nca2.inf = map[string]int{}
 }
 
@@ -347,6 +351,7 @@ func (s *Scheduler) nca2Pushout(g *engineGroup, id, reason string, now time.Time
 		return
 	}
 	s.nca2.admitted[id] = false
+	s.nca2.pushed[id] = true
 	s.nca2m.ObservePushout(engineLabel(g.id), reason)
 	m := g.threads[id]
 	if m == nil {
@@ -484,6 +489,7 @@ func (s *Scheduler) nca2ResetPod(g *engineGroup, now time.Time) {
 	if g.nca2 != nil {
 		for admitted := range s.nca2AdmittedSet(g) {
 			s.nca2.admitted[admitted] = false
+			s.nca2.pushed[admitted] = true
 			s.nca2m.ObservePushout(engineLabel(g.id), pushoutRestart)
 			if s.nca2Active(admitted) {
 				s.nca2m.ObserveActivePushout(engineLabel(g.id))
@@ -545,16 +551,23 @@ func (s *Scheduler) nca2WarmReturners(g *engineGroup) []*waiter {
 	return out
 }
 
-// nca2OutsideHead is A3's head: the oldest on the GLOBAL priority list (a thread that was admitted
-// before), and — only when that list is empty — the oldest on the GLOBAL newcomer queue. The lists
-// are GLOBAL (all pods), keyed by the head's arrival (waiter.since, the base's own key), with the id
-// as the total tie-break.
+// nca2OutsideHead is A3's head: the oldest on the GLOBAL priority list (a thread that is NOT
+// admitted now but was admitted before), and — only when that list is empty — the oldest on the
+// GLOBAL newcomer queue (never admitted). The lists are GLOBAL (all pods), keyed by the head's
+// arrival (waiter.since, the base's own key), with the id as the total tie-break.
+//
+// A thread that IS admitted and waiting is NOT an outside thread (§2): it is one of its pod's warm
+// returners, A2.2's business — never the priority list's, never A2.1's. The CURRENT admission state
+// is the key; "was admitted once" only splits the outsiders into the two classes.
 func (s *Scheduler) nca2OutsideHead() *waiter {
 	if s.nca2 == nil {
 		return nil
 	}
 	var priority, newcomer *waiter
 	for id, w := range s.waiters {
+		if s.nca2.admitted[id] {
+			continue // an admitted thread waiting without a seat: a warm returner (A2.2)
+		}
 		if s.nca2.ever[id] {
 			if priority == nil || outsideLess(w, priority) {
 				priority = w
@@ -593,4 +606,104 @@ func (s *Scheduler) nca2TrackHead(now time.Time) {
 	if head.id != s.nca2.blockedHead {
 		s.nca2.blockedHead, s.nca2.blockedSince = head.id, now
 	}
+}
+
+// ---- the whole-policy view (DumpState and the nca2 gauges) ----
+
+// NCA2Snapshot is the CPU tier's whole-policy view: DumpState serialises it and the nca2 gauges
+// render from it, so a scrape is ONE read of the state and never a mutation (I9). It is nil in OFF.
+type NCA2Snapshot struct {
+	// Engines is the per-pod section.
+	Engines map[string]NCA2PodSnapshot `json:"engines,omitempty"`
+	// PriorityWaiting and NewcomerWaiting are the GLOBAL outside lists' sizes.
+	PriorityWaiting int `json:"priorityWaiting"`
+	NewcomerWaiting int `json:"newcomerWaiting"`
+	// HeadBlockedSeconds is how long the current outside head has been the head without fitting any
+	// pod, and BlockedHead names it ("" when the queue is empty).
+	HeadBlockedSeconds float64 `json:"headBlockedSeconds"`
+	BlockedHead        string  `json:"blockedHead,omitempty"`
+}
+
+// NCA2PodSnapshot is ONE pod's CPU line as a scraped reader sees it: the geometry the decision uses
+// (line, room, LAA), the class counts, and the GPU layer's own occupancy.
+type NCA2PodSnapshot struct {
+	ID string `json:"id"`
+	// LineTokens is the CPU tier's resident size, RoomTokens the space an admission could consume,
+	// LAAPositionTokens the position of the LOWEST admitted active entry (0 when there is none).
+	LineTokens        int64  `json:"lineTokens"`
+	RoomTokens        int64  `json:"roomTokens"`
+	LAAPositionTokens int64  `json:"laaPositionTokens"`
+	LAA               string `json:"laa,omitempty"`
+	// AdmittedTokens is the admitted entries' tokens inside the line, AdmittedActiveTokens the part
+	// of it that belongs to ACTIVE threads.
+	AdmittedTokens       int64 `json:"admittedTokens"`
+	AdmittedActiveTokens int64 `json:"admittedActiveTokens"`
+	AdmittedThreads      int   `json:"admittedThreads"`
+	ActiveThreads        int   `json:"activeThreads"`
+	// WarmReturnersWaiting is A2.2's list, PendingHeads the warm returners plus the seated threads
+	// with a queued head (i.e. the demand this pod could serve without a new admission).
+	WarmReturnersWaiting int `json:"warmReturnersWaiting"`
+	PendingHeads         int `json:"pendingHeads"`
+	// SeatsInflight is the seats whose thread has a request in flight, SeatsReclaimable the seats the
+	// shipped rotation would accept as a victim right now.
+	SeatsInflight    int `json:"seatsInflight"`
+	SeatsReclaimable int `json:"seatsReclaimable"`
+	// IdleWithWaiters is 1 when this pod has nothing in flight while an outside head or one of its own
+	// warm returners waits: the state a liveness bug looks like from a dashboard.
+	IdleWithWaiters int `json:"idleWithWaiters"`
+}
+
+// nca2Snapshot builds the nca2 section under the caller's lock. Every number is a READ: the only
+// clock it takes is the caller's, and nothing is written back (I9).
+func (s *Scheduler) nca2Snapshot(now time.Time) *NCA2Snapshot {
+	if s.nca2 == nil {
+		return nil
+	}
+	snap := &NCA2Snapshot{Engines: map[string]NCA2PodSnapshot{}}
+	for id := range s.waiters {
+		if s.nca2.admitted[id] {
+			continue // a warm returner, not an outside thread
+		}
+		if s.nca2.ever[id] {
+			snap.PriorityWaiting++
+		} else {
+			snap.NewcomerWaiting++
+		}
+	}
+	if s.nca2.blockedHead != "" && !s.nca2.blockedSince.IsZero() {
+		snap.BlockedHead = s.nca2.blockedHead
+		snap.HeadBlockedSeconds = now.Sub(s.nca2.blockedSince).Seconds()
+	}
+	outsideWaits := snap.PriorityWaiting+snap.NewcomerWaiting > 0
+	for _, id := range s.groupOrder {
+		g := s.groups[id]
+		if g.nca2 == nil {
+			continue
+		}
+		v := s.nca2View(g)
+		ps := NCA2PodSnapshot{ID: engineLabel(id),
+			LineTokens: v.lineTokens, RoomTokens: v.room(s.nca2.AdmitLineTokens),
+			LAAPositionTokens: v.laaPosition, LAA: v.laa,
+			AdmittedTokens: v.admittedTokens, AdmittedActiveTokens: v.admittedActiveTokens,
+			AdmittedThreads: v.admittedThreads, ActiveThreads: v.activeThreads,
+			WarmReturnersWaiting: len(s.nca2WarmReturners(g)),
+		}
+		for tid, m := range g.threads {
+			if !m.noQueuedHead() {
+				ps.PendingHeads++
+			}
+			if s.nca2.inf[tid] > 0 {
+				ps.SeatsInflight++
+			}
+			if _, ok := s.eligible(m, now); ok {
+				ps.SeatsReclaimable++
+			}
+		}
+		ps.PendingHeads += ps.WarmReturnersWaiting
+		if ps.SeatsInflight == 0 && (outsideWaits || ps.WarmReturnersWaiting > 0) {
+			ps.IdleWithWaiters = 1
+		}
+		snap.Engines[ps.ID] = ps
+	}
+	return snap
 }

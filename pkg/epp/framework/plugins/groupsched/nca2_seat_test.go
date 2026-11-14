@@ -22,6 +22,7 @@ package groupsched
 // it (A2/S1) and the cold valve never evicting for (C9), and the room consumed at the decision (L0).
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -208,6 +209,73 @@ func TestWarmReturnerNearestTheTailIsSeated(t *testing.T) {
 	}
 	if f.classOf("warm") != nca2ClassReturner {
 		t.Fatalf("the seat's class is returner, got %q", f.classOf("warm"))
+	}
+	f.s.onEvent = nil
+}
+
+// TestReturnersOnlyIsA2_2sPathAndTheyAreNeverOutsiders: §2/A2.2 — a currently ADMITTED thread that
+// waits without a seat is a warm returner, never an outside thread: with no outsider waiting, A2.2
+// simply seats them all, the deepest position first.
+func TestReturnersOnlyIsA2_2sPathAndTheyAreNeverOutsiders(t *testing.T) {
+	f := newFixture(t, "p0")
+	f.turn("warm", 10) // 640 at the head
+	f.turn("cool", 5)  // 320 at the head, warm at 960
+	f.s.mu.Lock()
+	for _, id := range []string{"warm", "cool"} {
+		g := f.s.groups["p0"]
+		f.s.exit(g, g.threads[id], "idle", f.now) // unseated, the admission kept (S4)
+	}
+	head := f.s.nca2OutsideHead() // the CURRENT admission state decides the class
+	f.s.mu.Unlock()
+	if head != nil {
+		t.Fatalf("an admitted waiting thread is not the outside head: %v", head.id)
+	}
+	var seats []string
+	f.s.onEvent = func(ev Event) {
+		if ev.Kind == "SEAT" {
+			seats = append(seats, ev.ID)
+		}
+	}
+	if i := f.step(f.hd("warm", 10), f.hd("cool", 5)); i < 0 {
+		t.Fatal("A2.2 must seat the returners")
+	}
+	if len(seats) != 2 || seats[0] != "warm" || seats[1] != "cool" {
+		t.Fatalf("deepest position first: %v", seats)
+	}
+	f.s.onEvent = nil
+}
+
+// TestOutsiderFirstThenTheReturner: A2's order — a fitting OUTSIDE head is admitted first (A2.1), and
+// the pod's waiting warm returner takes the next decision (A2.2), in the same pass.
+func TestOutsiderFirstThenTheReturner(t *testing.T) {
+	f := newFixture(t, "p0")
+	f.turn("warm", 5) // admitted, entry at 320, then evicted: a warm returner when its head arrives
+	f.s.mu.Lock()
+	g := f.s.groups["p0"]
+	f.s.exit(g, g.threads["warm"], "idle", f.now)
+	s := f.s
+	s.mu.Unlock()
+	var seats []string
+	f.s.onEvent = func(ev Event) {
+		if ev.Kind == "SEAT" {
+			seats = append(seats, ev.ID+"@"+ev.Detail)
+		}
+	}
+	// an outsider (5 blocks = 320 tokens) and the returner, both waiting
+	if i := f.step(f.hd("new", 5), f.hd("warm", 5)); i < 0 {
+		t.Fatal("a decision must be taken")
+	}
+	if len(seats) != 2 {
+		t.Fatalf("two seats: the outsider (A2.1) and the returner (A2.2), got %v", seats)
+	}
+	if !strings.HasPrefix(seats[0], "new@") || !strings.HasPrefix(seats[1], "warm@") {
+		t.Fatalf("A2.1 admits the outsider first, then A2.2 seats the returner: %v", seats)
+	}
+	if !f.admitted("new") || f.classOf("new") != nca2ClassAdmittedNow {
+		t.Fatal("the outsider is admitted and seated (admitted_now)")
+	}
+	if f.classOf("warm") != nca2ClassReturner {
+		t.Fatalf("the returner is seated as a returner, got %q", f.classOf("warm"))
 	}
 	f.s.onEvent = nil
 }

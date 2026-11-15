@@ -69,15 +69,18 @@ type doorMetrics struct {
 	collections *prometheus.CounterVec
 	// refused is O5: the exhaustive backfill sweep's refusals, by the furthest check reached.
 	refused *prometheus.CounterVec
-	// classes are O1's class label values (priority | newcomer, or A | B | C).
+	// reclaimedSeats is the seats BF4 released, per pod (LOGIC Amendment 2; nil unless backfillReclaim).
+	reclaimedSeats *prometheus.CounterVec
+	// classes are O1's class label values (priority | newcomer, or A | B | C), and paths O1's path values.
 	classes []string
+	paths   []string
 	// sessionHeader and sessionMismatch are O6 (nil in Part A).
 	sessionHeader   *prometheus.CounterVec
 	sessionMismatch prometheus.Counter
 }
 
-// newDoorMetrics declares the door's series; the session layer's only when it runs.
-func newDoorMetrics(sessionAware bool) *doorMetrics {
+// newDoorMetrics declares the door's series; the session layer's and backfill reclaim's only when they run.
+func newDoorMetrics(sessionAware, backfillReclaim bool) *doorMetrics {
 	d := &doorMetrics{
 		admissions: prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "door_admissions_total",
 			Help: "admissions through the door: path head_fit (the head fit a pod as it was), head_collected (the head fit after collecting on its one pod), backfill (anyone else, into budget already free); class priority | newcomer (doorBackfill) or the session group A | B | C (sessionAware)"}, []string{"path", "class"}),
@@ -88,6 +91,12 @@ func newDoorMetrics(sessionAware bool) *doorMetrics {
 		refused: prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "backfill_refused_total",
 			Help: "outsiders the exhaustive backfill sweep at the end of a pass refused, by the furthest check reached on any pod: cpu, gpu, valve, valve_head_headroom (the valve headroom the head needs on its pod). A PASS count: every pass that ends with outsiders waiting adds them again"}, []string{"reason"}),
 		classes: []string{pathPriority, pathNewcomer},
+		paths:   []string{doorPathHeadFit, doorPathHeadCollected, doorPathBackfill},
+	}
+	if backfillReclaim {
+		d.paths = append(d.paths, doorPathBackfillReclaim)
+		d.reclaimedSeats = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "backfill_reclaimed_seats_total",
+			Help: "seats backfill released on this pod (backfillReclaim): eligible seats on a pod that is not the collection pod and has no returner waiting, each for an outsider admitted there in the same step"}, []string{"pod"})
 	}
 	if sessionAware {
 		d.classes = []string{"A", "B", "C"}
@@ -101,7 +110,7 @@ func newDoorMetrics(sessionAware bool) *doorMetrics {
 
 // collectors is the door's series with their zero series pre-instantiated (a zero is a fact).
 func (d *doorMetrics) collectors() []prometheus.Collector {
-	for _, path := range []string{doorPathHeadFit, doorPathHeadCollected, doorPathBackfill} {
+	for _, path := range d.paths {
 		for _, class := range d.classes {
 			d.admissions.WithLabelValues(path, class)
 		}
@@ -117,6 +126,9 @@ func (d *doorMetrics) collectors() []prometheus.Collector {
 		d.refused.WithLabelValues(reason)
 	}
 	out := []prometheus.Collector{d.admissions, d.headChanges, d.collections, d.refused}
+	if d.reclaimedSeats != nil {
+		out = append(out, d.reclaimedSeats)
+	}
 	if d.sessionHeader != nil {
 		d.sessionHeader.WithLabelValues("true")
 		d.sessionHeader.WithLabelValues("false")
@@ -148,6 +160,14 @@ func (m *nca2Metrics) ObserveCollection(event string) {
 		return
 	}
 	m.door.collections.WithLabelValues(event).Inc()
+}
+
+// ObserveBackfillReclaimedSeats records the seats BF4 released on one pod (LOGIC Amendment 2).
+func (m *nca2Metrics) ObserveBackfillReclaimedSeats(pod string, n int) {
+	if m == nil || m.door == nil || m.door.reclaimedSeats == nil {
+		return
+	}
+	m.door.reclaimedSeats.WithLabelValues(pod).Add(float64(n))
 }
 
 // ObserveSessionHeader records one dispatched request with or without the session header (O6).
@@ -245,6 +265,9 @@ func (m *nca2Metrics) preInstantiatePod(pod string) {
 		m.pushouts.WithLabelValues(pod, reason).Add(0)
 	}
 	m.returnerSeats.WithLabelValues(pod).Add(0)
+	if m.door != nil && m.door.reclaimedSeats != nil {
+		m.door.reclaimedSeats.WithLabelValues(pod).Add(0)
+	}
 	m.activePushouts.WithLabelValues(pod).Add(0)
 	m.moves.WithLabelValues(pod).Add(0)
 	m.lineTouchTokens.WithLabelValues(pod).Add(0)

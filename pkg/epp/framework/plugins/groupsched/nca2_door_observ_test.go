@@ -90,7 +90,7 @@ func TestO_DoorSeriesOnlyWithTheirSwitch(t *testing.T) {
 func withDoorMetrics(t *testing.T, f *fixture) *prometheus.Registry {
 	t.Helper()
 	m := newNCA2Metrics()
-	m.door = newDoorMetrics(f.s.nca2.door.sessionAware)
+	m.door = newDoorMetrics(f.s.nca2.door.sessionAware, f.s.nca2.door.backfillReclaim)
 	reg := prometheus.NewRegistry()
 	for _, c := range m.collectors() {
 		require.NoError(t, reg.Register(c))

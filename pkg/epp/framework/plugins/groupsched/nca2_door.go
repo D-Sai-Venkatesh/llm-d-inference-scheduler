@@ -28,7 +28,9 @@ package groupsched
 //	H6-H9  otherwise it collects on ONE pod, chosen once (not for a Part-B new-session head: H8)
 //	L2-1   the pods' returners, v2's step unchanged (free budget excludes the held blocks)
 //	H10    a Part-B new-session head collects only if no returner of its pod waits
-//	BF     everyone else, in ranking order, into what is already free; never a release
+//	BF     everyone else, in ranking order, into what is already free; with backfillReclaim (BF4) a
+//	       candidate that fits nowhere as it is may release eligible seats on a pod that is not the
+//	       collection pod and has no returner waiting, for its own admission only
 //
 // The decision is ONE admission or ONE seating at most, like v2's: the pass repeats it (A1's cap).
 
@@ -106,6 +108,8 @@ const (
 	doorPathHeadFit       = "head_fit"
 	doorPathHeadCollected = "head_collected"
 	doorPathBackfill      = "backfill"
+	// doorPathBackfillReclaim is BF4 (LOGIC Amendment 2): backfill that released eligible seats first.
+	doorPathBackfillReclaim = "backfill_reclaim"
 )
 
 // The collection events (session-layer O2, LOGIC Amendment 1 Q5).
@@ -331,7 +335,7 @@ func (s *Scheduler) doorSelectHead(base []podState, memo map[fitKey]fitFacts, no
 	if first == nil || first.w.id == d.headID || first.class >= s.doorClassOf(d.headID) {
 		return head, false
 	}
-	if s.doorBackfillsAnywhere(base, first.w, head, memo) {
+	if s.doorBackfillsAnywhere(base, first.w, head, memo, now) {
 		return head, false
 	}
 	x := first.w
@@ -584,7 +588,8 @@ func (s *Scheduler) doorReturnerWaitingOn(g *engineGroup) bool {
 // doorBackfill is BF1: every outsider but the head, in ranking order, on each pod of its own order,
 // admitted if it passes the three checks with what is ALREADY free — no rotationVictim, no exit, no
 // reclaim (I4) — and, on the collection pod, neither the held blocks nor the valve headroom the head
-// needs (I5). The first admission ends the decision.
+// needs (I5). With backfillReclaim, a candidate BF1 refused on every pod gets BF4's second chance before
+// the next candidate is asked. The first admission ends the decision.
 func (s *Scheduler) doorBackfill(base []podState, head *waiter, memo map[fitKey]fitFacts, now time.Time) bool {
 	d := s.nca2.door
 	var maxRoom int64
@@ -608,7 +613,7 @@ func (s *Scheduler) doorBackfill(base []podState, head *waiter, memo map[fitKey]
 			continue
 		}
 		f := s.nca2CandOf(w).tokens
-		// BF2: the CPU prefilter is exact — no pod has the room
+		// BF2: the CPU prefilter is exact — no pod has the room (BF4 needs the room too)
 		if f > maxRoom {
 			d.refused[refusedCPU]++
 			continue
@@ -625,9 +630,52 @@ func (s *Scheduler) doorBackfill(base []podState, head *waiter, memo map[fitKey]
 			}
 			furthest = max(furthest, reason)
 		}
+		if d.backfillReclaim && s.doorBackfillReclaim(pods, w, f, memo, now) {
+			return true
+		}
+		// O5: a refusal is booked only once BF4 refused the candidate too (LOGIC Amendment 2)
 		d.refused[furthest]++
 	}
 	return false
+}
+
+// doorBackfillReclaim is BF4 (LOGIC Amendment 2) for one candidate that BF1 refused on every pod: the
+// first pod of its order that passes doorReclaimFits releases its eligible seats in the rotationVictim
+// order until the candidate fits (v2's ncaV2Reclaim, the returner step's own), and the candidate is
+// admitted there. The fit is asked before any release, so a candidate that cannot fit releases nothing.
+func (s *Scheduler) doorBackfillReclaim(pods []podState, w *waiter, f int64, memo map[fitKey]fitFacts, now time.Time) bool {
+	for j := range pods {
+		p := &pods[j]
+		if !s.doorReclaimFits(p, w, f, memo, now) {
+			continue
+		}
+		seats := len(p.g.threads)
+		fits := s.ncaV2Reclaim(p.g, w, now, memo)
+		if released := seats - len(p.g.threads); released > 0 {
+			s.nca2m.ObserveBackfillReclaimedSeats(engineLabel(p.g.id), released)
+		}
+		if fits && s.doorAdmit(p, w, doorPathBackfillReclaim, now) {
+			return true
+		}
+	}
+	return false
+}
+
+// doorReclaimFits is BF4's question for one candidate on one pod, read without releasing anything:
+// (a) the pod is not the collection pod (budget freed there is the head's), (b) no returner of the pod
+// waits (the pass's returner list, as H10 reads it: inside threads first), the CPU room, and (c) v2's
+// ncaV2Fits — the valve, then the cost inside the free budget plus what the pod's eligible seats would
+// return. A pod with no seat has nothing to reclaim: BF1 already asked its free budget, and Rule O
+// stays the head's (U4).
+func (s *Scheduler) doorReclaimFits(p *podState, w *waiter, f int64, memo map[fitKey]fitFacts, now time.Time) bool {
+	g := p.g
+	if g.numBlocks <= 0 || g.nca2 == nil || g.id == s.nca2.door.collectPod || f > p.room || len(g.threads) == 0 {
+		return false
+	}
+	if s.doorReturnerWaitingOn(g) {
+		return false
+	}
+	return s.ncaV2Fits(g, w, now, memo)
 }
 
 // doorBackfillFits is BF1's three checks for one candidate on one pod, cheapest first, with the reason a
@@ -666,8 +714,10 @@ func (s *Scheduler) doorBackfillFits(p *podState, w *waiter, f int64, collect *e
 }
 
 // doorBackfillsAnywhere is H3's "cannot backfill anywhere" (LOGIC Amendment 1 Q3), read with the
-// backfill's own checks against the current head's collection; it changes nothing.
-func (s *Scheduler) doorBackfillsAnywhere(base []podState, x, head *waiter, memo map[fitKey]fitFacts) bool {
+// backfill's own checks against the current head's collection; it releases nothing. With backfillReclaim
+// on, "can backfill" includes BF4 (LOGIC Amendment 2): an outsider that BF4 would admit does not take the
+// head, it is admitted by backfill in this decision.
+func (s *Scheduler) doorBackfillsAnywhere(base []podState, x, head *waiter, memo map[fitKey]fitFacts, now time.Time) bool {
 	d := s.nca2.door
 	var collect *engineGroup
 	var headNeed int64
@@ -681,6 +731,13 @@ func (s *Scheduler) doorBackfillsAnywhere(base []podState, x, head *waiter, memo
 	for i := range base {
 		if _, ok := s.doorBackfillFits(&base[i], x, f, collect, headNeed, memo); ok {
 			return true
+		}
+	}
+	if d.backfillReclaim {
+		for i := range base {
+			if s.doorReclaimFits(&base[i], x, f, memo, now) {
+				return true
+			}
 		}
 	}
 	return false

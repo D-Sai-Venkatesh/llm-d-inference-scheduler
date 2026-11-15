@@ -131,7 +131,7 @@ Two more `nca2` switches, with or without the door. With both absent (or false) 
 
 | Parameter | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `valveCPUWarm` | bool | `false` | The cold valve counts a returner's context in its home pod's CPU line as warm, like its GPU-resident prefix: its cold tokens are the prompt minus the larger of the two, in every valve check and in the seat's cold charge. Outsiders (not admitted) stay fully cold. GPU block costs and the cache predictions are unchanged. `valve_cpu_warm_tokens_total{pod}` counts the tokens it excused at each seat. |
+| `valveCPUWarm` | bool | `false` | The cold valve counts the tokens of a thread's entry on the pod's CPU line as warm, like its GPU-resident prefix: its cold tokens are the prompt minus the larger of the two, in every valve check and in the seat's cold charge. The entry exists while the thread is admitted and, after a push-out, until the line is trimmed past `cpuTierTokens`; a thread with no entry on the pod (a newcomer, a new thread id, a trimmed entry) stays fully cold. GPU block costs and the cache predictions are unchanged. `valve_cpu_warm_tokens_total{pod}` counts the tokens it excused at each seat. |
 | `noQuantum` | bool | `false` | A seat becomes rotation-eligible only by silence (`idleSeconds`, nothing in flight), never by using its `quantum`. The engine-idle rule, push-outs and the budget-pressure exits are unchanged. |
 
 `idleSeconds` becomes the INACTIVE grace (a seat holder with no head and nothing in flight is

@@ -1,9 +1,10 @@
 # Why this scheduler exists, and what each part is for
 
 This file records the **intent** behind the group scheduler's `nca2` mode and the two layers added on top of it on this branch —
-the **door fix** (`doorBackfill`, with its option `backfillReclaim`) and the **session layer** (`sessionAware`). The README says how to
-configure it; this file says what it is trying to achieve, why each rule exists, what was measured that led to it, and what it is
-deliberately **not** trying to do. When a rule here and the code disagree, the code is wrong or this file is stale — fix one of them.
+the **door fix** (`doorBackfill`, with its option `backfillReclaim`) and the **session layer** (`sessionAware`) — and two options of
+`nca2` itself: the cold valve's **CPU warmth** (`valveCPUWarm`, §3.1) and the **no-quantum** seat rotation (`noQuantum`, §4.1). The
+README says how to configure it; this file says what it is trying to achieve, why each rule exists, what was measured that led to it,
+and what it is deliberately **not** trying to do. When a rule here and the code disagree, the code is wrong or this file is stale — fix one of them.
 
 ---
 
@@ -103,6 +104,27 @@ pushed out — nothing useful lost.
 The intent is to run **high** (0.85–0.95): use the whole warm cache, and make the inside steady by how seats rotate (§4) and by who goes
 first (§6) — not by admitting only what the GPU holds.
 
+### 3.1 The cold valve counts what the CPU tier holds (`valveCPUWarm`)
+
+The **cold valve** keeps the tokens a pod has to prefill from scratch, in flight at once, under its cap (the KV headroom, ~20 %). It
+drains only as those prefills finish. Without the option, "cold" means "not on the GPU": the router's block index models only the
+blocks of **seated** threads, so a thread whose seat was released counts its **whole context** as cold, although that context is in the
+pod's CPU tier and vLLM loads it instead of computing it.
+
+**The rule:** with `valveCPUWarm`, the tokens of the thread's **entry on the pod's CPU line** count as warm, exactly like a GPU-resident
+prefix: its cold tokens are the prompt minus the larger of the two. The entry exists while the thread is admitted, and also after a
+push-out until the line is trimmed past the tier's size (`cpuTierTokens`), so a pushed-out thread coming back to its old pod is warm as
+long as its entry is still there. A newcomer, a context rewritten under a new thread id, and an entry already trimmed are fully cold.
+The warm count is used by every valve check (the head, backfill, the returners, v2's own decision) and by the cold charge a seat takes;
+the **GPU block costs are unchanged** (the loaded context occupies GPU blocks like any other).
+
+**Why:** the valve exists to protect the engine from too much **computation** at once; a CPU-tier load is not computation. Charging a
+returner's full context made the valve hold returners (and a pushed-out thread's re-admission) whose context only had to be loaded,
+and inflated the pod's cold-in-flight for everyone behind them.
+
+Example (cap 3,200 tokens, another cold prefill holds 3,000): a returner with 5,000 tokens in its CPU entry sends a 5,120-token prompt.
+The GPU-only valve charges min(5,120, 3,200) and refuses it; with the option it is charged 120 and seated.
+
 ---
 
 ## 4. GPU seats — who runs right now (v2, unchanged by the layers)
@@ -119,6 +141,18 @@ idle release are the **turn length**: shorter turns spread the waiting thinner (
 reloads from the CPU tier. Measured on v2 at full cache: returners waited p50 36 s / p90 206 s at quantum 8, p50 27 s at quantum 4.
 
 **Never raised for the experiments here:** `groupBudgetFraction` (the seat budget) — the headroom keeps the engine from preempting.
+
+### 4.1 Seats taken from idle threads only (`noQuantum`)
+
+**The rule:** with `noQuantum`, the quantum no longer makes a seat releasable: a seat is released by rotation only when its thread has
+been **silent for `idleSeconds`** with nothing in flight. A thread that keeps working keeps its seat, however many turns it runs.
+Everything else that releases a seat is unchanged: the engine-idle rule (a pod with nothing in flight and nothing queued while someone
+waits), push-outs, the memory-pressure exits, and the order among releasable seats.
+
+**Why:** the quantum interrupts a session in the middle of its work — the freeze §1.2 is about — to hand its seat to someone else. With
+seats taken only from threads that paused, a working session runs on, and the waiting moves to the threads that are not running anyway
+and to the door. **Cost:** a pod whose seat holders never pause for `idleSeconds` releases nothing by rotation, so its returners and the
+door wait for a pause (the turn length becomes the session's own think time).
 
 ---
 
@@ -203,13 +237,15 @@ Example: pod A has 4 seats — 3 held by session S1, 1 by another. Waiting: `r1`
 ## 7. What is deliberately NOT done
 
 - **No eviction of engine blocks.** A thread is protected from falling off the CPU tail only by being served.
-- **No change to the cold valve.** It protects the engine from too much uncached prefill at once.
-- **No change to the CPU line, pushout reasons, quantum, idle release, home pods, the seat budget or the dispatch of seated threads** —
+- **No change to the cold valve's cap or its drain.** It protects the engine from too much uncached prefill at once; `valveCPUWarm` only
+  changes what counts as uncached (§3.1).
+- **No change to the CPU line, pushout reasons, quantum, idle release, home pods, the seat budget or the dispatch of seated threads**
+  (`noQuantum`, §4.1, is the one option that drops the quantum from rotation) —
   the layers change only how the door admits and in what order.
 - **No per-session charging, no co-locating a session's threads, no role inference** (root vs sub-agent is not needed).
 - **No two lines or reserved headroom for inside sessions** — they would hold CPU room for threads with no request.
-- **Both switches off ⇒ exactly v2.** This is pinned by digest tests of the decision stream (below), so existing baselines stay
-  reproducible.
+- **Both switches off ⇒ exactly v2** (and `valveCPUWarm`, `noQuantum` off ⇒ exactly the code before them). This is pinned by digest
+  tests of the decision stream (below), so existing baselines stay reproducible.
 
 ---
 
@@ -221,9 +257,11 @@ Example: pod A has 4 seats — 3 held by session S1, 1 by another. Waiting: `r1`
 | `backfillReclaim` | false | backfill may release idle seats (§5.3) | true without `doorBackfill` |
 | `sessionAware` | false | Part B: session order (§6) | true without `doorBackfill`; without a usable `sessionHeader` |
 | `sessionHeader` | "" | the request header carrying the session id | set without `sessionAware`; a fairness / request / correlation header |
+| `valveCPUWarm` | false | the cold valve counts a thread's CPU-line entry as warm (§3.1) | set without `mode: nca2` |
+| `noQuantum` | false | seats are released by silence only, never by the quantum (§4.1) | set without `mode: nca2` |
 
-The startup echo prints every resolved value (`doorBackfill=… sessionAware=… sessionHeader=… backfillReclaim=…`); a run is counted only
-after reading it back.
+The startup echo prints every resolved value (`doorBackfill=… sessionAware=… sessionHeader=… backfillReclaim=… valveCPUWarm=…
+noQuantum=…`); a run is counted only after reading it back.
 
 ---
 
@@ -238,6 +276,8 @@ after reading it back.
 | `…_door_waiting{class or group}` | the door queue; a long queue of **new** sessions is the capacity signal |
 | `…_backfill_refused_total{reason}` | why backfill failed (`cpu`, `gpu`, `valve`, `valve_head_headroom`) — a per-pass count, read as a rate |
 | `…_backfill_reclaimed_seats_total{pod}` | idle seats released for outsiders; never on the collection pod |
+| `…_valve_cpu_warm_tokens_total{pod}` | `valveCPUWarm`: the tokens the CPU warmth excused from the valve, summed over the seats it charged |
+| `llm_d_epp_group_exits_total{reason="quantum-complete"}` | 0 with `noQuantum` (a non-zero value means the quantum still rotates) |
 | `…_session_header_total{present}`, `…_session_mismatch_total` | whether clients send the session id (a run needs ~100 %) |
 | span attributes `llm_d.nca2.door_path`, `…session_group`, `…session_id_hash` | per request: how its turn got its seat, its session's group |
 | events `SEAT … path=`, `COLLECT …` | the decision trail |
@@ -248,15 +288,18 @@ after reading it back.
 ## 10. How it is verified
 
 - **Identity pins.** Digest tests of the full decision stream: v2 with both switches off equals the base exactly; the door with
-  `backfillReclaim` off equals the door before that option existed. Each pin was computed on the *older* code before any change and proven
-  again on a pristine checkout of it.
+  `backfillReclaim` off equals the door before that option existed. Each of these pins was computed on the *older* code before any change
+  and proven again on a pristine checkout of it. A third pin holds v2 and the door with `valveCPUWarm` and `noQuantum` off to the code
+  before those options, over a fixture where CPU-warm threads meet the valve and seats pass their quantum; it was computed before the
+  options were written.
 - **Rule tests** — one per rule, each shown to fail when its rule is broken on purpose (mutation checks).
 - **Property loops** — seeded closed loops (several CPU tiers, Part A and Part B, the reclaim option on and off) checking after every pass
   and inside every decision: one pod holds at most; the held budget belongs to the head; backfill never releases a seat except through the
   reclaim rule; the head never collects while it fits somewhere; backfill was exhaustive; a new session's head never holds while its pod's
-  returner waits; every session finishes.
+  returner waits; a backfill on the collection pod leaves the head's held blocks and valve headroom alone; every session finishes. The
+  same loops (and v2's own) run with `valveCPUWarm`, `noQuantum` and both; with `noQuantum` no seat leaves as `quantum-complete`.
 - **Bench** — a pass with 500 outsiders, 200 admitted, 3 pods: the door costs 1.4–1.75× v2's pass time (bar: 3×), with a fixed number of
-  extra allocations, not one per outsider.
+  extra allocations, not one per outsider. `valveCPUWarm` and `noQuantum` add no allocation; with every switch on the pass is ~1.9× v2's.
 
 ---
 

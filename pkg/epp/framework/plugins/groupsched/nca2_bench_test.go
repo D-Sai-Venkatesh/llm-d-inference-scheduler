@@ -309,13 +309,8 @@ func BenchmarkBASEPass(b *testing.B) {
 // 80 returners waiting — and 500 outsiders (one in ten a pushed-out PRIORITY thread, one in twenty a big
 // prompt). The pass is the steady state the door lives in: the head fits nowhere and collects nothing,
 // and the backfill sweep has to ask every outsider on every pod and admits nobody.
-func benchDoor(b *testing.B, door, sessions, reclaim bool) (*Scheduler, []Head) {
-	b.Helper()
-	return benchDoorTuned(b, door, sessions, reclaim, nil)
-}
-
-// benchDoorTuned is benchDoor with extra keys set (LOGIC Amendment 3's switches).
-func benchDoorTuned(b *testing.B, door, sessions, reclaim bool, extra func(*Config)) (*Scheduler, []Head) {
+// extra sets more keys (LOGIC Amendment 3's switches) when not nil.
+func benchDoor(b *testing.B, door, sessions, reclaim bool, extra func(*Config)) (*Scheduler, []Head) {
 	b.Helper()
 	s := newNCA2Tuned(b, func(c *Config) {
 		c.CPUTierTokens = i64(defaultCPUTierTokens)
@@ -414,7 +409,7 @@ func benchDoorPassTuned(b *testing.B, door, sessions, reclaim, noReturners bool,
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		s, heads := benchDoorTuned(b, door, sessions, reclaim, extra)
+		s, heads := benchDoor(b, door, sessions, reclaim, extra)
 		if noReturners {
 			kept := heads[:0]
 			for _, h := range heads {

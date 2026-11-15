@@ -133,14 +133,14 @@ func valveFixture(t *testing.T, door, warm bool, pods ...string) *fixture {
 	return newV2Twin(t, tune, pods...)
 }
 
-// coldCharge gives a running seat an outstanding cold-entry charge of tokens (the caller does not hold
-// the lock).
-func (f *fixture) coldCharge(pod, id string, tokens int64) {
+// hotCharge gives the running seat "hot" an outstanding cold-entry charge of tokens on its pod (the caller
+// does not hold the lock).
+func (f *fixture) hotCharge(tokens int64) {
 	f.t.Helper()
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
-	g := f.s.groups[pod]
-	m := g.threads[id]
+	g := f.s.groupOf("hot")
+	m := g.threads["hot"]
 	m.coldEntry, m.coldDone = tokens, false
 	g.coldInFlight += tokens
 }
@@ -189,7 +189,7 @@ func TestVT1_CPUWarmReturnerPassesTheValve(t *testing.T) {
 		for _, warm := range []bool{false, true} {
 			f := valveFixture(t, door, warm, "p0")
 			f.running("p0", "hot", 100, 320)
-			f.coldCharge("p0", "hot", 3000)
+			f.hotCharge(3000)
 			f.cpuWarmReturner("p0", "r", 5000)
 			served := f.pass(f.warmHead("r"))
 			if warm && (served != 0 || !seated(f.s, "r")) {
@@ -216,7 +216,7 @@ func TestVT3_ColdInFlightIsChargedValveCold(t *testing.T) {
 		f.s.nca2m = m
 		m.preInstantiatePod("p0")
 		f.running("p0", "hot", 100, 320)
-		f.coldCharge("p0", "hot", 3000)
+		f.hotCharge(3000)
 		f.cpuWarmReturner("p0", "r", 5000)
 		if f.pass(f.warmHead("r")) != 0 {
 			t.Fatalf("door %v: fixture: r is seated", door)
@@ -284,7 +284,7 @@ func pushedOutFixture(t *testing.T, door, warm, trim bool) *fixture {
 	}, []string{"p0"})
 	f := &fixture{t: t, s: s, now: epoch}
 	f.running("p0", "hot", 100, 320)
-	f.coldCharge("p0", "hot", 3000)
+	f.hotCharge(3000)
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
 	g := f.s.groups["p0"]
@@ -337,7 +337,7 @@ func TestVT4_HeadHeadroomUsesValveCold(t *testing.T) {
 	for _, warm := range []bool{false, true} {
 		f := valveFixture(t, true, warm, "p0")
 		f.running("p0", "hot", 100, 320)
-		f.coldCharge("p0", "hot", 2000)
+		f.hotCharge(2000)
 		f.pushedOutWithEntry("p0", "N", 1000)
 		head := f.heavyAt("N", 900, 1000, f.now)
 		small := f.heavyAt("s", 5, 300, f.now)

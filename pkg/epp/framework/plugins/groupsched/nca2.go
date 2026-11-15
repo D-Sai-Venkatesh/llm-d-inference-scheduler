@@ -98,6 +98,10 @@ type nca2Policy struct {
 	// door is the door fix and the session layer (session-layer contract Part A/B): nil when doorBackfill
 	// is off, and then nothing reads it — the v2 decision runs unchanged (C7).
 	door *nca2Door
+
+	// valveCPUWarm is LOGIC Amendment 3's V1 (valveCold) and noQuantum its Q0 (eligible).
+	valveCPUWarm bool
+	noQuantum    bool
 }
 
 // maxInflightWindow is MaxInflightSeconds as a duration.

@@ -159,6 +159,11 @@ func (n *nca2Policy) doorEcho() string {
 		strconv.FormatBool(door), strconv.FormatBool(aware), header, strconv.FormatBool(reclaim))
 }
 
+// amend3Echo is C9's and C10's part of the nca2 config echo (LOGIC Amendment 3): the resolved values.
+func (n *nca2Policy) amend3Echo() string {
+	return fmt.Sprintf("valveCPUWarm=%s noQuantum=%s", strconv.FormatBool(n.valveCPUWarm), strconv.FormatBool(n.noQuantum))
+}
+
 // ---- the pass ----
 
 // doorBeginPass is the pass's own derivation (R3, ST1): the session facts (Part B) and the ranking of

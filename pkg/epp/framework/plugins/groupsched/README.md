@@ -125,6 +125,15 @@ exactly the one above.
 | `sessionHeader` | string | `""` | Required with `sessionAware` (and refused without it). It may not be the fairness header (`x-llm-d-inference-fairness-id` or its deprecated alias), `x-request-id` or `x-correlation-id`. A request without it is its own session. |
 | `backfillReclaim` | bool | `false` | Requires `doorBackfill`. An outsider that fits no pod's free budget may release rotation-eligible seats on a pod that is not the head's collection pod and has no returner waiting, only for its own admission in the same step. |
 
+#### The cold valve's CPU warmth and the no-quantum mode (`valveCPUWarm`, `noQuantum`)
+
+Two more `nca2` switches, with or without the door. With both absent (or false) the decisions are the ones above.
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `valveCPUWarm` | bool | `false` | The cold valve counts a returner's context in its home pod's CPU line as warm, like its GPU-resident prefix: its cold tokens are the prompt minus the larger of the two, in every valve check and in the seat's cold charge. Outsiders (not admitted) stay fully cold. GPU block costs and the cache predictions are unchanged. `valve_cpu_warm_tokens_total{pod}` counts the tokens it excused at each seat. |
+| `noQuantum` | bool | `false` | A seat becomes rotation-eligible only by silence (`idleSeconds`, nothing in flight), never by using its `quantum`. The engine-idle rule, push-outs and the budget-pressure exits are unchanged. |
+
 `idleSeconds` becomes the INACTIVE grace (a seat holder with no head and nothing in flight is
 rotation-eligible after it) and `quantum` the seat's tenure, so both are worth setting with the mode.
 

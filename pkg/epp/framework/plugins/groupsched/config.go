@@ -91,6 +91,14 @@ type Config struct {
 	// no returner waiting, for an outsider admitted in the same step (LOGIC Amendment 2, C8/BF4). It
 	// requires doorBackfill; off is the door without it.
 	BackfillReclaim *bool `json:"backfillReclaim,omitempty"`
+
+	// ---- LOGIC Amendment 3 (C9/C10): nca2-only presence keys, with or without the door ----
+	//
+	// ValveCPUWarm makes the cold valve count the tokens of a returner's CPU-line entry on its home pod as
+	// warm, exactly like the GPU-resident prefix (V1). NoQuantum releases seats by silence only: quantum
+	// completion stops making a seat rotation-eligible (Q0).
+	ValveCPUWarm *bool `json:"valveCPUWarm,omitempty"`
+	NoQuantum    *bool `json:"noQuantum,omitempty"`
 }
 
 // defaultConfig is what a config that omits every key gets: the shipped arm's own numbers.
@@ -187,6 +195,12 @@ func (c Config) nca2KeyNames() []string {
 	if c.BackfillReclaim != nil {
 		out = append(out, "backfillReclaim")
 	}
+	if c.ValveCPUWarm != nil {
+		out = append(out, "valveCPUWarm")
+	}
+	if c.NoQuantum != nil {
+		out = append(out, "noQuantum")
+	}
 	return out
 }
 
@@ -249,6 +263,8 @@ func (c Config) resolveNCA2() (*nca2Policy, error) {
 		return nil, err
 	}
 	n.door = door
+	n.valveCPUWarm = c.ValveCPUWarm != nil && *c.ValveCPUWarm
+	n.noQuantum = c.NoQuantum != nil && *c.NoQuantum
 	return n, nil
 }
 

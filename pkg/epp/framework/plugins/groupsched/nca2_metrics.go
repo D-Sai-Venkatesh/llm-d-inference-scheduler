@@ -53,6 +53,40 @@ type nca2Metrics struct {
 	doorWait *prometheus.HistogramVec
 	// seatWait is the wait for a seat, by the class of the seat itself.
 	seatWait *prometheus.HistogramVec
+	// door is the door fix's and the session layer's surface (session-layer O1-O6): nil unless
+	// doorBackfill is on, so v2's surface gains nothing.
+	door *doorMetrics
+}
+
+// doorMetrics is the door's counters (session-layer O1, O2, O5, O6).
+type doorMetrics struct{}
+
+// ObserveDoorAdmission records one admission through the door, by path and class (O1).
+func (m *nca2Metrics) ObserveDoorAdmission(path, class string) {
+	if m == nil || m.door == nil {
+		return
+	}
+}
+
+// ObserveHeadChange records one change of the door's head (O2).
+func (m *nca2Metrics) ObserveHeadChange(reason string) {
+	if m == nil || m.door == nil {
+		return
+	}
+}
+
+// ObserveCollection records one collection event (O2).
+func (m *nca2Metrics) ObserveCollection(event string) {
+	if m == nil || m.door == nil {
+		return
+	}
+}
+
+// ObserveBackfillRefused records n refusals of the exhaustive backfill sweep under one reason (O5).
+func (m *nca2Metrics) ObserveBackfillRefused(reason string, n int) {
+	if m == nil || m.door == nil {
+		return
+	}
 }
 
 // nca2Subsystem is the nca2 series' namespace (llm_d_epp_nca2_*).

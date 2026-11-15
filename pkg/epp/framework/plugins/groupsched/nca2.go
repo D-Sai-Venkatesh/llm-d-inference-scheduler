@@ -578,6 +578,10 @@ func (s *Scheduler) nca2ResetPod(g *engineGroup, now time.Time) {
 			}
 		}
 	}
+	// E9: a collection on a pod that no longer exists is released with it
+	if s.nca2.door != nil && s.nca2.door.collectPod == g.id {
+		s.doorReleaseAll(collectReleasedPodGone, now)
+	}
 	for id, home := range s.nca2.homes {
 		if home == g.id {
 			delete(s.nca2.homes, id) // no home on a pod that no longer exists
@@ -720,7 +724,7 @@ func (s *Scheduler) nca2TrackHead(now time.Time) {
 	if s.nca2 == nil {
 		return
 	}
-	head := s.nca2OutsideHead()
+	head := s.nca2CurrentHead()
 	if head == nil {
 		s.nca2.blockedHead, s.nca2.blockedSince = "", time.Time{}
 		return

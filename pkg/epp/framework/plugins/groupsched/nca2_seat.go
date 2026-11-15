@@ -50,9 +50,15 @@ func (s *Scheduler) ncaV2SeatWaiters(now time.Time) {
 	s.nca2.warmBuilt = false
 	limit := ncaV2DecisionCap(len(s.waiters), len(s.groups))
 	s.nca2.passDecisions, s.nca2.capHit = 0, false
+	decide := s.ncaV2DecideOnce
+	if s.nca2.door != nil {
+		// the door fix replaces the decision, nothing else of the pass (session-layer §7)
+		s.doorBeginPass()
+		decide = s.ncaDoorDecideOnce
+	}
 	decisions := 0
 	for ; decisions < limit && len(s.waiters) > 0; decisions++ {
-		if !s.ncaV2DecideOnce(now) {
+		if !decide(now) {
 			break
 		}
 		s.nca2.passDecisions++
@@ -65,7 +71,7 @@ func (s *Scheduler) ncaV2SeatWaiters(now time.Time) {
 	}
 	// nothing more could be seated: if the outside head is held by an engine's cold-entry valve (it
 	// would fit the budget, the valve refuses it), that is the shipped valve counter's event
-	if head := s.nca2OutsideHead(); head != nil {
+	if head := s.nca2CurrentHead(); head != nil {
 		if engine, held := s.coldValveHeldOn(head); held {
 			s.metrics.ObserveColdValveHeld(engineLabel(engine))
 		}
@@ -361,6 +367,12 @@ func (s *Scheduler) ncaV2Reclaim(g *engineGroup, w *waiter, now time.Time, memo 
 // provisional entry — and SEATED at once (the seat frees first: S1's rotation is what a blocked
 // admission evicts).
 func (s *Scheduler) nca2Admit(g *engineGroup, w *waiter, f, room int64, now time.Time) bool {
+	return s.nca2AdmitPath(g, w, f, room, "", now)
+}
+
+// nca2AdmitPath is nca2Admit with the door path that took the admission (session-layer O7/O8; "" when
+// the door is off, which is v2's admission exactly).
+func (s *Scheduler) nca2AdmitPath(g *engineGroup, w *waiter, f, room int64, doorPath string, now time.Time) bool {
 	path, class := pathNewcomer, nca2ClassAdmittedNow
 	if s.nca2.ever[w.id] {
 		path = pathPriority
@@ -371,7 +383,7 @@ func (s *Scheduler) nca2Admit(g *engineGroup, w *waiter, f, room int64, now time
 	// L_t, is not. L0's provisional entry must not answer this — it is the request's own tokens, not
 	// data the pod holds.
 	warm := s.nca2PreTouchWarm(g, w.id)
-	if !s.ncaV2Seat(g, w, class, path, room, warm, now) {
+	if !s.ncaV2Seat(g, w, class, path, doorPath, room, warm, now) {
 		return false
 	}
 	// L0: the provisional entry at the HOME's head with tokens = f. The home is this pod (A4 let it
@@ -399,9 +411,14 @@ func (s *Scheduler) nca2PreTouchWarm(g *engineGroup, id string) bool {
 // changes here — its entry is already inside the line, and L1 moves it to the head when its request
 // reaches the pod.
 func (s *Scheduler) nca2SeatReturner(g *engineGroup, w *waiter, room int64, now time.Time) bool {
+	return s.nca2SeatReturnerPath(g, w, room, "", now)
+}
+
+// nca2SeatReturnerPath is nca2SeatReturner with the door path (session-layer O7/O8).
+func (s *Scheduler) nca2SeatReturnerPath(g *engineGroup, w *waiter, room int64, doorPath string, now time.Time) bool {
 	// a returner's prediction is the position its entry holds when its request REACHES the pod (the
 	// at-pod hook reads it before the touch, and this seat changes nothing on the line)
-	if !s.ncaV2Seat(g, w, nca2ClassReturner, pathNone, room, false, now) {
+	if !s.ncaV2Seat(g, w, nca2ClassReturner, pathNone, doorPath, room, false, now) {
 		return false
 	}
 	s.nca2m.ObserveReturnerSeat(engineLabel(g.id))
@@ -412,9 +429,14 @@ func (s *Scheduler) nca2SeatReturner(g *engineGroup, w *waiter, room int64, now 
 // ncaV2Seat takes the GPU seat through the BASE's own seat path (the same TrySeat, Rule O, cold
 // charge, SEAT event and entry histogram a shipped seat takes) and stamps the turn's nca2 class, path
 // and the room it was decided on, for the span PreRequest sets.
-func (s *Scheduler) ncaV2Seat(g *engineGroup, w *waiter, class, path string, room int64, warm bool, now time.Time) bool {
+func (s *Scheduler) ncaV2Seat(g *engineGroup, w *waiter, class, path, doorPath string, room int64, warm bool, now time.Time) bool {
 	tokens := g.index.ColdTokens(w.chains)
-	if !s.seat(g, w, tokens, now) {
+	extra := ""
+	if doorPath != "" {
+		extra = " path=" + doorPath // O8: the SEAT event names the door path (door mode only)
+	}
+	sessionGroup, sessionHash := s.doorSessionLabels(w.id)
+	if !s.seatDetail(g, w, tokens, now, extra) {
 		return false
 	}
 	if m := g.threads[w.id]; m != nil {
@@ -424,7 +446,8 @@ func (s *Scheduler) ncaV2Seat(g *engineGroup, w *waiter, class, path string, roo
 				predictedWarm:   warm,
 				pushedOutBefore: s.nca2.pushed[w.id],
 				doorWait:        now.Sub(w.since), seatWait: now.Sub(w.since),
-				clientRequestID: w.clientReqID, wireID: w.wireID, threadID: w.id, valid: true}
+				clientRequestID: w.clientReqID, wireID: w.wireID, threadID: w.id, valid: true,
+				doorPath: doorPath, sessionGroup: sessionGroup, sessionHash: sessionHash}
 		}
 	}
 	return true

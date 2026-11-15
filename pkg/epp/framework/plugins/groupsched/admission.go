@@ -148,6 +148,12 @@ func newcomerLess(a, b *waiter) bool {
 
 // seat seats one waiting head on the engine the admission pass chose.
 func (s *Scheduler) seat(g *engineGroup, w *waiter, coldTokens int64, now time.Time) bool {
+	return s.seatDetail(g, w, coldTokens, now, "")
+}
+
+// seatDetail is seat with extra SEAT-event detail (the door's path=..., session-layer O8). An empty extra
+// writes the shipped event text byte for byte.
+func (s *Scheduler) seatDetail(g *engineGroup, w *waiter, coldTokens int64, now time.Time, extra string) bool {
 	// THE TURN'S PREDICTION IS MEASURED HERE, BEFORE THE SEAT RESERVES ANYTHING: from this moment the
 	// thread's blocks are resident by construction, so a measurement taken after the insert would
 	// report the reservation as cache and every seat-entry dispatch would predict its whole prompt.
@@ -198,7 +204,7 @@ func (s *Scheduler) seat(g *engineGroup, w *waiter, coldTokens int64, now time.T
 	// seat kind, the wait, and the arrival the wait is measured from
 	s.recordEvent("SEAT", w.id, fmt.Sprintf("kind=%s wait=%.3f fairness_id=%s wire_id=%s since=%s",
 		eventKind, now.Sub(w.since).Seconds(), fairnessOrNone(w.fairnessID), fairnessOrNone(w.wireID),
-		w.since.UTC().Format(time.RFC3339Nano)), now)
+		w.since.UTC().Format(time.RFC3339Nano))+extra, now)
 	g.threads[w.id] = m
 	return true
 }

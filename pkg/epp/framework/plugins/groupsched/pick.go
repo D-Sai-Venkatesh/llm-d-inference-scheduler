@@ -339,6 +339,11 @@ func (s *Scheduler) nca2DispatchObs(g *engineGroup, h Head) nca2Obs {
 		threadID: h.Thread, wireID: h.WireID, clientRequestID: h.ClientReqID,
 		pushedOutBefore: s.nca2.pushed[h.Thread], homePod: s.nca2.homes[h.Thread],
 		room: s.nca2View(g).room(s.nca2.AdmitLineTokens)}
+	if s.nca2.door != nil {
+		// O7: a seated thread's later turn took no door decision
+		o.doorPath = doorPathSeated
+		o.sessionGroup, o.sessionHash = s.doorSessionLabels(h.Thread)
+	}
 	return o
 }
 
@@ -365,6 +370,7 @@ func (s *Scheduler) observablesFor(g *engineGroup, h Head, now time.Time) dispat
 			// an admission's warm prediction is the DECISION's (§7): it was read before L0 wrote the
 			// provisional entry, so the seat's own value wins here
 			obs.nca2.predictedWarm = seat.predictedWarm
+			obs.nca2.doorPath, obs.nca2.sessionGroup, obs.nca2.sessionHash = seat.doorPath, seat.sessionGroup, seat.sessionHash
 		}
 		m.seatObs = nil
 		s.metrics.ObserveQueueWait(queueWaitKind(h), nonNegative(obs.queueWait))

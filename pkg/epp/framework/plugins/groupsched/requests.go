@@ -75,6 +75,13 @@ type nca2Obs struct {
 	// valid reports that this turn is nca2's to describe (it was taken by a decision, or its thread
 	// is in nca2's state). OFF never sets it.
 	valid bool
+	// doorPath is the door's path for the turn (seated | returner | head_fit | head_collected |
+	// backfill), sessionGroup the session's group at the decision (A | B | C, none without the session
+	// layer) and sessionHash a 10-hex hash of the session id (session-layer O7). All three are empty
+	// when the door is off.
+	doorPath     string
+	sessionGroup string
+	sessionHash  string
 }
 
 // release opens one request's record: the thread that dispatched it, the chains it was charged

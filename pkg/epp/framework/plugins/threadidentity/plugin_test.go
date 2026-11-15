@@ -35,6 +35,7 @@ import (
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/requestheader/agentidentity"
+	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 	testutils "github.com/llm-d/llm-d-router/test/utils"
 )
 
@@ -153,4 +154,21 @@ func TestLifecycle_ContinuationIsTheSameID(t *testing.T) {
 	id2, flow2 := threadOf(t, p, second)
 	assert.Equal(t, id1, id2, "an appended turn continues the thread")
 	assert.Equal(t, id1, flow2)
+}
+
+// TestRequestHeader_SessionHeaderDoesNotChangeTheFlowKey: the group scheduler's session layer reads its
+// own session header for ORDER only (session-layer S2b/I13). The flow-control queue key stays the derived
+// THREAD: a request carrying the session header gets exactly the flow key, and no fairness header, it gets
+// without it.
+func TestRequestHeader_SessionHeaderDoesNotChangeTheFlowKey(t *testing.T) {
+	plain := chatReq(user('s', 600))
+	_, plainKey := threadOf(t, newTestPlugin(t), plain)
+	tagged := chatReq(user('s', 600))
+	tagged.Headers["x-llm-d-session-id"] = "root-1"
+	_, taggedKey := threadOf(t, newTestPlugin(t), tagged)
+	require.NotEmpty(t, plainKey)
+	assert.Equal(t, plainKey, taggedKey, "the session header must not change the flow key")
+	assert.Empty(t, tagged.FairnessID, "the session header is not a fairness id")
+	_, fairness := metadata.GetLowerCaseHeaderValue(tagged.Headers, metadata.FlowFairnessIDKey)
+	assert.False(t, fairness, "the director's fairness header is absent: the thread stays the queue key")
 }

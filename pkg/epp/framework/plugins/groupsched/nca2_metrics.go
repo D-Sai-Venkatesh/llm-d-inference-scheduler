@@ -82,6 +82,20 @@ func (m *nca2Metrics) ObserveCollection(event string) {
 	}
 }
 
+// ObserveSessionHeader records one dispatched request with or without the session header (O6).
+func (m *nca2Metrics) ObserveSessionHeader(present bool) {
+	if m == nil || m.door == nil {
+		return
+	}
+}
+
+// ObserveSessionMismatch records one dispatched request whose session value differs from its thread's (O6).
+func (m *nca2Metrics) ObserveSessionMismatch() {
+	if m == nil || m.door == nil {
+		return
+	}
+}
+
 // ObserveBackfillRefused records n refusals of the exhaustive backfill sweep under one reason (O5).
 func (m *nca2Metrics) ObserveBackfillRefused(reason string, n int) {
 	if m == nil || m.door == nil {

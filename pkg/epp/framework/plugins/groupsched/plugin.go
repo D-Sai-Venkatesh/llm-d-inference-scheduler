@@ -111,6 +111,10 @@ type GroupScheduler struct {
 	// decision trace does not depend on wall time.
 	now func() time.Time
 
+	// sessionHeader is the session layer's header (session-layer S3), "" unless it runs: Pick reads it
+	// per head. Set once at construction.
+	sessionHeader string
+
 	// ---- capacity ----
 	// endpoints is the set of KNOWN endpoints (the capacity_missing gauge reports them). Capacity is
 	// learned from the candidates Saturation is handed, at the moment it is handed them.
@@ -175,6 +179,9 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		// checks cannot run at Factory time — RegisterDependencies runs after ALL plugins are
 		// constructed and added.
 		handle: handle,
+	}
+	if n2 := sched.nca2; n2 != nil && n2.door != nil && n2.door.sessionAware {
+		r.sessionHeader = n2.door.header
 	}
 	r.metrics = newPluginMetrics(r)
 	// The decoded config is echoed at the DEFAULT level, always: a run's configuration must be

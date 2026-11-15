@@ -60,6 +60,9 @@ type Head struct {
 	// Returner reports whether this request is NOT its thread's first turn — the fairness class,
 	// from thread identity's arrival record.
 	Returner bool
+	// Session is the value of the configured session header (session-layer S3; "" when the session
+	// layer is off or the request carries none). It orders the door and the seats, never the queue key.
+	Session string
 }
 
 // ---- per-thread scheduling state ----

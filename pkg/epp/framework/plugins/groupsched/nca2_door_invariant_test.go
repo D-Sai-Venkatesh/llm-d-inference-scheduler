@@ -189,6 +189,11 @@ func (p *doorProbe) stage(st doorStage) {
 		p.exitsBF = exitTotal(s)
 	case doorStageEnd:
 		exits := exitTotal(s)
+		// I8: a new session's head releases no seat on its pod while a returner of that pod waits
+		if d.sessionAware && st.path != doorPathReturner && d.collectPod != "" && s.waiters[d.headID] != nil &&
+			s.doorClassOf(d.headID) == 2 && s.doorReturnerWaitingOn(s.groups[d.collectPod]) && exits != p.exitsStart {
+			p.fail("I8: the new-session head %s released %d seats while a returner of %s waits", d.headID, exits-p.exitsStart, d.collectPod)
+		}
 		// I6: a head that fit some pod now released nothing in its decision
 		if p.fitAtStart && exits != p.exitsStart {
 			p.fail("I6: the head fit a pod now and %d seats were released", exits-p.exitsStart)
@@ -212,6 +217,14 @@ func (p *doorProbe) stage(st doorStage) {
 // prompts, pauses past idleSeconds, one served head per pass.
 func doorLoop(t *testing.T, seed, tier int64, passes int, tune func(*Config)) (*Scheduler, *doorProbe, int) {
 	t.Helper()
+	return doorLoopTraced(t, seed, tier, passes, tune, false, nil)
+}
+
+// doorLoopTraced is doorLoop that also records the decision stream (served index, SEAT/EXIT/COLLECT
+// events, each pod's held blocks, the head) when out is not nil.
+// With sessions, thread i belongs to session S(i/4) (a root and three sub-agents).
+func doorLoopTraced(t *testing.T, seed, tier int64, passes int, tune func(*Config), sessions bool, out *[]string) (*Scheduler, *doorProbe, int) {
+	t.Helper()
 	s := newNCA2Tuned(t, func(c *Config) {
 		on := true
 		c.DoorBackfill = &on
@@ -222,8 +235,14 @@ func doorLoop(t *testing.T, seed, tier int64, passes int, tune func(*Config)) (*
 		}
 	}, []string{"p0", "p1", "p2"})
 	probe := newDoorProbe(s)
+	if out != nil {
+		s.onEvent = func(ev Event) {
+			*out = append(*out, fmt.Sprintf("ev %s %s %s %s", ev.Kind, ev.ID, ev.Engine, ev.Detail))
+		}
+	}
 	rng := rand.New(rand.NewSource(seed))
 	threads := make([]*identityThread, 0, 36)
+	sessionOf := map[string]string{}
 	for i := 0; i < 36; i++ {
 		th := &identityThread{id: fmt.Sprintf("t%02d", i), blocks: 5 + rng.Intn(40), grow: rng.Intn(8),
 			turns: 3 + rng.Intn(4), gap: rng.Intn(3)}
@@ -231,6 +250,9 @@ func doorLoop(t *testing.T, seed, tier int64, passes int, tune func(*Config)) (*
 			th.blocks = 300 + rng.Intn(250)
 		}
 		threads = append(threads, th)
+		if sessions {
+			sessionOf[th.id] = fmt.Sprintf("S%d", i/4)
+		}
 	}
 	now := epoch
 	seq := 0
@@ -260,13 +282,21 @@ func doorLoop(t *testing.T, seed, tier int64, passes int, tune func(*Config)) (*
 				th.arrival = now
 				th.waiting = true
 			}
-			heads = append(heads, Head{Thread: th.id, ReqID: th.req, Arrival: th.arrival, Chains: chain(th.id, th.blocks)})
+			heads = append(heads, Head{Thread: th.id, ReqID: th.req, Arrival: th.arrival, Chains: chain(th.id, th.blocks),
+				Session: sessionOf[th.id]})
 		}
 		if alive == 0 {
 			return s, probe, pass
 		}
 		served := s.Pass(heads, now)
 		s.mu.Lock()
+		if out != nil {
+			line := fmt.Sprintf("pass %d served=%d head=%s collect=%s", pass, served, s.nca2.door.headID, s.nca2.door.collectPod)
+			for _, g := range s.activeGroups() {
+				line += fmt.Sprintf(" %s=%d", g.id, g.nca2.reservedBlocks)
+			}
+			*out = append(*out, line)
+		}
 		if msg := checkHolding(s); msg != "" {
 			probe.fail("pass %d: %s", pass, msg)
 		}
@@ -311,23 +341,32 @@ func doorLoop(t *testing.T, seed, tier int64, passes int, tune func(*Config)) (*
 }
 
 // TestTDR6_DoorInvariantsUnderInterleavings: T-DR6 — random interleavings over several seeds and two CPU
-// tiers: no invariant breaks, the loop's own coverage includes collections, takeovers-free head changes
+// tiers, Part A and Part B (I8 too): no invariant breaks, the loop's own coverage includes collections, takeovers-free head changes
 // and backfills, and every session finishes (liveness).
 func TestTDR6_DoorInvariantsUnderInterleavings(t *testing.T) {
 	collected, backfills, decisions, takeovers := 0, 0, 0, 0
 	for _, seed := range []int64{1, 7, 99, 4242, 20261115} {
 		for _, tier := range []int64{56_000, 72_000} {
-			_, probe, took := doorLoop(t, seed, tier, 3000, nil)
-			if len(probe.violations) > 0 {
-				t.Fatalf("seed %d tier %d: %v", seed, tier, probe.violations)
+			for _, sessions := range []bool{false, true} {
+				tune := func(c *Config) {}
+				if sessions {
+					tune = func(c *Config) {
+						on, header := true, "x-llm-d-session-id"
+						c.SessionAware, c.SessionHeader = &on, &header
+					}
+				}
+				_, probe, took := doorLoopTraced(t, seed, tier, 3000, tune, sessions, nil)
+				if len(probe.violations) > 0 {
+					t.Fatalf("seed %d tier %d sessions %v: %v", seed, tier, sessions, probe.violations)
+				}
+				if took >= 3000 {
+					t.Fatalf("seed %d tier %d sessions %v: liveness: sessions still unfinished after %d passes", seed, tier, sessions, took)
+				}
+				collected += probe.collected
+				backfills += probe.backfills
+				decisions += probe.decisions
+				takeovers += probe.takeovers
 			}
-			if took >= 3000 {
-				t.Fatalf("seed %d tier %d: liveness: sessions still unfinished after %d passes", seed, tier, took)
-			}
-			collected += probe.collected
-			backfills += probe.backfills
-			decisions += probe.decisions
-			takeovers += probe.takeovers
 		}
 	}
 	t.Logf("%d decisions: %d heads admitted after collecting, %d backfills, %d takeovers that kept the blocks",

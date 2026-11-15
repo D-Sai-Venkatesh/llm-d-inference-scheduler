@@ -62,7 +62,7 @@ func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccess
 			return true
 		}
 		thread := ""
-		reqID, fid, wire, clientReq := "", "", "", ""
+		reqID, fid, wire, clientReq, session := "", "", "", "", ""
 		returner := false
 		var chains []Chain
 		if req := h.OriginalRequest(); req != nil {
@@ -74,12 +74,13 @@ func (r *GroupScheduler) Pick(ctx context.Context, band fwkfc.PriorityBandAccess
 				clientReq = clientRequestID(ir) // the client's x-request-id (nca2's span join)
 				returner = isReturner(ir)
 				chains = chargeChains(ir)
+				session = sessionOfRequest(ir, r.sessionHeader) // S3: "" unless the session layer runs
 			}
 		}
 		queues = append(queues, q)
 		heads = append(heads, Head{Thread: thread, Returner: returner,
 			FairnessID: fid, WireID: wire, ClientReqID: clientReq, ReqID: reqID,
-			Arrival: h.EnqueueTime(), Chains: chains,
+			Arrival: h.EnqueueTime(), Chains: chains, Session: session,
 		})
 		return true
 	})

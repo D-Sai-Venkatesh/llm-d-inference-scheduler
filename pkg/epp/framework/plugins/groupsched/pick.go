@@ -86,6 +86,8 @@ func (s *Scheduler) syncQueue(heads []Head, now time.Time) {
 			continue
 		}
 		present[h.Thread] = h.Arrival
+		// S4: the thread's session, recorded before the door ranks it (a no-op unless the session layer runs)
+		s.sessionNote(h.Thread, h.Session)
 		if g := s.groupOf(h.Thread); g != nil {
 			if m, seated := g.threads[h.Thread]; seated {
 				if h.FairnessID != "" && m.fairnessID != h.FairnessID {
@@ -207,6 +209,7 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		// The request is RELEASED: it is neither queued nor in flight until PreRequest records it,
 		// and the record written here is what every later hook resolves it by.
 		s.release(m, winner.c.h.ReqID, winner.c.h.Chains, now, obs)
+		s.sessionObserveDispatch(winner.c.h) // S7/O6: once per dispatched request
 		m.lastActivity = now
 		g.counters.served++
 		s.counters.served++

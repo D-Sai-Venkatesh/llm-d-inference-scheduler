@@ -299,3 +299,81 @@ func TestO_AScrapeChangesNothing(t *testing.T) {
 	}
 	require.Equal(t, run(false), run(true))
 }
+
+// TestO_ReclaimSeriesOnlyWithItsSwitch (LOGIC Amendment 2): backfill_reclaimed_seats_total and O1's
+// backfill_reclaim path exist only with backfillReclaim; O2's released_returner only with sessionAware.
+func TestO_ReclaimSeriesOnlyWithItsSwitch(t *testing.T) {
+	build := func(t *testing.T, params string) map[string]float64 {
+		handle := testutils.NewTestHandle(t.Context())
+		built, err := Factory("group", json.NewDecoder(strings.NewReader(params)), handle)
+		require.NoError(t, err)
+		require.NoError(t, built.(*GroupScheduler).sched.SetNumBlocksFor("p0", 64, 1000))
+		return metricValues(t, handle.Metrics().(prometheus.Gatherer))
+	}
+	reclaimSeries := "llm_d_epp_nca2_backfill_reclaimed_seats_total{pod=p0}"
+	reclaimPath := "llm_d_epp_nca2_door_admissions_total{class=newcomer,path=backfill_reclaim}"
+	yield := "llm_d_epp_nca2_collections_total{event=released_returner}"
+	a := build(t, `{"mode":"nca2","doorBackfill":true}`)
+	for _, key := range []string{reclaimSeries, reclaimPath, yield} {
+		if _, ok := a[key]; ok {
+			t.Fatalf("Part A without backfillReclaim must not carry %s", key)
+		}
+	}
+	r := build(t, `{"mode":"nca2","doorBackfill":true,"backfillReclaim":true}`)
+	for _, key := range []string{reclaimSeries, reclaimPath} {
+		if v, ok := r[key]; !ok || v != 0 {
+			t.Fatalf("backfillReclaim pre-instantiates %s at zero (present %v, %v)", key, ok, v)
+		}
+	}
+	b := build(t, `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"x-llm-d-session-id"}`)
+	if v, ok := b[yield]; !ok || v != 0 {
+		t.Fatalf("sessionAware pre-instantiates %s at zero (present %v)", yield, ok)
+	}
+}
+
+// TestO_ReclaimCountersEventAndSpan: on T-R1 the reclaim moves O1 (path backfill_reclaim) and the
+// reclaimed-seats counter, the SEAT event names the path (O8), and the span carries it (O7, production
+// path: Pass, AtPod, annotateSpan).
+func TestO_ReclaimCountersEventAndSpan(t *testing.T) {
+	f, heads := rA1Fixture(t, true)
+	reg := withDoorMetrics(t, f)
+	var seats []string
+	f.s.onEvent = func(ev Event) {
+		if ev.Kind == "SEAT" {
+			seats = append(seats, ev.ID+" "+ev.Detail)
+		}
+	}
+	recorder := tracetestRecorder(t)
+	ctx, span := tracerStart(t, "request_orchestration")
+	if i := f.pass(heads...); i != 1 {
+		t.Fatalf("fixture: s is served, got %d", i)
+	}
+	annotateSpan(ctx, "p1", f.s.AtPod(heads[1].ReqID, "p1", f.now))
+	span.End()
+	v := metricValues(t, reg)
+	if v["llm_d_epp_nca2_door_admissions_total{class=newcomer,path=backfill_reclaim}"] != 1 ||
+		v["llm_d_epp_nca2_backfill_reclaimed_seats_total{pod=p1}"] != 1 {
+		t.Fatalf("O1 and the reclaimed-seats counter: %v", v)
+	}
+	if !strings.Contains(strings.Join(seats, "\n"), "s kind=newcomer") || !strings.Contains(strings.Join(seats, "\n"), "path=backfill_reclaim") {
+		t.Fatalf("O8: %v", seats)
+	}
+	got := map[string]string{}
+	for _, kv := range recorder.Ended()[0].Attributes() {
+		got[string(kv.Key)] = kv.Value.String()
+	}
+	if got[spanNCA2DoorPath] != doorPathBackfillReclaim {
+		t.Fatalf("O7: %v", got)
+	}
+}
+
+// TestO2_ReleasedReturnerCounted: H10b's yield is O2's released_returner.
+func TestO2_ReleasedReturnerCounted(t *testing.T) {
+	f, n, _ := h10bFixture(t, true)
+	reg := withDoorMetrics(t, f)
+	f.returnerOn("p0", "ret")
+	f.pass(n, f.heavyAt("ret", 600, 320, f.now.Add(-time.Minute)))
+	if v := metricValues(t, reg); v["llm_d_epp_nca2_collections_total{event=released_returner}"] != 1 {
+		t.Fatalf("O2: %v", v)
+	}
+}

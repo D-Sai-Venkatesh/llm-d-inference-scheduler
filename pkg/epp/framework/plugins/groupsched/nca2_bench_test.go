@@ -22,6 +22,7 @@ package groupsched
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -308,7 +309,7 @@ func BenchmarkBASEPass(b *testing.B) {
 // 80 returners waiting — and 500 outsiders (one in ten a pushed-out PRIORITY thread, one in twenty a big
 // prompt). The pass is the steady state the door lives in: the head fits nowhere and collects nothing,
 // and the backfill sweep has to ask every outsider on every pod and admits nobody.
-func benchDoor(b *testing.B, door, sessions bool) (*Scheduler, []Head) {
+func benchDoor(b *testing.B, door, sessions, reclaim bool) (*Scheduler, []Head) {
 	b.Helper()
 	s := newNCA2Tuned(b, func(c *Config) {
 		c.CPUTierTokens = i64(defaultCPUTierTokens)
@@ -320,6 +321,10 @@ func benchDoor(b *testing.B, door, sessions bool) (*Scheduler, []Head) {
 		if sessions {
 			on, header := true, "x-llm-d-session-id"
 			c.SessionAware, c.SessionHeader = &on, &header
+		}
+		if reclaim {
+			on := true
+			c.BackfillReclaim = &on
 		}
 	}, nil)
 	pods := []string{"p0", "p1", "p2"}
@@ -383,13 +388,28 @@ func benchDoor(b *testing.B, door, sessions bool) (*Scheduler, []Head) {
 }
 
 // benchDoorPass times one pass of B1's state.
-func benchDoorPass(b *testing.B, door, sessions bool) {
+func benchDoorPass(b *testing.B, door, sessions, reclaim bool) {
+	benchDoorPassOf(b, door, sessions, reclaim, false)
+}
+
+// benchDoorPassOf times one pass of B1's state; without returners, the timed pass no longer offers the
+// returners' heads, so no pod has one waiting and BF4 asks every refused candidate on every pod.
+func benchDoorPassOf(b *testing.B, door, sessions, reclaim, noReturners bool) {
 	b.ReportAllocs()
 	var total time.Duration
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		s, heads := benchDoor(b, door, sessions)
+		s, heads := benchDoor(b, door, sessions, reclaim)
+		if noReturners {
+			kept := heads[:0]
+			for _, h := range heads {
+				if !strings.Contains(h.Thread, "-ret") {
+					kept = append(kept, h)
+				}
+			}
+			heads = kept
+		}
 		b.StartTimer()
 		start := time.Now()
 		s.Pass(heads, epoch.Add(time.Second))
@@ -399,10 +419,24 @@ func benchDoorPass(b *testing.B, door, sessions bool) {
 }
 
 // BenchmarkDoorPassOff is B1's reference: the same state through v2's decision (both switches off).
-func BenchmarkDoorPassOff(b *testing.B) { benchDoorPass(b, false, false) }
+func BenchmarkDoorPassOff(b *testing.B) { benchDoorPass(b, false, false, false) }
 
 // BenchmarkDoorPassOn is B1 with doorBackfill on (acceptance: at most 3x the reference).
-func BenchmarkDoorPassOn(b *testing.B) { benchDoorPass(b, true, false) }
+func BenchmarkDoorPassOn(b *testing.B) { benchDoorPass(b, true, false, false) }
 
 // BenchmarkDoorPassSessions is B1 with the session layer on as well.
-func BenchmarkDoorPassSessions(b *testing.B) { benchDoorPass(b, true, true) }
+func BenchmarkDoorPassSessions(b *testing.B) { benchDoorPass(b, true, true, false) }
+
+// BenchmarkDoorPassReclaim is B1 with backfillReclaim on (LOGIC Amendment 2): every candidate BF1 refuses
+// is asked BF4 on every pod as well.
+func BenchmarkDoorPassReclaim(b *testing.B) { benchDoorPass(b, true, false, true) }
+
+// BenchmarkDoorPassSessionsReclaim is B1 with the session layer and backfillReclaim on.
+func BenchmarkDoorPassSessionsReclaim(b *testing.B) { benchDoorPass(b, true, true, true) }
+
+// BenchmarkDoorPassOffNoReturners is the reference for the BF4 worst case: B1 with no returner waiting.
+func BenchmarkDoorPassOffNoReturners(b *testing.B) { benchDoorPassOf(b, false, false, false, true) }
+
+// BenchmarkDoorPassReclaimNoReturners is BF4's worst case: no pod has a returner waiting, so every
+// candidate BF1 refuses is fitted against every pod's reclaimable seats (and none fits).
+func BenchmarkDoorPassReclaimNoReturners(b *testing.B) { benchDoorPassOf(b, true, false, true, true) }

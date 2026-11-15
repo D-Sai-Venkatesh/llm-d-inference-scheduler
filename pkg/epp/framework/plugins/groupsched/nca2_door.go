@@ -66,6 +66,10 @@ type nca2Door struct {
 	podBuf []podState
 	// refused is the last exhaustive backfill sweep's refusals by reason (O5), flushed once per pass.
 	refused [backfillRefusalReasons]int
+	// reclaimable is BF4's per-sweep memo of each pod's eligible-seat blocks (ncaV2ReclaimableBlocks):
+	// cleared at the start of every sweep and after every reclaim, the only seat change inside a sweep
+	// that does not end it.
+	reclaimable map[string]int64
 
 	// sessions is Part B's state (nil in Part A).
 	sessions *nca2Sessions
@@ -624,6 +628,7 @@ func (s *Scheduler) doorBackfill(base []podState, head *waiter, memo map[fitKey]
 		}
 	}
 	d.refused = [backfillRefusalReasons]int{}
+	d.clearReclaimable()
 	for i := range d.rank {
 		w := d.rank[i].w
 		if (head != nil && w.id == head.id) || !s.doorIsOutsider(w.id) {
@@ -668,6 +673,7 @@ func (s *Scheduler) doorBackfillReclaim(pods []podState, w *waiter, f int64, mem
 		}
 		seats := len(p.g.threads)
 		fits := s.ncaV2Reclaim(p.g, w, now, memo)
+		s.nca2.door.clearReclaimable()
 		if released := seats - len(p.g.threads); released > 0 {
 			s.nca2m.ObserveBackfillReclaimedSeats(engineLabel(p.g.id), released)
 		}
@@ -682,8 +688,10 @@ func (s *Scheduler) doorBackfillReclaim(pods []podState, w *waiter, f int64, mem
 // (a) the pod is not the collection pod (budget freed there is the head's), (b) no returner of the pod
 // waits (the pass's returner list, as H10 reads it: inside threads first), the CPU room, and (c) v2's
 // ncaV2Fits — the valve, then the cost inside the free budget plus what the pod's eligible seats would
-// return. A pod with no seat has nothing to reclaim: BF1 already asked its free budget, and Rule O
-// stays the head's (U4).
+// return. The CPU room is BF1's C (BF4 is BF1's three checks with the reclaimable budget added). A pod
+// with no seat has nothing to reclaim: BF1 already asked its free budget, and Rule O stays the head's
+// (U4). Before the exact fit, BF2's sound lower bound against the free budget plus the reclaimable
+// blocks skips a candidate no reclaim could seat without walking its keys.
 func (s *Scheduler) doorReclaimFits(p *podState, w *waiter, f int64, memo map[fitKey]fitFacts, now time.Time) bool {
 	g := p.g
 	if g.numBlocks <= 0 || g.nca2 == nil || g.id == s.nca2.door.collectPod || f > p.room || len(g.threads) == 0 {
@@ -692,8 +700,28 @@ func (s *Scheduler) doorReclaimFits(p *podState, w *waiter, f int64, memo map[fi
 	if s.doorReturnerWaitingOn(g) {
 		return false
 	}
+	if s.doorCostLowerBound(g, w) > s.ncaV2FreeFor(g, w)+s.doorReclaimableOn(g, now) {
+		return false
+	}
 	return s.ncaV2Fits(g, w, now, memo)
 }
+
+// doorReclaimableOn is ncaV2ReclaimableBlocks through the sweep's memo.
+func (s *Scheduler) doorReclaimableOn(g *engineGroup, now time.Time) int64 {
+	d := s.nca2.door
+	if d.reclaimable == nil {
+		d.reclaimable = map[string]int64{}
+	}
+	if v, ok := d.reclaimable[g.id]; ok {
+		return v
+	}
+	v := s.ncaV2ReclaimableBlocks(g, now)
+	d.reclaimable[g.id] = v
+	return v
+}
+
+// clearReclaimable drops the sweep's reclaimable memo (a seat changed, or a new sweep starts).
+func (d *nca2Door) clearReclaimable() { clear(d.reclaimable) }
 
 // doorBackfillFits is BF1's three checks for one candidate on one pod, cheapest first, with the reason a
 // refusal is booked under (O5). The exact cost is re-read before the grant: the pass memo may predate
@@ -751,6 +779,7 @@ func (s *Scheduler) doorBackfillsAnywhere(base []podState, x, head *waiter, memo
 		}
 	}
 	if d.backfillReclaim {
+		d.clearReclaimable()
 		for i := range base {
 			if s.doorReclaimFits(&base[i], x, f, memo, now) {
 				return true

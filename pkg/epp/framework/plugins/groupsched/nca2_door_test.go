@@ -304,15 +304,17 @@ func TestH1_HeadGoneReleasesTheCollection(t *testing.T) {
 	if f.held("p0") == 0 {
 		t.Fatal("fixture: the head is collecting on p0")
 	}
-	// N is cancelled: its head is no longer offered; a newcomer M (too big to backfill) waits
+	// N is cancelled: its head is no longer offered; a newcomer M whose prompt fits no pod's room waits
+	// (it cannot collect, so whatever is still held after this pass is N's)
 	rest := heads()[1:]
-	f.pass(append(rest, f.heavyAt("M", 940, 320, f.now))...)
-	head, _ := f.doorHead()
-	if head != "M" {
-		t.Fatalf("H1: the next outsider is the head, got %q", head)
+	f.pass(append(rest, f.heavyAt("M", 10, 2_000_000, f.now))...)
+	head, pod := f.doorHead()
+	if head != "M" || pod != "" {
+		t.Fatalf("H1: the next outsider is the head and it collects nowhere, got %q on %q", head, pod)
 	}
-	if f.reservedHead("p0") == "N" {
-		t.Fatal("I11: nothing is held for a head that is gone")
+	if f.held("p0") != 0 || f.held("p1") != 0 || f.reservedHead("p0") != "" {
+		t.Fatalf("H1/I11: nothing is held for a head that is gone (p0 %d for %q, p1 %d)",
+			f.held("p0"), f.reservedHead("p0"), f.held("p1"))
 	}
 }
 

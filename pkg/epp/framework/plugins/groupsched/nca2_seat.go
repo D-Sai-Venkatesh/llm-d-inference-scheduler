@@ -300,7 +300,7 @@ func (s *Scheduler) ncaV2Cold(g *engineGroup, w *waiter, memo map[fitKey]fitFact
 		f = fitFacts{}
 	}
 	if !f.coldKnown {
-		f.cold, f.coldKnown = g.index.ColdTokens(w.chains), true
+		f.cold, f.coldKnown = s.valveCold(g, w), true
 		memo[key] = f
 	}
 	return f
@@ -430,7 +430,7 @@ func (s *Scheduler) nca2SeatReturnerPath(g *engineGroup, w *waiter, room int64, 
 // charge, SEAT event and entry histogram a shipped seat takes) and stamps the turn's nca2 class, path
 // and the room it was decided on, for the span PreRequest sets.
 func (s *Scheduler) ncaV2Seat(g *engineGroup, w *waiter, class, path, doorPath string, room int64, warm bool, now time.Time) bool {
-	tokens := g.index.ColdTokens(w.chains)
+	tokens, gpuCold := s.valveColdParts(g, w)
 	extra := ""
 	if doorPath != "" {
 		extra = " path=" + doorPath // O8: the SEAT event names the door path (door mode only)
@@ -438,6 +438,9 @@ func (s *Scheduler) ncaV2Seat(g *engineGroup, w *waiter, class, path, doorPath s
 	sessionGroup, sessionHash := s.doorSessionLabels(w.id)
 	if !s.seatDetail(g, w, tokens, now, extra) {
 		return false
+	}
+	if excused := gpuCold - tokens; excused > 0 {
+		s.nca2m.ObserveValveCPUWarm(engineLabel(g.id), excused) // O10
 	}
 	if m := g.threads[w.id]; m != nil {
 		m.nca2Class, m.nca2Room = class, room

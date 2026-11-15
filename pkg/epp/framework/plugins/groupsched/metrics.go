@@ -76,6 +76,9 @@ func newPluginMetrics(r *GroupScheduler) *groupMetrics {
 		if door := r.sched.nca2.door; door != nil {
 			gm.nca2.door = newDoorMetrics(door.sessionAware, door.backfillReclaim) // session-layer O1-O6, only with the switch on
 		}
+		if r.sched.nca2.valveCPUWarm {
+			gm.nca2.cpuWarm = newCPUWarmCounter() // O10, only with the switch on
+		}
 		gm.nca2Gauges = newNCA2Gauges(r)
 		// the scheduler's own observer: nil-safe, and non-nil exactly when nca2 runs
 		r.sched.nca2m = gm.nca2

@@ -392,6 +392,12 @@ func (s *Scheduler) doorReleaseAll(event string, now time.Time) {
 	d.collectPod = ""
 }
 
+// doorHeadColdNeed is the head cold need on its collection pod: the valve headroom the head needs there,
+// min(valveCold, cap).
+func (s *Scheduler) doorHeadColdNeed(g *engineGroup, head *waiter) int64 {
+	return min(s.valveCold(g, head), g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize))
+}
+
 // ---- H4: the head fits now ----
 
 // doorHeadFitNow is H4: the head is admitted on the first pod of its order that takes it NOW — the
@@ -418,7 +424,7 @@ func (s *Scheduler) doorHeadFitsPod(p *podState, head *waiter, f int64) bool {
 	if g.numBlocks <= 0 || f > p.room {
 		return false
 	}
-	if !s.coldAllowsTokens(g, g.index.ColdTokens(head.chains)) {
+	if !s.coldAllowsTokens(g, s.valveCold(g, head)) {
 		return false
 	}
 	cost := int64(g.index.Cost(head.chains))
@@ -436,7 +442,7 @@ func (s *Scheduler) doorChoosePod(pods []podState, head *waiter) *podState {
 		if p.g.numBlocks <= 0 || p.g.nca2 == nil || f > p.room {
 			continue
 		}
-		if !s.coldAllowsTokens(p.g, p.g.index.ColdTokens(head.chains)) {
+		if !s.coldAllowsTokens(p.g, s.valveCold(p.g, head)) {
 			continue
 		}
 		return p
@@ -486,7 +492,7 @@ func (s *Scheduler) doorCollectionPod(pods []podState, head *waiter, now time.Ti
 // backfill that surplus is always taken. A valve refusal holds nothing new (Q1).
 func (s *Scheduler) doorCollect(p *podState, head *waiter, now time.Time) bool {
 	g := p.g
-	if !s.coldAllowsTokens(g, g.index.ColdTokens(head.chains)) {
+	if !s.coldAllowsTokens(g, s.valveCold(g, head)) {
 		return false
 	}
 	budget := int64(g.budgetBlocks)
@@ -629,7 +635,7 @@ func (s *Scheduler) doorBackfill(base []podState, head *waiter, memo map[fitKey]
 	if head != nil && d.collectPod != "" {
 		if g := s.groups[d.collectPod]; g != nil {
 			collect = g
-			headNeed = min(g.index.ColdTokens(head.chains), g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize))
+			headNeed = s.doorHeadColdNeed(g, head)
 		}
 	}
 	d.refused = [backfillRefusalReasons]int{}
@@ -752,7 +758,7 @@ func (s *Scheduler) doorBackfillFits(p *podState, w *waiter, f int64, collect *e
 			return refusedValveHeadHeadroom, false
 		}
 	}
-	exact := fitFacts{cost: int64(g.index.Cost(w.chains)), cold: g.index.ColdTokens(w.chains), costKnown: true, coldKnown: true}
+	exact := fitFacts{cost: int64(g.index.Cost(w.chains)), cold: s.valveCold(g, w), costKnown: true, coldKnown: true}
 	memo[fitKey{pod: g.id, thread: w.id}] = exact
 	if exact.cost > free {
 		return refusedGPU, false
@@ -774,7 +780,7 @@ func (s *Scheduler) doorBackfillsAnywhere(base []podState, x, head *waiter, memo
 	if head != nil && d.collectPod != "" {
 		if g := s.groups[d.collectPod]; g != nil {
 			collect = g
-			headNeed = min(g.index.ColdTokens(head.chains), g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize))
+			headNeed = s.doorHeadColdNeed(g, head)
 		}
 	}
 	f := s.nca2CandOf(x).tokens

@@ -57,6 +57,23 @@ type nca2Metrics struct {
 	// door is the door fix's and the session layer's surface (session-layer O1-O6): nil unless
 	// doorBackfill is on, so v2's surface gains nothing.
 	door *doorMetrics
+	// cpuWarm is O10 (LOGIC Amendment 3): the cold tokens the CPU warmth excused at each seat charge, per
+	// pod. Nil unless valveCPUWarm is on.
+	cpuWarm *prometheus.CounterVec
+}
+
+// newCPUWarmCounter declares O10's counter.
+func newCPUWarmCounter() *prometheus.CounterVec {
+	return prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "valve_cpu_warm_tokens_total",
+		Help: "valveCPUWarm: the tokens a returner's CPU-line entry excused from the cold valve at each seat on this pod (its GPU-cold tokens minus the cold tokens it was charged)"}, []string{"pod"})
+}
+
+// ObserveValveCPUWarm records the cold tokens the CPU warmth excused at one seat charge (O10).
+func (m *nca2Metrics) ObserveValveCPUWarm(pod string, tokens int64) {
+	if m == nil || m.cpuWarm == nil {
+		return
+	}
+	m.cpuWarm.WithLabelValues(pod).Add(float64(tokens))
 }
 
 // doorMetrics is the door's counters (session-layer O1, O2, O5) and the session layer's (O6, nil-valued
@@ -246,6 +263,9 @@ func (m *nca2Metrics) collectors() []prometheus.Collector {
 	if m.door != nil {
 		out = append(out, m.door.collectors()...)
 	}
+	if m.cpuWarm != nil {
+		out = append(out, m.cpuWarm)
+	}
 	return out
 }
 
@@ -268,6 +288,9 @@ func (m *nca2Metrics) preInstantiatePod(pod string) {
 	m.returnerSeats.WithLabelValues(pod).Add(0)
 	if m.door != nil && m.door.reclaimedSeats != nil {
 		m.door.reclaimedSeats.WithLabelValues(pod).Add(0)
+	}
+	if m.cpuWarm != nil {
+		m.cpuWarm.WithLabelValues(pod).Add(0)
 	}
 	m.activePushouts.WithLabelValues(pod).Add(0)
 	m.moves.WithLabelValues(pod).Add(0)

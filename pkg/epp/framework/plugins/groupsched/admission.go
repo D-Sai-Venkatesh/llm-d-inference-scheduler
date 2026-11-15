@@ -41,6 +41,43 @@ func (s *Scheduler) coldAllowsTokens(g *engineGroup, tokens int64) bool {
 	return g.coldInFlight+min(tokens, cap) <= cap
 }
 
+// valveCold is the cold valve's tokens for w on g: what the engine has to prefill. Without valveCPUWarm it
+// is the prompt beyond the GPU-resident prefix (ColdTokens). With it (LOGIC Amendment 3, V1) the tokens of
+// the thread's CPU-line entry on its home pod are warm too, exactly like the GPU-resident prefix: vLLM
+// loads them from the CPU tier instead of computing them. Every valve check and the seat's cold charge
+// read this; the GPU block costs and the cache predictions keep ColdTokens.
+func (s *Scheduler) valveCold(g *engineGroup, w *waiter) int64 {
+	cold, _ := s.valveColdParts(g, w)
+	return cold
+}
+
+// valveColdParts is valveCold and the GPU-cold tokens it was derived from.
+func (s *Scheduler) valveColdParts(g *engineGroup, w *waiter) (cold, gpuCold int64) {
+	gpuCold = g.index.ColdTokens(w.chains)
+	warm := s.cpuWarmTokens(g, w)
+	if warm <= 0 {
+		return gpuCold, gpuCold
+	}
+	// max(0, prompt - max(GPU-resident prefix, CPU-warm)), with the GPU-resident prefix = prompt - gpuCold
+	return max(0, min(gpuCold, PromptTokens(w.chains)-warm)), gpuCold
+}
+
+// cpuWarmTokens is V1's CPU-warm part: the tokens of w's CPU-line entry on g when w is admitted and g is
+// its home, capped at its prompt; 0 for every other thread (a newcomer, a pushed-out thread, a rewritten
+// context under a new thread id) and with valveCPUWarm off.
+func (s *Scheduler) cpuWarmTokens(g *engineGroup, w *waiter) int64 {
+	if s.nca2 == nil || !s.nca2.valveCPUWarm || g == nil || g.nca2 == nil || w == nil ||
+		!s.nca2.admitted[w.id] || s.nca2.homes[w.id] != g.id {
+		return 0
+	}
+	for _, e := range g.nca2.line {
+		if e.thread == w.id {
+			return min(e.tokens, PromptTokens(w.chains))
+		}
+	}
+	return 0
+}
+
 // seatChoice is placement's answer (chooseEngine) bound back to the engine it named.
 type seatChoice struct {
 	g *engineGroup
@@ -65,7 +102,7 @@ func (s *Scheduler) seatEngine(head *waiter, now time.Time) *seatChoice {
 		}
 		// the head's exact cost ON THIS ENGINE: what this engine would have to compute (its own
 		// resident prefix discounted) and the cold tokens behind it
-		tokens := g.index.ColdTokens(head.chains)
+		tokens := s.valveCold(g, head)
 		blocks := int64(g.index.Cost(head.chains))
 		free := s.freeBudget(g)
 		budget := int64(g.budgetBlocks)
@@ -100,7 +137,7 @@ func (s *Scheduler) coldValveHeldOn(head *waiter) (string, bool) {
 		if g.numBlocks <= 0 {
 			continue // no measured capacity: the engine is not taking seats at all
 		}
-		tokens := g.index.ColdTokens(head.chains)
+		tokens := s.valveCold(g, head)
 		if int64(g.index.Cost(head.chains)) > s.freeBudget(g) {
 			continue // the BUDGET is the blocker on this engine: the valve is not the reason
 		}

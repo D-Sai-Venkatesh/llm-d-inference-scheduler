@@ -231,82 +231,132 @@ func TestVT3_ColdInFlightIsChargedValveCold(t *testing.T) {
 	}
 }
 
-// TestVT2_OutsidersStayFullyCold: V1 — warmth counts only for an admitted thread on its home pod: a
-// newcomer, a rewritten context under a new thread id, a pushed-out thread with its old entry, and a
-// returner on a pod that is not its home are all as cold as the GPU says; and a pushed-out head the
-// GPU-only valve holds is still held with valveCPUWarm on.
-func TestVT2_OutsidersStayFullyCold(t *testing.T) {
+// TestVT2_NoEntryIsFullyCold: V1 (as corrected) - warmth is the thread's own entry on the pod's CPU line:
+// a newcomer, a rewritten context under a new thread id, and a thread on a pod that does not hold its
+// entry are as cold as the GPU says; an admitted returner and a pushed-out thread whose entry is still in
+// the line are warm on their pod.
+func TestVT2_NoEntryIsFullyCold(t *testing.T) {
 	f := valveFixture(t, false, true, "p0", "p1")
 	f.cpuWarmReturner("p0", "r", 5000)
 	f.pushedOutWithEntry("p0", "p", 5000)
 	h := f.warmHead("x")
 	f.s.mu.Lock()
+	defer f.s.mu.Unlock()
 	g0, g1 := f.s.groups["p0"], f.s.groups["p1"]
 	for _, c := range []struct {
 		name string
 		g    *engineGroup
 		w    *waiter
+		want int64
 	}{
-		{"newcomer", g0, &waiter{id: "n", chains: h.Chains}},
-		{"new-id rewrite of r", g0, &waiter{id: "r-rewritten", chains: h.Chains}},
-		{"pushed out", g0, &waiter{id: "p", chains: h.Chains}},
-		{"returner off its home", g1, &waiter{id: "r", chains: h.Chains}},
+		{"newcomer", g0, &waiter{id: "n", chains: h.Chains}, 5120},
+		{"new-id rewrite of r", g0, &waiter{id: "r-rewritten", chains: h.Chains}, 5120},
+		{"returner off its entry's pod", g1, &waiter{id: "r", chains: h.Chains}, 5120},
+		{"pushed out off its entry's pod", g1, &waiter{id: "p", chains: h.Chains}, 5120},
+		{"returner", g0, &waiter{id: "r", chains: h.Chains}, 120},
+		{"pushed out, entry in the line", g0, &waiter{id: "p", chains: h.Chains}, 120},
 	} {
-		if got, want := f.s.valveCold(c.g, c.w), c.g.index.ColdTokens(c.w.chains); got != want {
-			f.s.mu.Unlock()
-			t.Fatalf("%s: valveCold %d, want the GPU-cold %d", c.name, got, want)
+		if got := f.s.valveCold(c.g, c.w); got != c.want {
+			t.Fatalf("%s: valveCold %d, want %d (GPU-cold %d)", c.name, got, c.want, c.g.index.ColdTokens(c.w.chains))
 		}
-	}
-	if got := f.s.valveCold(g0, &waiter{id: "r", chains: h.Chains}); got != 120 {
-		f.s.mu.Unlock()
-		t.Fatalf("fixture: the returner on its home is warm: valveCold %d, want 120", got)
-	}
-	f.s.mu.Unlock()
-	f.running("p0", "hot", 100, 320)
-	f.coldCharge("p0", "hot", 3000)
-	f.running("p1", "hot1", 100, 320)
-	f.coldCharge("p1", "hot1", 3000)
-	if served := f.pass(f.warmHead("p")); served != -1 || f.admitted("p") {
-		t.Fatalf("the pushed-out head stays cold at the valve (served %d)", served)
 	}
 }
 
-// TestVT4_HeadHeadroomUsesValveCold: V1 on the head-headroom term — the door's head is an outsider, so
-// valveCold is its GPU-cold tokens: a pushed-out head whose old entry is on its collection pod still
-// needs its full headroom there, and a small cold outsider that would eat it backfills on the other pod.
-func TestVT4_HeadHeadroomUsesValveCold(t *testing.T) {
-	f := valveFixture(t, true, true, "p0", "p1")
+// pushedOutFixture is one pod with a 20000-token CPU tier and the admission line at 10000: a running seat
+// holds 3000 of the 3200-token cold cap (it is not on the line, so the room is the whole admission line),
+// and p was pushed out with its 1900-token entry at position 11700, past the admission line and inside
+// the tier. With trim, another thread's touch moves the entry past the tier and the trim drops it.
+func pushedOutFixture(t *testing.T, door, warm, trim bool) *fixture {
+	t.Helper()
+	tune := func(c *Config) {
+		c.CPUTierTokens, c.AdmitLine = i64(20_000), f64(0.5)
+		if warm {
+			on := true
+			c.ValveCPUWarm = &on
+		}
+	}
+	s := newNCA2Tuned(t, func(c *Config) {
+		if door {
+			on := true
+			c.DoorBackfill = &on
+		}
+		tune(c)
+	}, []string{"p0"})
+	f := &fixture{t: t, s: s, now: epoch}
+	f.running("p0", "hot", 100, 320)
+	f.coldCharge("p0", "hot", 3000)
 	f.s.mu.Lock()
+	defer f.s.mu.Unlock()
 	g := f.s.groups["p0"]
-	w := &waiter{id: "cold", since: f.now, chains: []Chain{{Keys: keys(400, seedFor("cold")), Tokens: 320}}}
-	f.s.seat(g, w, 2000, f.now)
-	f.s.nca2.homes["cold"], f.s.nca2.admitted["cold"], f.s.nca2.ever["cold"] = "p0", true, true
-	f.s.nca2LineSet(g, "cold", 320, f.now, pushoutRoom)
-	f.s.release(g.threads["cold"], "rq-cold", w.chains, f.now, dispatchObservables{})
-	f.s.mu.Unlock()
-	f.s.AtPod("rq-cold", "p0", f.now)
-	f.idleSeat("p0", "a1", 400)
-	for i := 0; i < 2; i++ {
-		f.running("p1", "b"+string(rune('0'+i)), 300, 320)
+	g.nca2.line = nca2DropEntry(g.nca2.line, "hot")
+	f.s.nca2.admitted["hot"] = false
+	f.s.nca2.homes["f1"], f.s.nca2.homes["p"] = "p0", "p0"
+	f.s.nca2.ever["p"], f.s.nca2.pushed["p"] = true, true
+	g.nca2.line = append(g.nca2.line, nca2Entry{thread: "f1", tokens: 9800}, nca2Entry{thread: "p", tokens: 1900})
+	if trim {
+		f.s.nca2.homes["o"] = "p0"
+		f.s.nca2LineSet(g, "o", 8500, f.now, pushoutTouch)
 	}
-	f.pushedOutWithEntry("p0", "N", 1000)
-	f.wait(10 * time.Second)
-	head := f.heavyAt("N", 900, 1000, f.now)
-	f.pass(head)
-	if h, pod := f.doorHead(); h != "N" || pod != "p0" {
-		t.Fatalf("fixture: the head N collects on p0, got %q on %q", h, pod)
+	if _, has := f.s.nca2PositionOn(g, "p"); has == trim {
+		t.Fatalf("fixture: p's entry on the line %v, want %v", has, !trim)
 	}
-	f.s.mu.Lock()
-	n := f.s.waiters["N"]
-	need := f.s.doorHeadColdNeed(f.s.groups["p0"], n)
-	want := min(f.s.groups["p0"].index.ColdTokens(n.chains), f.s.groups["p0"].coldCapTokens(f.s.cfg.GroupBudgetFraction, f.s.blockSize))
-	f.s.mu.Unlock()
-	if need != want || need != 1000 {
-		t.Fatalf("the head's headroom is min(valveCold, cap) = its GPU-cold %d, got %d", want, need)
+	return f
+}
+
+// TestVT5_PushedOutEntryInTheLineIsWarm: V1 (as corrected) - a pushed-out thread whose entry is still in
+// the line (past the admission line, inside the tier) is charged only its new tokens (2048 - 1900 = 148)
+// and re-admitted past a valve the GPU-cold tokens would not pass; its twin whose entry was trimmed past
+// the tier is fully cold and waits. v2 and the door; the off-switch waits too.
+func TestVT5_PushedOutEntryInTheLineIsWarm(t *testing.T) {
+	for _, door := range []bool{false, true} {
+		for _, c := range []struct{ warm, trim, admitted bool }{
+			{warm: true, trim: false, admitted: true},
+			{warm: true, trim: true, admitted: false},
+			{warm: false, trim: false, admitted: false},
+		} {
+			f := pushedOutFixture(t, door, c.warm, c.trim)
+			f.pass(f.heavyAt("p", 32, 2048, f.now.Add(-time.Minute)))
+			if f.admitted("p") != c.admitted {
+				t.Fatalf("door %v warm %v trim %v: p admitted %v, want %v", door, c.warm, c.trim, f.admitted("p"), c.admitted)
+			}
+			if !c.admitted {
+				continue
+			}
+			if pod, seat := f.coldOn("p0", "p"); seat != 148 || pod != 3148 {
+				t.Fatalf("door %v: p is charged its new tokens: seat %d (want 148), pod %d (want 3148)", door, seat, pod)
+			}
+		}
 	}
-	f.pass(head, f.heavyAt("s", 5, 300, f.now))
-	if f.homeOf("s") != "p1" {
-		t.Fatalf("the small cold outsider backfills on p1, got %q", f.homeOf("s"))
+}
+
+// TestVT4_HeadHeadroomUsesValveCold: V1 on the head-headroom term - the door's head is a pushed-out thread
+// whose entry (its whole 1000-token prompt) is still on its collection pod: with valveCPUWarm it needs no
+// valve headroom there, so a small cold outsider passes BF1's headroom check on that pod; the off-twin
+// keeps the 1000-token headroom and refuses it (valve_head_headroom).
+func TestVT4_HeadHeadroomUsesValveCold(t *testing.T) {
+	for _, warm := range []bool{false, true} {
+		f := valveFixture(t, true, warm, "p0")
+		f.running("p0", "hot", 100, 320)
+		f.coldCharge("p0", "hot", 2000)
+		f.pushedOutWithEntry("p0", "N", 1000)
+		head := f.heavyAt("N", 900, 1000, f.now)
+		small := f.heavyAt("s", 5, 300, f.now)
+		f.s.mu.Lock()
+		g := f.s.groups["p0"]
+		f.s.syncQueue([]Head{head, small}, f.now)
+		d := f.s.nca2.door
+		d.headID, d.collectPod = "N", "p0"
+		g.nca2.reservedHead = "N"
+		need := f.s.doorHeadColdNeed(g, f.s.waiters["N"])
+		p := podState{g: g, room: f.s.nca2View(g).room(f.s.nca2.AdmitLineTokens)}
+		reason, ok := f.s.doorBackfillFits(&p, f.s.waiters["s"], 300, g, need, map[fitKey]fitFacts{})
+		f.s.mu.Unlock()
+		if warm && (need != 0 || !ok) {
+			t.Fatalf("valveCPUWarm: the head needs no headroom (%d) and s passes BF1 on p0 (ok %v, reason %d)", need, ok, reason)
+		}
+		if !warm && (need != 1000 || ok || reason != refusedValveHeadHeadroom) {
+			t.Fatalf("off-twin: the head needs 1000 (%d) and s is refused for the headroom (ok %v, reason %d)", need, ok, reason)
+		}
 	}
 }
 

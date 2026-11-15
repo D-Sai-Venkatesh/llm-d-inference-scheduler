@@ -43,9 +43,9 @@ func (s *Scheduler) coldAllowsTokens(g *engineGroup, tokens int64) bool {
 
 // valveCold is the cold valve's tokens for w on g: what the engine has to prefill. Without valveCPUWarm it
 // is the prompt beyond the GPU-resident prefix (ColdTokens). With it (LOGIC Amendment 3, V1) the tokens of
-// the thread's CPU-line entry on its home pod are warm too, exactly like the GPU-resident prefix: vLLM
-// loads them from the CPU tier instead of computing them. Every valve check and the seat's cold charge
-// read this; the GPU block costs and the cache predictions keep ColdTokens.
+// the thread's entry on the pod's CPU line are warm too, exactly like the GPU-resident prefix: vLLM loads
+// them from the CPU tier instead of computing them. Every valve check and the seat's cold charge read
+// this; the GPU block costs and the cache predictions keep ColdTokens.
 func (s *Scheduler) valveCold(g *engineGroup, w *waiter) int64 {
 	cold, _ := s.valveColdParts(g, w)
 	return cold
@@ -62,12 +62,13 @@ func (s *Scheduler) valveColdParts(g *engineGroup, w *waiter) (cold, gpuCold int
 	return max(0, min(gpuCold, PromptTokens(w.chains)-warm)), gpuCold
 }
 
-// cpuWarmTokens is V1's CPU-warm part: the tokens of w's CPU-line entry on g when w is admitted and g is
-// its home, capped at its prompt; 0 for every other thread (a newcomer, a pushed-out thread, a rewritten
-// context under a new thread id) and with valveCPUWarm off.
+// cpuWarmTokens is V1's CPU-warm part: the tokens of w's entry on g's CPU line, capped at its prompt, for
+// an admitted thread and for a pushed-out one whose entry the trim past C has not dropped yet; 0 when g
+// holds no entry of w (a newcomer, a rewritten context under a new thread id, a trimmed entry) and with
+// valveCPUWarm off. A thread's entry lives on its home pod only (nca2HomeMove), so the home is the walk's
+// gate.
 func (s *Scheduler) cpuWarmTokens(g *engineGroup, w *waiter) int64 {
-	if s.nca2 == nil || !s.nca2.valveCPUWarm || g == nil || g.nca2 == nil || w == nil ||
-		!s.nca2.admitted[w.id] || s.nca2.homes[w.id] != g.id {
+	if s.nca2 == nil || !s.nca2.valveCPUWarm || g == nil || g.nca2 == nil || w == nil || s.nca2.homes[w.id] != g.id {
 		return 0
 	}
 	for _, e := range g.nca2.line {

@@ -22,7 +22,8 @@ package groupsched
 // over three pods with mixed prompt sizes and quantum 2. The fixture reaches the two states the amendment
 // changes: returners whose seats were released while they stayed admitted (their context is warm in the
 // pod's CPU line) consulting the cold valve, which refuses them on their GPU-cold tokens while it would
-// take them on what the CPU line does not hold; and seats past their quantum that are not silent. The
+// take them on what the CPU line does not hold; pushed-out outsiders whose entry is still in the line; and
+// seats past their quantum that are not silent. The
 // observable decision stream (the served index of every pass, the Snapshot, the event stream, the door's
 // head and collection pod, each pod's held blocks, the admission state) is digested and pinned to the value
 // the same fixture produces at e962778a. The file names no symbol e962778a lacks.
@@ -52,8 +53,9 @@ const (
 type amend3Coverage struct {
 	// warmExcused counts end-of-pass returners whose CPU-line entry on their home pod covers more of the
 	// prompt than the GPU-resident prefix does; valveFlips the ones among them the valve refuses on the
-	// GPU-cold tokens and would take on the tokens the CPU line does not hold.
-	warmExcused, valveFlips int
+	// GPU-cold tokens and would take on the tokens the CPU line does not hold. outsiderExcused and
+	// outsiderFlips are the same for pushed-out outsiders whose entry is still in the line.
+	warmExcused, valveFlips, outsiderExcused, outsiderFlips int
 	// quantumExits counts seats released as quantum-complete; quantumOnly counts end-of-pass seats that
 	// are eligible by their quantum alone (not busy, not silent).
 	quantumExits, quantumOnly                         int
@@ -63,9 +65,6 @@ type amend3Coverage struct {
 // amend3Probe reads the end-of-pass state for the coverage; it only reads (the caller holds the lock).
 func amend3Probe(s *Scheduler, now time.Time, cov *amend3Coverage) {
 	for id, w := range s.waiters {
-		if !s.nca2.admitted[id] {
-			continue
-		}
 		g := s.groups[s.nca2.homes[id]]
 		if g == nil || g.nca2 == nil || g.numBlocks <= 0 {
 			continue
@@ -87,9 +86,18 @@ func amend3Probe(s *Scheduler, now time.Time, cov *amend3Coverage) {
 		if cpuCold >= gpuCold {
 			continue
 		}
-		cov.warmExcused++
-		if !s.coldAllowsTokens(g, gpuCold) && s.coldAllowsTokens(g, cpuCold) {
-			cov.valveFlips++
+		flip := !s.coldAllowsTokens(g, gpuCold) && s.coldAllowsTokens(g, cpuCold)
+		switch {
+		case s.nca2.admitted[id]:
+			cov.warmExcused++
+			if flip {
+				cov.valveFlips++
+			}
+		default:
+			cov.outsiderExcused++
+			if flip {
+				cov.outsiderFlips++
+			}
 		}
 	}
 	for _, g := range s.activeGroups() {
@@ -276,8 +284,8 @@ func TestI15_DecisionsAreE962778a(t *testing.T) {
 	for _, p := range amend3Policies {
 		cov := covs[p.name]
 		t.Logf("%s: coverage %+v, digest %s", p.name, cov, parts[p.name])
-		if cov.warmExcused == 0 || cov.valveFlips == 0 || cov.quantumExits == 0 || cov.quantumOnly == 0 ||
-			cov.returnerSeats == 0 {
+		if cov.warmExcused == 0 || cov.valveFlips == 0 || cov.outsiderExcused == 0 || cov.quantumExits == 0 ||
+			cov.quantumOnly == 0 || cov.returnerSeats == 0 {
 			t.Fatalf("%s: fixture coverage %+v (CPU-warm returners at the valve and seats past their quantum must have happened)",
 				p.name, cov)
 		}

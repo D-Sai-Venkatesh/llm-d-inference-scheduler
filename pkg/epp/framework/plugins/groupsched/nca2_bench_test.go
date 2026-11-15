@@ -311,6 +311,12 @@ func BenchmarkBASEPass(b *testing.B) {
 // and the backfill sweep has to ask every outsider on every pod and admits nobody.
 func benchDoor(b *testing.B, door, sessions, reclaim bool) (*Scheduler, []Head) {
 	b.Helper()
+	return benchDoorTuned(b, door, sessions, reclaim, nil)
+}
+
+// benchDoorTuned is benchDoor with extra keys set (LOGIC Amendment 3's switches).
+func benchDoorTuned(b *testing.B, door, sessions, reclaim bool, extra func(*Config)) (*Scheduler, []Head) {
+	b.Helper()
 	s := newNCA2Tuned(b, func(c *Config) {
 		c.CPUTierTokens = i64(defaultCPUTierTokens)
 		c.Quantum, c.IdleSeconds = 8, 5
@@ -325,6 +331,9 @@ func benchDoor(b *testing.B, door, sessions, reclaim bool) (*Scheduler, []Head) 
 		if reclaim {
 			on := true
 			c.BackfillReclaim = &on
+		}
+		if extra != nil {
+			extra(c)
 		}
 	}, nil)
 	pods := []string{"p0", "p1", "p2"}
@@ -395,12 +404,17 @@ func benchDoorPass(b *testing.B, door, sessions, reclaim bool) {
 // benchDoorPassOf times one pass of B1's state; without returners, the timed pass no longer offers the
 // returners' heads, so no pod has one waiting and BF4 asks every refused candidate on every pod.
 func benchDoorPassOf(b *testing.B, door, sessions, reclaim, noReturners bool) {
+	benchDoorPassTuned(b, door, sessions, reclaim, noReturners, nil)
+}
+
+// benchDoorPassTuned is benchDoorPassOf with extra keys set.
+func benchDoorPassTuned(b *testing.B, door, sessions, reclaim, noReturners bool, extra func(*Config)) {
 	b.ReportAllocs()
 	var total time.Duration
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		s, heads := benchDoor(b, door, sessions, reclaim)
+		s, heads := benchDoorTuned(b, door, sessions, reclaim, extra)
 		if noReturners {
 			kept := heads[:0]
 			for _, h := range heads {
@@ -440,3 +454,20 @@ func BenchmarkDoorPassOffNoReturners(b *testing.B) { benchDoorPassOf(b, false, f
 // BenchmarkDoorPassReclaimNoReturners is BF4's worst case: no pod has a returner waiting, so every
 // candidate BF1 refuses is fitted against every pod's reclaimable seats (and none fits).
 func BenchmarkDoorPassReclaimNoReturners(b *testing.B) { benchDoorPassOf(b, true, false, true, true) }
+
+// BenchmarkDoorPassOffAmend3 is B1's reference state through v2's decision with valveCPUWarm and noQuantum
+// (LOGIC Amendment 3).
+func BenchmarkDoorPassOffAmend3(b *testing.B) {
+	benchDoorPassTuned(b, false, false, false, false, amend3Tune(true, true))
+}
+
+// BenchmarkDoorPassAmend3 is B1 with doorBackfill, valveCPUWarm and noQuantum on (acceptance: at most 3x
+// BenchmarkDoorPassOff).
+func BenchmarkDoorPassAmend3(b *testing.B) {
+	benchDoorPassTuned(b, true, false, false, false, amend3Tune(true, true))
+}
+
+// BenchmarkDoorPassSessionsReclaimAmend3 is B1 with every switch on.
+func BenchmarkDoorPassSessionsReclaimAmend3(b *testing.B) {
+	benchDoorPassTuned(b, true, true, true, false, amend3Tune(true, true))
+}

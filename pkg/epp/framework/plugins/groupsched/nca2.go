@@ -94,6 +94,10 @@ type nca2Policy struct {
 	// the pushed thread's activity. It is how the invariant tests check that an ACTIVE entry is only
 	// ever pushed by a touch (I2/A6) — the state alone cannot say which event pushed it.
 	onPushout func(reason string, active bool)
+
+	// door is the door fix and the session layer (session-layer contract Part A/B): nil when doorBackfill
+	// is off, and then nothing reads it — the v2 decision runs unchanged (C7).
+	door *nca2Door
 }
 
 // maxInflightWindow is MaxInflightSeconds as a duration.

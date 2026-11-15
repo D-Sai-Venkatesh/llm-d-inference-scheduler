@@ -24,6 +24,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 )
 
 // Config is the plugin's decoded parameters. One code path for one engine and for N: a single-pod
@@ -74,6 +77,15 @@ type Config struct {
 	// LostRequestSeconds is the released-window liveness bound (the base's expireWindows /
 	// windowLive): a request that never reached a pod is lost after this long.
 	LostRequestSeconds *float64 `json:"lostRequestSeconds,omitempty"`
+
+	// ---- the door switches (session-layer contract C1): nca2-only presence keys ----
+	//
+	// DoorBackfill is Part A: one head collects seats on one pod, everyone else backfills into what is
+	// already free. SessionAware is Part B: the door and the seat order rank by session, read from the
+	// SessionHeader request header. Both off is v2 exactly (C7).
+	DoorBackfill  *bool   `json:"doorBackfill,omitempty"`
+	SessionAware  *bool   `json:"sessionAware,omitempty"`
+	SessionHeader *string `json:"sessionHeader,omitempty"`
 }
 
 // defaultConfig is what a config that omits every key gets: the shipped arm's own numbers.
@@ -157,6 +169,16 @@ func (c Config) nca2KeyNames() []string {
 	if c.LostRequestSeconds != nil {
 		out = append(out, "lostRequestSeconds")
 	}
+	// C2: the door switches are nca2 keys too
+	if c.DoorBackfill != nil {
+		out = append(out, "doorBackfill")
+	}
+	if c.SessionAware != nil {
+		out = append(out, "sessionAware")
+	}
+	if c.SessionHeader != nil {
+		out = append(out, "sessionHeader")
+	}
 	return out
 }
 
@@ -214,7 +236,52 @@ func (c Config) resolveNCA2() (*nca2Policy, error) {
 	n.AdmitLine, n.TrustLine = admit, trust
 	n.AdmitLineTokens = int64(admit * float64(n.CPUTierTokens))
 	n.TrustLineTokens = int64(trust * float64(n.CPUTierTokens))
+	door, err := c.resolveDoor()
+	if err != nil {
+		return nil, err
+	}
+	n.door = door
 	return n, nil
+}
+
+// forbiddenSessionHeaders are the headers a session header may not be (C4, LOGIC Amendment 1 Q6): the
+// fairness header and its deprecated alias OVERRIDE the derived thread id as the flow-control queue key
+// (the director's derivation), which would turn v2 into a session-keyed scheduler; the two wire ids are
+// per-request, not per-session.
+var forbiddenSessionHeaders = []string{metadata.FlowFairnessIDKey, metadata.OldFlowFairnessIDKey,
+	reqcommon.RequestIDHeaderKey, "x-correlation-id"}
+
+// resolveDoor is C3-C5: nil unless doorBackfill is true (C7: the v2 decision runs), Part B only with
+// Part A and a usable header, and no key that would sit in the config doing nothing.
+func (c Config) resolveDoor() (*nca2Door, error) {
+	door := c.DoorBackfill != nil && *c.DoorBackfill
+	aware := c.SessionAware != nil && *c.SessionAware
+	if aware && !door {
+		return nil, fmt.Errorf("sessionAware requires doorBackfill: true (the session layer orders the door that Part A builds)")
+	}
+	if c.SessionHeader != nil && !aware {
+		return nil, fmt.Errorf("sessionHeader is set while sessionAware is not true: the header would be read by nothing")
+	}
+	if !door {
+		return nil, nil
+	}
+	d := &nca2Door{sessionAware: aware}
+	if aware {
+		header := ""
+		if c.SessionHeader != nil {
+			header = strings.ToLower(strings.TrimSpace(*c.SessionHeader))
+		}
+		if header == "" {
+			return nil, fmt.Errorf("sessionAware requires a non-empty sessionHeader (the request header that carries the session id)")
+		}
+		for _, bad := range forbiddenSessionHeaders {
+			if header == bad {
+				return nil, fmt.Errorf("sessionHeader may not be %q: it is a per-request id or the flow-control fairness key, not a session id", bad)
+			}
+		}
+		d.header = header
+	}
+	return d, nil
 }
 
 // configEcho renders the config as sorted key=value pairs (the startup echo's form).

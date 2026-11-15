@@ -132,3 +132,108 @@ func TestFailClosedOnTheSelector(t *testing.T) {
 		})
 	}
 }
+
+// TestC2_DoorKeysRequireNCA2: the three door keys are nca2 keys — any of them without mode: nca2 refuses
+// the startup, whatever its value (presence is the fact).
+func TestC2_DoorKeysRequireNCA2(t *testing.T) {
+	for name, params := range map[string]string{
+		"doorBackfill without mode":       `{"doorBackfill":true}`,
+		"doorBackfill false without mode": `{"doorBackfill":false}`,
+		"sessionAware without mode":       `{"sessionAware":true}`,
+		"sessionHeader without mode":      `{"sessionHeader":"x-llm-d-session-id"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := factoryWith(t, params); err == nil {
+				t.Fatalf("%s must refuse the startup", name)
+			}
+		})
+	}
+}
+
+// TestC3toC5_SessionKeysFailClosed: sessionAware needs doorBackfill (C3) and a usable header (C4); a
+// header without sessionAware does nothing and is refused (C5).
+func TestC3toC5_SessionKeysFailClosed(t *testing.T) {
+	for name, params := range map[string]string{
+		"C3 sessionAware without doorBackfill":  `{"mode":"nca2","sessionAware":true,"sessionHeader":"x-llm-d-session-id"}`,
+		"C3 sessionAware with doorBackfill off": `{"mode":"nca2","doorBackfill":false,"sessionAware":true,"sessionHeader":"x-llm-d-session-id"}`,
+		"C4 no header":                          `{"mode":"nca2","doorBackfill":true,"sessionAware":true}`,
+		"C4 empty header":                       `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":""}`,
+		"C4 the fairness header":                `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"X-LLM-D-Inference-Fairness-ID"}`,
+		"C4 the deprecated fairness alias":      `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"x-gateway-inference-fairness-id"}`,
+		"C4 x-request-id":                       `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"X-Request-Id"}`,
+		"C4 x-correlation-id":                   `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"x-correlation-id"}`,
+		"C5 header without sessionAware":        `{"mode":"nca2","doorBackfill":true,"sessionHeader":"x-llm-d-session-id"}`,
+		"C5 header with sessionAware false":     `{"mode":"nca2","doorBackfill":true,"sessionAware":false,"sessionHeader":"x-llm-d-session-id"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := factoryWith(t, params); err == nil {
+				t.Fatalf("%s must refuse the startup", name)
+			}
+		})
+	}
+}
+
+// TestC1_DoorKeysResolve: the accepted shapes resolve into the policy's door section, and both switches
+// off resolve to NO door section at all (C7: the v2 path runs, the new code is not entered).
+func TestC1_DoorKeysResolve(t *testing.T) {
+	resolve := func(t *testing.T, params string) *nca2Policy {
+		t.Helper()
+		cfg := defaultConfig()
+		dec := json.NewDecoder(strings.NewReader(params))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		n, err := cfg.resolveNCA2()
+		if err != nil {
+			t.Fatalf("%s must resolve, got %v", params, err)
+		}
+		return n
+	}
+	if n := resolve(t, `{"mode":"nca2"}`); n.door != nil {
+		t.Fatal("C7: no door key resolves to no door section")
+	}
+	if n := resolve(t, `{"mode":"nca2","doorBackfill":false}`); n.door != nil {
+		t.Fatal("C7: doorBackfill false resolves to no door section")
+	}
+	n := resolve(t, `{"mode":"nca2","doorBackfill":true}`)
+	if n.door == nil || n.door.sessionAware || n.door.header != "" {
+		t.Fatalf("Part A alone: %+v", n.door)
+	}
+	n = resolve(t, `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"X-LLM-D-Session-Id"}`)
+	if n.door == nil || !n.door.sessionAware || n.door.header != "x-llm-d-session-id" {
+		t.Fatalf("Part A + B: the header is kept lower-case (the EPP's header map is): %+v", n.door)
+	}
+}
+
+// TestC6_EchoNamesTheDoorSwitches: the nca2 echo prints the three resolved values, set or not, so a
+// run's read-back can quote them; OFF's echo names none of them.
+func TestC6_EchoNamesTheDoorSwitches(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Mode = modeNCA2
+	n, err := cfg.resolveNCA2()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := n.doorEcho(); got != "doorBackfill=false sessionAware=false sessionHeader=" {
+		t.Fatalf("both off: %q", got)
+	}
+	on, off := true, defaultConfig()
+	cfg.DoorBackfill, cfg.SessionAware = &on, &on
+	header := "x-llm-d-session-id"
+	cfg.SessionHeader = &header
+	if n, err = cfg.resolveNCA2(); err != nil {
+		t.Fatal(err)
+	}
+	if got := n.doorEcho(); got != "doorBackfill=true sessionAware=true sessionHeader=x-llm-d-session-id" {
+		t.Fatalf("both on: %q", got)
+	}
+	if echo := configEcho(cfg); !strings.Contains(echo, "doorBackfill=true") || !strings.Contains(echo, "sessionHeader=x-llm-d-session-id") {
+		t.Fatalf("the effective-config echo carries the keys that were set: %s", echo)
+	}
+	for _, key := range []string{"doorBackfill", "sessionAware", "sessionHeader"} {
+		if strings.Contains(configEcho(off), key) {
+			t.Fatalf("the OFF echo must not name %q", key)
+		}
+	}
+}

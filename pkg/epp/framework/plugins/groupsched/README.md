@@ -103,6 +103,27 @@ without `mode: nca2`, refuses the startup.
 | `lostRequestSeconds` | float | `300` | A RELEASED request that never reached a pod stops counting as in flight (the base's released-window bound; `idleSeconds` in the shipped mode). |
 | `maxInflightSeconds` | float | `1200` | An at-pod request older than this is treated as leaked for the activity test, and counted in `leaked_requests_total`. |
 
+#### The door fix and the session layer (`doorBackfill`, `sessionAware`)
+
+Two switches change only how the `nca2` door admits. With both absent (or false) the `nca2` decision is
+exactly the one above.
+
+```yaml
+- type: group-scheduler
+  name: group
+  parameters:
+    mode: nca2
+    doorBackfill: true                  # one head collects seats on one pod; everyone else backfills
+    sessionAware: true                  # rank the door and the freed seats by session
+    sessionHeader: x-llm-d-session-id   # the request header that carries the session id
+```
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `doorBackfill` | bool | `false` | Only the outside head may release seats, on one pod, and only when no pod can take it now; every other outsider is admitted as soon as it fits the budget that is already free (never the blocks held for the head, nor the cold-valve headroom the head needs). |
+| `sessionAware` | bool | `false` | Requires `doorBackfill`. Outsiders of sessions already inside go first (fewest active threads first), then sessions that were inside, then new sessions; a freed seat goes to the returner whose session holds the fewest seats; a new session's head never takes seats its pod's returners wait for. |
+| `sessionHeader` | string | `""` | Required with `sessionAware` (and refused without it). It may not be the fairness header (`x-llm-d-inference-fairness-id` or its deprecated alias), `x-request-id` or `x-correlation-id`. A request without it is its own session. |
+
 `idleSeconds` becomes the INACTIVE grace (a seat holder with no head and nothing in flight is
 rotation-eligible after it) and `quantum` the seat's tenure, so both are worth setting with the mode.
 

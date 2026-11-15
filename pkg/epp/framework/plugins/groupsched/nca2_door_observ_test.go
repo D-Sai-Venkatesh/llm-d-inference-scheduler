@@ -127,7 +127,7 @@ func TestO1toO5_CountersAndGaugesOnTheDryRun(t *testing.T) {
 		"llm_d_epp_nca2_door_admissions_total{class=newcomer,path=backfill}": 1,
 		"llm_d_epp_nca2_door_admissions_total{class=newcomer,path=head_fit}": 0,
 		"llm_d_epp_nca2_collections_total{event=start}":                      1,
-		"llm_d_epp_nca2_collect_held_blocks{pod=p0}":                         400,
+		"llm_d_epp_nca2_collect_held_blocks{pod=p0}":                         405,
 		"llm_d_epp_nca2_collect_held_blocks{pod=p1}":                         0,
 		"llm_d_epp_nca2_collect_pod{pod=p0}":                                 1,
 		"llm_d_epp_nca2_collect_pod{pod=p1}":                                 0,
@@ -171,7 +171,7 @@ func TestO2_TakeoverAndReleaseEvents(t *testing.T) {
 		t.Fatalf("O2: %v", v)
 	}
 	joined := strings.Join(events, "\n")
-	for _, want := range []string{"COLLECT N event=start pod=p0", "COLLECT N event=released_takeover pod=p0 held=400",
+	for _, want := range []string{"COLLECT N event=start pod=p0", "COLLECT N event=released_takeover pod=p0 held=405",
 		"COLLECT P event=start pod=p1", "SEAT rB kind=", "path=returner"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("O8: the event stream lacks %q:\n%s", want, joined)
@@ -260,8 +260,8 @@ func TestO9_DebugStateCarriesTheDoor(t *testing.T) {
 	f.pass(heads()...)
 	raw, err := json.Marshal(f.s.Snapshot(f.now))
 	require.NoError(t, err)
-	for _, want := range []string{`"headID":"N"`, `"collectPod":"p0"`, `"heldBlocks":400`, `"doorWaitingByGroup":{"newcomer":1,"priority":0}`,
-		`"collectHeldBlocks":400`} {
+	for _, want := range []string{`"headID":"N"`, `"collectPod":"p0"`, `"heldBlocks":405`, `"doorWaitingByGroup":{"newcomer":1,"priority":0}`,
+		`"collectHeldBlocks":405`} {
 		require.Contains(t, string(raw), want)
 	}
 	require.NotContains(t, string(raw), "sessionsInside", "Part A has no sessions")

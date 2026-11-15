@@ -231,8 +231,9 @@ func TestTDR1_HeadCollectsOnOnePodTheOtherPodKeepsSeating(t *testing.T) {
 	if head != "N" || pod != "p0" {
 		t.Fatalf("the head collects on ONE pod: head %q on %q", head, pod)
 	}
-	if f.held("p0") != 400 || f.held("p1") != 0 {
-		t.Fatalf("H9/I2: held p0=%d p1=%d (want 400 on p0 only)", f.held("p0"), f.held("p1"))
+	// the 400 blocks a1 released plus the 5 that were already free (D1: everything free there is the head's)
+	if f.held("p0") != 405 || f.held("p1") != 0 {
+		t.Fatalf("H9/I2: held p0=%d p1=%d (want 405 on p0 only)", f.held("p0"), f.held("p1"))
 	}
 	if seated(f.s, "a1") || !seated(f.s, "a2") {
 		t.Fatal("A's idle seat is released for the head, its running seat is not")
@@ -509,12 +510,12 @@ func TestBF1_BackfillNeverReleasesASeat(t *testing.T) {
 // candidate sees only free − held.
 func TestBF1_BackfillNeverSpendsTheHeldBlocks(t *testing.T) {
 	f, heads := collectingFixture(t, true)
-	f.pass(heads()...) // p0: free 405, held 400
+	f.pass(heads()...) // p0: free 405, all of it held (D1)
 	f.pass(append(heads(), f.heavyAt("mid", 300, 320, f.now))...)
 	if f.homeOf("mid") == "p0" {
 		t.Fatal("I5: backfill spent the blocks held for the head")
 	}
-	if f.held("p0") != 400 {
+	if f.held("p0") != 405 {
 		t.Fatalf("I5: held %d", f.held("p0"))
 	}
 }
@@ -609,5 +610,32 @@ func TestTDR5_HeldAndHeadBudgetNeverDecrease(t *testing.T) {
 	}
 	if !entered || f.homeOf("N") != "p0" {
 		t.Fatalf("DR5: the head enters on its collection pod in bounded time (entered %v, home %q)", entered, f.homeOf("N"))
+	}
+}
+
+// TestH9_FreeBudgetOnTheCollectionPodIsTheHeads: design A3's level-2 order (parent dry-run D1) — budget
+// that is free on the collection pod goes to the head FIRST, whatever freed it: here 150 blocks are free
+// before the head releases anything, and neither the pod's returner nor a backfill candidate may take
+// them while the head collects.
+func TestH9_FreeBudgetOnTheCollectionPodIsTheHeads(t *testing.T) {
+	f := newDoorFixture(t, nil, "p0", "p1")
+	f.running("p0", "a", 800, 320) // 150 free, nothing reclaimable
+	for i := 0; i < 2; i++ {       // p1 is busier (p0 first) and cannot take the head
+		f.running("p1", "b"+itoa(i), 300, 320)
+	}
+	f.returnerOn("p0", "rA")
+	f.pass(f.heavyAt("N", 900, 320, f.now), f.heavyAt("rA", 100, 320, f.now.Add(-time.Minute)),
+		f.heavyAt("s", 10, 320, f.now))
+	if _, pod := f.doorHead(); pod != "p0" {
+		t.Fatalf("fixture: the head collects on p0, got %q", pod)
+	}
+	if f.held("p0") < 150 {
+		t.Fatalf("D1: the budget free on the collection pod is held for the head: held %d", f.held("p0"))
+	}
+	if seated(f.s, "rA") {
+		t.Fatal("D1: the collection pod's returner may not take the head's free budget")
+	}
+	if f.homeOf("s") == "p0" {
+		t.Fatal("D1: a backfill candidate may not take the head's free budget")
 	}
 }

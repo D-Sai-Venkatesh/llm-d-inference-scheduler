@@ -230,8 +230,9 @@ func TestH10_NewSessionHeadNeverTakesItsPodsReturnersSeats(t *testing.T) {
 	if !seated(f.s, "ret") || seated(f.s, "idle") {
 		t.Fatal("H10: the returner reclaims the idle seat for itself first")
 	}
-	if f.held("p0") != 0 {
-		t.Fatalf("I8: the new session's head took nothing a returner waited for, held %d", f.held("p0"))
+	// with the returner seated, the head holds what is left free on its pod — budget no returner waits for
+	if f.held("p0") != f.free("p0") {
+		t.Fatalf("I8/D1: the head holds only the leftover free budget: held %d, free %d", f.held("p0"), f.free("p0"))
 	}
 	// the returner cannot fit (it needs more than the pod can ever free now): nothing is released
 	f, heads = h10Fixture(t, true, 2000)

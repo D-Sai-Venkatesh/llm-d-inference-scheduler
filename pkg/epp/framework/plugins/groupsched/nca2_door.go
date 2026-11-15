@@ -458,10 +458,11 @@ func (s *Scheduler) doorCollectionPod(pods []podState, head *waiter, now time.Ti
 // what is held and releases nothing: LOGIC Amendment 1 Q1), then the eligible seats released one at a
 // time in the rotationVictim order until the head fits — admitted — or none is left.
 //
-// The held amount is LOGIC Amendment 1 Q7: the blocks released FOR the head, capped at its cost, and no
-// deficit cap. Held blocks ARE free blocks, so v2's cap (cost − free) would hand 2·free − cost back to the
-// pod's other candidates once the head has gathered half its cost; with backfill that surplus is always
-// taken, and the head would hover near half. Holding what it was given makes the collection only grow.
+// The held amount is LOGIC Amendment 1 Q7 and the parent dry-run's D1: EVERYTHING free on the collection
+// pod is the head's, up to its cost, whatever freed it (the head's own releases, a push-out, a seat that
+// ended) — design A3's level-2 order, the head first. Held only grows: v2's deficit cap (cost − free) would
+// hand 2·free − cost back to the pod's other candidates once the head has gathered half its cost, and with
+// backfill that surplus is always taken. A valve refusal holds nothing new (Q1).
 func (s *Scheduler) doorCollect(p *podState, head *waiter, now time.Time) bool {
 	g := p.g
 	if !s.coldAllowsTokens(g, g.index.ColdTokens(head.chains)) {
@@ -473,6 +474,8 @@ func (s *Scheduler) doorCollect(p *podState, head *waiter, now time.Time) bool {
 		if cost <= s.freeBudget(g) || (len(g.threads) == 0 && cost > budget) {
 			return s.doorAdmit(p, head, doorPathHeadCollected, now)
 		}
+		g.nca2.reservedHead = head.id
+		g.nca2.reservedBlocks = min(cost, max(g.nca2.reservedBlocks, s.freeBudget(g)))
 		reason, victim := s.rotationVictim(g, now)
 		if victim == nil {
 			if g.nca2.reservedBlocks > cost {
@@ -480,11 +483,7 @@ func (s *Scheduler) doorCollect(p *podState, head *waiter, now time.Time) bool {
 			}
 			return false
 		}
-		before := s.freeBudget(g)
 		s.exit(g, victim, reason, now)
-		// what this release actually freed (a victim sharing blocks with a seat that stays frees less)
-		g.nca2.reservedHead = head.id
-		g.nca2.reservedBlocks = min(g.nca2.reservedBlocks+s.freeBudget(g)-before, cost)
 	}
 }
 

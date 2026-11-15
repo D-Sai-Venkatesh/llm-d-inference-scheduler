@@ -53,7 +53,7 @@ func headFitsNowAnywhere(s *Scheduler, head *waiter) bool {
 		if g.numBlocks <= 0 || g.nca2 == nil || f > s.nca2View(g).room(s.nca2.AdmitLineTokens) {
 			continue
 		}
-		if !s.coldAllowsTokens(g, g.index.ColdTokens(head.chains)) {
+		if !s.coldAllowsTokens(g, s.valveCold(g, head)) {
 			continue
 		}
 		cost := int64(g.index.Cost(head.chains))
@@ -132,13 +132,13 @@ func backfillFitsAnywhere(s *Scheduler, w *waiter) (string, bool) {
 		if int64(g.index.Cost(w.chains)) > free {
 			continue
 		}
-		cold := g.index.ColdTokens(w.chains)
+		cold := s.valveCold(g, w)
 		if !s.coldAllowsTokens(g, cold) {
 			continue
 		}
 		if head != nil && g.id == d.collectPod {
 			capTokens := g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize)
-			headNeed = min(g.index.ColdTokens(head.chains), capTokens)
+			headNeed = min(s.valveCold(g, head), capTokens)
 			if capTokens > 0 && g.coldInFlight+min(cold, capTokens)+headNeed > capTokens {
 				continue
 			}
@@ -146,6 +146,14 @@ func backfillFitsAnywhere(s *Scheduler, w *waiter) (string, bool) {
 		return g.id, true
 	}
 	return "", false
+}
+
+// headHeadroom is whether the head's valve headroom is available on its collection pod (the caller holds
+// the lock).
+func headHeadroom(s *Scheduler, g *engineGroup) bool {
+	head := s.waiters[s.nca2.door.headID]
+	capTokens := g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize)
+	return head == nil || capTokens <= 0 || g.coldInFlight+min(s.valveCold(g, head), capTokens) <= capTokens
 }
 
 // checkHolding is I2 and I3 (the caller holds the lock).
@@ -193,6 +201,13 @@ type doorProbe struct {
 	backfills       int
 	reclaims        int
 	yields          int
+
+	// heldBF, freeBF and headroomBF are the collection pod's held blocks, free budget and whether the head's
+	// valve headroom was available there when BF began; i5 counts the backfill admissions I5 was checked on
+	// (a collection pod existed).
+	heldBF, freeBF int64
+	headroomBF     bool
+	i5             int
 }
 
 func newDoorProbe(s *Scheduler, now *time.Time) *doorProbe {
@@ -250,6 +265,9 @@ func (p *doorProbe) stage(st doorStage) {
 		p.exitsBF = exitTotal(s)
 		p.podBF = podExits(s)
 		p.collectBF = d.collectPod
+		if g := s.groups[d.collectPod]; g != nil && g.nca2 != nil {
+			p.heldBF, p.freeBF, p.headroomBF = g.nca2.reservedBlocks, s.freeBudget(g), headHeadroom(s, g)
+		}
 		p.returnerBF = map[string]bool{}
 		for _, g := range s.activeGroups() {
 			p.returnerBF[g.id] = g.nca2 != nil && returnerWaitingAsTheDoorSees(s, g)
@@ -287,6 +305,22 @@ func (p *doorProbe) stage(st doorStage) {
 				if id == p.collectBF || p.returnerBF[id] {
 					p.fail("I4: backfill released %d seats on %s (collection pod %q, returner waiting %v)",
 						n-p.podBF[id], id, p.collectBF, p.returnerBF[id])
+				}
+			}
+		}
+		// I5: a backfill admission leaves the head's held blocks, its budget and its valve headroom on the
+		// collection pod as they were
+		if (st.path == doorPathBackfill || st.path == doorPathBackfillReclaim) && p.collectBF != "" && p.collectBF == d.collectPod {
+			if g := s.groups[p.collectBF]; g != nil && g.nca2 != nil {
+				p.i5++
+				if g.nca2.reservedBlocks != p.heldBF {
+					p.fail("I5: backfill moved the held blocks on %s (%d -> %d)", g.id, p.heldBF, g.nca2.reservedBlocks)
+				}
+				if p.heldBF <= p.freeBF && g.nca2.reservedBlocks > s.freeBudget(g) {
+					p.fail("I5: backfill spent the head's blocks on %s (held %d, free %d)", g.id, g.nca2.reservedBlocks, s.freeBudget(g))
+				}
+				if p.headroomBF && !headHeadroom(s, g) {
+					p.fail("I5: backfill took the head's valve headroom on %s", g.id)
 				}
 			}
 		}

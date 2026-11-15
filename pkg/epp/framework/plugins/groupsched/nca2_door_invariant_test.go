@@ -27,6 +27,7 @@ package groupsched
 import (
 	"fmt"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 )
@@ -213,15 +214,9 @@ func (p *doorProbe) stage(st doorStage) {
 	}
 }
 
-// doorLoop is the closed loop: mixed sizes (small threads and big heads that must collect), growing
-// prompts, pauses past idleSeconds, one served head per pass.
-func doorLoop(t *testing.T, seed, tier int64, passes int, tune func(*Config)) (*Scheduler, *doorProbe, int) {
-	t.Helper()
-	return doorLoopTraced(t, seed, tier, passes, tune, false, nil)
-}
-
-// doorLoopTraced is doorLoop that also records the decision stream (served index, SEAT/EXIT/COLLECT
-// events, each pod's held blocks, the head) when out is not nil.
+// doorLoopTraced is the closed loop: mixed sizes (small threads and big heads that must collect), growing
+// prompts, pauses past idleSeconds, one served head per pass. It records the decision stream (served
+// index, SEAT/EXIT/COLLECT events, each pod's held blocks, the head) when out is not nil.
 // With sessions, thread i belongs to session S(i/4) (a root and three sub-agents).
 func doorLoopTraced(t *testing.T, seed, tier int64, passes int, tune func(*Config), sessions bool, out *[]string) (*Scheduler, *doorProbe, int) {
 	t.Helper()
@@ -291,11 +286,12 @@ func doorLoopTraced(t *testing.T, seed, tier int64, passes int, tune func(*Confi
 		served := s.Pass(heads, now)
 		s.mu.Lock()
 		if out != nil {
-			line := fmt.Sprintf("pass %d served=%d head=%s collect=%s", pass, served, s.nca2.door.headID, s.nca2.door.collectPod)
+			var line strings.Builder
+			fmt.Fprintf(&line, "pass %d served=%d head=%s collect=%s", pass, served, s.nca2.door.headID, s.nca2.door.collectPod)
 			for _, g := range s.activeGroups() {
-				line += fmt.Sprintf(" %s=%d", g.id, g.nca2.reservedBlocks)
+				fmt.Fprintf(&line, " %s=%d", g.id, g.nca2.reservedBlocks)
 			}
-			*out = append(*out, line)
+			*out = append(*out, line.String())
 		}
 		if msg := checkHolding(s); msg != "" {
 			probe.fail("pass %d: %s", pass, msg)

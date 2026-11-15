@@ -182,7 +182,7 @@ func TestO2_TakeoverAndReleaseEvents(t *testing.T) {
 // TestO6_SessionCounters: O6 — one count per dispatched request, with or without the header, and the
 // mismatch counter.
 func TestO6_SessionCounters(t *testing.T) {
-	f := newSessionFixture(t, nil, "p0")
+	f := newSessionFixture(t, "p0")
 	reg := withDoorMetrics(t, f)
 	f.pass(inSession(f.heavyAt("a", 5, 320, f.now), "S"))
 	f.pass(f.heavyAt("b", 5, 320, f.now))
@@ -201,7 +201,7 @@ func TestO6_SessionCounters(t *testing.T) {
 // TestO7_SpanCarriesTheDoorPathAndTheSession: O7 — on the production path (Pass, AtPod, annotateSpan) a
 // backfilled turn's span names its door path, its session group and the session id's hash.
 func TestO7_SpanCarriesTheDoorPathAndTheSession(t *testing.T) {
-	f := newSessionFixture(t, nil, "p0")
+	f := newSessionFixture(t, "p0")
 	recorder := tracetestRecorder(t)
 	ctx, span := tracerStart(t, "request_orchestration")
 	h := inSession(f.heavyAt("a", 5, 320, f.now), "root-1")
@@ -212,7 +212,7 @@ func TestO7_SpanCarriesTheDoorPathAndTheSession(t *testing.T) {
 	span.End()
 	got := map[string]string{}
 	for _, kv := range recorder.Ended()[0].Attributes() {
-		got[string(kv.Key)] = kv.Value.Emit()
+		got[string(kv.Key)] = kv.Value.String()
 	}
 	if got[spanNCA2DoorPath] != doorPathHeadFit || got[spanNCA2SessionGroup] != "C" || len(got[spanNCA2SessionIDHash]) != 10 {
 		t.Fatalf("O7: %v", got)
@@ -229,7 +229,7 @@ func TestO7_SpanCarriesTheDoorPathAndTheSession(t *testing.T) {
 	span.End()
 	got = map[string]string{}
 	for _, kv := range recorder.Ended()[1].Attributes() {
-		got[string(kv.Key)] = kv.Value.Emit()
+		got[string(kv.Key)] = kv.Value.String()
 	}
 	if got[spanNCA2DoorPath] != doorPathSeated || got[spanNCA2SessionGroup] != "A" {
 		t.Fatalf("O7 on a seated turn: %v", got)
@@ -265,7 +265,7 @@ func TestO9_DebugStateCarriesTheDoor(t *testing.T) {
 		require.Contains(t, string(raw), want)
 	}
 	require.NotContains(t, string(raw), "sessionsInside", "Part A has no sessions")
-	g := newSessionFixture(t, nil, "p0")
+	g := newSessionFixture(t, "p0")
 	g.pass(inSession(g.heavyAt("a", 5, 320, g.now), "S"), inSession(g.heavyAt("b", 2000, 320, g.now), "T"))
 	raw, err = json.Marshal(g.s.Snapshot(g.now))
 	require.NoError(t, err)
@@ -284,7 +284,7 @@ func TestO9_DebugStateCarriesTheDoor(t *testing.T) {
 // fixture with and without scrapes takes the same decisions.
 func TestO_AScrapeChangesNothing(t *testing.T) {
 	run := func(scrape bool) []string {
-		f := newSessionFixture(t, nil, "p0", "p1")
+		f := newSessionFixture(t, "p0", "p1")
 		reg := withDoorMetrics(t, f)
 		var out []string
 		for i := 0; i < 8; i++ {

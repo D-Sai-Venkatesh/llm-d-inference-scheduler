@@ -179,7 +179,7 @@ func TestR1_RankIsPriorityThenNewcomerThenSinceThenID(t *testing.T) {
 	f.s.nca2.admitted["ret"], f.s.nca2.ever["ret"] = true, true
 	f.s.waiters["ret"] = &waiter{id: "ret", since: f.now.Add(-time.Hour)} // a returner, never an outsider
 	f.s.doorBeginPass()
-	var got []string
+	got := make([]string, 0, len(f.s.nca2.door.rank))
 	for _, c := range f.s.nca2.door.rank {
 		got = append(got, c.w.id)
 	}
@@ -237,8 +237,8 @@ func TestTDR1_HeadCollectsOnOnePodTheOtherPodKeepsSeating(t *testing.T) {
 	if seated(f.s, "a1") || !seated(f.s, "a2") {
 		t.Fatal("A's idle seat is released for the head, its running seat is not")
 	}
-	if !seated(f.s, "rB") {
-		t.Fatal("L2-1: B's returner is seated (B is not the collection pod)")
+	if !seated(f.s, "rB") || f.exitsOn("p1") != 1 {
+		t.Fatalf("L2-1: B's returner is seated from B's own reclaimable seat (B is not the collection pod), p1 exits %d", f.exitsOn("p1"))
 	}
 	if seated(f.s, "rA") {
 		t.Fatal("A's returner may not eat the head's held blocks")
@@ -349,8 +349,8 @@ func TestTDR3_TakeoverToAnotherPodReleases(t *testing.T) {
 	if head != "P" {
 		t.Fatalf("H3: the priority outsider takes the head, got %q", head)
 	}
-	if pod != "p1" || f.held("p0") != 0 {
-		t.Fatalf("H3: a different pod releases the collection (collect %q, p0 held %d)", pod, f.held("p0"))
+	if pod != "p1" || f.held("p0") != 0 || f.reservedHead("p1") != "P" {
+		t.Fatalf("H3: a different pod releases the collection (collect %q for %q, p0 held %d)", pod, f.reservedHead("p1"), f.held("p0"))
 	}
 	if !seated(f.s, "rA") {
 		t.Fatal("DR3: the released blocks belong to p0's returner again")

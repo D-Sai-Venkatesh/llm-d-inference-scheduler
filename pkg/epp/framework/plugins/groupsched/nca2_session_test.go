@@ -30,15 +30,12 @@ import (
 )
 
 // newSessionFixture is the door fixture with the session layer on.
-func newSessionFixture(t *testing.T, tune func(*Config), pods ...string) *fixture {
+func newSessionFixture(t *testing.T, pods ...string) *fixture {
 	t.Helper()
 	return newDoorFixture(t, func(c *Config) {
 		on := true
 		header := "x-llm-d-session-id"
 		c.SessionAware, c.SessionHeader = &on, &header
-		if tune != nil {
-			tune(c)
-		}
 	}, pods...)
 }
 
@@ -58,7 +55,7 @@ func (f *fixture) sessionKeyOf(id string) sessKey {
 // TestS4_FirstSessionValueWinsAndMismatchCounted: S4/E6 — the first value a thread carries is its
 // session for good; a later different value is counted and ignored.
 func TestS4_FirstSessionValueWinsAndMismatchCounted(t *testing.T) {
-	f := newSessionFixture(t, nil, "p0")
+	f := newSessionFixture(t, "p0")
 	f.pass(inSession(f.heavyAt("t", 5, 320, f.now), "sess-a"))
 	f.atPod("t", "p0")
 	f.done("t", "p0")
@@ -78,7 +75,7 @@ func TestS4_FirstSessionValueWinsAndMismatchCounted(t *testing.T) {
 
 // TestS5_NoHeaderIsItsOwnSession: S5 — a thread whose requests carry no header is its own session.
 func TestS5_NoHeaderIsItsOwnSession(t *testing.T) {
-	f := newSessionFixture(t, nil, "p0")
+	f := newSessionFixture(t, "p0")
 	f.pass(f.heavyAt("lone", 5, 320, f.now))
 	if got := f.sessionKeyOf("lone"); got != (sessKey{id: "lone", own: true}) {
 		t.Fatalf("S5: got %+v", got)
@@ -101,7 +98,7 @@ func TestS3_TheConfiguredHeaderIsRead(t *testing.T) {
 // t3 a returner), session P was inside (p1 pushed out, waiting), session N is new (n1 waiting).
 func sessionState(t *testing.T) *fixture {
 	t.Helper()
-	f := newSessionFixture(t, nil, "p0", "p1")
+	f := newSessionFixture(t, "p0", "p1")
 	f.running("p0", "t1", 10, 320)
 	f.returnerOn("p0", "t3")
 	f.priorityOn("p1", "p1", f.now.Add(-time.Hour))
@@ -142,7 +139,7 @@ func TestST2_GroupsAndR2Ranking(t *testing.T) {
 	f := sessionState(t)
 	f.s.mu.Lock()
 	f.s.doorBeginPass()
-	var got []string
+	got := make([]string, 0, len(f.s.nca2.door.rank))
 	for _, c := range f.s.nca2.door.rank {
 		got = append(got, c.w.id)
 	}
@@ -159,7 +156,7 @@ func TestST2_GroupsAndR2Ranking(t *testing.T) {
 // TestE7_FewestActiveSessionFirst: R2/E7 — inside group A, the session with the fewest active threads
 // goes first: one session's 87 waiting sub-agents rank behind a session with one; no cap.
 func TestE7_FewestActiveSessionFirst(t *testing.T) {
-	f := newSessionFixture(t, nil, "p0")
+	f := newSessionFixture(t, "p0")
 	f.running("p0", "rootBig", 10, 320)
 	f.running("p0", "rootSmall", 10, 320)
 	f.s.mu.Lock()
@@ -188,7 +185,7 @@ func TestE7_FewestActiveSessionFirst(t *testing.T) {
 // group-A thread that cannot backfill takes the head from a group-C head and keeps its collection when
 // its own pod is the same.
 func TestH3_InsideSessionTakesTheHeadFromANewSession(t *testing.T) {
-	f := newSessionFixture(t, nil, "p0")
+	f := newSessionFixture(t, "p0")
 	f.idleSeat("p0", "a1", 400)
 	f.running("p0", "a2", 545, 320)
 	f.s.mu.Lock()
@@ -213,7 +210,7 @@ func h10Fixture(t *testing.T, sessions bool, need int) (*fixture, []Head) {
 	t.Helper()
 	var f *fixture
 	if sessions {
-		f = newSessionFixture(t, nil, "p0")
+		f = newSessionFixture(t, "p0")
 	} else {
 		f = newDoorFixture(t, nil, "p0")
 	}
@@ -260,7 +257,7 @@ func TestL2_2_FewestSeatsFirstThenDeepest(t *testing.T) {
 	for _, sessions := range []bool{true, false} {
 		var f *fixture
 		if sessions {
-			f = newSessionFixture(t, nil, "p0")
+			f = newSessionFixture(t, "p0")
 		} else {
 			f = newDoorFixture(t, nil, "p0")
 		}

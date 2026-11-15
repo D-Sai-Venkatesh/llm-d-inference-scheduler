@@ -21,6 +21,7 @@ package groupsched
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -257,13 +258,13 @@ func (c Config) resolveDoor() (*nca2Door, error) {
 	door := c.DoorBackfill != nil && *c.DoorBackfill
 	aware := c.SessionAware != nil && *c.SessionAware
 	if aware && !door {
-		return nil, fmt.Errorf("sessionAware requires doorBackfill: true (the session layer orders the door that Part A builds)")
+		return nil, errors.New("sessionAware requires doorBackfill: true (the session layer orders the door that Part A builds)")
 	}
 	if c.SessionHeader != nil && !aware {
-		return nil, fmt.Errorf("sessionHeader is set while sessionAware is not true: the header would be read by nothing")
+		return nil, errors.New("sessionHeader is set while sessionAware is not true: the header would be read by nothing")
 	}
 	if !door {
-		return nil, nil
+		return nil, nil //nolint:nilnil // nil IS the answer: the door is off and v2's decision runs (C7)
 	}
 	d := &nca2Door{sessionAware: aware}
 	if aware {
@@ -272,7 +273,7 @@ func (c Config) resolveDoor() (*nca2Door, error) {
 			header = strings.ToLower(strings.TrimSpace(*c.SessionHeader))
 		}
 		if header == "" {
-			return nil, fmt.Errorf("sessionAware requires a non-empty sessionHeader (the request header that carries the session id)")
+			return nil, errors.New("sessionAware requires a non-empty sessionHeader (the request header that carries the session id)")
 		}
 		for _, bad := range forbiddenSessionHeaders {
 			if header == bad {

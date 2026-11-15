@@ -29,18 +29,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"sort"
-	"strings"
 
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 )
 
-// The session keys: a header value and a thread's own (no-header) session can never collide.
-const (
-	sessionKeyHeader = "s:"
-	sessionKeyThread = "t:"
-)
+// sessKey is a session: a header value, or a thread's own session (S5). The flag keeps the two from ever
+// colliding, and a struct key costs no allocation per lookup.
+type sessKey struct {
+	id  string
+	own bool
+}
 
 // sessionsLogged is S7's startup read-back: the first distinct session ids are logged.
 const sessionsLogged = 5
@@ -59,7 +59,7 @@ type nca2Sessions struct {
 	mismatches int64
 
 	// facts is ST1, derived at the top of every pass from the live sets.
-	facts map[string]sessFacts
+	facts map[sessKey]sessFacts
 }
 
 // sessFacts is ST1 for one session.
@@ -89,7 +89,7 @@ func (s *Scheduler) sessionsOn() *nca2Sessions {
 
 // newNCA2Sessions allocates Part B's state once, at construction (no read path ever creates it: I9).
 func newNCA2Sessions() *nca2Sessions {
-	return &nca2Sessions{sessionOf: map[string]string{}, members: map[string][]string{}, facts: map[string]sessFacts{}}
+	return &nca2Sessions{sessionOf: map[string]string{}, members: map[string][]string{}, facts: map[sessKey]sessFacts{}}
 }
 
 // sessionNote is S4: a thread's first session value is recorded; a later different value is ignored here
@@ -131,13 +131,13 @@ func (s *Scheduler) sessionObserveDispatch(h Head) {
 }
 
 // sessionKey is a thread's session: its header value, or the thread itself (S5).
-func (s *Scheduler) sessionKey(thread string) string {
+func (s *Scheduler) sessionKey(thread string) sessKey {
 	if ss := s.sessionsOn(); ss != nil {
 		if v, ok := ss.sessionOf[thread]; ok {
-			return sessionKeyHeader + v
+			return sessKey{id: v}
 		}
 	}
-	return sessionKeyThread + thread
+	return sessKey{id: thread, own: true}
 }
 
 // sessionBeginPass is ST1: every session's admitted, active and seated threads, from the BOUNDED live
@@ -190,7 +190,7 @@ func (s *Scheduler) sessionBeginPass() {
 }
 
 // sessionEverIn is ST1's everIn: any thread of the session was ever admitted (memoised for the pass).
-func (s *Scheduler) sessionEverIn(key string) bool {
+func (s *Scheduler) sessionEverIn(key sessKey) bool {
 	ss := s.sessionsOn()
 	f := ss.facts[key]
 	if f.everKnown {
@@ -202,12 +202,11 @@ func (s *Scheduler) sessionEverIn(key string) bool {
 }
 
 // sessionEverInNow is everIn read from the state, writing nothing (the snapshot's form, I9).
-func (s *Scheduler) sessionEverInNow(key string) bool {
-	if thread, own := strings.CutPrefix(key, sessionKeyThread); own {
-		return s.nca2.ever[thread]
+func (s *Scheduler) sessionEverInNow(key sessKey) bool {
+	if key.own {
+		return s.nca2.ever[key.id]
 	}
-	value, _ := strings.CutPrefix(key, sessionKeyHeader)
-	for _, t := range s.nca2.door.sessions.members[value] {
+	for _, t := range s.nca2.door.sessions.members[key.id] {
 		if s.nca2.ever[t] {
 			return true
 		}
@@ -217,8 +216,8 @@ func (s *Scheduler) sessionEverInNow(key string) bool {
 
 // sessionsInsideNow is the set of sessions with a thread admitted now, read from the lines (the
 // snapshot's form: nothing is written).
-func (s *Scheduler) sessionsInsideNow() map[string]bool {
-	out := map[string]bool{}
+func (s *Scheduler) sessionsInsideNow() map[sessKey]bool {
+	out := map[sessKey]bool{}
 	for _, g := range s.groups {
 		if g.nca2 == nil {
 			continue
@@ -278,7 +277,6 @@ func (s *Scheduler) doorSessionLabels(id string) (group, hash string) {
 		return "none", ""
 	}
 	group = [...]string{"A", "B", "C"}[s.sessionGroup(id)]
-	key := s.sessionKey(id)
-	sum := sha256.Sum256([]byte(key[len(sessionKeyHeader):])) // both prefixes have the same length
+	sum := sha256.Sum256([]byte(s.sessionKey(id).id))
 	return group, hex.EncodeToString(sum[:])[:10]
 }

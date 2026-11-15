@@ -302,3 +302,107 @@ func BenchmarkBASEPass(b *testing.B) {
 	}
 	b.ReportMetric(float64(total.Nanoseconds())/float64(b.N), "ns/pass")
 }
+
+// benchDoor is B1's state (session-layer §10.4): 3 pods of 8,000 blocks (a 7,600-block budget each), 200
+// admitted threads — 120 seated with a turn in flight, filling every budget so nothing is reclaimable, and
+// 80 returners waiting — and 500 outsiders (one in ten a pushed-out PRIORITY thread, one in twenty a big
+// prompt). The pass is the steady state the door lives in: the head fits nowhere and collects nothing,
+// and the backfill sweep has to ask every outsider on every pod and admits nobody.
+func benchDoor(b *testing.B, door, sessions bool) (*Scheduler, []Head) {
+	b.Helper()
+	s := newNCA2Tuned(b, func(c *Config) {
+		c.CPUTierTokens = i64(defaultCPUTierTokens)
+		c.Quantum, c.IdleSeconds = 8, 5
+		if door {
+			on := true
+			c.DoorBackfill = &on
+		}
+		if sessions {
+			on, header := true, "x-llm-d-session-id"
+			c.SessionAware, c.SessionHeader = &on, &header
+		}
+	}, nil)
+	pods := []string{"p0", "p1", "p2"}
+	for _, pod := range pods {
+		if err := s.SetNumBlocksFor(pod, 64, 8000); err != nil {
+			b.Fatal(err)
+		}
+	}
+	now := epoch
+	s.mu.Lock()
+	for pi, pod := range pods {
+		g := s.groups[pod]
+		for i := 0; i < 40; i++ { // 40 x 190 = 7,600: the budget is full
+			id := fmt.Sprintf("%s-seat%d", pod, i)
+			w := &waiter{id: id, since: now, chains: chain(id, 190)}
+			s.seat(g, w, 0, now)
+			s.nca2.homes[id], s.nca2.admitted[id], s.nca2.ever[id] = pod, true, true
+			g.nca2.line = append(g.nca2.line, nca2Entry{thread: id, tokens: 190 * 64, lastTouch: now})
+			s.release(g.threads[id], "rq-"+id, w.chains, now, dispatchObservables{}) // in flight: never a victim
+			s.sessionNote(id, fmt.Sprintf("S%d", (pi*40+i)/4))
+		}
+	}
+	s.mu.Unlock()
+	heads := make([]Head, 0, 580)
+	for pi, pod := range pods {
+		n := 27
+		if pi == 2 {
+			n = 26
+		}
+		for i := 0; i < n; i++ { // 80 returners
+			id := fmt.Sprintf("%s-ret%d", pod, i)
+			s.mu.Lock()
+			s.nca2.homes[id], s.nca2.admitted[id], s.nca2.ever[id] = pod, true, true
+			s.groups[pod].nca2.line = append(s.groups[pod].nca2.line, nca2Entry{thread: id, tokens: 3200, lastTouch: now})
+			s.mu.Unlock()
+			heads = append(heads, Head{Thread: id, ReqID: "r-" + id, Arrival: now.Add(-time.Minute),
+				Chains: chain(id, 50), Session: fmt.Sprintf("S%d", i)})
+		}
+	}
+	for i := 0; i < 500; i++ {
+		id := fmt.Sprintf("out%d", i)
+		blocks := 50
+		if i%20 == 0 {
+			blocks = 2000
+		}
+		if i%10 == 0 {
+			s.mu.Lock()
+			s.nca2.ever[id] = true
+			s.mu.Unlock()
+		}
+		heads = append(heads, Head{Thread: id, ReqID: "r-" + id, Arrival: now.Add(-time.Duration(i) * time.Millisecond),
+			Chains: chain(id, blocks), Session: fmt.Sprintf("S%d", 100+i/3)})
+	}
+	// one untimed pass first: the steady state has every thread's first observation (its waiter, its
+	// session) behind it, and in this state the pass admits nobody, so the timed pass sees the same state
+	s.Pass(heads, epoch.Add(500*time.Millisecond))
+	if snap := s.Snapshot(epoch).NCA2; snap.DecisionsThisPass != 0 || snap.Engines["p0"].SeatsReclaimable != 0 {
+		b.Fatalf("B1 fixture: the steady state admits nobody and has nothing reclaimable: %+v", snap)
+	}
+	return s, heads
+}
+
+// benchDoorPass times one pass of B1's state.
+func benchDoorPass(b *testing.B, door, sessions bool) {
+	b.ReportAllocs()
+	var total time.Duration
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		s, heads := benchDoor(b, door, sessions)
+		b.StartTimer()
+		start := time.Now()
+		s.Pass(heads, epoch.Add(time.Second))
+		total += time.Since(start)
+	}
+	b.ReportMetric(float64(total.Nanoseconds())/float64(b.N), "ns/pass")
+}
+
+// BenchmarkDoorPassOff is B1's reference: the same state through v2's decision (both switches off).
+func BenchmarkDoorPassOff(b *testing.B) { benchDoorPass(b, false, false) }
+
+// BenchmarkDoorPassOn is B1 with doorBackfill on (acceptance: at most 3x the reference).
+func BenchmarkDoorPassOn(b *testing.B) { benchDoorPass(b, true, false) }
+
+// BenchmarkDoorPassSessions is B1 with the session layer on as well.
+func BenchmarkDoorPassSessions(b *testing.B) { benchDoorPass(b, true, true) }

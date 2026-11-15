@@ -49,7 +49,7 @@ func inSession(h Head, session string) Head {
 }
 
 // sessionKeyOf reads a thread's session key under the lock.
-func (f *fixture) sessionKeyOf(id string) string {
+func (f *fixture) sessionKeyOf(id string) sessKey {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
 	return f.s.sessionKey(id)
@@ -65,8 +65,8 @@ func TestS4_FirstSessionValueWinsAndMismatchCounted(t *testing.T) {
 	h := inSession(f.heavyAt("t", 6, 384, f.now), "sess-b")
 	h.ReqID = "r-t2"
 	f.pass(h)
-	if got := f.sessionKeyOf("t"); got != sessionKeyHeader+"sess-a" {
-		t.Fatalf("S4: the first value is kept, got %q", got)
+	if got := f.sessionKeyOf("t"); got != (sessKey{id: "sess-a"}) {
+		t.Fatalf("S4: the first value is kept, got %+v", got)
 	}
 	f.s.mu.Lock()
 	mismatches := f.s.nca2.door.sessions.mismatches
@@ -80,8 +80,8 @@ func TestS4_FirstSessionValueWinsAndMismatchCounted(t *testing.T) {
 func TestS5_NoHeaderIsItsOwnSession(t *testing.T) {
 	f := newSessionFixture(t, nil, "p0")
 	f.pass(f.heavyAt("lone", 5, 320, f.now))
-	if got := f.sessionKeyOf("lone"); got != sessionKeyThread+"lone" {
-		t.Fatalf("S5: got %q", got)
+	if got := f.sessionKeyOf("lone"); got != (sessKey{id: "lone", own: true}) {
+		t.Fatalf("S5: got %+v", got)
 	}
 }
 
@@ -124,14 +124,14 @@ func TestST1_SessionFactsAreDerivedPerPass(t *testing.T) {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
 	sf := f.s.nca2.door.sessions.facts
-	s := sf[sessionKeyHeader+"S"]
+	s := sf[sessKey{id: "S"}]
 	if s.admitted != 2 || s.active != 3 || s.seats != 1 {
 		t.Fatalf("S: admitted t1+t3, active t1 (in flight) + t2 + t3 (waiting), one seat: %+v", s)
 	}
-	if p := sf[sessionKeyHeader+"P"]; p.admitted != 0 || p.active != 1 || p.seats != 0 {
+	if p := sf[sessKey{id: "P"}]; p.admitted != 0 || p.active != 1 || p.seats != 0 {
 		t.Fatalf("P: %+v", p)
 	}
-	if !f.s.sessionEverIn(sessionKeyHeader+"P") || f.s.sessionEverIn(sessionKeyHeader+"N") {
+	if !f.s.sessionEverIn(sessKey{id: "P"}) || f.s.sessionEverIn(sessKey{id: "N"}) {
 		t.Fatal("everIn: P had a thread admitted, N never")
 	}
 }

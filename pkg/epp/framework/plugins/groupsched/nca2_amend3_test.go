@@ -332,3 +332,79 @@ func TestO10_CPUWarmSeriesOnlyWithItsSwitch(t *testing.T) {
 		}
 	}
 }
+
+// quantumFixture is one pod in v2 (quantum 2), noQuantum on or off: q has run two whole turns on its seat
+// (two completed busy periods, its last settle a second ago), and a running seat leaves 5 blocks free.
+func quantumFixture(t *testing.T, noQuantum bool) *fixture {
+	t.Helper()
+	f := newV2Twin(t, func(c *Config) {
+		c.Quantum = 2
+		if noQuantum {
+			on := true
+			c.NoQuantum = &on
+		}
+	}, "p0")
+	f.turn("q", 10)
+	f.turn("q", 10)
+	f.running("p0", "big", 935, 320)
+	return f
+}
+
+// exitsByReason is the scheduler's exits by reason, read under the lock.
+func (f *fixture) exitsByReason(reason string) int64 {
+	f.s.mu.Lock()
+	defer f.s.mu.Unlock()
+	return f.s.counters.exits[reason]
+}
+
+// TestQT1_PastItsQuantumIsNoVictimWithNoQuantum: Q0 — a seat past its quantum that is not silent (its next
+// head is queued) is rotation-eligible by quantum completion without noQuantum, and released for an
+// outsider that needs the space (v2 then seats it again as a returner from the surplus); with noQuantum it
+// is not eligible and keeps its seat.
+func TestQT1_PastItsQuantumIsNoVictimWithNoQuantum(t *testing.T) {
+	for _, noQuantum := range []bool{false, true} {
+		f := quantumFixture(t, noQuantum)
+		f.s.mu.Lock()
+		g := f.s.groups["p0"]
+		m := g.threads["q"]
+		if m == nil || m.busyPeriods != 2 || m.busy() {
+			f.s.mu.Unlock()
+			t.Fatalf("fixture: q is seated with two busy periods and nothing in flight")
+		}
+		m.waitingSince = f.now // its next head is queued
+		reason, ok := f.s.eligible(m, f.now)
+		_, victim := f.s.rotationVictim(g, f.now)
+		f.s.mu.Unlock()
+		if noQuantum && (ok || victim != nil) {
+			t.Fatalf("noQuantum: q is not eligible (eligible %v %q, victim %v)", ok, reason, victim)
+		}
+		if !noQuantum && (!ok || reason != "quantum-complete" || victim == nil || victim.id != "q") {
+			t.Fatalf("off-twin: q is the quantum-complete victim (eligible %v %q, victim %v)", ok, reason, victim)
+		}
+		f.pass(f.hd("q", 10), f.hd("n", 20))
+		exits := f.exitsByReason("quantum-complete")
+		if noQuantum && (exits != 0 || !seated(f.s, "q")) {
+			t.Fatalf("noQuantum: q keeps its seat (quantum-complete exits %d)", exits)
+		}
+		if !noQuantum && exits != 1 {
+			t.Fatalf("off-twin: q is released for n (quantum-complete exits %d)", exits)
+		}
+	}
+}
+
+// TestQT2_AnIdleSeatIsStillAVictim: Q0 — silence still releases a seat with noQuantum: q, past its quantum
+// and silent for longer than idleSeconds, is the idle victim and is released for the outsider.
+func TestQT2_AnIdleSeatIsStillAVictim(t *testing.T) {
+	f := quantumFixture(t, true)
+	f.wait(10 * time.Second)
+	f.s.mu.Lock()
+	reason, ok := f.s.eligible(f.s.groups["p0"].threads["q"], f.now)
+	f.s.mu.Unlock()
+	if !ok || reason != "idle" {
+		t.Fatalf("a silent seat is eligible as idle with noQuantum, got %v %q", ok, reason)
+	}
+	f.pass(f.hd("n", 15))
+	if f.exitsByReason("idle") != 1 || seated(f.s, "q") || !f.admitted("n") {
+		t.Fatalf("q is released as idle and n admitted (idle exits %d, n admitted %v)", f.exitsByReason("idle"), f.admitted("n"))
+	}
+}

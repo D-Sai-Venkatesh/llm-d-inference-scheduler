@@ -57,20 +57,27 @@ func (s *Scheduler) drainExiting(now time.Time) {
 }
 
 // eligible asks whether a resident may be released, and why: Q — the one rotation
-// value — in COMPLETED BUSY PERIODS, or S of silence.
+// value — in COMPLETED BUSY PERIODS, or S of silence. With noQuantum (LOGIC Amendment 3, Q0) only
+// silence makes a seat eligible.
 func (s *Scheduler) eligible(m *thread, now time.Time) (string, bool) {
 	if m.busy() {
 		// a request at a pod, OR a live released window: a turn is in progress either way, and
 		// rotating it out would evict a thread that is about to run
 		return "", false
 	}
-	if m.busyPeriods >= s.cfg.Quantum {
+	if s.quantumRotates() && m.busyPeriods >= s.cfg.Quantum {
 		return "quantum-complete", true
 	}
 	if s.silent(m, now) {
 		return "idle", true
 	}
 	return "", false
+}
+
+// quantumRotates reports whether quantum completion makes a seat rotation-eligible: always, except in
+// nca2 with noQuantum.
+func (s *Scheduler) quantumRotates() bool {
+	return s.nca2 == nil || !s.nca2.noQuantum
 }
 
 // silent is the idle test: no queued head and no activity for S.
@@ -178,6 +185,8 @@ func (s *Scheduler) budgetVictim(g *engineGroup, now time.Time) (string, *thread
 	//                       enough for reclaiming it to be worth the loss. (The ≥Q ones are already
 	//                       rotation victims, which is why mid-quantum is the whole class.)
 	//  4 (budget-exiting) — a request RUNNING.
+	// With noQuantum (Q0) a resident past Q is no rotation victim, so memory pressure finds it in 2 or 3: the
+	// buckets are by state, not by quantum.
 	var noQueue, midQuantum, running *thread
 	for _, m := range g.threads {
 		if g.index.Exiting(m.id) {

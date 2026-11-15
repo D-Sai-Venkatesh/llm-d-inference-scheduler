@@ -44,6 +44,8 @@ type nca2Door struct {
 	// sessionAware is Part B; header is the lower-case session header it reads (C1/C4).
 	sessionAware bool
 	header       string
+	// backfillReclaim is BF4 (LOGIC Amendment 2, C8): backfill's second chance by reclaiming seats.
+	backfillReclaim bool
 
 	// ST3: the head and its collection pod survive the passes. The held blocks themselves stay in v2's
 	// per-pod reservedHead/reservedBlocks, and only collectPod may hold any (I2).
@@ -137,14 +139,14 @@ const (
 // backfillRefusalNames are O5's label values, indexed by the reasons above.
 var backfillRefusalNames = [backfillRefusalReasons]string{"cpu", "gpu", "valve", "valve_head_headroom"}
 
-// doorEcho is C6's part of the nca2 config echo: the three resolved values, whether or not they were set.
+// doorEcho is C6's (and C8's) part of the nca2 config echo: the resolved values, whether or not they were set.
 func (n *nca2Policy) doorEcho() string {
-	door, aware, header := false, false, ""
+	door, aware, header, reclaim := false, false, "", false
 	if n != nil && n.door != nil {
-		door, aware, header = true, n.door.sessionAware, n.door.header
+		door, aware, header, reclaim = true, n.door.sessionAware, n.door.header, n.door.backfillReclaim
 	}
-	return fmt.Sprintf("doorBackfill=%s sessionAware=%s sessionHeader=%s",
-		strconv.FormatBool(door), strconv.FormatBool(aware), header)
+	return fmt.Sprintf("doorBackfill=%s sessionAware=%s sessionHeader=%s backfillReclaim=%s",
+		strconv.FormatBool(door), strconv.FormatBool(aware), header, strconv.FormatBool(reclaim))
 }
 
 // ---- the pass ----

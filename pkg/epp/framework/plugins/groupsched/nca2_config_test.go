@@ -141,6 +141,8 @@ func TestC2_DoorKeysRequireNCA2(t *testing.T) {
 		"doorBackfill false without mode": `{"doorBackfill":false}`,
 		"sessionAware without mode":       `{"sessionAware":true}`,
 		"sessionHeader without mode":      `{"sessionHeader":"x-llm-d-session-id"}`,
+		"backfillReclaim without mode":    `{"backfillReclaim":true}`,
+		"backfillReclaim false w/o mode":  `{"backfillReclaim":false}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := factoryWith(t, params); err == nil {
@@ -154,16 +156,18 @@ func TestC2_DoorKeysRequireNCA2(t *testing.T) {
 // header without sessionAware does nothing and is refused (C5).
 func TestC3toC5_SessionKeysFailClosed(t *testing.T) {
 	for name, params := range map[string]string{
-		"C3 sessionAware without doorBackfill":  `{"mode":"nca2","sessionAware":true,"sessionHeader":"x-llm-d-session-id"}`,
-		"C3 sessionAware with doorBackfill off": `{"mode":"nca2","doorBackfill":false,"sessionAware":true,"sessionHeader":"x-llm-d-session-id"}`,
-		"C4 no header":                          `{"mode":"nca2","doorBackfill":true,"sessionAware":true}`,
-		"C4 empty header":                       `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":""}`,
-		"C4 the fairness header":                `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"X-LLM-D-Inference-Fairness-ID"}`,
-		"C4 the deprecated fairness alias":      `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"x-gateway-inference-fairness-id"}`,
-		"C4 x-request-id":                       `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"X-Request-Id"}`,
-		"C4 x-correlation-id":                   `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"x-correlation-id"}`,
-		"C5 header without sessionAware":        `{"mode":"nca2","doorBackfill":true,"sessionHeader":"x-llm-d-session-id"}`,
-		"C5 header with sessionAware false":     `{"mode":"nca2","doorBackfill":true,"sessionAware":false,"sessionHeader":"x-llm-d-session-id"}`,
+		"C3 sessionAware without doorBackfill":     `{"mode":"nca2","sessionAware":true,"sessionHeader":"x-llm-d-session-id"}`,
+		"C3 sessionAware with doorBackfill off":    `{"mode":"nca2","doorBackfill":false,"sessionAware":true,"sessionHeader":"x-llm-d-session-id"}`,
+		"C4 no header":                             `{"mode":"nca2","doorBackfill":true,"sessionAware":true}`,
+		"C4 empty header":                          `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":""}`,
+		"C4 the fairness header":                   `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"X-LLM-D-Inference-Fairness-ID"}`,
+		"C4 the deprecated fairness alias":         `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"x-gateway-inference-fairness-id"}`,
+		"C4 x-request-id":                          `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"X-Request-Id"}`,
+		"C4 x-correlation-id":                      `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"x-correlation-id"}`,
+		"C5 header without sessionAware":           `{"mode":"nca2","doorBackfill":true,"sessionHeader":"x-llm-d-session-id"}`,
+		"C5 header with sessionAware false":        `{"mode":"nca2","doorBackfill":true,"sessionAware":false,"sessionHeader":"x-llm-d-session-id"}`,
+		"C8 backfillReclaim without doorBackfill":  `{"mode":"nca2","backfillReclaim":true}`,
+		"C8 backfillReclaim with doorBackfill off": `{"mode":"nca2","doorBackfill":false,"backfillReclaim":true}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := factoryWith(t, params); err == nil {
@@ -197,8 +201,18 @@ func TestC1_DoorKeysResolve(t *testing.T) {
 		t.Fatal("C7: doorBackfill false resolves to no door section")
 	}
 	n := resolve(t, `{"mode":"nca2","doorBackfill":true}`)
-	if n.door == nil || n.door.sessionAware || n.door.header != "" {
+	if n.door == nil || n.door.sessionAware || n.door.header != "" || n.door.backfillReclaim {
 		t.Fatalf("Part A alone: %+v", n.door)
+	}
+	// C8 (LOGIC Amendment 2): backfillReclaim rides on the door; false is the door at a2142ddc (I14)
+	if n := resolve(t, `{"mode":"nca2","doorBackfill":true,"backfillReclaim":true}`); n.door == nil || !n.door.backfillReclaim {
+		t.Fatalf("C8: backfillReclaim resolves into the door: %+v", n.door)
+	}
+	if n := resolve(t, `{"mode":"nca2","doorBackfill":true,"backfillReclaim":false}`); n.door == nil || n.door.backfillReclaim {
+		t.Fatalf("C8: backfillReclaim false: %+v", n.door)
+	}
+	if n := resolve(t, `{"mode":"nca2","backfillReclaim":false}`); n.door != nil {
+		t.Fatal("C7/C8: backfillReclaim false without the door resolves to no door section")
 	}
 	n = resolve(t, `{"mode":"nca2","doorBackfill":true,"sessionAware":true,"sessionHeader":"X-LLM-D-Session-Id"}`)
 	if n.door == nil || !n.door.sessionAware || n.door.header != "x-llm-d-session-id" {
@@ -215,23 +229,24 @@ func TestC6_EchoNamesTheDoorSwitches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := n.doorEcho(); got != "doorBackfill=false sessionAware=false sessionHeader=" {
+	if got := n.doorEcho(); got != "doorBackfill=false sessionAware=false sessionHeader= backfillReclaim=false" {
 		t.Fatalf("both off: %q", got)
 	}
 	on, off := true, defaultConfig()
-	cfg.DoorBackfill, cfg.SessionAware = &on, &on
+	cfg.DoorBackfill, cfg.SessionAware, cfg.BackfillReclaim = &on, &on, &on
 	header := "x-llm-d-session-id"
 	cfg.SessionHeader = &header
 	if n, err = cfg.resolveNCA2(); err != nil {
 		t.Fatal(err)
 	}
-	if got := n.doorEcho(); got != "doorBackfill=true sessionAware=true sessionHeader=x-llm-d-session-id" {
+	if got := n.doorEcho(); got != "doorBackfill=true sessionAware=true sessionHeader=x-llm-d-session-id backfillReclaim=true" {
 		t.Fatalf("both on: %q", got)
 	}
-	if echo := configEcho(cfg); !strings.Contains(echo, "doorBackfill=true") || !strings.Contains(echo, "sessionHeader=x-llm-d-session-id") {
+	if echo := configEcho(cfg); !strings.Contains(echo, "doorBackfill=true") || !strings.Contains(echo, "sessionHeader=x-llm-d-session-id") ||
+		!strings.Contains(echo, "backfillReclaim=true") {
 		t.Fatalf("the effective-config echo carries the keys that were set: %s", echo)
 	}
-	for _, key := range []string{"doorBackfill", "sessionAware", "sessionHeader"} {
+	for _, key := range []string{"doorBackfill", "sessionAware", "sessionHeader", "backfillReclaim"} {
 		if strings.Contains(configEcho(off), key) {
 			t.Fatalf("the OFF echo must not name %q", key)
 		}

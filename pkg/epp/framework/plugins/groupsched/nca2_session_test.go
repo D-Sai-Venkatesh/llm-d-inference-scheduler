@@ -331,7 +331,7 @@ func TestI10_NoHeadersCollapsesToPartA(t *testing.T) {
 				c.SessionAware, c.SessionHeader = &on, &header
 			}
 		}
-		s, probe, _ := doorLoopTraced(t, 20261115, 72_000, 400, tune, false, &out)
+		s, probe, _ := doorLoopTraced(t, 20261115, 72_000, 400, tune, false, false, &out)
 		if len(probe.violations) > 0 {
 			t.Fatalf("sessions=%v: %v", sessions, probe.violations)
 		}

@@ -26,6 +26,7 @@ package groupsched
 //	H1-H3  who is the head (sticky; a strictly higher outsider that cannot backfill takes over)
 //	H4     the head fits some pod NOW: admit it there, nothing released anywhere (H5)
 //	H6-H9  otherwise it collects on ONE pod, chosen once (not for a Part-B new-session head: H8)
+//	H10b   a Part-B new-session head holds nothing while a returner of its pod waits
 //	L2-1   the pods' returners, v2's step unchanged (free budget excludes the held blocks)
 //	H10    a Part-B new-session head collects only if no returner of its pod waits
 //	BF     everyone else, in ranking order, into what is already free; with backfillReclaim (BF4) a
@@ -112,7 +113,7 @@ const (
 	doorPathBackfillReclaim = "backfill_reclaim"
 )
 
-// The collection events (session-layer O2, LOGIC Amendment 1 Q5).
+// The collection events (session-layer O2, LOGIC Amendment 1 Q5, Amendment 2 H10b).
 const (
 	collectStart            = "start"
 	collectKeptOnTakeover   = "kept_on_takeover"
@@ -120,6 +121,7 @@ const (
 	collectReleasedCPU      = "released_cpu"
 	collectReleasedHeadGone = "released_head_gone"
 	collectReleasedPodGone  = "released_pod_gone"
+	collectReleasedReturner = "released_returner"
 	collectCompleted        = "completed"
 )
 
@@ -286,6 +288,10 @@ func (s *Scheduler) doorDecide(base []podState, head *waiter, memo map[fitKey]fi
 		}
 		// H8: a Part-B new-session head waits for its pod's returners (H10 below)
 		deferred = d.sessionAware && s.doorClassOf(head.id) == 2
+		// H10b (LOGIC Amendment 2): and while one waits it holds nothing, so L2-1 can seat it from that budget
+		if deferred && collect != nil && collect.g.nca2.reservedBlocks > 0 && s.doorReturnerWaitingOn(collect.g) {
+			s.doorYield(collect.g, head, now)
+		}
 		if collect != nil && !deferred && s.doorCollect(collect, head, now) {
 			return doorPathHeadCollected, true
 		}
@@ -302,8 +308,8 @@ func (s *Scheduler) doorDecide(base []podState, head *waiter, memo map[fitKey]fi
 	if d.onStage != nil {
 		d.onStage(doorStage{name: doorStageBackfill, head: d.headID})
 	}
-	if s.doorBackfill(base, head, memo, now) {
-		return doorPathBackfill, true
+	if path, ok := s.doorBackfill(base, head, memo, now); ok {
+		return path, true
 	}
 	// BF3: nothing could be admitted or seated: the pass ends here, and this sweep was exhaustive (O5)
 	s.doorFlushRefusals()
@@ -493,6 +499,17 @@ func (s *Scheduler) doorCollect(p *podState, head *waiter, now time.Time) bool {
 	}
 }
 
+// doorYield is H10b: a new session's head gives its held blocks on its collection pod back to the pod's
+// waiting returners. The collection pod and reservedHead are kept: H10 collects again there once no
+// returner of the pod waits.
+func (s *Scheduler) doorYield(g *engineGroup, head *waiter, now time.Time) {
+	held := g.nca2.reservedBlocks
+	g.nca2.reservedBlocks = 0
+	s.nca2m.ObserveCollection(collectReleasedReturner)
+	s.recordEvent("COLLECT", head.id, fmt.Sprintf("event=%s pod=%s held=%d",
+		collectReleasedReturner, engineLabel(g.id), held), now)
+}
+
 // ---- the admission ----
 
 // doorAdmit is A2.1 through the door: v2's admission and seat, the door's counters, and — for the head —
@@ -589,8 +606,8 @@ func (s *Scheduler) doorReturnerWaitingOn(g *engineGroup) bool {
 // admitted if it passes the three checks with what is ALREADY free — no rotationVictim, no exit, no
 // reclaim (I4) — and, on the collection pod, neither the held blocks nor the valve headroom the head
 // needs (I5). With backfillReclaim, a candidate BF1 refused on every pod gets BF4's second chance before
-// the next candidate is asked. The first admission ends the decision.
-func (s *Scheduler) doorBackfill(base []podState, head *waiter, memo map[fitKey]fitFacts, now time.Time) bool {
+// the next candidate is asked. The first admission ends the decision; its door path is returned.
+func (s *Scheduler) doorBackfill(base []podState, head *waiter, memo map[fitKey]fitFacts, now time.Time) (string, bool) {
 	d := s.nca2.door
 	var maxRoom int64
 	for i := range base {
@@ -624,19 +641,19 @@ func (s *Scheduler) doorBackfill(base []podState, head *waiter, memo map[fitKey]
 			reason, ok := s.doorBackfillFits(&pods[j], w, f, collect, headNeed, memo)
 			if ok {
 				if s.doorAdmit(&pods[j], w, doorPathBackfill, now) {
-					return true
+					return doorPathBackfill, true
 				}
 				continue
 			}
 			furthest = max(furthest, reason)
 		}
 		if d.backfillReclaim && s.doorBackfillReclaim(pods, w, f, memo, now) {
-			return true
+			return doorPathBackfillReclaim, true
 		}
 		// O5: a refusal is booked only once BF4 refused the candidate too (LOGIC Amendment 2)
 		d.refused[furthest]++
 	}
-	return false
+	return "", false
 }
 
 // doorBackfillReclaim is BF4 (LOGIC Amendment 2) for one candidate that BF1 refused on every pod: the

@@ -64,6 +64,56 @@ func headFitsNowAnywhere(s *Scheduler, head *waiter) bool {
 	return false
 }
 
+// podExits is every pod's seat RELEASES so far, push-outs excluded as in exitTotal (the caller holds the lock).
+func podExits(s *Scheduler) map[string]int64 {
+	out := map[string]int64{}
+	for _, g := range s.activeGroups() {
+		for reason, v := range g.counters.exits {
+			if reason != exitReasonPushout {
+				out[g.id] += v
+			}
+		}
+	}
+	return out
+}
+
+// returnerWaitingAsTheDoorSees is BF4(b)/H10/H10b's question: the pass's returner list once it is built,
+// and otherwise the list the door would build from the state now — read without building it, so the
+// probe moves no decision.
+func returnerWaitingAsTheDoorSees(s *Scheduler, g *engineGroup) bool {
+	if s.nca2.warmBuilt {
+		return s.doorReturnerWaitingOn(g)
+	}
+	return len(s.nca2WarmReturners(g)) > 0
+}
+
+// reclaimFitsAnywhere is BF4's checks for a non-head outsider on some pod, from the state (nothing is
+// released, the costs are fresh).
+func reclaimFitsAnywhere(s *Scheduler, w *waiter, now time.Time) (string, bool) {
+	f := PromptTokens(w.chains)
+	for _, g := range s.activeGroups() {
+		if g.numBlocks <= 0 || g.nca2 == nil || g.id == s.nca2.door.collectPod || len(g.threads) == 0 ||
+			f > s.nca2View(g).room(s.nca2.AdmitLineTokens) || returnerWaitingAsTheDoorSees(s, g) {
+			continue
+		}
+		if s.ncaV2Fits(g, w, now, map[fitKey]fitFacts{}) {
+			return g.id, true
+		}
+	}
+	return "", false
+}
+
+// canBackfill is "can backfill" as H3 and I12 mean it: BF1, and with backfillReclaim also BF4.
+func canBackfill(s *Scheduler, w *waiter, now time.Time) (string, bool) {
+	if pod, ok := backfillFitsAnywhere(s, w); ok {
+		return pod, true
+	}
+	if s.nca2.door.backfillReclaim {
+		return reclaimFitsAnywhere(s, w, now)
+	}
+	return "", false
+}
+
 // backfillFitsAnywhere is BF1's three checks for a non-head outsider on some pod, from the state.
 func backfillFitsAnywhere(s *Scheduler, w *waiter) (string, bool) {
 	d := s.nca2.door
@@ -122,22 +172,31 @@ func checkHolding(s *Scheduler) string {
 	return ""
 }
 
-// doorProbe installs the per-decision checks (I4, I6, I7, I11) on the seam and collects violations.
+// doorProbe installs the per-decision checks (I4 as amended, I6, I7, I8 extended, I11) on the seam and
+// collects violations.
 type doorProbe struct {
 	s          *Scheduler
+	now        *time.Time
 	violations []string
 	lastHead   string
 	fitAtStart bool
 	exitsStart int64
 	exitsBF    int64
-	decisions  int
-	takeovers  int
-	collected  int
-	backfills  int
+	// podStart / podBF are each pod's releases at the decision's start and at BF's start; collectBF and
+	// returnerBF are the collection pod and the pods with a returner waiting when BF began (I4 amended).
+	podStart, podBF map[string]int64
+	collectBF       string
+	returnerBF      map[string]bool
+	decisions       int
+	takeovers       int
+	collected       int
+	backfills       int
+	reclaims        int
+	yields          int
 }
 
-func newDoorProbe(s *Scheduler) *doorProbe {
-	p := &doorProbe{s: s}
+func newDoorProbe(s *Scheduler, now *time.Time) *doorProbe {
+	p := &doorProbe{s: s, now: now}
 	s.nca2.door.onStage = p.stage
 	return p
 }
@@ -155,6 +214,7 @@ func (p *doorProbe) stage(st doorStage) {
 	case doorStageStart:
 		p.decisions++
 		p.exitsStart = exitTotal(s)
+		p.podStart = podExits(s)
 		if msg := checkHolding(s); msg != "" {
 			p.fail("at a decision start: %s", msg)
 		}
@@ -166,7 +226,7 @@ func (p *doorProbe) stage(st doorStage) {
 			if st.head != p.lastHead {
 				p.fail("I7: a new head %s that is not the first-ranked outsider %s", st.head, first.w.id)
 			} else if first.class < s.doorClassOf(st.head) {
-				if _, ok := backfillFitsAnywhere(s, first.w); !ok {
+				if _, ok := canBackfill(s, first.w, *p.now); !ok {
 					p.fail("I7: %s (class %d) cannot backfill and did not take the head from %s (class %d)",
 						first.w.id, first.class, st.head, s.doorClassOf(st.head))
 				}
@@ -188,26 +248,55 @@ func (p *doorProbe) stage(st doorStage) {
 		}
 	case doorStageBackfill:
 		p.exitsBF = exitTotal(s)
+		p.podBF = podExits(s)
+		p.collectBF = d.collectPod
+		p.returnerBF = map[string]bool{}
+		for _, g := range s.activeGroups() {
+			p.returnerBF[g.id] = g.nca2 != nil && returnerWaitingAsTheDoorSees(s, g)
+		}
 	case doorStageEnd:
 		exits := exitTotal(s)
-		// I8: a new session's head releases no seat on its pod while a returner of that pod waits
-		if d.sessionAware && st.path != doorPathReturner && d.collectPod != "" && s.waiters[d.headID] != nil &&
-			s.doorClassOf(d.headID) == 2 && s.doorReturnerWaitingOn(s.groups[d.collectPod]) && exits != p.exitsStart {
-			p.fail("I8: the new-session head %s released %d seats while a returner of %s waits", d.headID, exits-p.exitsStart, d.collectPod)
+		pods := podExits(s)
+		// I8: a new session's head releases no seat on its pod while a returner of that pod waits, and
+		// (LOGIC Amendment 2, H10b) holds no blocks there while one waits
+		if d.sessionAware && d.collectPod != "" && s.doorIsOutsider(d.headID) && s.doorClassOf(d.headID) == 2 {
+			g := s.groups[d.collectPod]
+			if g != nil && returnerWaitingAsTheDoorSees(s, g) {
+				if st.path != doorPathReturner && pods[g.id] != p.podStart[g.id] {
+					p.fail("I8: the new-session head %s released %d seats while a returner of %s waits", d.headID, pods[g.id]-p.podStart[g.id], g.id)
+				}
+				if g.nca2.reservedBlocks > 0 {
+					p.fail("I8 (H10b): the new-session head %s holds %d on %s while a returner of it waits", d.headID, g.nca2.reservedBlocks, g.id)
+				}
+			}
 		}
 		// I6: a head that fit some pod now released nothing in its decision
 		if p.fitAtStart && exits != p.exitsStart {
 			p.fail("I6: the head fit a pod now and %d seats were released", exits-p.exitsStart)
 		}
-		// I4: backfill never releases a seat
-		if (st.path == doorPathBackfill || !st.ok) && p.exitsBF >= 0 && exits != p.exitsBF {
-			p.fail("I4: backfill released %d seats", exits-p.exitsBF)
+		// I4 (LOGIC Amendment 2): backfill releases seats only through BF4 — never on the collection pod,
+		// never on a pod whose returner waits, and only for the admission of this decision
+		if p.exitsBF >= 0 && exits != p.exitsBF {
+			if !d.backfillReclaim || st.path != doorPathBackfillReclaim {
+				p.fail("I4: backfill released %d seats (path %q)", exits-p.exitsBF, st.path)
+			}
+			for id, n := range pods {
+				if n == p.podBF[id] {
+					continue
+				}
+				if id == p.collectBF || p.returnerBF[id] {
+					p.fail("I4: backfill released %d seats on %s (collection pod %q, returner waiting %v)",
+						n-p.podBF[id], id, p.collectBF, p.returnerBF[id])
+				}
+			}
 		}
 		switch st.path {
 		case doorPathHeadCollected:
 			p.collected++
 		case doorPathBackfill:
 			p.backfills++
+		case doorPathBackfillReclaim:
+			p.reclaims++
 		}
 		p.exitsBF = -1
 		p.lastHead = d.headID
@@ -217,8 +306,10 @@ func (p *doorProbe) stage(st doorStage) {
 // doorLoopTraced is the closed loop: mixed sizes (small threads and big heads that must collect), growing
 // prompts, pauses past idleSeconds, one served head per pass. It records the decision stream (served
 // index, SEAT/EXIT/COLLECT events, each pod's held blocks, the head) when out is not nil.
-// With sessions, thread i belongs to session S(i/4) (a root and three sub-agents).
-func doorLoopTraced(t *testing.T, seed, tier int64, passes int, tune func(*Config), sessions bool, out *[]string) (*Scheduler, *doorProbe, int) {
+// With sessions, thread i belongs to session S(i/4) (a root and three sub-agents). heavy is a mix that makes
+// the GPU bind: larger threads, and one in four pausing long on its seat (an idle seat holder).
+func doorLoopTraced(t *testing.T, seed, tier int64, passes int, tune func(*Config), sessions, heavy bool,
+	out *[]string) (*Scheduler, *doorProbe, int) {
 	t.Helper()
 	s := newNCA2Tuned(t, func(c *Config) {
 		on := true
@@ -229,9 +320,13 @@ func doorLoopTraced(t *testing.T, seed, tier int64, passes int, tune func(*Confi
 			tune(c)
 		}
 	}, []string{"p0", "p1", "p2"})
-	probe := newDoorProbe(s)
-	if out != nil {
-		s.onEvent = func(ev Event) {
+	now := epoch
+	probe := newDoorProbe(s, &now)
+	s.onEvent = func(ev Event) {
+		if ev.Kind == "COLLECT" && strings.Contains(ev.Detail, "event="+collectReleasedReturner) {
+			probe.yields++
+		}
+		if out != nil {
 			*out = append(*out, fmt.Sprintf("ev %s %s %s %s", ev.Kind, ev.ID, ev.Engine, ev.Detail))
 		}
 	}
@@ -244,12 +339,17 @@ func doorLoopTraced(t *testing.T, seed, tier int64, passes int, tune func(*Confi
 		if i%6 == 0 {
 			th.blocks = 300 + rng.Intn(250)
 		}
+		if heavy {
+			th.blocks = 10 + rng.Intn(110)
+			if i%6 == 0 {
+				th.blocks = 300 + rng.Intn(300)
+			}
+		}
 		threads = append(threads, th)
 		if sessions {
 			sessionOf[th.id] = fmt.Sprintf("S%d", i/4)
 		}
 	}
-	now := epoch
 	seq := 0
 	homeOf := func(id string) string {
 		s.mu.Lock()
@@ -302,7 +402,7 @@ func doorLoopTraced(t *testing.T, seed, tier int64, passes int, tune func(*Confi
 				if s.nca2.admitted[id] || id == s.nca2.door.headID {
 					continue
 				}
-				if pod, ok := backfillFitsAnywhere(s, w); ok {
+				if pod, ok := canBackfill(s, w, now); ok {
 					probe.fail("I12 at pass %d: %s fits %s by backfill and was left outside", pass, id, pod)
 				}
 			}
@@ -331,44 +431,61 @@ func doorLoopTraced(t *testing.T, seed, tier int64, passes int, tune func(*Confi
 			th.turns--
 			th.blocks += th.grow
 			th.gap = rng.Intn(9)
+			if heavy && th.id[len(th.id)-1]%4 == 1 {
+				th.gap = 15 + rng.Intn(30)
+			}
 		}
 	}
 	return s, probe, passes
 }
 
-// TestTDR6_DoorInvariantsUnderInterleavings: T-DR6 — random interleavings over several seeds and two CPU
-// tiers, Part A and Part B (I8 too): no invariant breaks, the loop's own coverage includes collections, takeovers-free head changes
-// and backfills, and every session finishes (liveness).
+// TestTDR6_DoorInvariantsUnderInterleavings: T-DR6 — random interleavings over several seeds and three CPU
+// tiers (the roomiest one makes the GPU bind, so new-session heads yield to returners), Part A and Part B
+// (I8 too), each with backfillReclaim off and on (LOGIC Amendment 2): no invariant breaks, the loop's own
+// coverage includes collections, backfills, backfill reclaims and group-C yields, and every session
+// finishes (liveness).
 func TestTDR6_DoorInvariantsUnderInterleavings(t *testing.T) {
-	collected, backfills, decisions, takeovers := 0, 0, 0, 0
+	collected, backfills, decisions, takeovers, reclaims, yields := 0, 0, 0, 0, 0, 0
 	for _, seed := range []int64{1, 7, 99, 4242, 20261115} {
-		for _, tier := range []int64{56_000, 72_000} {
+		for _, tier := range []int64{56_000, 72_000, 150_000} {
 			for _, sessions := range []bool{false, true} {
-				tune := func(c *Config) {}
-				if sessions {
-					tune = func(c *Config) {
-						on, header := true, "x-llm-d-session-id"
-						c.SessionAware, c.SessionHeader = &on, &header
+				for _, reclaim := range []bool{false, true} {
+					tune := func(c *Config) {
+						if sessions {
+							on, header := true, "x-llm-d-session-id"
+							c.SessionAware, c.SessionHeader = &on, &header
+						}
+						if reclaim {
+							on := true
+							c.BackfillReclaim = &on
+						}
 					}
+					_, probe, took := doorLoopTraced(t, seed, tier, 3000, tune, sessions, tier >= 150_000, nil)
+					if len(probe.violations) > 0 {
+						t.Fatalf("seed %d tier %d sessions %v reclaim %v: %v", seed, tier, sessions, reclaim, probe.violations)
+					}
+					if took >= 3000 {
+						t.Fatalf("seed %d tier %d sessions %v reclaim %v: liveness: sessions still unfinished after %d passes",
+							seed, tier, sessions, reclaim, took)
+					}
+					if !reclaim && probe.reclaims > 0 {
+						t.Fatalf("seed %d: %d backfill reclaims with the switch off", seed, probe.reclaims)
+					}
+					collected += probe.collected
+					backfills += probe.backfills
+					decisions += probe.decisions
+					takeovers += probe.takeovers
+					reclaims += probe.reclaims
+					yields += probe.yields
 				}
-				_, probe, took := doorLoopTraced(t, seed, tier, 3000, tune, sessions, nil)
-				if len(probe.violations) > 0 {
-					t.Fatalf("seed %d tier %d sessions %v: %v", seed, tier, sessions, probe.violations)
-				}
-				if took >= 3000 {
-					t.Fatalf("seed %d tier %d sessions %v: liveness: sessions still unfinished after %d passes", seed, tier, sessions, took)
-				}
-				collected += probe.collected
-				backfills += probe.backfills
-				decisions += probe.decisions
-				takeovers += probe.takeovers
 			}
 		}
 	}
-	t.Logf("%d decisions: %d heads admitted after collecting, %d backfills, %d takeovers that kept the blocks",
-		decisions, collected, backfills, takeovers)
-	if collected == 0 || backfills == 0 {
-		t.Fatalf("fixture coverage: %d head collections, %d backfills", collected, backfills)
+	t.Logf("%d decisions: %d heads admitted after collecting, %d backfills, %d backfill reclaims, %d group-C yields, %d takeovers that kept the blocks",
+		decisions, collected, backfills, reclaims, yields, takeovers)
+	if collected == 0 || backfills == 0 || reclaims == 0 || yields == 0 {
+		t.Fatalf("fixture coverage: %d head collections, %d backfills, %d backfill reclaims, %d group-C yields",
+			collected, backfills, reclaims, yields)
 	}
 }
 

@@ -87,7 +87,7 @@ func newDoorMetrics(sessionAware, backfillReclaim bool) *doorMetrics {
 		headChanges: prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "head_changes_total",
 			Help: "the door's head ended its tenure: admitted, gone (left the queue), takeover (a strictly higher outsider that could not backfill took it)"}, []string{"reason"}),
 		collections: prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "collections_total",
-			Help: "collection events: start (a collection pod was chosen), kept_on_takeover, released_takeover, released_cpu (the head lost the room there), released_head_gone, released_pod_gone (the pod was removed), completed (the head was admitted)"}, []string{"event"}),
+			Help: "collection events: start (a collection pod was chosen), kept_on_takeover, released_takeover, released_cpu (the head lost the room there), released_head_gone, released_pod_gone (the pod was removed), released_returner (sessionAware: a new session's head gave its held blocks back to its pod's waiting returners), completed (the head was admitted)"}, []string{"event"}),
 		refused: prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "backfill_refused_total",
 			Help: "outsiders the exhaustive backfill sweep at the end of a pass refused, by the furthest check reached on any pod: cpu, gpu, valve, valve_head_headroom (the valve headroom the head needs on its pod). A PASS count: every pass that ends with outsiders waiting adds them again"}, []string{"reason"}),
 		classes: []string{pathPriority, pathNewcomer},
@@ -130,6 +130,7 @@ func (d *doorMetrics) collectors() []prometheus.Collector {
 		out = append(out, d.reclaimedSeats)
 	}
 	if d.sessionHeader != nil {
+		d.collections.WithLabelValues(collectReleasedReturner)
 		d.sessionHeader.WithLabelValues("true")
 		d.sessionHeader.WithLabelValues("false")
 		d.sessionMismatch.Add(0)

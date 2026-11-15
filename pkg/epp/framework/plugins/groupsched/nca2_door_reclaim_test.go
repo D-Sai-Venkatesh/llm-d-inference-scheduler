@@ -16,11 +16,13 @@ limitations under the License.
 
 package groupsched
 
-// BACKFILL RECLAIM (session-layer LOGIC Amendment 2, BF4/I4 amended), one rule per test: an outsider that
-// fits no pod's free budget may release eligible seats on a pod that is not the collection pod and has no
-// returner waiting, and only for its own admission in the same step (T-R1..T-R4).
+// LOGIC AMENDMENT 2, one rule per test. Backfill reclaim (BF4, I4 amended): an outsider that fits no pod's
+// free budget may release eligible seats on a pod that is not the collection pod and has no returner
+// waiting, and only for its own admission in the same step (T-R1..T-R4). The group-C yield (H10b): a new
+// session's head holds nothing on its pod while a returner of that pod waits (T-R5).
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -172,5 +174,70 @@ func TestH3_ReclaimCountsAsBackfill(t *testing.T) {
 		} else if f.doorPathOf("P") != doorPathHeadCollected || f.homeOf("P") != "p1" {
 			t.Fatalf("reclaim off: P takes the head and collects on p1 (path %q, home %q)", f.doorPathOf("P"), f.homeOf("P"))
 		}
+	}
+}
+
+// h10bFixture: the head N collects on p0 (one idle seat released, one running); in Part B N is a new
+// session's head (group C), collecting through H10 because no returner of p0 waits yet.
+func h10bFixture(t *testing.T, sessions bool) (*fixture, Head, *[]string) {
+	t.Helper()
+	var f *fixture
+	if sessions {
+		f = newSessionFixture(t, "p0")
+	} else {
+		f = newDoorFixture(t, nil, "p0")
+	}
+	var events []string
+	f.s.onEvent = func(ev Event) {
+		if ev.Kind == "COLLECT" {
+			events = append(events, ev.ID+" "+ev.Detail)
+		}
+	}
+	f.idleSeat("p0", "a1", 400)
+	f.running("p0", "a2", 545, 320)
+	f.wait(10 * time.Second)
+	n := inSession(f.heavyAt("N", 900, 320, f.now), "new")
+	f.pass(n)
+	if head, pod := f.doorHead(); head != "N" || pod != "p0" || f.held("p0") != 405 {
+		t.Fatalf("fixture: N collects on p0 (%q on %q, held %d)", head, pod, f.held("p0"))
+	}
+	return f, n, &events
+}
+
+// TestTR5_NewSessionHeadYieldsToItsPodsReturner: T-R5/H10b — a returner of the collection pod starts
+// waiting: the group-C head's held blocks are released (its collection pod and reservedHead are kept),
+// and the yield is an O2 event. While the returner waits the head holds nothing (I8 extended); once it
+// is gone, H10 collects again.
+func TestTR5_NewSessionHeadYieldsToItsPodsReturner(t *testing.T) {
+	f, n, events := h10bFixture(t, true)
+	f.returnerOn("p0", "ret")
+	ret := f.heavyAt("ret", 600, 320, f.now.Add(-time.Minute)) // 405 free, nothing reclaimable: it waits
+	f.pass(n, ret)
+	if head, pod := f.doorHead(); head != "N" || pod != "p0" || f.reservedHead("p0") != "N" {
+		t.Fatalf("H10b: the head and its collection pod are kept (%q on %q, reservedHead %q)", head, pod, f.reservedHead("p0"))
+	}
+	if f.held("p0") != 0 || seated(f.s, "ret") {
+		t.Fatalf("H10b: nothing is held while p0's returner waits (held %d)", f.held("p0"))
+	}
+	if !strings.Contains(strings.Join(*events, "\n"), "N event=released_returner pod=p0 held=405") {
+		t.Fatalf("O2/O8: the yield is a COLLECT event: %v", *events)
+	}
+	f.pass(n, ret) // still waiting: still nothing held
+	if f.held("p0") != 0 {
+		t.Fatalf("I8: held %d while the returner waits", f.held("p0"))
+	}
+	f.pass(n) // the returner's request is gone: H10 collects again
+	if f.held("p0") != 405 || f.reservedHead("p0") != "N" {
+		t.Fatalf("H10: the head collects again once no returner waits (held %d for %q)", f.held("p0"), f.reservedHead("p0"))
+	}
+}
+
+// TestTR5_PartAHeadKeepsItsBlocks is the contrast: in Part A the head keeps head-first on its pod (D1).
+func TestTR5_PartAHeadKeepsItsBlocks(t *testing.T) {
+	f, n, events := h10bFixture(t, false)
+	f.returnerOn("p0", "ret")
+	f.pass(n, f.heavyAt("ret", 600, 320, f.now.Add(-time.Minute)))
+	if f.held("p0") != 405 || strings.Contains(strings.Join(*events, "\n"), "released_returner") {
+		t.Fatalf("Part A: the head keeps its held blocks (held %d)", f.held("p0"))
 	}
 }

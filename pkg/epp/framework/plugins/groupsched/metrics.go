@@ -73,6 +73,9 @@ func newPluginMetrics(r *GroupScheduler) *groupMetrics {
 	gm := &groupMetrics{sched: r.sched, gauges: newStateGauges(r)}
 	if r.sched.nca2 != nil {
 		gm.nca2 = newNCA2Metrics()
+		if door := r.sched.nca2.door; door != nil {
+			gm.nca2.door = newDoorMetrics(door.sessionAware) // session-layer O1-O6, only with the switch on
+		}
 		gm.nca2Gauges = newNCA2Gauges(r)
 		// the scheduler's own observer: nil-safe, and non-nil exactly when nca2 runs
 		r.sched.nca2m = gm.nca2

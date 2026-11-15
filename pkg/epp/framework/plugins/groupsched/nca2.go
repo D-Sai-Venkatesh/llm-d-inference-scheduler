@@ -753,6 +753,15 @@ type NCA2Snapshot struct {
 	// candidate. A cap hit is a capacity signal; a no-candidate end with capacity is a bug (I7).
 	DecisionsThisPass int  `json:"decisionsThisPass"`
 	DecisionCapHit    bool `json:"decisionCapHit,omitempty"`
+
+	// The door (session-layer O9), absent unless doorBackfill is on: the head, its collection pod, the
+	// blocks held for it, the outsiders by class (or session group) and, with the session layer, the
+	// sessions with a thread admitted.
+	HeadID             string         `json:"headID,omitempty"`
+	CollectPod         string         `json:"collectPod,omitempty"`
+	HeldBlocks         *int64         `json:"heldBlocks,omitempty"`
+	DoorWaitingByGroup map[string]int `json:"doorWaitingByGroup,omitempty"`
+	SessionsInside     *int           `json:"sessionsInside,omitempty"`
 }
 
 // NCA2PodSnapshot is ONE pod's CPU line as a scraped reader sees it: the geometry the decision uses
@@ -782,6 +791,9 @@ type NCA2PodSnapshot struct {
 	// IdleWithWaiters is 1 when this pod has nothing in flight while an outside head or one of its own
 	// warm returners waits: the state a liveness bug looks like from a dashboard.
 	IdleWithWaiters int `json:"idleWithWaiters"`
+	// CollectHeldBlocks is the blocks this pod holds for the door's head (session-layer O3; absent unless
+	// doorBackfill is on). Non-zero on one pod at most (I2).
+	CollectHeldBlocks *int64 `json:"collectHeldBlocks,omitempty"`
 }
 
 // nca2Snapshot builds the nca2 section under the caller's lock. Every number is a READ: the only
@@ -835,7 +847,12 @@ func (s *Scheduler) nca2Snapshot(now time.Time) *NCA2Snapshot {
 		if ps.SeatsInflight == 0 && (outsideWaits || ps.WarmReturnersWaiting > 0) {
 			ps.IdleWithWaiters = 1
 		}
+		if s.nca2.door != nil {
+			held := g.nca2.reservedBlocks
+			ps.CollectHeldBlocks = &held
+		}
 		snap.Engines[ps.ID] = ps
 	}
+	s.doorSnapshot(snap)
 	return snap
 }

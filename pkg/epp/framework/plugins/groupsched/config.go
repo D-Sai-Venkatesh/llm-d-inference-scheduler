@@ -280,6 +280,7 @@ func (c Config) resolveDoor() (*nca2Door, error) {
 			}
 		}
 		d.header = header
+		d.sessions = newNCA2Sessions()
 	}
 	return d, nil
 }

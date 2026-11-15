@@ -323,6 +323,14 @@ func annotateSpan(ctx context.Context, engine string, obs dispatchObservables) {
 			attribute.String(spanNCA2Thread, n.threadID),
 			attribute.String(spanNCA2WireID, n.wireID),
 		)
+		// the door's facts (session-layer O7): only when the door ran the decision
+		if n.doorPath != "" {
+			attrs = append(attrs, attribute.String(spanNCA2DoorPath, n.doorPath),
+				attribute.String(spanNCA2SessionGroup, n.sessionGroup))
+		}
+		if n.sessionHash != "" {
+			attrs = append(attrs, attribute.String(spanNCA2SessionIDHash, n.sessionHash))
+		}
 	}
 	span.SetAttributes(attrs...)
 }
@@ -351,4 +359,8 @@ const (
 	spanNCA2ClientRequestID = "llm_d.nca2.client_request_id"
 	spanNCA2Thread          = "llm_d.nca2.thread"
 	spanNCA2WireID          = "llm_d.nca2.wire_id"
+	// the door fix and the session layer (session-layer O7)
+	spanNCA2DoorPath      = "llm_d.nca2.door_path"
+	spanNCA2SessionGroup  = "llm_d.nca2.session_group"
+	spanNCA2SessionIDHash = "llm_d.nca2.session_id_hash"
 )

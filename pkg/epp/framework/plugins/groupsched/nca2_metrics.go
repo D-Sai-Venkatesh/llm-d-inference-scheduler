@@ -25,6 +25,7 @@ package groupsched
 
 import (
 	"sort"
+	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -58,14 +59,79 @@ type nca2Metrics struct {
 	door *doorMetrics
 }
 
-// doorMetrics is the door's counters (session-layer O1, O2, O5, O6).
-type doorMetrics struct{}
+// doorMetrics is the door's counters (session-layer O1, O2, O5) and the session layer's (O6, nil-valued
+// in Part A).
+type doorMetrics struct {
+	// admissions is O1: every admission through the door, by path and class.
+	admissions *prometheus.CounterVec
+	// headChanges and collections are O2.
+	headChanges *prometheus.CounterVec
+	collections *prometheus.CounterVec
+	// refused is O5: the exhaustive backfill sweep's refusals, by the furthest check reached.
+	refused *prometheus.CounterVec
+	// classes are O1's class label values (priority | newcomer, or A | B | C).
+	classes []string
+	// sessionHeader and sessionMismatch are O6 (nil in Part A).
+	sessionHeader   *prometheus.CounterVec
+	sessionMismatch prometheus.Counter
+}
+
+// newDoorMetrics declares the door's series; the session layer's only when it runs.
+func newDoorMetrics(sessionAware bool) *doorMetrics {
+	d := &doorMetrics{
+		admissions: prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "door_admissions_total",
+			Help: "admissions through the door: path head_fit (the head fit a pod as it was), head_collected (the head fit after collecting on its one pod), backfill (anyone else, into budget already free); class priority | newcomer (doorBackfill) or the session group A | B | C (sessionAware)"}, []string{"path", "class"}),
+		headChanges: prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "head_changes_total",
+			Help: "the door's head ended its tenure: admitted, gone (left the queue), takeover (a strictly higher outsider that could not backfill took it)"}, []string{"reason"}),
+		collections: prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "collections_total",
+			Help: "collection events: start (a collection pod was chosen), kept_on_takeover, released_takeover, released_cpu (the head lost the room there), released_head_gone, released_pod_gone (the pod was removed), completed (the head was admitted)"}, []string{"event"}),
+		refused: prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "backfill_refused_total",
+			Help: "outsiders the exhaustive backfill sweep at the end of a pass refused, by the furthest check reached on any pod: cpu, gpu, valve, valve_head_headroom (the valve headroom the head needs on its pod). A PASS count: every pass that ends with outsiders waiting adds them again"}, []string{"reason"}),
+		classes: []string{pathPriority, pathNewcomer},
+	}
+	if sessionAware {
+		d.classes = []string{"A", "B", "C"}
+		d.sessionHeader = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "session_header_total",
+			Help: "dispatched requests with (present=true) and without (present=false) the session header; a run is counted only when present is ~100%"}, []string{"present"})
+		d.sessionMismatch = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "session_mismatch_total",
+			Help: "dispatched requests whose session header differs from the first value their thread carried (the first value is kept)"})
+	}
+	return d
+}
+
+// collectors is the door's series with their zero series pre-instantiated (a zero is a fact).
+func (d *doorMetrics) collectors() []prometheus.Collector {
+	for _, path := range []string{doorPathHeadFit, doorPathHeadCollected, doorPathBackfill} {
+		for _, class := range d.classes {
+			d.admissions.WithLabelValues(path, class)
+		}
+	}
+	for _, reason := range []string{headChangeAdmitted, headChangeGone, headChangeTakeover} {
+		d.headChanges.WithLabelValues(reason)
+	}
+	for _, event := range []string{collectStart, collectKeptOnTakeover, collectReleasedTakeover, collectReleasedCPU,
+		collectReleasedHeadGone, collectReleasedPodGone, collectCompleted} {
+		d.collections.WithLabelValues(event)
+	}
+	for _, reason := range backfillRefusalNames {
+		d.refused.WithLabelValues(reason)
+	}
+	out := []prometheus.Collector{d.admissions, d.headChanges, d.collections, d.refused}
+	if d.sessionHeader != nil {
+		d.sessionHeader.WithLabelValues("true")
+		d.sessionHeader.WithLabelValues("false")
+		d.sessionMismatch.Add(0)
+		out = append(out, d.sessionHeader, d.sessionMismatch)
+	}
+	return out
+}
 
 // ObserveDoorAdmission records one admission through the door, by path and class (O1).
 func (m *nca2Metrics) ObserveDoorAdmission(path, class string) {
 	if m == nil || m.door == nil {
 		return
 	}
+	m.door.admissions.WithLabelValues(path, class).Inc()
 }
 
 // ObserveHeadChange records one change of the door's head (O2).
@@ -73,6 +139,7 @@ func (m *nca2Metrics) ObserveHeadChange(reason string) {
 	if m == nil || m.door == nil {
 		return
 	}
+	m.door.headChanges.WithLabelValues(reason).Inc()
 }
 
 // ObserveCollection records one collection event (O2).
@@ -80,20 +147,23 @@ func (m *nca2Metrics) ObserveCollection(event string) {
 	if m == nil || m.door == nil {
 		return
 	}
+	m.door.collections.WithLabelValues(event).Inc()
 }
 
 // ObserveSessionHeader records one dispatched request with or without the session header (O6).
 func (m *nca2Metrics) ObserveSessionHeader(present bool) {
-	if m == nil || m.door == nil {
+	if m == nil || m.door == nil || m.door.sessionHeader == nil {
 		return
 	}
+	m.door.sessionHeader.WithLabelValues(strconv.FormatBool(present)).Inc()
 }
 
 // ObserveSessionMismatch records one dispatched request whose session value differs from its thread's (O6).
 func (m *nca2Metrics) ObserveSessionMismatch() {
-	if m == nil || m.door == nil {
+	if m == nil || m.door == nil || m.door.sessionMismatch == nil {
 		return
 	}
+	m.door.sessionMismatch.Inc()
 }
 
 // ObserveBackfillRefused records n refusals of the exhaustive backfill sweep under one reason (O5).
@@ -101,6 +171,7 @@ func (m *nca2Metrics) ObserveBackfillRefused(reason string, n int) {
 	if m == nil || m.door == nil {
 		return
 	}
+	m.door.refused.WithLabelValues(reason).Add(float64(n))
 }
 
 // nca2Subsystem is the nca2 series' namespace (llm_d_epp_nca2_*).
@@ -149,8 +220,12 @@ func (m *nca2Metrics) collectors() []prometheus.Collector {
 	for _, class := range []string{nca2ClassReturner, nca2ClassAdmittedNow} {
 		m.seatWait.WithLabelValues(class)
 	}
-	return []prometheus.Collector{m.admissions, m.returnerSeats, m.decisions, m.pushouts,
+	out := []prometheus.Collector{m.admissions, m.returnerSeats, m.decisions, m.pushouts,
 		m.activePushouts, m.moves, m.lineTouchTokens, m.leakedRequests, m.doorWait, m.seatWait}
+	if m.door != nil {
+		out = append(out, m.door.collectors()...)
+	}
+	return out
 }
 
 // preInstantiatePod creates this pod's zero-valued counter series when its group is created: "no
@@ -276,6 +351,11 @@ type nca2Gauges struct {
 	priorityWaiting    *prometheus.Desc
 	newcomerWaiting    *prometheus.Desc
 	headBlockedSeconds *prometheus.Desc
+
+	// the door's gauges (session-layer O3/O4): nil unless doorBackfill is on
+	collectHeld *prometheus.Desc
+	collectPod  *prometheus.Desc
+	doorWaiting *prometheus.Desc
 }
 
 // nca2GaugeDesc is one per-pod nca2 gauge descriptor (the pod label is the endpoint id).
@@ -285,6 +365,26 @@ func nca2GaugeDesc(name, help string) *prometheus.Desc {
 
 // newNCA2Gauges builds the collector for one plugin instance.
 func newNCA2Gauges(r *GroupScheduler) *nca2Gauges {
+	g := newNCA2GaugesV2(r)
+	if n := r.sched.nca2; n != nil && n.door != nil {
+		g.collectHeld = nca2GaugeDesc("collect_held_blocks",
+			"the GPU blocks held empty on this pod for the door's head while it collects: non-zero on at most ONE pod (the collection pod)")
+		g.collectPod = nca2GaugeDesc("collect_pod", "1 on the pod the door's head is collecting on, 0 elsewhere")
+		// O4: the door's waiting outsiders, by class (doorBackfill) or by session group (sessionAware): a
+		// long queue of NEW sessions is the capacity signal
+		label := "class"
+		if n.door.sessionAware {
+			label = "group"
+		}
+		g.doorWaiting = prometheus.NewDesc(prometheus.BuildFQName("", nca2Subsystem, "door_waiting"),
+			"outsiders waiting at the door, by class (priority | newcomer) or session group (A inside, B was inside, C new)",
+			[]string{label}, nil)
+	}
+	return g
+}
+
+// newNCA2GaugesV2 is v2's gauge set.
+func newNCA2GaugesV2(r *GroupScheduler) *nca2Gauges {
 	return &nca2Gauges{
 		r:     r,
 		sched: r.sched,
@@ -326,8 +426,10 @@ func (c *nca2Gauges) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{c.room, c.laaPosition, c.lineTokens, c.admitted,
 		c.admittedActive, c.admittedThreads, c.activeThreads, c.warmReturners, c.pendingHeads,
 		c.seatsInflight, c.seatsReclaimable, c.idleWithWaiters, c.priorityWaiting,
-		c.newcomerWaiting, c.headBlockedSeconds} {
-		ch <- d
+		c.newcomerWaiting, c.headBlockedSeconds, c.collectHeld, c.collectPod, c.doorWaiting} {
+		if d != nil {
+			ch <- d
+		}
 	}
 }
 
@@ -363,4 +465,28 @@ func (c *nca2Gauges) Collect(ch chan<- prometheus.Metric) {
 	gauge(c.priorityWaiting, float64(snap.PriorityWaiting))
 	gauge(c.newcomerWaiting, float64(snap.NewcomerWaiting))
 	gauge(c.headBlockedSeconds, snap.HeadBlockedSeconds)
+	if c.collectHeld == nil {
+		return
+	}
+	for _, id := range pods {
+		p := snap.Engines[id]
+		var held float64
+		if p.CollectHeldBlocks != nil {
+			held = float64(*p.CollectHeldBlocks)
+		}
+		on := 0.0
+		if id == snap.CollectPod {
+			on = 1
+		}
+		gauge(c.collectHeld, held, p.ID)
+		gauge(c.collectPod, on, p.ID)
+	}
+	groups := make([]string, 0, len(snap.DoorWaitingByGroup))
+	for k := range snap.DoorWaitingByGroup {
+		groups = append(groups, k)
+	}
+	sort.Strings(groups)
+	for _, k := range groups {
+		gauge(c.doorWaiting, float64(snap.DoorWaitingByGroup[k]), k)
+	}
 }

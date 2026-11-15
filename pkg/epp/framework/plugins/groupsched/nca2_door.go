@@ -710,6 +710,57 @@ func (s *Scheduler) doorFlushRefusals() {
 	d.refused = [backfillRefusalReasons]int{}
 }
 
+// ---- the debug state (O9) ----
+
+// doorSnapshot fills the door's part of the nca2 snapshot. It only READS (I9): the session groups are
+// derived here from the live state, without the pass's memo.
+func (s *Scheduler) doorSnapshot(snap *NCA2Snapshot) {
+	d := s.nca2.door
+	if d == nil {
+		return
+	}
+	if d.headID != "" && s.doorIsOutsider(d.headID) {
+		snap.HeadID = d.headID
+	}
+	snap.CollectPod = d.collectPod
+	var held int64
+	if g := s.groups[d.collectPod]; g != nil && g.nca2 != nil {
+		held = g.nca2.reservedBlocks
+	}
+	snap.HeldBlocks = &held
+	if !d.sessionAware {
+		snap.DoorWaitingByGroup = map[string]int{pathPriority: 0, pathNewcomer: 0}
+		for id := range s.waiters {
+			switch {
+			case s.nca2.admitted[id]:
+			case s.nca2.ever[id]:
+				snap.DoorWaitingByGroup[pathPriority]++
+			default:
+				snap.DoorWaitingByGroup[pathNewcomer]++
+			}
+		}
+		return
+	}
+	inside := s.sessionsInsideNow()
+	n := len(inside)
+	snap.SessionsInside = &n
+	snap.DoorWaitingByGroup = map[string]int{"A": 0, "B": 0, "C": 0}
+	for id := range s.waiters {
+		if s.nca2.admitted[id] {
+			continue
+		}
+		key := s.sessionKey(id)
+		switch {
+		case inside[key]:
+			snap.DoorWaitingByGroup["A"]++
+		case s.sessionEverInNow(key):
+			snap.DoorWaitingByGroup["B"]++
+		default:
+			snap.DoorWaitingByGroup["C"]++
+		}
+	}
+}
+
 // ---- the pod order of one candidate ----
 
 // doorIndexLines is A4's entry test for every candidate of this decision: one walk of the lines.

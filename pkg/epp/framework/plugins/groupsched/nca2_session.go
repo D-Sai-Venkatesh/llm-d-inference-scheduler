@@ -81,15 +81,15 @@ func sessionOfRequest(request *fwksched.InferenceRequest, header string) string 
 
 // sessionsOn is Part B's state, nil unless the session layer runs.
 func (s *Scheduler) sessionsOn() *nca2Sessions {
-	if s.nca2 == nil || s.nca2.door == nil || !s.nca2.door.sessionAware {
+	if s.nca2 == nil || s.nca2.door == nil {
 		return nil
 	}
-	d := s.nca2.door
-	if d.sessions == nil {
-		d.sessions = &nca2Sessions{sessionOf: map[string]string{}, members: map[string][]string{},
-			facts: map[string]sessFacts{}}
-	}
-	return d.sessions
+	return s.nca2.door.sessions
+}
+
+// newNCA2Sessions allocates Part B's state once, at construction (no read path ever creates it: I9).
+func newNCA2Sessions() *nca2Sessions {
+	return &nca2Sessions{sessionOf: map[string]string{}, members: map[string][]string{}, facts: map[string]sessFacts{}}
 }
 
 // sessionNote is S4: a thread's first session value is recorded; a later different value is ignored here
@@ -196,20 +196,40 @@ func (s *Scheduler) sessionEverIn(key string) bool {
 	if f.everKnown {
 		return f.everIn
 	}
+	f.everIn, f.everKnown = s.sessionEverInNow(key), true
+	ss.facts[key] = f
+	return f.everIn
+}
+
+// sessionEverInNow is everIn read from the state, writing nothing (the snapshot's form, I9).
+func (s *Scheduler) sessionEverInNow(key string) bool {
 	if thread, own := strings.CutPrefix(key, sessionKeyThread); own {
-		f.everIn = s.nca2.ever[thread]
-	} else {
-		value, _ := strings.CutPrefix(key, sessionKeyHeader)
-		for _, t := range ss.members[value] {
-			if s.nca2.ever[t] {
-				f.everIn = true
-				break
+		return s.nca2.ever[thread]
+	}
+	value, _ := strings.CutPrefix(key, sessionKeyHeader)
+	for _, t := range s.nca2.door.sessions.members[value] {
+		if s.nca2.ever[t] {
+			return true
+		}
+	}
+	return false
+}
+
+// sessionsInsideNow is the set of sessions with a thread admitted now, read from the lines (the
+// snapshot's form: nothing is written).
+func (s *Scheduler) sessionsInsideNow() map[string]bool {
+	out := map[string]bool{}
+	for _, g := range s.groups {
+		if g.nca2 == nil {
+			continue
+		}
+		for _, e := range g.nca2.line {
+			if s.nca2.admitted[e.thread] && s.nca2.homes[e.thread] == g.id {
+				out[s.sessionKey(e.thread)] = true
 			}
 		}
 	}
-	f.everKnown = true
-	ss.facts[key] = f
-	return f.everIn
+	return out
 }
 
 // sessionGroup is ST2: 0 = A (inside), 1 = B (was inside), 2 = C (new).

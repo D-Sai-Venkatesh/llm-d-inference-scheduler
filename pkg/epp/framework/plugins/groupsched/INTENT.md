@@ -232,6 +232,20 @@ refuses the fairness header names (and `x-request-id` / `x-correlation-id`). Que
 
 Example: pod A has 4 seats — 3 held by session S1, 1 by another. Waiting: `r1` (S1) and `r2` (S2, holds no seat). A seat frees ⇒ `r2`.
 
+### 6.3 A collecting head of a session that is or was inside keeps its turn (`headKeepsTurn`)
+
+**The rule:** with `headKeepsTurn`, once the door's head has started collecting (its collection pod is chosen) and its session is inside
+or was inside (group A or B, including a session whose threads were all pushed out), no outsider takes the head over; it keeps its turn
+until it is admitted or leaves the queue. A new session's head (group C) and a head that has not started collecting are taken over as
+without the option.
+
+**Why:** a takeover releases what the head collected, or hands it to the taker, and the old head collects again from the start when its
+turn comes back. A session whose threads were all pushed out (a returning main agent) ranks below every inside session's outsider, so it
+can lose its collection again and again. Measured (Part B, 3 pods): group-B heads completed 34 % of their collections, lost 60 % to
+takeovers, and carried 68 of the 69 waits over 600 s. A new session's head still gives way, since new sessions are the ones meant to
+wait (§6.2). **Cost:** an outsider of an inside session (a sub-agent's first request, a fork) waits behind such a head, and so do the
+returners of its collection pod while it holds blocks there.
+
 ---
 
 ## 7. What is deliberately NOT done
@@ -259,9 +273,10 @@ Example: pod A has 4 seats — 3 held by session S1, 1 by another. Waiting: `r1`
 | `sessionHeader` | "" | the request header carrying the session id | set without `sessionAware`; a fairness / request / correlation header |
 | `valveCPUWarm` | false | the cold valve counts a thread's CPU-line entry as warm (§3.1) | set without `mode: nca2` |
 | `noQuantum` | false | seats are released by silence only, never by the quantum (§4.1) | set without `mode: nca2` |
+| `headKeepsTurn` | false | a collecting head of a session that is or was inside is not taken over (§6.3) | set without `mode: nca2`; true without `doorBackfill` and `sessionAware` |
 
 The startup echo prints every resolved value (`doorBackfill=… sessionAware=… sessionHeader=… backfillReclaim=… valveCPUWarm=…
-noQuantum=…`); a run is counted only after reading it back.
+noQuantum=… headKeepsTurn=…`); a run is counted only after reading it back.
 
 ---
 
@@ -278,6 +293,7 @@ noQuantum=…`); a run is counted only after reading it back.
 | `…_backfill_reclaimed_seats_total{pod}` | idle seats released for outsiders; never on the collection pod |
 | `…_valve_cpu_warm_tokens_total{pod}` | `valveCPUWarm`: the tokens the CPU warmth excused from the valve, summed over the seats it charged |
 | `llm_d_epp_group_exits_total{reason="quantum-complete"}` | 0 with `noQuantum` (a non-zero value means the quantum still rotates) |
+| `…_door_takeover_suppressed_total` | `headKeepsTurn`: the passes in which a collecting head of a session that is or was inside was kept against an outsider that would have taken it over |
 | `…_session_header_total{present}`, `…_session_mismatch_total` | whether clients send the session id (a run needs ~100 %) |
 | span attributes `llm_d.nca2.door_path`, `…session_group`, `…session_id_hash` | per request: how its turn got its seat, its session's group |
 | events `SEAT … path=`, `COLLECT …` | the decision trail |
@@ -291,7 +307,8 @@ noQuantum=…`); a run is counted only after reading it back.
   `backfillReclaim` off equals the door before that option existed. Each of these pins was computed on the *older* code before any change
   and proven again on a pristine checkout of it. A third pin holds v2 and the door with `valveCPUWarm` and `noQuantum` off to the code
   before those options, over a fixture where CPU-warm threads meet the valve and seats pass their quantum; it was computed before the
-  options were written.
+  options were written. A fourth set holds every stream with `headKeepsTurn` absent or false to the code before it, including the
+  streams with `valveCPUWarm` and `noQuantum` on and a Part B loop that reaches the state the option changes.
 - **Rule tests** — one per rule, each shown to fail when its rule is broken on purpose (mutation checks).
 - **Property loops** — seeded closed loops (several CPU tiers, Part A and Part B, the reclaim option on and off) checking after every pass
   and inside every decision: one pod holds at most; the held budget belongs to the head; backfill never releases a seat except through the

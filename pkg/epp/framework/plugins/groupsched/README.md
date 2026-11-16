@@ -124,6 +124,7 @@ exactly the one above.
 | `sessionAware` | bool | `false` | Requires `doorBackfill`. Outsiders of sessions already inside go first (fewest active threads first), then sessions that were inside, then new sessions; a freed seat goes to the returner whose session holds the fewest seats; a new session's head never takes seats its pod's returners wait for. |
 | `sessionHeader` | string | `""` | Required with `sessionAware` (and refused without it). It may not be the fairness header (`x-llm-d-inference-fairness-id` or its deprecated alias), `x-request-id` or `x-correlation-id`. A request without it is its own session. |
 | `backfillReclaim` | bool | `false` | Requires `doorBackfill`. An outsider that fits no pod's free budget may release rotation-eligible seats on a pod that is not the head's collection pod and has no returner waiting, only for its own admission in the same step. |
+| `headKeepsTurn` | bool | `false` | Requires `doorBackfill` and `sessionAware`. Once the door's head has started collecting (its collection pod is chosen) and its session is inside or was inside, no outsider takes the head over: it keeps its turn until it is admitted or leaves the queue. A new session's head and a head that has not started collecting are taken over as without it. `door_takeover_suppressed_total` counts the passes in which it kept the head against an outsider that would have taken it. |
 
 #### The cold valve's CPU warmth and the no-quantum mode (`valveCPUWarm`, `noQuantum`)
 

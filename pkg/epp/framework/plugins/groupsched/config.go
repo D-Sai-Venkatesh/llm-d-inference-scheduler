@@ -91,6 +91,10 @@ type Config struct {
 	// no returner waiting, for an outsider admitted in the same step (LOGIC Amendment 2, C8/BF4). It
 	// requires doorBackfill; off is the door without it.
 	BackfillReclaim *bool `json:"backfillReclaim,omitempty"`
+	// HeadKeepsTurn stops a strictly higher outsider from taking the door's head once the head has started a
+	// collection and its session is inside or was inside (group A or B; LOGIC Amendment 4, C11). It requires
+	// doorBackfill and sessionAware; off is the door without it.
+	HeadKeepsTurn *bool `json:"headKeepsTurn,omitempty"`
 
 	// ---- LOGIC Amendment 3 (C9/C10): nca2-only presence keys, with or without the door ----
 	//
@@ -201,6 +205,9 @@ func (c Config) nca2KeyNames() []string {
 	if c.NoQuantum != nil {
 		out = append(out, "noQuantum")
 	}
+	if c.HeadKeepsTurn != nil {
+		out = append(out, "headKeepsTurn")
+	}
 	return out
 }
 
@@ -275,17 +282,22 @@ func (c Config) resolveNCA2() (*nca2Policy, error) {
 var forbiddenSessionHeaders = []string{metadata.FlowFairnessIDKey, metadata.OldFlowFairnessIDKey,
 	reqcommon.RequestIDHeaderKey, "x-correlation-id"}
 
-// resolveDoor is C3-C5 and C8: nil unless doorBackfill is true (C7: the v2 decision runs), Part B and
-// backfillReclaim only with Part A, a usable header, and no key that would sit in the config doing nothing.
+// resolveDoor is C3-C5, C8 and C11: nil unless doorBackfill is true (C7: the v2 decision runs), Part B and
+// backfillReclaim only with Part A, headKeepsTurn only with Part B, a usable header, and no key that would
+// sit in the config doing nothing.
 func (c Config) resolveDoor() (*nca2Door, error) {
 	door := c.DoorBackfill != nil && *c.DoorBackfill
 	aware := c.SessionAware != nil && *c.SessionAware
 	reclaim := c.BackfillReclaim != nil && *c.BackfillReclaim
+	keepsTurn := c.HeadKeepsTurn != nil && *c.HeadKeepsTurn
 	if aware && !door {
 		return nil, errors.New("sessionAware requires doorBackfill: true (the session layer orders the door that Part A builds)")
 	}
 	if reclaim && !door {
 		return nil, errors.New("backfillReclaim requires doorBackfill: true (it is a second chance of the door's backfill)")
+	}
+	if keepsTurn && (!door || !aware) {
+		return nil, errors.New("headKeepsTurn requires doorBackfill: true and sessionAware: true (it reads the session groups of the door's head)")
 	}
 	if c.SessionHeader != nil && !aware {
 		return nil, errors.New("sessionHeader is set while sessionAware is not true: the header would be read by nothing")
@@ -293,7 +305,7 @@ func (c Config) resolveDoor() (*nca2Door, error) {
 	if !door {
 		return nil, nil //nolint:nilnil // nil IS the answer: the door is off and v2's decision runs (C7)
 	}
-	d := &nca2Door{sessionAware: aware, backfillReclaim: reclaim}
+	d := &nca2Door{sessionAware: aware, backfillReclaim: reclaim, headKeepsTurn: keepsTurn}
 	if aware {
 		header := ""
 		if c.SessionHeader != nil {

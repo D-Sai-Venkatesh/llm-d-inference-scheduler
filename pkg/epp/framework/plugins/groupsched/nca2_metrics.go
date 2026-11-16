@@ -88,6 +88,9 @@ type doorMetrics struct {
 	refused *prometheus.CounterVec
 	// reclaimedSeats is the seats BF4 released, per pod (LOGIC Amendment 2; nil unless backfillReclaim).
 	reclaimedSeats *prometheus.CounterVec
+	// takeoverSuppressed is the passes in which C11 kept the head against a takeover (LOGIC Amendment 4;
+	// nil unless headKeepsTurn).
+	takeoverSuppressed prometheus.Counter
 	// classes are O1's class label values (priority | newcomer, or A | B | C), and paths O1's path values.
 	classes []string
 	paths   []string
@@ -96,8 +99,9 @@ type doorMetrics struct {
 	sessionMismatch prometheus.Counter
 }
 
-// newDoorMetrics declares the door's series; the session layer's and backfill reclaim's only when they run.
-func newDoorMetrics(sessionAware, backfillReclaim bool) *doorMetrics {
+// newDoorMetrics declares the door's series; the session layer's, backfill reclaim's and headKeepsTurn's only
+// when they run.
+func newDoorMetrics(sessionAware, backfillReclaim, headKeepsTurn bool) *doorMetrics {
 	d := &doorMetrics{
 		admissions: prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "door_admissions_total",
 			Help: "admissions through the door: path head_fit (the head fit a pod as it was), head_collected (the head fit after collecting on its one pod), backfill (anyone else, into budget already free); class priority | newcomer (doorBackfill) or the session group A | B | C (sessionAware)"}, []string{"path", "class"}),
@@ -114,6 +118,10 @@ func newDoorMetrics(sessionAware, backfillReclaim bool) *doorMetrics {
 		d.paths = append(d.paths, doorPathBackfillReclaim)
 		d.reclaimedSeats = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "backfill_reclaimed_seats_total",
 			Help: "seats backfill released on this pod (backfillReclaim): eligible seats on a pod that is not the collection pod and has no returner waiting, each for an outsider admitted there in the same step"}, []string{"pod"})
+	}
+	if headKeepsTurn {
+		d.takeoverSuppressed = prometheus.NewCounter(prometheus.CounterOpts{Subsystem: nca2Subsystem, Name: "door_takeover_suppressed_total",
+			Help: "passes in which headKeepsTurn kept the door's head (collecting, of a session that is or was inside) against a strictly higher outsider that could not backfill and would otherwise have taken it over"})
 	}
 	if sessionAware {
 		d.classes = []string{"A", "B", "C"}
@@ -145,6 +153,10 @@ func (d *doorMetrics) collectors() []prometheus.Collector {
 	out := []prometheus.Collector{d.admissions, d.headChanges, d.collections, d.refused}
 	if d.reclaimedSeats != nil {
 		out = append(out, d.reclaimedSeats)
+	}
+	if d.takeoverSuppressed != nil {
+		d.takeoverSuppressed.Add(0)
+		out = append(out, d.takeoverSuppressed)
 	}
 	if d.sessionHeader != nil {
 		d.collections.WithLabelValues(collectReleasedReturner)
@@ -186,6 +198,14 @@ func (m *nca2Metrics) ObserveBackfillReclaimedSeats(pod string, n int) {
 		return
 	}
 	m.door.reclaimedSeats.WithLabelValues(pod).Add(float64(n))
+}
+
+// ObserveTakeoverSuppressed records one pass in which C11 kept the head against a takeover (LOGIC Amendment 4).
+func (m *nca2Metrics) ObserveTakeoverSuppressed() {
+	if m == nil || m.door == nil || m.door.takeoverSuppressed == nil {
+		return
+	}
+	m.door.takeoverSuppressed.Inc()
 }
 
 // ObserveSessionHeader records one dispatched request with or without the session header (O6).

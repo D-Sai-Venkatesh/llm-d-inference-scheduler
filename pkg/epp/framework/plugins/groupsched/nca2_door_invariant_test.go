@@ -201,6 +201,11 @@ type doorProbe struct {
 	backfills       int
 	reclaims        int
 	yields          int
+	// keptTurns counts the decisions in which C11 (LOGIC Amendment 4) kept a collecting group-A/B head
+	// against a strictly higher outsider that cannot backfill (I7 as amended); lastCollect is the
+	// collection pod at the end of the last decision.
+	keptTurns   int
+	lastCollect string
 
 	// heldBF, freeBF and headroomBF are the collection pod's held blocks, free budget and whether the head's
 	// valve headroom was available there when BF began; i5 counts the backfill admissions I5 was checked on
@@ -236,16 +241,27 @@ func (p *doorProbe) stage(st doorStage) {
 		head := s.waiters[st.head]
 		p.fitAtStart = head != nil && headFitsNowAnywhere(s, head)
 		first := s.doorFirstOutsider()
-		// I7: the first-ranked outsider, or the sticky head that the first-ranked could not take over
+		// I7: the first-ranked outsider, or the sticky head that the first-ranked could not take over; with
+		// headKeepsTurn (C11) also a collecting head of group A or B that it could have taken over
 		if head != nil && first != nil && first.w.id != st.head {
 			if st.head != p.lastHead {
 				p.fail("I7: a new head %s that is not the first-ranked outsider %s", st.head, first.w.id)
 			} else if first.class < s.doorClassOf(st.head) {
 				if _, ok := canBackfill(s, first.w, *p.now); !ok {
-					p.fail("I7: %s (class %d) cannot backfill and did not take the head from %s (class %d)",
-						first.w.id, first.class, st.head, s.doorClassOf(st.head))
+					if d.headKeepsTurn && d.collectPod != "" && s.doorClassOf(st.head) <= 1 {
+						p.keptTurns++
+					} else {
+						p.fail("I7: %s (class %d) cannot backfill and did not take the head from %s (class %d)",
+							first.w.id, first.class, st.head, s.doorClassOf(st.head))
+					}
 				}
 			}
+		}
+		// C11: with headKeepsTurn, no outsider takes the head from a collecting head of group A or B
+		if st.head != p.lastHead && d.headKeepsTurn && p.lastCollect != "" && s.groups[p.lastCollect] != nil &&
+			s.doorIsOutsider(p.lastHead) && s.doorClassOf(p.lastHead) <= 1 {
+			p.fail("C11: %s took the head from %s (class %d), which was collecting on %s",
+				st.head, p.lastHead, s.doorClassOf(p.lastHead), p.lastCollect)
 		}
 		// I11: a head change leaves nothing held, except a collection a takeover kept on its own pod
 		if st.head != p.lastHead {
@@ -333,7 +349,7 @@ func (p *doorProbe) stage(st doorStage) {
 			p.reclaims++
 		}
 		p.exitsBF = -1
-		p.lastHead = d.headID
+		p.lastHead, p.lastCollect = d.headID, d.collectPod
 	}
 }
 

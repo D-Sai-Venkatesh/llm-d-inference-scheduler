@@ -23,7 +23,8 @@ package groupsched
 //
 // One decision, in the contract's order (§7.7):
 //
-//	H1-H3  who is the head (sticky; a strictly higher outsider that cannot backfill takes over)
+//	H1-H3  who is the head (sticky; a strictly higher outsider that cannot backfill takes over, except,
+//	       with headKeepsTurn, from a collecting head of group A or B: C11)
 //	H4     the head fits some pod NOW: admit it there, nothing released anywhere (H5)
 //	H6-H9  otherwise it collects on ONE pod, chosen once (not for a Part-B new-session head: H8)
 //	H10b   a Part-B new-session head holds nothing while a returner of its pod waits
@@ -49,6 +50,10 @@ type nca2Door struct {
 	header       string
 	// backfillReclaim is BF4 (LOGIC Amendment 2, C8): backfill's second chance by reclaiming seats.
 	backfillReclaim bool
+	// headKeepsTurn is C11 (LOGIC Amendment 4): no takeover from a collecting head of group A or B.
+	headKeepsTurn bool
+	// keptTurn is whether C11 kept the head against a takeover in this pass (its counter counts passes).
+	keptTurn bool
 
 	// ST3: the head and its collection pod survive the passes. The held blocks themselves stay in v2's
 	// per-pod reservedHead/reservedBlocks, and only collectPod may hold any (I2).
@@ -164,6 +169,12 @@ func (n *nca2Policy) amend3Echo() string {
 	return fmt.Sprintf("valveCPUWarm=%s noQuantum=%s", strconv.FormatBool(n.valveCPUWarm), strconv.FormatBool(n.noQuantum))
 }
 
+// amend4Echo is C11's part of the nca2 config echo (LOGIC Amendment 4): the resolved value.
+func (n *nca2Policy) amend4Echo() string {
+	keepsTurn := n != nil && n.door != nil && n.door.headKeepsTurn
+	return "headKeepsTurn=" + strconv.FormatBool(keepsTurn)
+}
+
 // ---- the pass ----
 
 // doorBeginPass is the pass's own derivation (R3, ST1): the session facts (Part B) and the ranking of
@@ -189,6 +200,7 @@ func (s *Scheduler) doorBeginPass() {
 		d.rankIdx[c.w.id] = i
 	}
 	d.refused = [backfillRefusalReasons]int{}
+	d.keptTurn = false
 }
 
 // doorRankKey is R1's class (PRIORITY before NEWCOMER) or, in Part B, R2's group and active count.
@@ -351,6 +363,15 @@ func (s *Scheduler) doorSelectHead(base []podState, memo map[fitKey]fitFacts, no
 		return head, false
 	}
 	if s.doorBackfillsAnywhere(base, first.w, head, memo, now) {
+		return head, false
+	}
+	// C11 (LOGIC Amendment 4): with headKeepsTurn, a head of group A or B that has started collecting keeps
+	// its turn until it is admitted or leaves the queue (H1)
+	if d.headKeepsTurn && d.collectPod != "" && s.doorClassOf(d.headID) <= 1 {
+		if !d.keptTurn {
+			d.keptTurn = true
+			s.nca2m.ObserveTakeoverSuppressed()
+		}
 		return head, false
 	}
 	x := first.w

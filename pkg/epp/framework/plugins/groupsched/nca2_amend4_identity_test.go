@@ -24,8 +24,8 @@ package groupsched
 // options off the same fixtures are I15's and I14's own pins. Neither fixture reaches the state
 // headKeepsTurn changes (a head of a session that is or was inside, collecting, while a strictly higher
 // outsider that cannot backfill waits), so the door's Part B closed loop also runs over amend4Mix, a
-// population that reaches it, and its decision stream is pinned the same way. The file names no symbol
-// 5c61d6eb lacks.
+// population that reaches it, and its decision stream is pinned the same way. Every pin holds with
+// headKeepsTurn absent and with it false; the amend4Mix stream with headKeepsTurn on is pinned too.
 
 import (
 	"crypto/sha256"
@@ -44,18 +44,21 @@ const (
 	amend4MixDigest          = "8e734108a3b5021552b1abaf814abe489f879b7fb69e7327d55aebf7e09e72a7"
 )
 
+// amend4KeepsTurnDigest is the amend4Mix stream with headKeepsTurn on, pinned when C11 was written.
+const amend4KeepsTurnDigest = "17dc51ee2c7120e7e11031cd07d8fc27c71b598fb027ac268b3da1bb78f2c4dd"
+
 // amend4Mix is a population whose Part B loop reaches headKeepsTurn's state: sessions of two threads and
 // one thread in two big, so a session whose threads were all pushed out has a big head that collects
 // while a big thread of an inside session cannot backfill.
 var amend4Mix = doorMix{sessionSize: 2, bigEvery: 2, heavy: true}
 
 // amend4MixTrace is the Part B closed loop over amend4Mix (seeds and tiers fixed), its recorded decision
-// stream made canonical (each run of push-out EXITs of one trim is sorted, as canonicalEvents does), and the
-// takeovers from a collecting head it saw.
-func amend4MixTrace(t *testing.T, tune func(*Config)) ([]string, int) {
+// stream made canonical (each run of push-out EXITs of one trim is sorted, as canonicalEvents does), the
+// takeovers from a collecting head it saw, and the decisions in which C11 kept the head.
+func amend4MixTrace(t *testing.T, tune func(*Config)) ([]string, int, int) {
 	t.Helper()
 	var trace []string
-	takeovers := 0
+	takeovers, keptTurns := 0, 0
 	for _, seed := range []int64{1, 7, 99, 4242, 20261115} {
 		for _, tier := range []int64{56_000, 72_000} {
 			var out []string
@@ -69,6 +72,7 @@ func amend4MixTrace(t *testing.T, tune func(*Config)) ([]string, int) {
 			if len(probe.violations) > 0 || took >= 3000 {
 				t.Fatalf("seed %d tier %d: %v, %d passes", seed, tier, probe.violations, took)
 			}
+			keptTurns += probe.keptTurns
 			trace = append(trace, fmt.Sprintf("loop seed=%d tier=%d passes=%d", seed, tier, took))
 			run := 0
 			for _, line := range out {
@@ -85,16 +89,21 @@ func amend4MixTrace(t *testing.T, tune func(*Config)) ([]string, int) {
 			}
 		}
 	}
-	return trace, takeovers
+	return trace, takeovers, keptTurns
 }
 
 // amend4MixStream is amend4MixTrace's digest under a tune.
 func amend4MixStream(t *testing.T, tune func(*Config)) string {
 	t.Helper()
-	trace, takeovers := amend4MixTrace(t, tune)
+	trace, takeovers, _ := amend4MixTrace(t, tune)
 	if takeovers == 0 {
 		t.Fatal("fixture: the amend4Mix loop must take the head from a collecting head")
 	}
+	return traceDigest(trace)
+}
+
+// traceDigest is a decision stream's digest.
+func traceDigest(trace []string) string {
 	sum := sha256.Sum256([]byte(strings.Join(trace, "\n")))
 	return hex.EncodeToString(sum[:])
 }
@@ -115,8 +124,8 @@ func amend4I14(sessions bool, tiers [2]int64) func(*testing.T, func(*Config)) st
 	}
 }
 
-// amend4Pins are the streams I16 holds to 5c61d6eb: with valveCPUWarm and noQuantum on (options), pinned
-// here, and with both off, pinned by I15 and I14.
+// amend4Pins are the streams I16 holds to 5c61d6eb: I15's and I14's fixtures with valveCPUWarm and
+// noQuantum on (options) and the amend4Mix loop, pinned here, and I15's and I14's own pins.
 var amend4Pins = []struct {
 	name    string
 	digest  func(*testing.T, func(*Config)) string
@@ -132,17 +141,40 @@ var amend4Pins = []struct {
 	{"Part B over amend4Mix", amend4MixStream, false, amend4MixDigest},
 }
 
-// TestI16_DecisionsAre5c61d6eb holds every pinned stream to 5c61d6eb (I16): the streams with valveCPUWarm
-// and noQuantum on, and I15's and I14's with them off.
+// TestI16_DecisionsAre5c61d6eb holds every pinned stream to 5c61d6eb (I16), with headKeepsTurn absent and
+// with it false.
 func TestI16_DecisionsAre5c61d6eb(t *testing.T) {
-	for _, p := range amend4Pins {
-		tune := func(c *Config) {
-			if p.options {
-				amend3Tune(true, true)(c)
+	off := false
+	for _, keepsTurn := range []*bool{nil, &off} {
+		for _, p := range amend4Pins {
+			tune := func(c *Config) {
+				if p.options {
+					amend3Tune(true, true)(c)
+				}
+				c.HeadKeepsTurn = keepsTurn
+			}
+			if got := p.digest(t, tune); got != p.want {
+				t.Errorf("%s, headKeepsTurn %v: the decision stream is not 5c61d6eb's: digest %s, want %s",
+					p.name, keepsTurn != nil, got, p.want)
 			}
 		}
-		if got := p.digest(t, tune); got != p.want {
-			t.Errorf("%s: the decision stream is not 5c61d6eb's: digest %s, want %s", p.name, got, p.want)
-		}
+	}
+}
+
+// TestI16_HeadKeepsTurnStreamIsPinned pins the amend4Mix stream with headKeepsTurn on: C11 kept a head in
+// it, so the stream is not the switch-off one, and a new session's collecting head is still taken over.
+func TestI16_HeadKeepsTurnStreamIsPinned(t *testing.T) {
+	on := true
+	trace, takeovers, keptTurns := amend4MixTrace(t, func(c *Config) { c.HeadKeepsTurn = &on })
+	got := traceDigest(trace)
+	t.Logf("C11 kept the head in %d decisions, %d takeovers from a collecting head, digest %s", keptTurns, takeovers, got)
+	if keptTurns == 0 || takeovers == 0 {
+		t.Fatalf("fixture coverage: %d kept turns, %d takeovers from a collecting head", keptTurns, takeovers)
+	}
+	if got == amend4MixDigest {
+		t.Fatal("the stream with headKeepsTurn on is the switch-off one")
+	}
+	if got != amend4KeepsTurnDigest {
+		t.Fatalf("the headKeepsTurn stream moved: digest %s, want %s", got, amend4KeepsTurnDigest)
 	}
 }

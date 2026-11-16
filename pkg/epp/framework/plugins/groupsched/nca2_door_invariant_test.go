@@ -345,6 +345,24 @@ func (p *doorProbe) stage(st doorStage) {
 func doorLoopTraced(t *testing.T, seed, tier int64, passes int, tune func(*Config), sessions, heavy bool,
 	out *[]string) (*Scheduler, *doorProbe, int) {
 	t.Helper()
+	mix := doorMix{bigEvery: 6, heavy: heavy}
+	if sessions {
+		mix.sessionSize = 4
+	}
+	return doorLoopMixed(t, seed, tier, passes, tune, mix, out)
+}
+
+// doorMix is a closed loop's population: sessionSize threads per session (0: no session header), one
+// thread in bigEvery big, and heavy the mix that makes the GPU bind.
+type doorMix struct {
+	sessionSize, bigEvery int
+	heavy                 bool
+}
+
+// doorLoopMixed is doorLoopTraced's loop over any population.
+func doorLoopMixed(t *testing.T, seed, tier int64, passes int, tune func(*Config), mix doorMix,
+	out *[]string) (*Scheduler, *doorProbe, int) {
+	t.Helper()
 	s := newNCA2Tuned(t, func(c *Config) {
 		on := true
 		c.DoorBackfill = &on
@@ -370,18 +388,18 @@ func doorLoopTraced(t *testing.T, seed, tier int64, passes int, tune func(*Confi
 	for i := 0; i < 36; i++ {
 		th := &identityThread{id: fmt.Sprintf("t%02d", i), blocks: 5 + rng.Intn(40), grow: rng.Intn(8),
 			turns: 3 + rng.Intn(4), gap: rng.Intn(3)}
-		if i%6 == 0 {
+		if i%mix.bigEvery == 0 {
 			th.blocks = 300 + rng.Intn(250)
 		}
-		if heavy {
+		if mix.heavy {
 			th.blocks = 10 + rng.Intn(110)
-			if i%6 == 0 {
+			if i%mix.bigEvery == 0 {
 				th.blocks = 300 + rng.Intn(300)
 			}
 		}
 		threads = append(threads, th)
-		if sessions {
-			sessionOf[th.id] = fmt.Sprintf("S%d", i/4)
+		if mix.sessionSize > 0 {
+			sessionOf[th.id] = fmt.Sprintf("S%d", i/mix.sessionSize)
 		}
 	}
 	seq := 0
@@ -465,7 +483,7 @@ func doorLoopTraced(t *testing.T, seed, tier int64, passes int, tune func(*Confi
 			th.turns--
 			th.blocks += th.grow
 			th.gap = rng.Intn(9)
-			if heavy && th.id[len(th.id)-1]%4 == 1 {
+			if mix.heavy && th.id[len(th.id)-1]%4 == 1 {
 				th.gap = 15 + rng.Intn(30)
 			}
 		}

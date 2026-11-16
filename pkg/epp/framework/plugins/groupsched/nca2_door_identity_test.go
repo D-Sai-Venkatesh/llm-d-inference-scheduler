@@ -48,6 +48,12 @@ const (
 	doorIdentityDigestB = "c768e7eb5e3718fd87236d06a11bbf622fa689c5499c84633acffb07e8f00579"
 )
 
+// The CPU tiers of the two pinned loops: Part A's, and Part B's (in which H10b's state never arises).
+var (
+	doorIdentityTiersA = [2]int64{150_000, 300_000}
+	doorIdentityTiersB = [2]int64{56_000, 72_000}
+)
+
 // doorIdentityCoverage is what the loop must have exercised for a digest to mean anything.
 type doorIdentityCoverage struct {
 	headFit, headCollected, backfills, returners, collectStarts int
@@ -142,8 +148,9 @@ func canonicalEvents(events []Event) []string {
 	return out
 }
 
-// doorIdentityTrace drives one door loop and returns its canonical decision stream.
-func doorIdentityTrace(t *testing.T, seed, tier int64, sessions bool, cov *doorIdentityCoverage) []string {
+// doorIdentityTrace drives one door loop and returns its canonical decision stream. tune is applied last
+// (nil for the pinned stream).
+func doorIdentityTrace(t *testing.T, seed, tier int64, sessions bool, tune func(*Config), cov *doorIdentityCoverage) []string {
 	t.Helper()
 	s := newNCA2Tuned(t, func(c *Config) {
 		on := true
@@ -153,6 +160,9 @@ func doorIdentityTrace(t *testing.T, seed, tier int64, sessions bool, cov *doorI
 		if sessions {
 			header := "x-llm-d-session-id"
 			c.SessionAware, c.SessionHeader = &on, &header
+		}
+		if tune != nil {
+			tune(c)
 		}
 	}, []string{"p0", "p1", "p2"})
 	now := epoch
@@ -258,12 +268,15 @@ func doorIdentityTrace(t *testing.T, seed, tier int64, sessions bool, cov *doorI
 // running seat, one idle), p1's other seats are held by idle threads and no returner of p1 waits, and a
 // small newcomer arrives every pass that p1's free budget cannot take as it is. Seat a2 on p0 ends its
 // turn at pass 5, so the head is admitted inside the horizon.
-func doorRA1Trace(t *testing.T, sessions bool, cov *doorIdentityCoverage) []string {
+func doorRA1Trace(t *testing.T, sessions bool, tune func(*Config), cov *doorIdentityCoverage) []string {
 	t.Helper()
 	f := newDoorFixture(t, func(c *Config) {
 		if sessions {
 			on, header := true, "x-llm-d-session-id"
 			c.SessionAware, c.SessionHeader = &on, &header
+		}
+		if tune != nil {
+			tune(c)
 		}
 	}, "p0", "p1")
 	doorIdentityProbe(f.s, &f.now, cov)
@@ -312,20 +325,20 @@ func doorRA1Trace(t *testing.T, sessions bool, cov *doorIdentityCoverage) []stri
 }
 
 // doorIdentityDigest is the digest of two closed loops (a tight and a roomier CPU tier) and the R-A1
-// scenario, with their coverage.
-func doorIdentityDigest(t *testing.T, sessions bool, tiers [2]int64) (string, doorIdentityCoverage, int) {
+// scenario, with their coverage. tune is applied last (nil for the pinned stream).
+func doorIdentityDigest(t *testing.T, sessions bool, tiers [2]int64, tune func(*Config)) (string, doorIdentityCoverage, int) {
 	t.Helper()
 	var cov doorIdentityCoverage
-	trace := doorIdentityTrace(t, 20261115, tiers[0], sessions, &cov)
-	trace = append(trace, doorIdentityTrace(t, 7, tiers[1], sessions, &cov)...)
-	trace = append(trace, doorRA1Trace(t, sessions, &cov)...)
+	trace := doorIdentityTrace(t, 20261115, tiers[0], sessions, tune, &cov)
+	trace = append(trace, doorIdentityTrace(t, 7, tiers[1], sessions, tune, &cov)...)
+	trace = append(trace, doorRA1Trace(t, sessions, tune, &cov)...)
 	sum := sha256.Sum256([]byte(strings.Join(trace, "\n")))
 	return hex.EncodeToString(sum[:]), cov, len(trace)
 }
 
 // TestI14_DoorPartAIsA2142ddc pins Part A's door decision stream (I14), over a loop that reaches R-A1.
 func TestI14_DoorPartAIsA2142ddc(t *testing.T) {
-	got, cov, lines := doorIdentityDigest(t, false, [2]int64{150_000, 300_000})
+	got, cov, lines := doorIdentityDigest(t, false, doorIdentityTiersA, nil)
 	t.Logf("coverage %+v, %d lines, digest %s", cov, lines, got)
 	if cov.headFit == 0 || cov.headCollected == 0 || cov.backfills == 0 || cov.returners == 0 ||
 		cov.collectStarts == 0 || cov.rA1 == 0 {
@@ -339,7 +352,7 @@ func TestI14_DoorPartAIsA2142ddc(t *testing.T) {
 // TestI14_DoorPartBIsA2142ddc pins Part B's door decision stream (I14) over a loop in which H10b's state
 // never arises.
 func TestI14_DoorPartBIsA2142ddc(t *testing.T) {
-	got, cov, lines := doorIdentityDigest(t, true, [2]int64{56_000, 72_000})
+	got, cov, lines := doorIdentityDigest(t, true, doorIdentityTiersB, nil)
 	t.Logf("coverage %+v, %d lines, digest %s", cov, lines, got)
 	if cov.headCollected == 0 || cov.backfills == 0 || cov.returners == 0 || cov.collectStarts == 0 {
 		t.Fatalf("fixture coverage: %+v", cov)

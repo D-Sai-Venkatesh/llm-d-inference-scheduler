@@ -51,6 +51,9 @@ type BlockIndex struct {
 
 	blocks     map[Hash]int
 	blocksStay map[Hash]int
+	// blocksRun counts the keys of the seats that are RUNNING (a turn released and not yet ended):
+	// what the GPU must hold right now. Deduplicated like the other two.
+	blocksRun map[Hash]int
 	// seats holds every seated thread's record.
 	seats map[string]*seatBlocks
 }
@@ -63,6 +66,7 @@ type seatBlocks struct {
 	// incremented by at the seat, and what the unseat releases.
 	charged map[Hash]struct{}
 	exiting bool
+	running bool
 }
 
 // NewBlockIndex returns the index for an engine whose KV blocks hold blockSizeTokens tokens.
@@ -74,6 +78,7 @@ func NewBlockIndex(blockSizeTokens int) (*BlockIndex, error) {
 		blockSizeTokens: blockSizeTokens,
 		blocks:          make(map[Hash]int),
 		blocksStay:      make(map[Hash]int),
+		blocksRun:       make(map[Hash]int),
 		seats:           make(map[string]*seatBlocks),
 	}, nil
 }
@@ -232,6 +237,9 @@ func (b *BlockIndex) applyDelta(s *seatBlocks, old map[Hash]struct{}) {
 			if !s.exiting {
 				b.blocksStay[h]++
 			}
+			if s.running {
+				b.blocksRun[h]++
+			}
 		}
 	}
 	for h := range old {
@@ -239,6 +247,9 @@ func (b *BlockIndex) applyDelta(s *seatBlocks, old map[Hash]struct{}) {
 			b.dec(b.blocks, h)
 			if !s.exiting {
 				b.dec(b.blocksStay, h)
+			}
+			if s.running {
+				b.dec(b.blocksRun, h)
 			}
 		}
 	}
@@ -256,6 +267,9 @@ func (b *BlockIndex) Unseat(id string) {
 		b.dec(b.blocks, h)
 		if !s.exiting {
 			b.dec(b.blocksStay, h) // an exiting thread left the STAY side at its mark
+		}
+		if s.running {
+			b.dec(b.blocksRun, h)
 		}
 	}
 	delete(b.seats, id)
@@ -294,6 +308,49 @@ func (b *BlockIndex) Exiting(id string) bool {
 	return ok && s.exiting
 }
 
+// SetRunning marks whether a seated thread has a turn running, moving its keys in or out of the RUN
+// side. The pass sets it from the thread's own derived counts, so it cannot drift from them.
+func (b *BlockIndex) SetRunning(id string, running bool) {
+	s, ok := b.seats[id]
+	if !ok || s.running == running {
+		return
+	}
+	s.running = running
+	for h := range s.charged {
+		if running {
+			b.blocksRun[h]++
+		} else {
+			b.dec(b.blocksRun, h)
+		}
+	}
+}
+
+// RunCost is how many blocks the chains would add to the RUN side. One chain is a binary search:
+// the run side is a union of whole chains of chained prefix hashes, so it is prefix-closed along any
+// chain, as residency is (residentPrefix).
+func (b *BlockIndex) RunCost(chains []Chain) int {
+	if len(chains) == 1 {
+		keys := chains[0].Keys
+		lo, hi := 0, len(keys)
+		for lo < hi {
+			mid := int(uint(lo+hi) >> 1)
+			if _, held := b.blocksRun[keys[mid]]; held {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		return len(keys) - lo
+	}
+	n := 0
+	for h := range chargeSet(chains) {
+		if _, held := b.blocksRun[h]; !held {
+			n++
+		}
+	}
+	return n
+}
+
 // ---- the counted views ----
 
 // UniqueBlocks is the USED side: every seated thread's blocks, exiting included.
@@ -301,6 +358,20 @@ func (b *BlockIndex) UniqueBlocks() int { return len(b.blocks) }
 
 // StayBlocks is the STAY side: the blocks of the threads that are not exiting.
 func (b *BlockIndex) StayBlocks() int { return len(b.blocksStay) }
+
+// RunningBlocks is the RUN side: the blocks of the seats with a turn running.
+func (b *BlockIndex) RunningBlocks() int { return len(b.blocksRun) }
+
+// RunningSeats is how many seats have a turn running.
+func (b *BlockIndex) RunningSeats() int {
+	n := 0
+	for _, s := range b.seats {
+		if s.running {
+			n++
+		}
+	}
+	return n
+}
 
 // ExitingBlocks is the part of the USED side that belongs only to exiting threads (used
 // − stay): the overage enforcement must NOT evict again, and admission still refuses.

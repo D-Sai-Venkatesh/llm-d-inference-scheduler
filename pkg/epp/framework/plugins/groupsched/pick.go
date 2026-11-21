@@ -33,6 +33,7 @@ import (
 // only the tests read is a return value that will drift.
 //
 //	tidy              the derived counts, the reaps, the leavers (before anything reads a count)
+//	markRunning       which seats have a turn running, from those counts (the GPU side)
 //	syncQueue         reconciles the SHARED waiter queue with this pass's heads
 //	deriveColdCharges the cold charges, AFTER syncQueue: they read waitingSince, which it writes
 //	enforceBudgets    the per-engine budget pressure, before anybody is seated
@@ -43,6 +44,7 @@ func (s *Scheduler) Pass(heads []Head, now time.Time) int {
 	defer s.mu.Unlock()
 	s.now = now
 	s.tidy(now)
+	s.markRunning()
 	s.syncQueue(heads, now)
 	s.deriveColdCharges()
 	s.enforceBudgets(now)
@@ -57,6 +59,22 @@ func (s *Scheduler) tidy(now time.Time) {
 	s.derive()
 	s.reapRequests(now)
 	s.drainExiting(now)
+}
+
+// markRunning sets every seat's RUNNING state from its thread's derived counts: a seat runs while a
+// turn of it is released or at a pod. It is read from the counts tidy just derived, so a turn that
+// ended, was abandoned, or whose window outlived S stops counting here, before any decision reads it.
+// Only a CPU-tier group keeps it: without a tier nothing reads it, and the one-level path stays the
+// one it was.
+func (s *Scheduler) markRunning() {
+	if !s.tiered() {
+		return
+	}
+	for _, g := range s.groups {
+		for id, m := range g.threads {
+			g.index.SetRunning(id, m.busy())
+		}
+	}
 }
 
 // enforceBudgets is MEMORY PRESSURE over every active engine, before this pass seats anybody.
@@ -177,6 +195,13 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		sort.SliceStable(cands, func(x, y int) bool { return cands[x].h.Arrival.Before(cands[y].h.Arrival) })
 		// FIFO: the candidates are oldest-first, so the head is the first one
 		chosen := &cands[0]
+		// THE GPU SIDE (with a CPU tier the seats outgrow the GPU): the oldest seated head runs only if
+		// it fits the GPU budget beside the seats already running. Strict FIFO: a held head holds the
+		// younger ones, so a large context is never overtaken by small ones.
+		if s.gpuHolds(g, chosen.h) {
+			s.metrics.ObserveRunGateHeld(engineLabel(g.id))
+			continue
+		}
 		score := s.queuedPerSeat(g)
 		if winner == nil || score > winner.score ||
 			(score == winner.score && chosen.h.Arrival.Before(winner.c.h.Arrival)) ||
@@ -199,6 +224,9 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		// The request is RELEASED: it is neither queued nor in flight until PreRequest records it,
 		// and the record written here is what every later hook resolves it by.
 		s.release(m, winner.c.h.ReqID, winner.c.h.Chains, now, obs)
+		if s.tiered() {
+			g.index.SetRunning(m.id, true)
+		}
 		m.lastActivity = now
 		g.counters.served++
 		s.counters.served++
@@ -222,6 +250,19 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		s.metrics.ObserveQueueWait(queueWaitUntracked, nonNegative(now.Sub(heads[fcfs].Arrival)))
 	}
 	return fcfs
+}
+
+// gpuHolds is the GPU side's one question: does this seated head have to wait for the GPU? Only when
+// the seats can outgrow the GPU (a CPU tier) — without one every seat fits the GPU by construction and
+// nothing is held — and only while something is running: with nothing running every head fits (one
+// request is bounded by the engine's max-model-len, which the engine itself sizes to fit its KV), and
+// a head that did not would otherwise wait forever.
+func (s *Scheduler) gpuHolds(g *engineGroup, h Head) bool {
+	if g.budgetBlocks <= g.runBudgetBlocks {
+		return false
+	}
+	running := g.index.RunningBlocks()
+	return running > 0 && running+g.index.RunCost(h.Chains) > g.runBudgetBlocks
 }
 
 // queuedPerSeat is dispatch's engine score: the fraction of this engine's SEATED threads that have

@@ -27,7 +27,8 @@ import (
 )
 
 // groupMetrics exports the MINIMAL set an operator needs to see liveness and fairness or to
-// diagnose a known failure class — twenty names, and nothing else.
+// diagnose a known failure class — twenty-four names (four of them the GPU side of a CPU-tier group),
+// and nothing else.
 type groupMetrics struct {
 	sched *Scheduler
 
@@ -55,6 +56,9 @@ type groupMetrics struct {
 	// coldValveHeld counts heads the cold-entry VALVE held back: the budget would have admitted
 	// the head, the valve refused it, so the head WAITED for the engine's prefill slot.
 	coldValveHeld *prometheus.CounterVec
+	// runGateHeld counts passes in which an engine's oldest seated head waited for the GPU (CPU-tier
+	// groups only).
+	runGateHeld *prometheus.CounterVec
 }
 
 // subsystem namespaces every series (llm_d_epp_group_*).
@@ -97,6 +101,9 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.coldValveHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "cold_valve_held_total",
 		Help: "Pick passes in which the queue head was held by this engine's cold-entry valve (the budget would have admitted it; it WAITS, nothing is evicted). A PASS count, not a head count: Pick runs at ~1 kHz, so a head held for a second counts about a thousand times"}, engineLabels)
 
+	g.runGateHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "run_gate_held_total",
+		Help: "Pick passes in which this engine's oldest seated head waited for the GPU: the seats already running plus the head would exceed groupBudgetFraction x num_gpu_blocks. CPU-tier groups only. A PASS count, not a head count"}, engineLabels)
+
 	// The GLOBAL zero series: a zero is a fact, an absent series is a question (and a
 	// should-be-zero count with no series is the shape of a bug nobody notices).
 	g.served.WithLabelValues(nocapacityEngine).Add(0)
@@ -105,7 +112,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	}
 	for _, c := range []prometheus.Collector{g.gauges,
 		g.exits, g.entryWait, g.served, g.queueWait, g.predictedCached, g.dispatchedPrompt,
-		g.affinityViolations, g.engineGone, g.coldValveHeld, g.anomalies,
+		g.affinityViolations, g.engineGone, g.coldValveHeld, g.anomalies, g.runGateHeld,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
@@ -138,6 +145,9 @@ func (g *groupMetrics) preInstantiateEngine(engine string) {
 	}
 	label := engineLabel(engine)
 	g.served.WithLabelValues(label).Add(0)
+	if g.runGateHeld != nil {
+		g.runGateHeld.WithLabelValues(label).Add(0)
+	}
 	for _, reason := range exitReasons {
 		g.exits.WithLabelValues(label, reason).Add(0)
 	}
@@ -221,6 +231,14 @@ func (g *groupMetrics) ObserveColdValveHeld(engine string) {
 	g.coldValveHeld.WithLabelValues(engineLabel(engine)).Inc()
 }
 
+// ObserveRunGateHeld counts a pass in which the engine's oldest seated head waited for the GPU.
+func (g *groupMetrics) ObserveRunGateHeld(engine string) {
+	if g == nil || g.runGateHeld == nil {
+		return
+	}
+	g.runGateHeld.WithLabelValues(engineLabel(engine)).Inc()
+}
+
 // ---- the gauges: rendered from ONE Snapshot at scrape time ----
 
 // stateGauges renders every per-engine GAUGE from ONE Snapshot at scrape time, so a scrape sees the
@@ -244,6 +262,9 @@ type stateGauges struct {
 	coldCap         *prometheus.Desc
 	capacityMissing *prometheus.Desc
 	waiters         *prometheus.Desc
+	runBudget       *prometheus.Desc
+	runningBlocks   *prometheus.Desc
+	runningThreads  *prometheus.Desc
 }
 
 // gaugeDesc builds one per-engine gauge descriptor under the plugin's subsystem.
@@ -261,7 +282,13 @@ func newStateGauges(r *GroupScheduler) *stateGauges {
 		neBlocks: gaugeDesc("ne_blocks",
 			"distinct blocks charged to this engine's budget: every seated thread's set, exiting threads included until they drain"),
 		budgetBlocks: gaugeDesc("budget_blocks",
-			"seat budget in blocks (groupBudgetFraction x this engine's num_gpu_blocks)"),
+			"seat budget in blocks: groupBudgetFraction x this engine's num_gpu_blocks, or with a CPU tier tierBudgetFraction x the tier"),
+		runBudget: gaugeDesc("run_budget_blocks",
+			"GPU budget for the seats with a turn running, in blocks: groupBudgetFraction x this engine's num_gpu_blocks (equal to budget_blocks without a CPU tier)"),
+		runningBlocks: gaugeDesc("running_blocks",
+			"distinct blocks of the seats with a turn running (released or at a pod)"),
+		runningThreads: gaugeDesc("running_threads",
+			"seats with a turn running"),
 		exiting: gaugeDesc("exiting_threads",
 			"threads on this engine that have been marked exiting and still hold their seat until their in-flight requests drain"),
 		exitingBlks: gaugeDesc("exiting_blocks",
@@ -282,7 +309,8 @@ func newStateGauges(r *GroupScheduler) *stateGauges {
 // Describe sends every descriptor this collector can produce.
 func (c *stateGauges) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{c.seats, c.neBlocks, c.budgetBlocks, c.exiting,
-		c.exitingBlks, c.exitingAge, c.coldInFlight, c.coldCap, c.capacityMissing, c.waiters} {
+		c.exitingBlks, c.exitingAge, c.coldInFlight, c.coldCap, c.capacityMissing, c.waiters,
+		c.runBudget, c.runningBlocks, c.runningThreads} {
 		ch <- d
 	}
 }
@@ -310,6 +338,9 @@ func (c *stateGauges) Collect(ch chan<- prometheus.Metric) {
 		gauge(c.exitingAge, es.ExitingOldestAgeS, es.ID)
 		gauge(c.coldInFlight, float64(es.ColdInFlight), es.ID)
 		gauge(c.coldCap, float64(es.ColdCapTokens), es.ID)
+		gauge(c.runBudget, float64(es.RunBudgetBlocks), es.ID)
+		gauge(c.runningBlocks, float64(es.RunningBlocks), es.ID)
+		gauge(c.runningThreads, float64(es.RunningThreads), es.ID)
 	}
 	// capacity_missing: every KNOWN endpoint whose geometry the scheduler has not measured. An engine
 	// counts as measured only once it has blocks; one with no group at all is the pre-capacity case.

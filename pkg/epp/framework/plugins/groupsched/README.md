@@ -27,6 +27,14 @@ Consider a pool of two model servers and a workload of multi-turn conversations 
 5.  **Seat waiters**: free budget admits waiting threads, newcomers before returners and then oldest first, with a cold-start stagger: an engine's outstanding cold-entry charge is capped at `(1 − groupBudgetFraction)` of its KV, so a burst of large prompts cannot make every resident prefill at once. **Rule O**: an empty engine admits one oversize head, charging its full exact chain, rather than refusing it — an over-budget counter is recoverable, an idle engine is not.
 6.  **Dispatch**: among seated threads with a dispatchable head, the engine with the MOST queued turns per seat wins — an engine with many threads waiting is the one whose seats are most contended, so serving it first keeps the fleet's queues balanced; ties go to the older head. The dispatched turn's chain is charged to that engine in the same critical section as the decision, and the turn is handed to the framework. A head with no engine to serve it — anonymous traffic, a thread whose render produced no tokens, a stack whose capacity has not been measured yet — is served last, in arrival order, unseated and uncharged.
 
+**With a CPU KV tier.** When the engines offload KV to a CPU tier (vLLM's offloading connector), set `tierCapacityTokens` and the CPU becomes a natural extension of the group:
+
+*   **The group is sized by the tier.** The seat budget is `tierBudgetFraction` × the tier, charged exactly as without one (each seat's exact blocks, a shared prefix once). The tier keeps a copy of every block the engine computes, so a member's history is there even when the GPU dropped it, and its next turn reloads instead of re-prefilling.
+*   **What runs is sized by the GPU, first come first served inside the group.** A member's oldest queued turn is dispatched only if it fits `groupBudgetFraction` × `num_gpu_blocks` beside the members already running (a shared prefix once). A turn that does not fit waits, and the younger turns of its engine wait behind it. With nothing running, the oldest turn runs whatever its size: a single request is bounded by the engine's `max-model-len`, which the engine sizes to fit its own KV.
+*   Everything else is unchanged: quantum, idle S, newcomers first, the cold-start stagger, Rule O. A thread outside the group can be seated on any engine.
+
+Without a tier (`tierCapacityTokens: 0`, the default) the GPU sizes the seats, every member fits the GPU by construction, and nothing waits for the GPU: the one-level policy, decision for decision.
+
 **Rotation.** A seat is held for `quantum` completed busy periods (a busy period is one turn's work: released, run, settled) or until the thread has been idle for `idleSeconds`. Either makes the resident rotation-eligible — and a seat is only given up when a waiter needs it: the rotation is demand-driven, so an idle fleet keeps its seats. A thread that returns finds its seat if it is still there, and re-enters as a returner if it is not.
 
 **The observed engine wins.** If a request's `PreRequest` reports an endpoint other than the seat, the thread is moved to the observed engine and the blocks are re-seated there (`affinity_violations_total` counts the event). The framework's choice is authoritative about where the request ran; the policy's model follows it.
@@ -43,7 +51,7 @@ Consider a pool of two model servers and a workload of multi-turn conversations 
 
 *   **Thread identity's attributes**: the thread id (the queue key and the seat identity), the arrival record (first turn or later, and which turn), and the rendered block keys the thread's prompt hashes to.
 *   **The rendered tokens**: the block keys are hashed once, at arrival, by thread identity; this policy charges exactly those blocks. It performs no rendering of its own.
-*   **Endpoint metrics**: `num_gpu_blocks` and the block size, read from the engine's own metric endpoint once per engine — from the candidate set the detector is handed, not from a timer an operator can see — **the only two things this policy ever takes from vLLM**. No live metric (queue depth, KV utilization, TTFT) enters any decision.
+*   **Endpoint metrics**: `num_gpu_blocks` and the block size, read from the engine's own metric endpoint once per engine — from the candidate set the detector is handed, not from a timer an operator can see — **the only two things this policy ever takes from vLLM**. No live metric (queue depth, KV utilization, TTFT) enters any decision. The CPU tier's size is the deployment's statement (`tierCapacityTokens`).
 *   **Lifecycle events**: an endpoint appearing or disappearing; a request's `PreRequest` (which engine actually served it), its first response chunk (prefill done) and its end of stream.
 
 ## Configuration
@@ -52,7 +60,9 @@ Consider a pool of two model servers and a workload of multi-turn conversations 
 - type: group-scheduler
   name: group
   parameters:
-    groupBudgetFraction: 0.95    # seat budget = fraction x the engine's num_gpu_blocks
+    groupBudgetFraction: 0.95    # the group's share of the engine's num_gpu_blocks
+    tierCapacityTokens: 0        # the engine's CPU KV tier in tokens; 0 = no tier
+    tierBudgetFraction: 0.95     # with a tier: the seats' share of it
     quantum: 4                   # completed busy periods a seat is held before rotation
     idleSeconds: 20              # silence after which a seat is rotation-eligible
     inFlightCap: 64              # how many of one thread's requests may be in flight
@@ -62,7 +72,9 @@ Consider a pool of two model servers and a workload of multi-turn conversations 
 
 | Parameter | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `groupBudgetFraction` | float | `0.95` | Fraction of an engine's measured `num_gpu_blocks` that may be charged to seats. Must be in (0, 1]. |
+| `groupBudgetFraction` | float | `0.95` | Fraction of an engine's measured `num_gpu_blocks` the group may use: the seats without a tier, the running members with one. Must be in (0, 1]. |
+| `tierCapacityTokens` | int | `0` | The engine's CPU KV tier in tokens: the offloading connector's `cpu_bytes_to_use` ÷ the model's KV bytes per token. `0` = no tier. Must be ≥ 0. |
+| `tierBudgetFraction` | float | `0.95` | With a tier: the share of it the seats may hold. Must be in (0, 1]. |
 | `quantum` | int | `4` | Q: completed busy periods a seat is held before it becomes rotation-eligible. Must be ≥ 1. |
 | `idleSeconds` | float | `20` | S: silence after which a resident becomes rotation-eligible (it is not going to use its seat). Must be > 0. |
 | `inFlightCap` | int | `64` | Maximum in-flight requests of one thread. Must be ≥ 1. |
@@ -77,6 +89,7 @@ Most deployments set **one** of these.
 
 *   **Set `blockSizeTokens` whenever the engine's `--block-size` is not 64.** It is the only parameter that can silently corrupt every cost: the policy charges the block keys thread identity hashed, so a disagreement means every charge is wrong. Both plugins refuse to start if they disagree.
 *   **Leave `groupBudgetFraction` alone** unless the engine is shared with something else. `0.95` leaves 5% of the KV for the engine's own working room; the remainder doubles as the cold-start stagger cap.
+*   **Set `tierCapacityTokens` only when the engines run a CPU KV tier.** For 98,304 bytes of KV per token and `cpu_bytes_to_use` of 512 GiB it is 5,592,405.
 *   **Leave `inFlightCap` alone** unless a single conversation is expected to fan out wider than 64 parallel turns.
 *   **`quantum` is a workload choice.** It trades locality for the wait of others: a larger Q keeps a conversation's cache resident longer (better hit rate) and makes a waiting conversation wait longer to be admitted. 4 fits conversational traffic; a fan-out agentic workload with many short conversations wants 1–2.
 *   **`idleSeconds` is a workload choice.** Set it above the client's typical gap between turns — a tool call, a human reading — or a conversation's seat is released between its own turns. It is measured from the last activity, not from the last completion.
@@ -138,7 +151,10 @@ All series are under `llm_d_epp_group_`. Gauges are rendered at scrape from one 
 | --- | --- | --- | --- | --- |
 | `seats` | gauge | `engine` | seated threads on this engine | between 1 and the budget's capacity; a floor of 0 on a busy stack means nothing is being admitted |
 | `ne_blocks` | gauge | `engine` | distinct blocks charged to the engine's budget | ≤ `budget_blocks`; above it is a transient the enforcement pass is correcting |
-| `budget_blocks` | gauge | `engine` | the seat budget: `groupBudgetFraction` × `num_gpu_blocks` | constant per engine |
+| `budget_blocks` | gauge | `engine` | the seat budget: `groupBudgetFraction` × `num_gpu_blocks`, or with a tier `tierBudgetFraction` × the tier | constant per engine |
+| `run_budget_blocks` | gauge | `engine` | the GPU budget for the running members: `groupBudgetFraction` × `num_gpu_blocks` | constant per engine |
+| `running_blocks` | gauge | `engine` | distinct blocks of the members with a turn running (tier only; 0 without one) | ≤ `run_budget_blocks`, except one member running alone or a turn the framework placed on another engine |
+| `running_threads` | gauge | `engine` | members with a turn running (tier only; 0 without one) | follows the load |
 | `exiting_threads` | gauge | `engine` | threads marked exiting that still hold their seat until their requests drain | returns to 0; a value that persists is a drain that is not happening |
 | `exiting_blocks` | gauge | `engine` | the part of `ne_blocks` that belongs to exiting threads | bounded by `ne_blocks` |
 | `exiting_oldest_age_seconds` | gauge | `engine` | how long the oldest exiting thread has been on its way out | stays small; only growing means a stuck drain |
@@ -153,6 +169,7 @@ All series are under `llm_d_epp_group_`. Gauges are rendered at scrape from one 
 | `dispatched_prompt_tokens_total` | counter | `engine` | prompt tokens of every dispatched turn, summed over a request's prompts | the denominator of the predicted hit rate |
 | `predicted_cached_tokens_total` | counter | `engine` | prompt tokens the engine was predicted to hold as a resident prefix, measured read-only **before** the turn's own charge | ratio to the line above is the predicted prefix hit rate |
 | `cold_valve_held_total` | counter | `engine` | Pick passes in which the head was held by this engine's cold-entry valve | a rate, not a count: Pick runs at ~1 kHz |
+| `run_gate_held_total` | counter | `engine` | Pick passes in which the engine's oldest member turn waited for the GPU (tier only) | a rate; 0 without a tier |
 | `anomalies_total` | counter | `kind` | should-be-zero events the policy could not act on (below) | `no_tokens_head` 0, `no_request_id` 0 in practice, `reaped_*` 0 |
 | `affinity_violations_total` | counter | `from`, `to` | requests that landed on an engine other than the thread's seat (the thread was rebound) | 0 is the invariant; a value means the placement and the seat disagreed |
 | `engine_gone_total` | counter | — | engines torn down by an endpoint delete | follows endpoint churn |

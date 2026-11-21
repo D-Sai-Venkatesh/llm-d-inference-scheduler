@@ -29,9 +29,16 @@ import (
 // Config is the plugin's decoded parameters. One code path for one engine and for N: a single-pod
 // stack is the N=1 case of the per-engine state, never a thread of its own.
 type Config struct {
-	// GroupBudgetFraction sizes each engine's SEAT BUDGET from that engine's own measured KV
-	// capacity: budgetBlocks = fraction × num_gpu_blocks.
+	// GroupBudgetFraction is the share of each engine's own measured GPU KV the group may use:
+	// fraction × num_gpu_blocks. Without a CPU tier it sizes the SEATS; with one it sizes the turns
+	// RUNNING on the GPU, and the seats are sized by the tier.
 	GroupBudgetFraction float64 `json:"groupBudgetFraction"`
+
+	// TierCapacityTokens is each engine's CPU KV tier in tokens (the offloading connector's
+	// cpu_bytes_to_use ÷ the model's KV bytes per token). 0 = no tier.
+	TierCapacityTokens int64 `json:"tierCapacityTokens"`
+	// TierBudgetFraction is the share of the tier the seats may hold.
+	TierBudgetFraction float64 `json:"tierBudgetFraction"`
 
 	// Quantum is Q — the fixed tenure, in COMPLETED busy periods, after which a resident becomes
 	// rotation-eligible.
@@ -57,6 +64,8 @@ type Config struct {
 func defaultConfig() Config {
 	return Config{
 		GroupBudgetFraction: 0.95,
+		TierCapacityTokens:  0,
+		TierBudgetFraction:  0.95,
 		Quantum:             4,
 		IdleSeconds:         20,
 		InFlightCap:         64,
@@ -70,6 +79,12 @@ func defaultConfig() Config {
 func (c Config) validate() error {
 	if c.GroupBudgetFraction <= 0 || c.GroupBudgetFraction > 1 {
 		return fmt.Errorf("groupBudgetFraction must be in (0,1], got %v", c.GroupBudgetFraction)
+	}
+	if c.TierCapacityTokens < 0 {
+		return fmt.Errorf("tierCapacityTokens must be >= 0 (0 = no CPU tier), got %d", c.TierCapacityTokens)
+	}
+	if c.TierBudgetFraction <= 0 || c.TierBudgetFraction > 1 {
+		return fmt.Errorf("tierBudgetFraction must be in (0,1], got %v", c.TierBudgetFraction)
 	}
 	if c.Quantum < 1 {
 		return fmt.Errorf("quantum must be >= 1 (Q is the fixed tenure, in completed busy periods), got %d", c.Quantum)

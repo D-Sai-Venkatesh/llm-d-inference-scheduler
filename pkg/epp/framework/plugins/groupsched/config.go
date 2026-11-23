@@ -58,6 +58,12 @@ type Config struct {
 	// the turn and ended at its settle, its abandon, its thread's exit — so a record that
 	// outlives this bound has no owner left).
 	InflightReapSeconds float64 `json:"inflightReapSeconds"`
+
+	// CPUResidencyProducer names an approx-prefix-cache-producer instance sized to the CPU tier
+	// (autoTune false, lruCapacityPerServer = tierCapacityTokens / blockSizeTokens, both match caps
+	// 0). With it, placement prefers the engine whose tier still holds the most of the head's prompt
+	// (the fewest tokens to really prefill); "" = off, placement exactly as without it.
+	CPUResidencyProducer string `json:"cpuResidencyProducer,omitempty"`
 }
 
 // defaultConfig is what a config that omits every key gets: the shipped arm's own numbers.
@@ -97,6 +103,9 @@ func (c Config) validate() error {
 	}
 	if c.BlockSizeTokens <= 0 {
 		return fmt.Errorf("blockSizeTokens is required (the token processor's block size; got %d)", c.BlockSizeTokens)
+	}
+	if c.CPUResidencyProducer != "" && c.TierCapacityTokens <= 0 {
+		return fmt.Errorf("cpuResidencyProducer %q needs tierCapacityTokens: the residency index models each engine's CPU tier, and without a tier there is none to model", c.CPUResidencyProducer)
 	}
 	if c.InflightReapSeconds < 60 {
 		return fmt.Errorf("inflightReapSeconds must be >= 60 (it is the belt over an unobserved termination, not a timeout: it must sit above the client's own request timeout; got %v)", c.InflightReapSeconds)

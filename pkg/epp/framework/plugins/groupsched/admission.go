@@ -49,6 +49,9 @@ type seatChoice struct {
 	costTokens int64
 	// fits: the head's cost was inside the free budget AND the cold-entry valve allowed it.
 	fits bool
+	// resident is the head's prompt tokens the CPU-residency index says THIS engine's tier still
+	// holds, and bestResident the most any candidate engine holds (both 0 with residency off).
+	resident, bestResident int64
 }
 
 // seatEngine is THE seat-time engine choice: the scheduler gathers the FACTS (per-engine
@@ -57,7 +60,9 @@ func (s *Scheduler) seatEngine(head *waiter, now time.Time) *seatChoice {
 	groups := s.activeGroups()
 	cands := make([]EngineCandidate, 0, len(groups))
 	owners := make([]*engineGroup, 0, len(groups))
-	for _, g := range groups {
+	resident := s.residentTokens(head.chains, groups)
+	prompt := PromptTokens(head.chains)
+	for gi, g := range groups {
 		if g.numBlocks <= 0 {
 			// NO measured capacity: the engine cannot be costed, and seating into an unknown budget is
 			// how an engine takes unbounded seats during the metrics race.
@@ -81,6 +86,10 @@ func (s *Scheduler) seatEngine(head *waiter, now time.Time) *seatChoice {
 			// budget.
 			Fits:      (budgetFits || ruleO) && s.coldAllowsTokens(g, tokens),
 			HasVictim: func() bool { return s.hasRotationVictim(gg, now) },
+			// what this engine would REALLY prefill: the prompt beyond what its CPU tier still holds
+			// (0 for every engine with residency off, so the orders below are today's exactly)
+			PhysColdTokens: physCold(prompt, resident, gi),
+			Resident:       residentAt(resident, gi),
 		})
 		owners = append(owners, gg)
 	}
@@ -88,7 +97,50 @@ func (s *Scheduler) seatEngine(head *waiter, now time.Time) *seatChoice {
 	if idx < 0 || idx >= len(cands) {
 		return nil
 	}
-	return &seatChoice{g: owners[idx], costTokens: cands[idx].CostTokens, fits: cands[idx].Fits}
+	var best int64
+	for _, c := range cands {
+		best = max(best, c.Resident)
+	}
+	return &seatChoice{g: owners[idx], costTokens: cands[idx].CostTokens, fits: cands[idx].Fits,
+		resident: cands[idx].Resident, bestResident: best}
+}
+
+// residentTokens is the CPU-residency read for one head, per group (positional): the prompt tokens
+// of each chain the engine's tier still holds as a leading run, summed over the head's prompts. nil
+// when residency is off. ONE read per chain covers every engine.
+func (s *Scheduler) residentTokens(chains []Chain, groups []*engineGroup) []int64 {
+	if s.residency == nil || len(groups) == 0 {
+		return nil
+	}
+	ids := make([]string, len(groups))
+	for i, g := range groups {
+		ids[i] = g.id
+	}
+	out := make([]int64, len(groups))
+	for _, c := range chains {
+		runs := s.residency(c.Keys, ids)
+		for i := range out {
+			if i < len(runs) {
+				out[i] += min(int64(runs[i])*int64(s.blockSize), int64(c.Tokens))
+			}
+		}
+	}
+	return out
+}
+
+func residentAt(resident []int64, i int) int64 {
+	if i < len(resident) {
+		return resident[i]
+	}
+	return 0
+}
+
+// physCold is the prompt beyond what engine i's tier holds; 0 with residency off (no ordering).
+func physCold(prompt int64, resident []int64, i int) int64 {
+	if resident == nil {
+		return 0
+	}
+	return max(prompt-residentAt(resident, i), 0)
 }
 
 // coldValveHeldOn reports WHICH engine's cold-entry valve is the only thing keeping this head
@@ -223,11 +275,20 @@ type EngineCandidate struct {
 	Fits bool
 	// HasVictim is LAZY (it costs a scan): may the engine evict an eligible incumbent right now?
 	HasVictim func() bool
+	// PhysColdTokens is what this engine would REALLY prefill for the head: its prompt beyond the
+	// leading run the CPU-residency index says the engine's tier still holds. 0 for every engine when
+	// residency is off, which leaves both placement orders exactly as without it.
+	PhysColdTokens int64
+	// Resident is the head's prompt tokens that tier holds (observability).
+	Resident int64
 }
 
 // chooseEngine answers "which engine takes this head?": among the engines where the head FITS
-// (budget AND the cold valve), the one with the MOST FREE BUDGET AFTER the seat — free minus
-// this head's cost on it; ties → lowest engine id. It returns the index into cands, or -1.
+// (budget AND the cold valve), the one with the FEWEST TOKENS TO REALLY PREFILL (PhysColdTokens —
+// all 0 with residency off), then the MOST FREE BUDGET AFTER the seat — free minus this head's cost
+// on it; ties → lowest engine id. When nothing fits, the eviction that today's rule makes anyway is
+// made on the engine chosen by the same order among the engines with an eligible victim: the
+// residency index changes WHERE, never WHETHER or WHOM. It returns the index into cands, or -1.
 func chooseEngine(cands []EngineCandidate) int {
 	best := -1
 	for i := range cands {
@@ -248,7 +309,7 @@ func chooseEngine(cands []EngineCandidate) int {
 			if cands[i].HasVictim == nil || !cands[i].HasVictim() {
 				continue
 			}
-			if best < 0 || betterEngine(cands[i], cands[best]) {
+			if best < 0 || betterVictimEngine(cands[i], cands[best]) {
 				best = i
 			}
 		}
@@ -266,16 +327,20 @@ func chooseEngine(cands []EngineCandidate) int {
 		if cands[i].HasVictim == nil || !cands[i].HasVictim() {
 			continue
 		}
-		if best < 0 || betterEngine(cands[i], cands[best]) {
+		if best < 0 || betterVictimEngine(cands[i], cands[best]) {
 			best = i
 		}
 	}
 	return best
 }
 
-// betterFit is the placement total order among engines the head FITS: the most free budget
-// left AFTER the seat, then the engine id.
+// betterFit is the placement total order among engines the head FITS: the fewest tokens to really
+// prefill (equal everywhere with residency off), then the most free budget left AFTER the seat,
+// then the engine id.
 func betterFit(c, best EngineCandidate) bool {
+	if c.PhysColdTokens != best.PhysColdTokens {
+		return c.PhysColdTokens < best.PhysColdTokens
+	}
 	if c.FreeBudget-c.CostBlocks != best.FreeBudget-best.CostBlocks {
 		return c.FreeBudget-c.CostBlocks > best.FreeBudget-best.CostBlocks
 	}
@@ -294,6 +359,15 @@ func oversizeEverywhere(cands []EngineCandidate) bool {
 		}
 	}
 	return true
+}
+
+// betterVictimEngine is the order for the engine an eviction is made on when the head fits nowhere:
+// the fewest tokens to really prefill (equal everywhere with residency off), then betterEngine.
+func betterVictimEngine(c, best EngineCandidate) bool {
+	if c.PhysColdTokens != best.PhysColdTokens {
+		return c.PhysColdTokens < best.PhysColdTokens
+	}
+	return betterEngine(c, best)
 }
 
 // betterEngine is the placement total order for the engines that cannot take the head (and for

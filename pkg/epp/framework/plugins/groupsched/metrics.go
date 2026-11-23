@@ -59,6 +59,10 @@ type groupMetrics struct {
 	// runGateHeld counts passes in which an engine's oldest seated head waited for the GPU (CPU-tier
 	// groups only).
 	runGateHeld *prometheus.CounterVec
+	// residencyPlacements / residencySeatTokens are the CPU-residency index's placement ledger
+	// (cpuResidencyProducer set; zero series otherwise).
+	residencyPlacements *prometheus.CounterVec
+	residencySeatTokens *prometheus.CounterVec
 }
 
 // subsystem namespaces every series (llm_d_epp_group_*).
@@ -104,6 +108,14 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.runGateHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "run_gate_held_total",
 		Help: "Pick passes in which this engine's oldest seated head waited for the GPU: the seats already running plus the head would exceed groupBudgetFraction x num_gpu_blocks. CPU-tier groups only. A PASS count, not a head count"}, engineLabels)
 
+	g.residencyPlacements = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "residency_placements_total",
+		Help: "seats by what the CPU-residency index (cpuResidencyProducer) said about the chosen engine: warmest = its tier held the most of the head's prompt; cold-everywhere = no engine held any of it; not-warmest = a warmer engine could not take the head this pass (no fit, its cold valve, or no eligible victim). Zero without the index"}, []string{"outcome"})
+	g.residencySeatTokens = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "residency_seat_tokens_total",
+		Help: "seated heads' prompt tokens on the chosen engine, split by the CPU-residency index: resident = its tier still held them (a reload), cold = they had to be prefilled. Zero without the index"}, []string{"engine", "kind"})
+	for _, o := range placementOutcomes {
+		g.residencyPlacements.WithLabelValues(o).Add(0)
+	}
+
 	// The GLOBAL zero series: a zero is a fact, an absent series is a question (and a
 	// should-be-zero count with no series is the shape of a bug nobody notices).
 	g.served.WithLabelValues(nocapacityEngine).Add(0)
@@ -113,6 +125,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	for _, c := range []prometheus.Collector{g.gauges,
 		g.exits, g.entryWait, g.served, g.queueWait, g.predictedCached, g.dispatchedPrompt,
 		g.affinityViolations, g.engineGone, g.coldValveHeld, g.anomalies, g.runGateHeld,
+		g.residencyPlacements, g.residencySeatTokens,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
@@ -229,6 +242,16 @@ func (g *groupMetrics) ObserveColdValveHeld(engine string) {
 		return
 	}
 	g.coldValveHeld.WithLabelValues(engineLabel(engine)).Inc()
+}
+
+// ObservePlacement books one seat's CPU-residency outcome and its resident/cold prompt split.
+func (g *groupMetrics) ObservePlacement(engine, outcome string, resident, cold int64) {
+	if g == nil || g.residencyPlacements == nil {
+		return
+	}
+	g.residencyPlacements.WithLabelValues(outcome).Inc()
+	g.residencySeatTokens.WithLabelValues(engine, "resident").Add(float64(resident))
+	g.residencySeatTokens.WithLabelValues(engine, "cold").Add(float64(cold))
 }
 
 // ObserveRunGateHeld counts a pass in which the engine's oldest seated head waited for the GPU.

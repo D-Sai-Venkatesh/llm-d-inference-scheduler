@@ -254,6 +254,12 @@ type Scheduler struct {
 	// decision entry point).
 	now time.Time
 
+	// residency, when set, answers per engine how many LEADING blocks of a chain the engine's CPU
+	// tier still holds (the CPU-residency index, read through the plugin handle). It only ORDERS the
+	// engines a head is placed on (fewest tokens to really prefill first); it never admits, evicts or
+	// charges anything. nil = placement exactly as without it.
+	residency func(keys []Hash, engines []string) []int
+
 	counters struct {
 		// anomalies counts the EVENTS THE POLICY CANNOT ACT ON, by kind (anomalyKinds).
 		anomalies map[string]int64
@@ -265,7 +271,21 @@ type Scheduler struct {
 		exits              map[string]int64
 		served             int64
 		fcfsServed         int64
+		// placements counts seats by what the residency index said about the chosen engine
+		// (placementOutcomes); seatResident / seatCold split the seated heads' prompt tokens into the
+		// part the chosen engine's tier held and the part it had to prefill. Residency on only.
+		placements   map[string]int64
+		seatResident int64
+		seatCold     int64
 	}
+}
+
+// SetResidency installs the CPU-residency read (nil removes it). Called once at startup, before any
+// pass, by the plugin's sibling gate.
+func (s *Scheduler) SetResidency(f func(keys []Hash, engines []string) []int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.residency = f
 }
 
 // NewScheduler builds the state machine.
@@ -280,6 +300,7 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 		waiters:  map[string]*waiter{}}
 	s.counters.exits = map[string]int64{}
 	s.counters.anomalies = map[string]int64{}
+	s.counters.placements = map[string]int64{}
 	return s, nil
 }
 
@@ -500,6 +521,16 @@ type Snapshot struct {
 	// Anomalies is the should-be-zero ledger, by kind (anomalyKinds): every entry is an event the
 	// policy could not act on.
 	Anomalies map[string]int64 `json:"anomalies,omitempty"`
+	// Residency is the CPU-residency placement ledger (absent when the index is not configured).
+	Residency *ResidencySnapshot `json:"residency,omitempty"`
+}
+
+// ResidencySnapshot is what the CPU-residency index did to placement: seats by outcome, and the
+// seated heads' prompt tokens split into tier-resident and to-prefill on the chosen engine.
+type ResidencySnapshot struct {
+	Placements         map[string]int64 `json:"placements"`
+	SeatResidentTokens int64            `json:"seatResidentTokens"`
+	SeatColdTokens     int64            `json:"seatColdTokens"`
 }
 
 // EngineSnapshot is ONE engine's group state: seats, the budget, the exit mix and the exiting
@@ -595,5 +626,13 @@ func (s *Scheduler) snapshot(now time.Time) Snapshot {
 	}
 	snap.Seats, snap.NEBlocks = seats, ne
 	snap.WaitersShared = len(s.waiters)
+	if s.residency != nil {
+		rs := &ResidencySnapshot{Placements: map[string]int64{},
+			SeatResidentTokens: s.counters.seatResident, SeatColdTokens: s.counters.seatCold}
+		for _, k := range placementOutcomes {
+			rs.Placements[k] = s.counters.placements[k]
+		}
+		snap.Residency = rs
+	}
 	return snap
 }

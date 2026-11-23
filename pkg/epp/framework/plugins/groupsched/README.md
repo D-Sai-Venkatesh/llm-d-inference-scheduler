@@ -35,6 +35,31 @@ Consider a pool of two model servers and a workload of multi-turn conversations 
 
 Without a tier (`tierCapacityTokens: 0`, the default) the GPU sizes the seats, every member fits the GPU by construction, and nothing waits for the GPU: the one-level policy, decision for decision.
 
+**CPU-residency placement (optional, with a tier).** The seat index forgets a thread when it exits, but the engine's CPU tier does not: a returning thread's history is usually still on the tier of the engine it left. Name an `approx-prefix-cache-producer` instance in `cpuResidencyProducer`, sized to the tier, and placement reads it through the plugin handle:
+
+*   Among the engines where the head **fits**, the one whose tier still holds the most of its prompt (the fewest tokens to really prefill) wins; ties fall to the usual most-free-budget order.
+*   When the head fits nowhere, the one eviction the rotation makes anyway is made on the engine where the head is warm, among those with an eligible victim.
+*   Nothing else changes: the entry order, the quantum and idle rotation, the cold valve, Rule O and the GPU run gate. The index never admits, waits, evicts or charges; it only orders the engines.
+
+The producer must model the tier: `autoTune: false`, `blockSizeTokens` equal to this plugin's, `lruCapacityPerServer` = `tierCapacityTokens / blockSizeTokens`, and `maxPrefixTokensToMatch: 0` with `maxPrefixBlocksToMatch: 0` (whole prompts). The startup refuses anything else, naming both numbers. It indexes prompt blocks only, which is what the tier stores.
+
+```yaml
+- type: approx-prefix-cache-producer
+  name: cpu-residency
+  parameters:
+    autoTune: false
+    blockSizeTokens: 64
+    lruCapacityPerServer: 87381   # 5592405 / 64
+    maxPrefixTokensToMatch: 0
+    maxPrefixBlocksToMatch: 0
+    syncCrossReplicaState: false
+- type: group-scheduler
+  name: group
+  parameters:
+    tierCapacityTokens: 5592405
+    cpuResidencyProducer: cpu-residency
+```
+
 **Rotation.** A seat is held for `quantum` completed busy periods (a busy period is one turn's work: released, run, settled) or until the thread has been idle for `idleSeconds`. Either makes the resident rotation-eligible — and a seat is only given up when a waiter needs it: the rotation is demand-driven, so an idle fleet keeps its seats. A thread that returns finds its seat if it is still there, and re-enters as a returner if it is not.
 
 **The observed engine wins.** If a request's `PreRequest` reports an endpoint other than the seat, the thread is moved to the observed engine and the blocks are re-seated there (`affinity_violations_total` counts the event). The framework's choice is authoritative about where the request ran; the policy's model follows it.
@@ -80,6 +105,7 @@ Without a tier (`tierCapacityTokens: 0`, the default) the GPU sizes the seats, e
 | `inFlightCap` | int | `64` | Maximum in-flight requests of one thread. Must be ≥ 1. |
 | `blockSizeTokens` | int | `64` | The engine's KV block size in tokens. Must equal vLLM's `--block-size` and thread identity's `blockSizeTokens`; the startup refuses a disagreement, naming both numbers. |
 | `inflightReapSeconds` | float | `9300` | Age beyond which a tracked request is closed by the reap. Must exceed the client's request timeout. |
+| `cpuResidencyProducer` | string | `""` | Name of an `approx-prefix-cache-producer` sized to the CPU tier; orders placement by the tokens each engine would really prefill. Requires `tierCapacityTokens`. `""` = off. |
 
 The parameters are decoded **strictly**: an unknown key fails the startup instead of being ignored.
 
@@ -173,6 +199,8 @@ All series are under `llm_d_epp_group_`. Gauges are rendered at scrape from one 
 | `anomalies_total` | counter | `kind` | should-be-zero events the policy could not act on (below) | `no_tokens_head` 0, `no_request_id` 0 in practice, `reaped_*` 0 |
 | `affinity_violations_total` | counter | `from`, `to` | requests that landed on an engine other than the thread's seat (the thread was rebound) | 0 is the invariant; a value means the placement and the seat disagreed |
 | `engine_gone_total` | counter | — | engines torn down by an endpoint delete | follows endpoint churn |
+| `residency_placements_total` | counter | `outcome` (`warmest`, `cold-everywhere`, `not-warmest`) | seats by what the CPU-residency index said about the chosen engine | `not-warmest` small: a warmer engine could not take the head (no fit, its valve, no eligible victim) |
+| `residency_seat_tokens_total` | counter | `engine`, `kind` (`resident`, `cold`) | seated heads' prompt tokens the chosen engine's tier held vs had to prefill | `resident` ≫ 0 for returners; all `cold` means the index keys do not match the chains |
 
 **Anomaly kinds.** `no_tokens_head` — one Pick **pass** saw a thread head with no rendered tokens, so it could not be seated or charged; a render failure, and a rate rather than a request count. `no_request_id` — a turn was released for a request with no id; a boundary guard, 0 in practice because the router assigns every request one. `reaped_inflight` / `reaped_window` — a request (or a released window) outlived the reap and had to be closed by it. They are the signals that a termination was never reported, and **`reaped_window` can be non-zero without anything being wrong**: two framework paths (a head finalised but not swept, and a dispatch whose candidate set came back empty after admission) leave a released request with no later hook, so its window simply ages out and the reap closes it. Read them as "how many records the framework did not come back for", not as a leak.
 

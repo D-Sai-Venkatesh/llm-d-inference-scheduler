@@ -204,6 +204,9 @@ func (r *GroupScheduler) RegisterDependencies(reg fwkdl.Registrar) error {
 	if err := r.validateThreadProducer(); err != nil {
 		return err
 	}
+	if err := r.validateResidencyProducer(); err != nil {
+		return err
+	}
 	return reg.Register(fwkdl.PendingRegistration{
 		Owner:      r.typedName,
 		SourceType: sourcenotifications.EndpointNotificationSourceType,

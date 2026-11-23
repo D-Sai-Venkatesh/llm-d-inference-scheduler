@@ -67,6 +67,7 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/dataproducer/approximateprefix"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/requestheader/agentidentity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/threadidentity"
 )
@@ -279,6 +280,46 @@ func (r *GroupScheduler) validateThreadProducer() error {
 		// owner. Say why here, so the log names the conflict from this side too.
 		r.logger.V(logutil.DEBUG).Info("group-scheduler: agent identity is also configured — thread identity owns the flow-key attribute and will refuse to start beside it (its startup check names the conflict)")
 	}
+	return nil
+}
+
+// validateResidencyProducer is the fail-closed gate for the CPU-residency index: a named
+// cpuResidencyProducer must be an approx-prefix-cache-producer in this config whose index models
+// each engine's CPU tier — sized to it, at our block size, recording whole prompts. An index sized to
+// the GPU (autoTune) or truncated by a match cap would say "cold" for prompts the tier still holds
+// (and "warm" for ones it dropped), so a disagreement refuses the startup, naming both numbers.
+func (r *GroupScheduler) validateResidencyProducer() error {
+	name := r.cfg.CPUResidencyProducer
+	if name == "" || r.handle == nil {
+		return nil // off, or unit/test mode
+	}
+	raw := r.handle.Plugin(name)
+	if raw == nil {
+		return fmt.Errorf("the '%s' plugin names cpuResidencyProducer %q, but this config has no plugin of that name: add an '%s' instance named %q",
+			PluginType, name, approximateprefix.ApproxPrefixCachePluginType, name)
+	}
+	rr, ok := raw.(approximateprefix.ResidencyReader)
+	if !ok {
+		return fmt.Errorf("the '%s' plugin's cpuResidencyProducer %q is a '%s', not an '%s'",
+			PluginType, name, raw.TypedName().Type, approximateprefix.ApproxPrefixCachePluginType)
+	}
+	c := rr.ResidencyConfig()
+	want := int(r.cfg.TierCapacityTokens / int64(r.cfg.BlockSizeTokens))
+	switch {
+	case c.AutoTune:
+		return fmt.Errorf("cpuResidencyProducer %q has autoTune on: that sizes its index to the GPU's num_gpu_blocks, not the CPU tier — set autoTune: false and lruCapacityPerServer: %d", name, want)
+	case c.BlockSizeTokens != r.cfg.BlockSizeTokens:
+		return fmt.Errorf("cpuResidencyProducer %q hashes %d-token blocks and this policy's chains are %d-token blocks: the keys would never match — set its blockSizeTokens to %d",
+			name, c.BlockSizeTokens, r.cfg.BlockSizeTokens, r.cfg.BlockSizeTokens)
+	case c.CapacityBlocks != want:
+		return fmt.Errorf("cpuResidencyProducer %q holds %d blocks per endpoint but the CPU tier is tierCapacityTokens %d / blockSizeTokens %d = %d blocks — set its lruCapacityPerServer to %d",
+			name, c.CapacityBlocks, r.cfg.TierCapacityTokens, r.cfg.BlockSizeTokens, want, want)
+	case !c.UnlimitedPrefix:
+		return fmt.Errorf("cpuResidencyProducer %q caps the prompt blocks it hashes: it would record only a prompt's leading blocks and under-count the tier — set maxPrefixTokensToMatch: 0 and maxPrefixBlocksToMatch: 0", name)
+	}
+	r.sched.SetResidency(rr.ResidentPrefixBlocks)
+	r.logger.V(logutil.DEFAULT).Info("group-scheduler: CPU-residency placement ON — engines are ordered by the tokens each would really prefill (its tier's resident prefix discounted); admission, rotation and charges are unchanged",
+		"producer", name, "capacityBlocks", c.CapacityBlocks, "blockSizeTokens", c.BlockSizeTokens)
 	return nil
 }
 

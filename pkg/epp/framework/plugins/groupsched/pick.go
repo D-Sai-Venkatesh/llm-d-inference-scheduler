@@ -22,6 +22,7 @@ package groupsched
 // dispatch scores the seats.
 
 import (
+	"fmt"
 	"sort"
 	"time"
 )
@@ -312,6 +313,7 @@ func (s *Scheduler) seatWaiters(now time.Time) {
 			if !s.seat(cand.g, head, cand.costTokens, now) {
 				return
 			}
+			s.notePlacement(cand, head, now)
 			continue
 		}
 		// Nothing fits BY BUDGET on the chosen engine: eviction is the only way a budget-blocked
@@ -392,4 +394,33 @@ func queueWaitKind(h Head) string {
 		return queueWaitReturner
 	}
 	return queueWaitNew
+}
+
+// placementOutcomes are what the CPU-residency index said about the engine a head was seated on:
+// the engine whose tier held the most of its prompt, no engine holding any of it, or an engine
+// holding less than another did (the warmer one could not take the head this pass: no fit, its cold
+// valve, or no eligible victim).
+var placementOutcomes = []string{"warmest", "cold-everywhere", "not-warmest"}
+
+// notePlacement books one seat's residency outcome (residency on only: off, nothing is recorded and
+// the event stream is the one without it).
+func (s *Scheduler) notePlacement(c *seatChoice, w *waiter, now time.Time) {
+	if s.residency == nil {
+		return
+	}
+	outcome := "warmest"
+	switch {
+	case c.bestResident == 0:
+		outcome = "cold-everywhere"
+	case c.resident < c.bestResident:
+		outcome = "not-warmest"
+	}
+	prompt := PromptTokens(w.chains)
+	cold := max(prompt-c.resident, 0)
+	s.counters.placements[outcome]++
+	s.counters.seatResident += c.resident
+	s.counters.seatCold += cold
+	s.metrics.ObservePlacement(engineLabel(c.g.id), outcome, c.resident, cold)
+	s.recordEvent("PLACE", w.id, fmt.Sprintf("outcome=%s resident=%d best_resident=%d prompt=%d returner=%t",
+		outcome, c.resident, c.bestResident, prompt, w.returner), now)
 }

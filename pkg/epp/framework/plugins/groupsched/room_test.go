@@ -20,6 +20,7 @@ package groupsched
 // absorb its write without evicting a seated block; the seat records its chain; dispatch touches it.
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -340,5 +341,45 @@ func TestRoomGateReplay(t *testing.T) {
 	}
 	if held == 0 {
 		t.Fatal("the small tiers must make the room gate hold somebody")
+	}
+}
+
+// With newcomersFirst false a rotation serves the head that asked for it: the victim (quantum-complete,
+// its next turn queued since BEFORE the head arrived) re-queues behind the head instead of re-seating
+// at once with a fresh quantum. (Found by the verifier; reproduced with the gate on and off.)
+func TestRotationVictimRequeuesBehindTheHead(t *testing.T) {
+	for _, gate := range []bool{false, true} {
+		s := roomSched(t, gate, func(c *Config) { c.NewcomersFirst = false; c.VictimOldestDispatch = true })
+		at := func(sec int) time.Time { return epoch.Add(time.Duration(sec) * time.Second) }
+		hd := func(id string, n int, arr time.Time, c []Chain) Head {
+			return Head{Thread: id, ReqID: fmt.Sprintf("%s#%d", id, n), Arrival: arr, Chains: c, Returner: n > 0}
+		}
+		turn := func(h Head, now time.Time) {
+			if i := s.Pass([]Head{h}, now); i != 0 {
+				t.Fatalf("%s must dispatch, got %d", h.ReqID, i)
+			}
+			s.AtPod(h.ReqID, "", now)
+			s.FirstChunk(h.ReqID, now)
+			s.Settle(h.ReqID, "", now)
+		}
+		for i := 0; i < 8; i++ { // m completes its quantum (8 busy periods)
+			turn(hd("m", i, at(i), chain("m", 300)), at(i))
+		}
+		turn(hd("f", 0, at(20), chain("f", 500)), at(20))
+		r := hd("r", 0, at(21), chain("r", 800))
+		if i := s.Pass([]Head{r}, at(21)); i != 0 {
+			t.Fatal("r must dispatch")
+		}
+		s.AtPod(r.ReqID, "", at(21))
+		s.FirstChunk(r.ReqID, at(21))             // r RUNNING: 800 of the 950-block run budget
+		mh := hd("m", 8, at(20), chain("m", 300)) // m's next turn, queued at 20, GPU-held behind r
+		h := hd("h", 0, at(24), chain("h", 400))  // the head: 1600 + 400 > the 1900-block seat budget
+		s.Pass([]Head{mh, h}, at(25))
+		if !seated(s, "h") {
+			t.Fatalf("gate=%v: the head that triggered the rotation must be seated", gate)
+		}
+		if seated(s, "m") {
+			t.Fatalf("gate=%v: the victim must wait behind the head, not re-seat with a fresh quantum", gate)
+		}
 	}
 }

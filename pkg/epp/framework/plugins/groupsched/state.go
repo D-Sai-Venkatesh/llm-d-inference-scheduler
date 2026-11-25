@@ -354,6 +354,9 @@ type Scheduler struct {
 		seatedEvicted map[string]int64
 		// roomBlocker counts, once per room-held head, what held it (the member state ending the walk)
 		roomBlocker map[string]int64
+		// quantumDoneDeferred counts dispatches where quantumDoneLast served a member within its quantum
+		// ahead of an OLDER turn of a quantum-complete member
+		quantumDoneDeferred int64
 	}
 }
 
@@ -518,6 +521,13 @@ func (s *Scheduler) SetNumBlocksFor(engine string, blockSizeTokens, numBlocks in
 				}
 				if gg.index.Staying(k) {
 					cause := gg.tierCause
+					if s.cfg.RoomDisplace && cause != tierCauseSeat {
+						// roomDisplace: a block whose every staying holder is ELIGIBLE is a designated
+						// leaver's, booked apart from a protected member's (the real in-group loss)
+						if elig := s.eligibleKeyCount(gg); gg.index.blocksStay[k] <= elig[k] {
+							cause += "-eligible"
+						}
+					}
 					s.counters.seatedEvicted[cause]++
 					s.metrics.ObserveSeatedEvicted(engineLabel(gg.id), cause)
 				}
@@ -722,6 +732,8 @@ type RoomSnapshot struct {
 	SeatedEvicted map[string]int64 `json:"seatedEvicted"`
 	// Blockers: once per room-held head, the state of the member whose block ended the room walk
 	Blockers map[string]int64 `json:"blockers"`
+	// QuantumDoneDeferred: dispatches where quantumDoneLast put a quantum-complete member's older turn back
+	QuantumDoneDeferred int64 `json:"quantumDoneDeferred"`
 }
 
 // Snapshot is the whole-policy view of the state machine: DumpState serialises it and the scrape
@@ -810,7 +822,13 @@ func (s *Scheduler) snapshot(now time.Time) Snapshot {
 		}
 		if s.cfg.RoomDisplace {
 			room.SeatedEvicted[tierCauseDisplaced] = s.counters.seatedEvicted[tierCauseDisplaced]
+			for _, c := range tierCauses {
+				if c != tierCauseSeat {
+					room.SeatedEvicted[c+"-eligible"] = s.counters.seatedEvicted[c+"-eligible"]
+				}
+			}
 		}
+		room.QuantumDoneDeferred = s.counters.quantumDoneDeferred
 		room.Blockers = map[string]int64{}
 		for _, b := range blockerStates {
 			room.Blockers[b] = s.counters.roomBlocker[b]

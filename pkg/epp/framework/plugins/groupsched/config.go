@@ -91,6 +91,12 @@ type Config struct {
 	// recorded write pushed out of the tier are rotated out at once (exit reason "displaced"): admit
 	// first, then remove the members whose KV the newcomer displaced. The room-driven rotation is off.
 	RoomDisplace bool `json:"roomDisplace,omitempty"`
+	// QuantumDoneLast orders the turns INSIDE an engine's group while anyone waits outside (the shared
+	// queue is not empty): the turns of members still within their quantum first (oldest first), the
+	// turns of quantum-complete members only when no other member has a turn queued. With nobody waiting
+	// the order is plain oldest-first, as without it. A held-back member's blocks are not refreshed, so
+	// they sink to the tier's tail, where roomDisplace counts them as room.
+	QuantumDoneLast bool `json:"quantumDoneLast,omitempty"`
 	// NewcomersFirst orders the shared admission queue: true (the default) seats a thread's FIRST turn
 	// before returning threads, then oldest first; false is plain oldest-first for every head.
 	NewcomersFirst bool `json:"newcomersFirst"`

@@ -75,6 +75,7 @@ type groupMetrics struct {
 	tierPromptTotal *prometheus.CounterVec
 	roomHold        *prometheus.HistogramVec
 	roomBlocker     *prometheus.CounterVec
+	qdDeferred      *prometheus.CounterVec
 }
 
 // subsystem namespaces every series (llm_d_epp_group_*).
@@ -144,6 +145,8 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Buckets: prometheus.ExponentialBuckets(0.1, 2, 18)}, []string{"engine", "outcome"})
 	g.roomBlocker = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "room_blocker_total",
 		Help: "once per room-held head, what held it: the state of the member whose block ended the room walk — running-last (in flight on its quantum's last turn), running (in flight, mid-quantum), between-turns (not in flight, not eligible), eligible (without roomDisplace only), none (no protected block: the write is bigger than the tier)"}, []string{"engine", "state"})
+	g.qdDeferred = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "quantum_done_deferred_total",
+		Help: "dispatches where quantumDoneLast (anyone waiting outside) served a member within its quantum ahead of an OLDER queued turn of a quantum-complete member"}, engineLabels)
 	g.tierPromptTotal = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_dispatched_prompt_tokens_total",
 		Help: "prompt tokens of every turn tier_predicted_cached_tokens_total was read for — its denominator"}, engineLabels)
 
@@ -158,7 +161,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.affinityViolations, g.engineGone, g.coldValveHeld, g.anomalies, g.runGateHeld,
 		g.residencyPlacements, g.residencySeatTokens,
 		g.roomHeld, g.roomForced, g.roomRotations, g.tierWrites, g.seatedEvicted, g.tierPredicted, g.tierPromptTotal,
-		g.roomHold, g.roomBlocker,
+		g.roomHold, g.roomBlocker, g.qdDeferred,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
@@ -205,6 +208,7 @@ func (g *groupMetrics) preInstantiateEngine(engine string) {
 		for _, b := range blockerStates {
 			g.roomBlocker.WithLabelValues(label, b).Add(0)
 		}
+		g.qdDeferred.WithLabelValues(label).Add(0)
 		g.tierPredicted.WithLabelValues(label).Add(0)
 		g.tierPromptTotal.WithLabelValues(label).Add(0)
 		for _, c := range tierCauses {
@@ -239,6 +243,14 @@ func (g *groupMetrics) ObserveRoomForced(engine string) {
 }
 
 // ObserveRoomRotation counts a member rotated out to make room.
+// ObserveQuantumDoneDeferred counts one dispatch where quantumDoneLast deferred an older quantum-complete turn.
+func (g *groupMetrics) ObserveQuantumDoneDeferred(engine string) {
+	if g == nil || g.qdDeferred == nil {
+		return
+	}
+	g.qdDeferred.WithLabelValues(engine).Inc()
+}
+
 // ObserveRoomBlocker counts, once per room-held head, what held it.
 func (g *groupMetrics) ObserveRoomBlocker(engine, state string) {
 	if g == nil || g.roomBlocker == nil {

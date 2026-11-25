@@ -277,7 +277,9 @@ func TestLRURoomRunConfigLoads(t *testing.T) {
 	require.NotEqual(t, lruRoomRunConfig, noforce)
 	// the displace arm (epp-cm/t2l-q8-lru-displace-plugins.yaml): no forced seat, eligible tail blocks count as room
 	displace := strings.Replace(lruRoomRunConfig, "roomHoldMaxSeconds: 90", "roomHoldMaxSeconds: 0\n    roomDisplace: true", 1)
-	for name, cfg := range map[string]string{"gate": lruRoomRunConfig, "control": lruRoomControlConfig, "noforce": noforce, "displace": displace} {
+	// the quantum-done-last arm (epp-cm/t2l-q8-lru-qdlast-plugins.yaml): the displace arm + quantumDoneLast
+	qdlast := strings.Replace(displace, "roomDisplace: true", "roomDisplace: true\n    quantumDoneLast: true", 1)
+	for name, cfg := range map[string]string{"gate": lruRoomRunConfig, "control": lruRoomControlConfig, "noforce": noforce, "displace": displace, "qdlast": qdlast} {
 		t.Run(name, func(t *testing.T) { loadLRURoomConfig(t, cfg) })
 	}
 }

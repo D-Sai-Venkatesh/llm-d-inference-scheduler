@@ -195,10 +195,11 @@ func (s *Scheduler) roomBlocker(g *engineGroup, w *waiter, need int) string {
 }
 
 // eligibleKeyCount (roomDisplace) is, per block, how many ELIGIBLE staying members hold it, at the
-// current pass time. Cached for one (pass time, tier gen, index gen): a dispatch inside the pass touches
-// the tier (gen moves), so a member that just started a turn is never read as eligible.
+// current pass time. Cached for one (pass time, index gen): within one hook's clock the busy states only
+// change at the dispatch's release, which comes after its tier write, and the seated set is the index
+// gen. The tier gen is NOT in the key: an eviction callback reads this map once per evicted block.
 func (s *Scheduler) eligibleKeyCount(g *engineGroup) map[Hash]int {
-	key := [3]uint64{uint64(s.now.UnixNano()), g.tier.Gen(), g.index.Gen()}
+	key := [3]uint64{uint64(s.now.UnixNano()), 0, g.index.Gen()}
 	if g.eligCount != nil && g.eligKey == key {
 		return g.eligCount
 	}

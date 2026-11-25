@@ -193,9 +193,30 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		if len(cands) == 0 {
 			continue
 		}
-		sort.SliceStable(cands, func(x, y int) bool { return cands[x].h.Arrival.Before(cands[y].h.Arrival) })
+		// quantumDoneLast: while anyone waits outside, a quantum-complete member's turn goes behind every
+		// other member's (oldest-first within each class); with nobody waiting, plain oldest-first
+		qdLast := s.cfg.QuantumDoneLast && len(s.waiters) > 0
+		sort.SliceStable(cands, func(x, y int) bool {
+			if qdLast {
+				dx, dy := s.quantumDone(g, cands[x].h.Thread), s.quantumDone(g, cands[y].h.Thread)
+				if dx != dy {
+					return !dx
+				}
+			}
+			return cands[x].h.Arrival.Before(cands[y].h.Arrival)
+		})
 		// FIFO: the candidates are oldest-first, so the head is the first one
 		chosen := &cands[0]
+		if qdLast && !s.quantumDone(g, chosen.h.Thread) {
+			// the order deferred a quantum-complete member's OLDER turn: count it (proof it fires)
+			for _, c := range cands[1:] {
+				if s.quantumDone(g, c.h.Thread) && !c.h.Arrival.After(chosen.h.Arrival) {
+					s.counters.quantumDoneDeferred++
+					s.metrics.ObserveQuantumDoneDeferred(engineLabel(g.id))
+					break
+				}
+			}
+		}
 		// THE GPU SIDE (with a CPU tier the seats outgrow the GPU): the oldest seated head runs only if
 		// it fits the GPU budget beside the seats already running. Strict FIFO: a held head holds the
 		// younger ones, so a large context is never overtaken by small ones.
@@ -259,6 +280,12 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		s.metrics.ObserveQueueWait(queueWaitUntracked, nonNegative(now.Sub(heads[fcfs].Arrival)))
 	}
 	return fcfs
+}
+
+// quantumDone reports whether a seated member has completed its quantum (the rotation's own test).
+func (s *Scheduler) quantumDone(g *engineGroup, id string) bool {
+	m := g.threads[id]
+	return m != nil && m.busyPeriods >= s.cfg.Quantum
 }
 
 // gpuHolds is the GPU side's one question: does this seated head have to wait for the GPU? Only when

@@ -103,3 +103,36 @@ func TestTierLRUTailRoom(t *testing.T) {
 	// a protected block AT the tail: only the free capacity
 	require.Equal(t, 4, tl.TailRoom(100, nil, is(out)))
 }
+
+// Extending a held chain evicts only OTHER content: the chain's surviving blocks are refreshed before the
+// inserts, so the observer never names them.
+func TestTierLRUExtendEvictsOnlyOthers(t *testing.T) {
+	tl := NewTierLRU(10)
+	c := chainOf(1, 8)
+	o := chainOf(2, 5)
+	tl.AddChain(c[:5]) // oldest
+	tl.AddChain(o)     // newer
+	var dropped []prefixhash.BlockHash
+	tl.OnEvict(func(k prefixhash.BlockHash) { dropped = append(dropped, k) })
+	tl.AddChain(c) // the chain grows by 3: three OTHER blocks go, tail-first
+	require.Equal(t, []prefixhash.BlockHash{o[4], o[3], o[2]}, dropped)
+	require.Equal(t, 8, tl.ResidentPrefix(c))
+	require.Equal(t, 2, tl.ResidentPrefix(o))
+}
+
+// A key the inserting chain shares with a protected chain is skipped, never a stop.
+func TestTierLRUTailRoomSkipBeforeStop(t *testing.T) {
+	tl := NewTierLRU(6)
+	shared := chainOf(1, 2)
+	tl.AddChain(shared) // oldest: shared by the head and a seated chain
+	tl.AddChain(chainOf(2, 2))
+	is := func(set []prefixhash.BlockHash) func(prefixhash.BlockHash) bool {
+		m := map[prefixhash.BlockHash]bool{}
+		for _, k := range set {
+			m[k] = true
+		}
+		return func(k prefixhash.BlockHash) bool { return m[k] }
+	}
+	// free 2 + walk: shared (own: skipped, not a stop) then the 2 outside blocks
+	require.Equal(t, 4, tl.TailRoom(100, is(shared), is(shared)))
+}

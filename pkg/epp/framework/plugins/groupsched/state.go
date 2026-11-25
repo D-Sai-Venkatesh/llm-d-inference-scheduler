@@ -234,6 +234,10 @@ type engineGroup struct {
 	// tierCause names what the tier index is being written for right now (seat / dispatch /
 	// passthrough / rebind), so its eviction observer can book a seated block's eviction by cause.
 	tierCause string
+	// roomMemo caches the room gate's walks (head, victim, need) while neither the tier index nor the
+	// seated set has changed: a room-held head is re-tested on every pass (~1 kHz).
+	roomMemo    map[roomKey]int
+	roomMemoGen [2]uint64
 
 	counters struct {
 		served int64 // dispatches served on this engine
@@ -336,6 +340,12 @@ type Scheduler struct {
 		tierWrites    map[string]int64
 		seatedEvicted map[string]int64
 	}
+}
+
+// roomKey is one memoised room walk.
+type roomKey struct {
+	head, victim string
+	need, own    int
 }
 
 // tier write causes (index writes and seated-block evictions are booked by them).

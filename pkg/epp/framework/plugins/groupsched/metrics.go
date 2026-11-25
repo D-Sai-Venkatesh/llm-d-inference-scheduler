@@ -73,6 +73,7 @@ type groupMetrics struct {
 	seatedEvicted   *prometheus.CounterVec
 	tierPredicted   *prometheus.CounterVec
 	tierPromptTotal *prometheus.CounterVec
+	roomHold        *prometheus.HistogramVec
 }
 
 // subsystem namespaces every series (llm_d_epp_group_*).
@@ -137,6 +138,9 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "blocks of a SEATED (staying) thread that a write into the group's own tier index evicted, by the write's cause — the in-group loss the room gate exists to prevent (its model of it)"}, []string{"engine", "cause"})
 	g.tierPredicted = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_predicted_cached_tokens_total",
 		Help: "prompt tokens the group's own tier index predicted the engine's CPU tier held for each dispatched turn (read before the turn's touch; a seat-recorded first turn reports the read taken before the seat's record). Its ratio to tier_dispatched_prompt_tokens_total is comparable with the engine's own cached share (local_cache_hit + external_kv_transfer over prompt tokens)"}, engineLabels)
+	g.roomHold = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "room_hold_seconds",
+		Help:    "how long the room gate held a head before its seat, from its first held pass, by outcome: opened = the room opened, forced = roomHoldMaxSeconds admitted it (a forced hold may include time the head was budget-blocked)",
+		Buckets: prometheus.ExponentialBuckets(0.1, 2, 18)}, []string{"engine", "outcome"})
 	g.tierPromptTotal = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_dispatched_prompt_tokens_total",
 		Help: "prompt tokens of every turn tier_predicted_cached_tokens_total was read for — its denominator"}, engineLabels)
 
@@ -151,6 +155,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.affinityViolations, g.engineGone, g.coldValveHeld, g.anomalies, g.runGateHeld,
 		g.residencyPlacements, g.residencySeatTokens,
 		g.roomHeld, g.roomForced, g.roomRotations, g.tierWrites, g.seatedEvicted, g.tierPredicted, g.tierPromptTotal,
+		g.roomHold,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
@@ -209,6 +214,14 @@ func (g *groupMetrics) ObserveRoomHeld(engine string) {
 		return
 	}
 	g.roomHeld.WithLabelValues(engine).Inc()
+}
+
+// ObserveRoomHold records how long the room gate held one head before its seat.
+func (g *groupMetrics) ObserveRoomHold(engine, outcome string, seconds float64) {
+	if g == nil || g.roomHold == nil {
+		return
+	}
+	g.roomHold.WithLabelValues(engine, outcome).Observe(seconds)
 }
 
 // ObserveRoomForced counts a head admitted by the room gate's last resort.

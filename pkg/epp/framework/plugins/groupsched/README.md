@@ -212,6 +212,7 @@ All series are under `llm_d_epp_group_`. Gauges are rendered at scrape from one 
 | `room_held_total` | counter | `engine` | heads the room gate held (once per head) | > 0 under tier pressure; 0 with the gate off |
 | `room_forced_seats_total` | counter | `engine` | heads seated by the gate's last resort | small; a steady rate means the room does not open in time |
 | `room_rotations_total` | counter | `engine` | members rotated out to make room | ≤ room holds |
+| `room_hold_seconds` | histogram | `engine`, `outcome` (`opened`, `forced`) | how long the room held a head before its seat | `forced` ≈ roomHoldMaxSeconds (may include budget-blocked time) |
 | `tier_writes_total` | counter | `engine`, `cause` (`seat`, `dispatch`, `passthrough`, `rebind`) | writes into the group's own tier index | `dispatch` ≈ dispatches; `seat` ≈ seats with the gate |
 | `tier_seated_evictions_total` | counter | `engine`, `cause` | seated (staying) blocks a tier-index write evicted — the in-group loss the gate prevents, in the index's model | ≈ 0 with the gate (a `dispatch` residue is per-turn deltas) |
 | `tier_predicted_cached_tokens_total` / `tier_dispatched_prompt_tokens_total` | counter | `engine` | the own index's prediction at dispatch (before the touch) and its denominator | ratio ≈ the engine's own cached share |

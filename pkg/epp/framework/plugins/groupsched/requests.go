@@ -247,8 +247,8 @@ func (s *Scheduler) AtPod(reqID, engine string, now time.Time) dispatchObservabl
 // engine with chains: the engine's tier will hold them all the same. A tracked request was already
 // touched at its dispatch.
 func (s *Scheduler) RecordUntracked(reqID, engine string, chains []Chain, now time.Time) {
-	if engine == "" || len(chains) == 0 {
-		return
+	if !s.cfg.OwnTierIndex || engine == "" || len(chains) == 0 {
+		return // no own index: nothing to keep, and no lock taken on every PreRequest
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

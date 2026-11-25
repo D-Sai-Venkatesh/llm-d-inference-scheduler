@@ -50,6 +50,16 @@ func (t *TierLRU) AddChain(keys []prefixhash.BlockHash) {
 	if len(keys) == 0 || t.l.capacity <= 0 {
 		return
 	}
+	// REFRESH FIRST (vLLM's lookup touches the whole chain before any store): every key already held
+	// moves to the fresh end, so the inserts below evict OTHER content, never this chain's own surviving
+	// blocks (which would only be re-added: membership would end right, but the evictions — and an
+	// eviction observer — would name the chain's own blocks). Tail-first, so the order is the one the
+	// loop below leaves anyway.
+	for idx := len(keys) - 1; idx >= 0; idx-- {
+		if t.l.Contains(keys[idx]) {
+			t.l.Add(keys[idx]) // a held key: moveFront only
+		}
+	}
 	for idx := len(keys) - 1; idx >= 0; idx-- {
 		k := keys[idx]
 		if t.onEvict != nil && !t.l.Contains(k) && len(t.l.nodes) >= t.l.capacity && t.l.tail != nodeNil {
@@ -91,11 +101,13 @@ func (t *TierLRU) TailRoom(need int, skip, stop func(prefixhash.BlockHash) bool)
 	}
 	for i := t.l.tail; i != nodeNil && room < need; i = t.l.nodes[i].prev {
 		k := t.l.nodes[i].key
-		if stop != nil && stop(k) {
-			break
-		}
+		// skip BEFORE stop: the inserting chain's own key is refreshed by its own touch, so it never
+		// ends the walk — even when another (seated) chain shares it
 		if skip != nil && skip(k) {
 			continue
+		}
+		if stop != nil && stop(k) {
+			break
 		}
 		room++
 	}

@@ -74,13 +74,34 @@ func (s *Scheduler) roomNeed(writeTokens int64) int {
 
 // tierRoom is the engine's tier room for the head: free capacity plus the run of non-seated blocks at
 // the eviction end, skipping the head's own blocks, up to the first STAYING (seated, not exiting) block
-// — blocks of also are treated as not seated (the rotation guard's "if this member left" read). The
-// walk stops once need is reached.
-func (s *Scheduler) tierRoom(g *engineGroup, w *waiter, need int, also map[Hash]struct{}) int {
+// — the blocks of victim (nil = none) treated as not seated: the rotation guard's "if it left" read.
+// The walk stops once need is reached. Memoised per (head, victim, need) until the tier index or the
+// seated set changes.
+func (s *Scheduler) tierRoom(g *engineGroup, w *waiter, need int, victim *thread) int {
 	if g.tier == nil {
 		return 0
 	}
+	gens := [2]uint64{g.tier.Gen(), g.index.Gen()}
+	if g.roomMemo == nil || g.roomMemoGen != gens {
+		g.roomMemo, g.roomMemoGen = map[roomKey]int{}, gens
+	}
 	own := w.ownKeys()
+	key := roomKey{head: w.id, need: need, own: len(own)}
+	var also map[Hash]struct{}
+	if victim != nil {
+		key.victim = victim.id
+	}
+	if v, ok := g.roomMemo[key]; ok {
+		return v
+	}
+	if victim != nil {
+		also = map[Hash]struct{}{}
+		for _, c := range g.index.Chains(victim.id) {
+			for _, k := range c.Keys {
+				also[k] = struct{}{}
+			}
+		}
+	}
 	skip := func(k Hash) bool { _, ok := own[k]; return ok }
 	stop := func(k Hash) bool {
 		if also != nil {
@@ -90,20 +111,16 @@ func (s *Scheduler) tierRoom(g *engineGroup, w *waiter, need int, also map[Hash]
 		}
 		return g.index.Staying(k)
 	}
-	return g.tier.TailRoom(need, skip, stop)
+	v := g.tier.TailRoom(need, skip, stop)
+	g.roomMemo[key] = v
+	return v
 }
 
 // roomGrowsWithout is the room-rotation guard: would rotating victim out give the head more room?
 // Only if victim's blocks lie below the first staying block of somebody else (a busy member at the
 // eviction end — a long decode — blocks every rotation behind it, and then none is made).
 func (s *Scheduler) roomGrowsWithout(g *engineGroup, w *waiter, victim *thread, need int) bool {
-	keys := map[Hash]struct{}{}
-	for _, c := range g.index.Chains(victim.id) {
-		for _, k := range c.Keys {
-			keys[k] = struct{}{}
-		}
-	}
-	return s.tierRoom(g, w, need, keys) > s.tierRoom(g, w, need, nil)
+	return s.tierRoom(g, w, need, victim) > s.tierRoom(g, w, need, nil)
 }
 
 // seatEngine is THE seat-time engine choice: the scheduler gathers the FACTS (per-engine

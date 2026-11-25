@@ -56,7 +56,13 @@ type BlockIndex struct {
 	blocksRun map[Hash]int
 	// seats holds every seated thread's record.
 	seats map[string]*seatBlocks
+	// gen advances on every change to the seated / staying sets, so a reader can memoise a walk that
+	// depends on them (the room gate's).
+	gen uint64
 }
+
+// Gen is the seated-set change counter (see gen).
+func (b *BlockIndex) Gen() uint64 { return b.gen }
 
 // seatBlocks is one seated thread's footprint: its newest chains (the turns of its thread
 // extend one another, so the newest chain is its set) and the keys actually charged for it.
@@ -176,6 +182,7 @@ func (b *BlockIndex) TrySeat(id string, chains []Chain, budgetBlocks int) (bool,
 
 // insert creates the seat's record and charges its keys to both counters.
 func (b *BlockIndex) insert(id string, chains []Chain) {
+	b.gen++
 	s := &seatBlocks{chains: chains, charged: chargeSet(chains)}
 	b.seats[id] = s
 	for h := range s.charged {
@@ -231,6 +238,7 @@ func sameChains(a, c []Chain) bool {
 
 // applyDelta charges the keys the thread gained and releases the keys it lost.
 func (b *BlockIndex) applyDelta(s *seatBlocks, old map[Hash]struct{}) {
+	b.gen++
 	for h := range s.charged {
 		if _, had := old[h]; !had {
 			b.blocks[h]++
@@ -259,6 +267,7 @@ func (b *BlockIndex) applyDelta(s *seatBlocks, old map[Hash]struct{}) {
 // and the record does not outlive the seat (a re-seat costs the thread nothing to rebuild —
 // its head carries the chain).
 func (b *BlockIndex) Unseat(id string) {
+	b.gen++
 	s, ok := b.seats[id]
 	if !ok {
 		return
@@ -292,6 +301,7 @@ func (b *BlockIndex) dec(m map[Hash]int, h Hash) {
 // MarkExiting marks a thread as on its way out: it is not dispatched and not re-seated,
 // and it leaves at its next drain.
 func (b *BlockIndex) MarkExiting(id string) {
+	b.gen++
 	s, ok := b.seats[id]
 	if !ok || s.exiting {
 		return

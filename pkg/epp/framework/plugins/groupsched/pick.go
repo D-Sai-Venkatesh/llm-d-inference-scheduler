@@ -405,6 +405,15 @@ func (s *Scheduler) afterSeat(c *seatChoice, w *waiter, now time.Time) {
 		s.counters.roomForced++
 		s.metrics.ObserveRoomForced(engineLabel(c.g.id))
 	}
+	if !w.roomHeldSince.IsZero() {
+		// how long the room held this head (from its first held pass; a forced seat's hold may include
+		// time it was budget-blocked), by how the hold ended
+		outcome := "opened"
+		if c.roomForced {
+			outcome = "forced"
+		}
+		s.metrics.ObserveRoomHold(engineLabel(c.g.id), outcome, nonNegative(now.Sub(w.roomHeldSince)))
+	}
 	if !s.cfg.RoomGate || c.g.tier == nil {
 		return
 	}

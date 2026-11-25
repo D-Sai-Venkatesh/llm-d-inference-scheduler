@@ -242,7 +242,15 @@ type engineGroup struct {
 	// roomMemo caches the room gate's walks (head, victim, need) while neither the tier index nor the
 	// seated set has changed: a room-held head is re-tested on every pass (~1 kHz).
 	roomMemo    map[roomKey]int
-	roomMemoGen [2]uint64
+	roomMemoGen [3]uint64
+	// eligCount (roomDisplace) counts, per block, the ELIGIBLE staying members that hold it: a block is
+	// protected iff it has a staying holder that is not eligible (blocksStay > eligCount). Cached for one
+	// (pass time, tier gen, index gen).
+	eligCount map[Hash]int
+	eligKey   [3]uint64
+	// displaced (roomDisplace) collects, while a seat's chain is being recorded, the staying blocks the
+	// write evicted: their eligible holders are rotated out right after the record.
+	displaced map[Hash]struct{}
 
 	counters struct {
 		served int64 // dispatches served on this engine
@@ -344,6 +352,8 @@ type Scheduler struct {
 		roomRotations int64
 		tierWrites    map[string]int64
 		seatedEvicted map[string]int64
+		// roomBlocker counts, once per room-held head, what held it (the member state ending the walk)
+		roomBlocker map[string]int64
 	}
 }
 
@@ -360,6 +370,10 @@ const (
 	tierCausePassthrough = "passthrough"
 	tierCauseRebind      = "rebind"
 )
+
+// tierCauseDisplaced books (roomDisplace) the blocks of ELIGIBLE members a seat's write pushed out —
+// the room the design meant to use; their members are rotated out with exit reason "displaced".
+const tierCauseDisplaced = "displaced"
 
 var tierCauses = []string{tierCauseSeat, tierCauseDispatch, tierCausePassthrough, tierCauseRebind}
 
@@ -414,6 +428,7 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 	s.counters.placements = map[string]int64{}
 	s.counters.tierWrites = map[string]int64{}
 	s.counters.seatedEvicted = map[string]int64{}
+	s.counters.roomBlocker = map[string]int64{}
 	if cfg.OwnTierIndex {
 		// the group's own tier index is placement's residency read (it replaces cpuResidencyProducer)
 		s.residency = s.ownResidency
@@ -497,6 +512,10 @@ func (s *Scheduler) SetNumBlocksFor(engine string, blockSizeTokens, numBlocks in
 			g.tier = approximateprefix.NewTierLRU(int(tierBlocks))
 			gg := g
 			g.tier.OnEvict(func(k Hash) {
+				if gg.index.Staying(k) && gg.displaced != nil {
+					gg.displaced[k] = struct{}{} // classified (displaced vs seated) after the seat's record
+					return
+				}
 				if gg.index.Staying(k) {
 					cause := gg.tierCause
 					s.counters.seatedEvicted[cause]++
@@ -701,6 +720,8 @@ type RoomSnapshot struct {
 	Rotations     int64            `json:"rotations"`
 	TierWrites    map[string]int64 `json:"tierWrites"`
 	SeatedEvicted map[string]int64 `json:"seatedEvicted"`
+	// Blockers: once per room-held head, the state of the member whose block ended the room walk
+	Blockers map[string]int64 `json:"blockers"`
 }
 
 // Snapshot is the whole-policy view of the state machine: DumpState serialises it and the scrape
@@ -786,6 +807,13 @@ func (s *Scheduler) snapshot(now time.Time) Snapshot {
 		for _, c := range tierCauses {
 			room.TierWrites[c] = s.counters.tierWrites[c]
 			room.SeatedEvicted[c] = s.counters.seatedEvicted[c]
+		}
+		if s.cfg.RoomDisplace {
+			room.SeatedEvicted[tierCauseDisplaced] = s.counters.seatedEvicted[tierCauseDisplaced]
+		}
+		room.Blockers = map[string]int64{}
+		for _, b := range blockerStates {
+			room.Blockers[b] = s.counters.roomBlocker[b]
 		}
 		snap.Room = room
 	}

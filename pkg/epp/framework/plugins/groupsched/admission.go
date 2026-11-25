@@ -20,6 +20,7 @@ package groupsched
 
 import (
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -81,7 +82,10 @@ func (s *Scheduler) tierRoom(g *engineGroup, w *waiter, need int, victim *thread
 	if g.tier == nil {
 		return 0
 	}
-	gens := [2]uint64{g.tier.Gen(), g.index.Gen()}
+	gens := [3]uint64{g.tier.Gen(), g.index.Gen(), 0}
+	if s.cfg.RoomDisplace {
+		gens[2] = uint64(s.now.UnixNano()) // eligibility moves with time (the idle test)
+	}
 	if g.roomMemo == nil || g.roomMemoGen != gens {
 		g.roomMemo, g.roomMemoGen = map[roomKey]int{}, gens
 	}
@@ -102,18 +106,173 @@ func (s *Scheduler) tierRoom(g *engineGroup, w *waiter, need int, victim *thread
 			}
 		}
 	}
+	skip, stop := s.roomPreds(g, own, also)
+	v := g.tier.TailRoom(need, skip, stop)
+	g.roomMemo[key] = v
+	return v
+}
+
+// roomPreds is the room walk's two predicates: skip = the head's own keys (its own touch refreshes
+// them); stop = a protected block — a staying member's (roomDisplace: a NON-eligible staying member's),
+// unless it is one of also (the rotation guard's "if it left").
+func (s *Scheduler) roomPreds(g *engineGroup, own, also map[Hash]struct{}) (func(Hash) bool, func(Hash) bool) {
 	skip := func(k Hash) bool { _, ok := own[k]; return ok }
+	var elig map[Hash]int
+	if s.cfg.RoomDisplace {
+		elig = s.eligibleKeyCount(g)
+	}
 	stop := func(k Hash) bool {
 		if also != nil {
 			if _, ok := also[k]; ok {
 				return false
 			}
 		}
+		if elig != nil {
+			// roomDisplace: only a block with a NON-eligible staying holder stops the walk
+			return g.index.blocksStay[k] > elig[k]
+		}
 		return g.index.Staying(k)
 	}
-	v := g.tier.TailRoom(need, skip, stop)
-	g.roomMemo[key] = v
-	return v
+	return skip, stop
+}
+
+// Room-blocker states: what holds a room-held head — the member whose block ends the room walk.
+const (
+	blockerRunningLast  = "running-last"  // in flight on the LAST turn of its quantum
+	blockerRunning      = "running"       // in flight, mid-quantum
+	blockerBetweenTurns = "between-turns" // not in flight, not eligible (mid-quantum, idle < idleSeconds)
+	blockerEligible     = "eligible"      // eligible (only without roomDisplace: the rotation's case)
+	blockerNone         = "none"          // no protected block ended the walk (the tier is smaller than the write)
+)
+
+var blockerStates = []string{blockerRunningLast, blockerRunning, blockerBetweenTurns, blockerEligible, blockerNone}
+
+// roomBlocker classifies what holds w on g: the state of the member whose block ended the room walk.
+// A diagnostic only (read once per hold): it decides nothing.
+func (s *Scheduler) roomBlocker(g *engineGroup, w *waiter, need int) string {
+	if g == nil || g.tier == nil {
+		return blockerNone
+	}
+	skip, stop := s.roomPreds(g, w.ownKeys(), nil)
+	_, k, stopped := g.tier.TailRoomStop(need, skip, stop)
+	if !stopped {
+		return blockerNone
+	}
+	state := ""
+	rank := map[string]int{blockerRunningLast: 4, blockerRunning: 3, blockerBetweenTurns: 2, blockerEligible: 1}
+	for _, m := range g.threads {
+		if g.index.Exiting(m.id) {
+			continue
+		}
+		sb := g.index.seats[m.id]
+		if sb == nil {
+			continue
+		}
+		if _, ok := sb.charged[k]; !ok {
+			continue
+		}
+		var st string
+		switch {
+		case m.busy() && m.busyPeriods == s.cfg.Quantum-1:
+			st = blockerRunningLast
+		case m.busy():
+			st = blockerRunning
+		default:
+			if _, ok := s.eligible(m, s.now); ok {
+				st = blockerEligible
+			} else {
+				st = blockerBetweenTurns
+			}
+		}
+		if rank[st] > rank[state] {
+			state = st
+		}
+	}
+	if state == "" {
+		return blockerNone
+	}
+	return state
+}
+
+// eligibleKeyCount (roomDisplace) is, per block, how many ELIGIBLE staying members hold it, at the
+// current pass time. Cached for one (pass time, tier gen, index gen): a dispatch inside the pass touches
+// the tier (gen moves), so a member that just started a turn is never read as eligible.
+func (s *Scheduler) eligibleKeyCount(g *engineGroup) map[Hash]int {
+	key := [3]uint64{uint64(s.now.UnixNano()), g.tier.Gen(), g.index.Gen()}
+	if g.eligCount != nil && g.eligKey == key {
+		return g.eligCount
+	}
+	m := map[Hash]int{}
+	for _, t := range g.threads {
+		if g.index.Exiting(t.id) {
+			continue
+		}
+		if _, ok := s.eligible(t, s.now); !ok {
+			continue
+		}
+		if sb := g.index.seats[t.id]; sb != nil {
+			for k := range sb.charged {
+				m[k]++
+			}
+		}
+	}
+	g.eligCount, g.eligKey = m, key
+	return m
+}
+
+// displace (roomDisplace) runs right after a seat's chain was recorded: every ELIGIBLE member whose
+// blocks the write pushed out of the tier is rotated out (reason "displaced") — the admitted head took
+// exactly that room. A pushed-out block with a NON-eligible holder is a seated eviction (the walk should
+// have stopped there; only an index edge reaches it) and is booked as one; its holder stays.
+func (s *Scheduler) displace(g *engineGroup, head *waiter, now time.Time) {
+	hit := g.displaced
+	g.displaced = nil
+	if len(hit) == 0 {
+		return
+	}
+	var victims []*thread
+	eligHolders := map[Hash]int{}
+	for _, m := range g.threads {
+		if m.id == head.id || g.index.Exiting(m.id) {
+			continue
+		}
+		sb := g.index.seats[m.id]
+		if sb == nil {
+			continue
+		}
+		if _, ok := s.eligible(m, now); !ok {
+			continue
+		}
+		lost := false
+		for k := range hit {
+			if _, ok := sb.charged[k]; ok {
+				eligHolders[k]++
+				lost = true
+			}
+		}
+		if lost {
+			victims = append(victims, m)
+		}
+	}
+	for k := range hit {
+		cause := tierCauseDisplaced
+		if g.index.blocksStay[k] > eligHolders[k] {
+			cause = tierCauseSeat
+		}
+		s.counters.seatedEvicted[cause]++
+		s.metrics.ObserveSeatedEvicted(engineLabel(g.id), cause)
+	}
+	sort.Slice(victims, func(i, j int) bool { return victims[i].id < victims[j].id })
+	key := entryKey(head)
+	for _, v := range victims {
+		s.exit(g, v, "displaced", now)
+		if !s.cfg.NewcomersFirst {
+			// behind the head it made room for (the rotation's queue floor)
+			if w, ok := s.waiters[v.id]; ok && !entryKey(w).After(key) {
+				w.floor = key.Add(time.Nanosecond)
+			}
+		}
+	}
 }
 
 // roomGrowsWithout is the room-rotation guard: would rotating victim out give the head more room?
@@ -154,7 +313,8 @@ func (s *Scheduler) seatEngine(head *waiter, now time.Time) *seatChoice {
 		if s.cfg.RoomGate && gg.tier != nil && (budgetFits || ruleO) && len(gg.threads) > 0 {
 			need = s.roomNeed(physCold(prompt, resident, gi))
 			if s.tierRoom(gg, head, need, nil) < need {
-				if !head.roomHeldSince.IsZero() && now.Sub(head.roomHeldSince).Seconds() >= s.cfg.RoomHoldMaxSeconds {
+				if s.cfg.RoomHoldMaxSeconds > 0 && !head.roomHeldSince.IsZero() &&
+					now.Sub(head.roomHeldSince).Seconds() >= s.cfg.RoomHoldMaxSeconds {
 					roomForced = true
 				} else {
 					roomFits, roomHeld = false, true
@@ -185,7 +345,7 @@ func (s *Scheduler) seatEngine(head *waiter, now time.Time) *seatChoice {
 		// can book the hold (roomGate)
 		for _, c := range cands {
 			if c.RoomHeld {
-				return &seatChoice{roomHeld: true, heldOn: c.Engine}
+				return &seatChoice{roomHeld: true, heldOn: c.Engine, writeBlocks: c.Need}
 			}
 		}
 		return nil

@@ -81,12 +81,7 @@ func TestRoomConfigIsValidated(t *testing.T) {
 		"roomGate without ownTierIndex":  func(c *Config) { c.TierCapacityTokens = 64000; c.RoomGate = true },
 		"ownTierIndex with the producer": func(c *Config) { c.TierCapacityTokens = 64000; c.OwnTierIndex = true; c.CPUResidencyProducer = "x" },
 		"negative reserve":               func(c *Config) { c.RoomReserveTokens = -1 },
-		"roomGate with a zero hold": func(c *Config) {
-			c.TierCapacityTokens = 64000
-			c.OwnTierIndex = true
-			c.RoomGate = true
-			c.RoomHoldMaxSeconds = 0
-		},
+		"negative hold":                  func(c *Config) { c.RoomHoldMaxSeconds = -1 },
 	}
 	for name, f := range cases {
 		cfg := defaultConfig()
@@ -234,6 +229,44 @@ func TestRoomHoldMaxIsTheLastResort(t *testing.T) {
 	}
 }
 
+// roomHoldMaxSeconds 0 = NO forced seat: the same head stays held however long, and the room opens
+// only the way the design opens it — here the tail blocker d finishes, idles past idleSeconds, and the
+// held head's room rotation moves it out.
+func TestRoomHoldZeroNeverForces(t *testing.T) {
+	s := roomSched(t, true, func(c *Config) { c.RoomHoldMaxSeconds = 0 })
+	d := headN("d", 0, 3*time.Second, chain("d", 400))
+	if i := s.Pass([]Head{d}, epoch); i != 0 {
+		t.Fatal("d must dispatch")
+	}
+	s.AtPod(d.ReqID, "", epoch) // running, the tail blocker: no rotation can help yet
+	runTurn(t, s, headN("x", 0, time.Second, chain("x", 500)), epoch)
+	evict(t, s, "x")
+	b := headN("b", 0, time.Second, chain("b", 1200)) // budget fits; room 1100 < 1200
+	for _, sec := range []int{0, 31, 91, 600} {
+		s.Pass([]Head{b}, epoch.Add(time.Duration(sec)*time.Second))
+		if seated(s, "b") {
+			t.Fatalf("held %d s with roomHoldMaxSeconds 0: no forced seat", sec)
+		}
+	}
+	// d finishes at 600 s and idles past idleSeconds: the held head rotates it out (its blocks are the
+	// tail) and seats into the room it leaves — without any forced seat
+	s.FirstChunk(d.ReqID, epoch.Add(600*time.Second))
+	s.Settle(d.ReqID, "", epoch.Add(600*time.Second))
+	later := epoch.Add(time.Duration(600+s.cfg.IdleSeconds+1) * time.Second)
+	s.Pass([]Head{b}, later)
+	s.Pass([]Head{b}, later.Add(time.Millisecond))
+	if !seated(s, "b") {
+		t.Fatal("once the blocker idles out, the room rotation must open the room and seat b")
+	}
+	snap := s.Snapshot(later)
+	if snap.Room.Forced != 0 || snap.Room.Rotations < 1 {
+		t.Fatalf("no forced seat, at least one room rotation, got %+v", snap.Room)
+	}
+	if got := snap.Room.SeatedEvicted[tierCauseSeat]; got != 0 {
+		t.Fatalf("b's seat must not evict a seated block, got %+v", snap.Room.SeatedEvicted)
+	}
+}
+
 // The first dispatch after a seat that recorded its chain reports the read taken BEFORE the record.
 func TestTierPredictionOfASeatRecordedTurn(t *testing.T) {
 	s := roomSched(t, true)
@@ -291,12 +324,15 @@ func TestNewcomersFirstOff(t *testing.T) {
 // The replay workload with the gate: it runs to the end (liveness), the run side stays exact, the gate
 // fires, and the index's own count of SEATED blocks evicted is far below the same workload without it.
 func TestRoomGateReplay(t *testing.T) {
-	seatedEvicted := func(gate bool, seed int64, tierBlocks int64) (int64, Snapshot) {
+	seatedEvicted := func(gate bool, seed int64, tierBlocks int64, hold ...float64) (int64, Snapshot) {
 		cfg := defaultConfig()
 		cfg.TierCapacityTokens = tierBlocks * 64
 		cfg.OwnTierIndex = true
 		cfg.RoomGate = gate
 		cfg.VictimOldestDispatch = gate
+		if len(hold) > 0 {
+			cfg.RoomHoldMaxSeconds = hold[0]
+		}
 		s, err := NewScheduler(cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -318,6 +354,37 @@ func TestRoomGateReplay(t *testing.T) {
 		}
 		return n, snap
 	}
+	seatedEvictedDisplace := func(seed int64, tierBlocks int64) (int64, Snapshot) {
+		cfg := defaultConfig()
+		cfg.TierCapacityTokens = tierBlocks * 64
+		cfg.OwnTierIndex = true
+		cfg.RoomGate = true
+		cfg.VictimOldestDispatch = true
+		cfg.RoomDisplace = true
+		cfg.RoomHoldMaxSeconds = 0
+		s, err := NewScheduler(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out strings.Builder
+		var bad error
+		driveReplay(t, s, seed, 500, &out, replayOpts{noMoves: true}, func(step int) {
+			if bad == nil {
+				bad = runSideExact(s)
+			}
+		})
+		if bad != nil {
+			t.Fatalf("displace seed %d: %v", seed, bad)
+		}
+		snap := s.Snapshot(epoch)
+		var n int64
+		for c, v := range snap.Room.SeatedEvicted {
+			if c != tierCauseDisplaced {
+				n += v
+			}
+		}
+		return n, snap
+	}
 	held := int64(0)
 	for _, tc := range []struct {
 		seed int64
@@ -335,6 +402,26 @@ func TestRoomGateReplay(t *testing.T) {
 		}
 		t.Logf("seed %d tier %d: seated blocks evicted %d (gate off) -> %d (gate on); held %d forced %d rotations %d; served %d -> %d",
 			seed, tc.tier, off, on, onSnap.Room.Held, onSnap.Room.Forced, onSnap.Room.Rotations, offSnap.Served, onSnap.Served)
+		// roomHoldMaxSeconds 0: no forced seat ever, no stall (the room rotation and the dispatch touch
+		// open the room), and no more seated loss than with the last resort
+		nf, nfSnap := seatedEvicted(true, seed, tc.tier, 0)
+		if nfSnap.Room.Forced != 0 {
+			t.Fatalf("seed %d: roomHoldMaxSeconds 0 must never force a seat, got %d", seed, nfSnap.Room.Forced)
+		}
+		if nfSnap.Served < offSnap.Served/2 {
+			t.Fatalf("seed %d: no-forced-seat must not starve the workload: served %d vs %d", seed, nfSnap.Served, offSnap.Served)
+		}
+		t.Logf("seed %d tier %d: no forced seat: seated blocks evicted %d; held %d rotations %d; served %d",
+			seed, tc.tier, nf, nfSnap.Room.Held, nfSnap.Room.Rotations, nfSnap.Served)
+		dn, dnSnap := seatedEvictedDisplace(seed, tc.tier)
+		if dnSnap.Room.Forced != 0 || dnSnap.Room.Rotations != 0 {
+			t.Fatalf("seed %d: displace mode has no forced seat and no room rotation, got %+v", seed, dnSnap.Room)
+		}
+		if dnSnap.Served < offSnap.Served/2 {
+			t.Fatalf("seed %d: displace mode must not starve the workload: served %d vs %d", seed, dnSnap.Served, offSnap.Served)
+		}
+		t.Logf("seed %d tier %d: displace: seated (protected) blocks evicted %d (seat %d), displaced %d; held %d; served %d",
+			seed, tc.tier, dn, dnSnap.Room.SeatedEvicted[tierCauseSeat], dnSnap.Room.SeatedEvicted[tierCauseDisplaced], dnSnap.Room.Held, dnSnap.Served)
 		if on > off {
 			t.Errorf("seed %d: the gate must not evict MORE seated blocks than no gate (%d > %d)", seed, on, off)
 		}
@@ -424,6 +511,93 @@ func TestRotationVictimFloorHoldsAcrossPasses(t *testing.T) {
 		s.mu.Unlock()
 		if w == nil || !w.since.Equal(at(20)) || !entryKey(w).After(at(24)) {
 			t.Fatalf("gate=%v: the victim keeps its true arrival (20 s) and queues behind the head (24 s): %+v", gate, w)
+		}
+	}
+}
+
+// roomDisplace: an ELIGIBLE member's tail blocks count as room — the head is admitted at once and the
+// member whose blocks its write pushed out is rotated out ("displaced"); a NON-eligible (running)
+// member's blocks stop the walk and are never touched; before the member turns eligible the head waits.
+func TestRoomDisplaceAdmitsThenRemovesTheDisplaced(t *testing.T) {
+	s := roomSched(t, true, func(c *Config) {
+		c.RoomDisplace = true
+		c.RoomHoldMaxSeconds = 0
+		c.NewcomersFirst = false
+		c.VictimOldestDispatch = true
+	})
+	runTurn(t, s, headN("e", 0, time.Second, chain("e", 400)), epoch) // e: done, the OLDEST blocks
+	r := headN("r", 0, time.Second, chain("r", 300))
+	if i := s.Pass([]Head{r}, epoch.Add(time.Second)); i != 0 {
+		t.Fatal("r must dispatch")
+	}
+	s.AtPod(r.ReqID, "", epoch.Add(time.Second)) // r: running — never eligible, its blocks are protected
+	runTurn(t, s, headN("x", 0, time.Second, chain("x", 500)), epoch.Add(2*time.Second))
+	evict(t, s, "x") // x's 500 blocks: non-member, the NEWEST
+	// tail -> head: e 400 | r 300 | x 500 | free 800. h writes 1000 (budget 400+300+1000 <= 1900).
+	h := headN("h", 0, time.Second, chain("h", 1000))
+	early := epoch.Add(5 * time.Second) // e not idle yet: room = free 800 (e is protected) < 1000
+	s.Pass([]Head{h}, early)
+	if seated(s, "h") || !seated(s, "e") {
+		t.Fatal("before e is eligible, h must wait and e must stay")
+	}
+	late := epoch.Add(time.Duration(s.cfg.IdleSeconds+2) * time.Second) // e idle: room = 800 + e's 400
+	s.Pass([]Head{h}, late)
+	if !seated(s, "h") {
+		t.Fatal("e's tail blocks count as room once it is eligible: h must be admitted")
+	}
+	if seated(s, "e") {
+		t.Fatal("e's blocks were pushed out by h's write: e must be rotated out (displaced)")
+	}
+	if !seated(s, "r") {
+		t.Fatal("r is running: it must stay")
+	}
+	snap := s.Snapshot(late)
+	if got := snap.Room.SeatedEvicted[tierCauseSeat]; got != 0 {
+		t.Fatalf("no protected (non-eligible) block may be evicted by the seat, got %+v", snap.Room.SeatedEvicted)
+	}
+	if got := snap.Room.SeatedEvicted[tierCauseDisplaced]; got != 200 {
+		t.Fatalf("h's 1000 into 800 free pushes out 200 of e's blocks, got %+v", snap.Room.SeatedEvicted)
+	}
+	if snap.Room.Rotations != 0 || snap.Room.Forced != 0 {
+		t.Fatalf("no room rotation and no forced seat in displace mode, got %+v", snap.Room)
+	}
+	// the early hold: the walk ended at e's block (not yet eligible, not in flight) -> between-turns
+	if snap.Room.Held != 1 || snap.Room.Blockers[blockerBetweenTurns] != 1 {
+		t.Fatalf("one hold, blocked by a between-turns member, got held %d blockers %+v", snap.Room.Held, snap.Room.Blockers)
+	}
+}
+
+// The blocker diagnostic names a RUNNING member at the tail (and its quantum's last turn apart).
+func TestRoomBlockerNamesARunningTail(t *testing.T) {
+	for _, last := range []bool{false, true} {
+		s := roomSched(t, true, func(c *Config) { c.RoomDisplace = true; c.RoomHoldMaxSeconds = 0; c.Quantum = 8 })
+		at := epoch
+		turns := 0
+		if last {
+			turns = 7 // seven completed busy periods: the next one is the quantum's last
+		}
+		for i := 0; i < turns; i++ {
+			runTurn(t, s, headN("d", i, time.Second, chain("d", 400)), at)
+			at = at.Add(time.Second)
+		}
+		d := headN("d", turns, time.Second, chain("d", 400))
+		if i := s.Pass([]Head{d}, at); i != 0 {
+			t.Fatal("d must dispatch")
+		}
+		s.AtPod(d.ReqID, "", at) // in flight: the tail blocker
+		runTurn(t, s, headN("x", 0, time.Second, chain("x", 500)), at.Add(time.Second))
+		evict(t, s, "x")
+		b := headN("b", 0, time.Second, chain("b", 1200)) // room 1100 < 1200
+		s.Pass([]Head{b}, at.Add(2*time.Second))
+		if seated(s, "b") {
+			t.Fatal("b must be held")
+		}
+		want := blockerRunning
+		if last {
+			want = blockerRunningLast
+		}
+		if got := s.Snapshot(at).Room.Blockers[want]; got != 1 {
+			t.Fatalf("last=%v: the blocker must read %s, got %+v", last, want, s.Snapshot(at).Room.Blockers)
 		}
 	}
 }

@@ -315,7 +315,7 @@ func (s *Scheduler) seatWaiters(now time.Time) {
 				s.metrics.ObserveColdValveHeld(engineLabel(engine))
 			}
 			if cand != nil && cand.roomHeld {
-				s.noteRoomHold(head, cand.heldOn, now)
+				s.noteRoomHold(head, cand.heldOn, cand.writeBlocks, now)
 			}
 			return
 		}
@@ -337,7 +337,7 @@ func (s *Scheduler) seatWaiters(now time.Time) {
 		reason, victim := s.rotationVictim(cand.g, now)
 		if victim == nil {
 			if cand.roomHeld {
-				s.noteRoomHold(head, cand.g.id, now)
+				s.noteRoomHold(head, cand.g.id, cand.writeBlocks, now)
 			}
 			return // this engine can free nothing; another pass will re-evaluate
 		}
@@ -345,8 +345,10 @@ func (s *Scheduler) seatWaiters(now time.Time) {
 			// THE ROOM-ROTATION GUARD: a member leaves for ROOM only if its blocks would make room (a busy
 			// member at the eviction end — a long decode — makes every rotation behind it useless), and
 			// at most one per pass.
-			if roomExitDone || !s.roomGrowsWithout(cand.g, head, victim, cand.writeBlocks) {
-				s.noteRoomHold(head, cand.g.id, now)
+			// roomDisplace: no room-driven rotation — the eligible members' blocks already count as room,
+			// and a seat removes exactly the ones it displaces
+			if s.cfg.RoomDisplace || roomExitDone || !s.roomGrowsWithout(cand.g, head, victim, cand.writeBlocks) {
+				s.noteRoomHold(head, cand.g.id, cand.writeBlocks, now)
 				return
 			}
 			roomExitDone = true
@@ -393,13 +395,17 @@ func (s *Scheduler) observeTierPrediction(g *engineGroup, m *thread, chains []Ch
 // noteRoomHold books a head the room gate is holding: its hold starts at the first such pass (the
 // roomHoldMaxSeconds last resort is measured from it), and the hold is counted ONCE per head, not per
 // pass.
-func (s *Scheduler) noteRoomHold(w *waiter, engine string, now time.Time) {
+func (s *Scheduler) noteRoomHold(w *waiter, engine string, need int, now time.Time) {
 	if !w.roomHeldSince.IsZero() {
 		return
 	}
 	w.roomHeldSince = now
 	s.counters.roomHeld++
 	s.metrics.ObserveRoomHeld(engineLabel(engine))
+	// what holds it (a diagnostic, once per hold)
+	state := s.roomBlocker(s.groups[engine], w, need)
+	s.counters.roomBlocker[state]++
+	s.metrics.ObserveRoomBlocker(engineLabel(engine), state)
 }
 
 // afterSeat is what a seat leaves in the group's own tier index (ownTierIndex): the thread's tier
@@ -429,7 +435,13 @@ func (s *Scheduler) afterSeat(c *seatChoice, w *waiter, now time.Time) {
 		return
 	}
 	m.seatTierResident, m.seatTierPending = c.resident, true
+	if s.cfg.RoomDisplace {
+		c.g.displaced = map[Hash]struct{}{}
+	}
 	s.recordTier(c.g, w.chains, tierCauseSeat)
+	if s.cfg.RoomDisplace {
+		s.displace(c.g, w, now)
+	}
 }
 
 // FCFSPick returns the index of the oldest head, or -1: the pre-capacity pass-through's order.

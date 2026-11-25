@@ -74,6 +74,7 @@ type groupMetrics struct {
 	tierPredicted   *prometheus.CounterVec
 	tierPromptTotal *prometheus.CounterVec
 	roomHold        *prometheus.HistogramVec
+	roomBlocker     *prometheus.CounterVec
 }
 
 // subsystem namespaces every series (llm_d_epp_group_*).
@@ -141,6 +142,8 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.roomHold = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "room_hold_seconds",
 		Help:    "how long the room gate held a head before its seat, from its first held pass, by outcome: opened = the room opened, forced = roomHoldMaxSeconds admitted it (a forced hold may include time the head was budget-blocked)",
 		Buckets: prometheus.ExponentialBuckets(0.1, 2, 18)}, []string{"engine", "outcome"})
+	g.roomBlocker = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "room_blocker_total",
+		Help: "once per room-held head, what held it: the state of the member whose block ended the room walk — running-last (in flight on its quantum's last turn), running (in flight, mid-quantum), between-turns (not in flight, not eligible), eligible (without roomDisplace only), none (no protected block: the write is bigger than the tier)"}, []string{"engine", "state"})
 	g.tierPromptTotal = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_dispatched_prompt_tokens_total",
 		Help: "prompt tokens of every turn tier_predicted_cached_tokens_total was read for — its denominator"}, engineLabels)
 
@@ -155,7 +158,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.affinityViolations, g.engineGone, g.coldValveHeld, g.anomalies, g.runGateHeld,
 		g.residencyPlacements, g.residencySeatTokens,
 		g.roomHeld, g.roomForced, g.roomRotations, g.tierWrites, g.seatedEvicted, g.tierPredicted, g.tierPromptTotal,
-		g.roomHold,
+		g.roomHold, g.roomBlocker,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
@@ -199,6 +202,9 @@ func (g *groupMetrics) preInstantiateEngine(engine string) {
 		g.roomHeld.WithLabelValues(label).Add(0)
 		g.roomForced.WithLabelValues(label).Add(0)
 		g.roomRotations.WithLabelValues(label).Add(0)
+		for _, b := range blockerStates {
+			g.roomBlocker.WithLabelValues(label, b).Add(0)
+		}
 		g.tierPredicted.WithLabelValues(label).Add(0)
 		g.tierPromptTotal.WithLabelValues(label).Add(0)
 		for _, c := range tierCauses {
@@ -233,6 +239,14 @@ func (g *groupMetrics) ObserveRoomForced(engine string) {
 }
 
 // ObserveRoomRotation counts a member rotated out to make room.
+// ObserveRoomBlocker counts, once per room-held head, what held it.
+func (g *groupMetrics) ObserveRoomBlocker(engine, state string) {
+	if g == nil || g.roomBlocker == nil {
+		return
+	}
+	g.roomBlocker.WithLabelValues(engine, state).Inc()
+}
+
 func (g *groupMetrics) ObserveRoomRotation(engine string) {
 	if g == nil || g.roomRotations == nil {
 		return

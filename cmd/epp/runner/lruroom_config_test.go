@@ -19,6 +19,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -271,7 +272,12 @@ flowControl:
 // Both arm configs load through the real registry and loader with the strict factory, the startup gate
 // accepts them (no residency producer to find), and the dump carries the room ledger.
 func TestLRURoomRunConfigLoads(t *testing.T) {
-	for name, cfg := range map[string]string{"gate": lruRoomRunConfig, "control": lruRoomControlConfig} {
+	// the no-forced-seat arm (epp-cm/t2l-q8-lru-noforce-plugins.yaml) is the gate arm with roomHoldMaxSeconds 0
+	noforce := strings.Replace(lruRoomRunConfig, "roomHoldMaxSeconds: 90", "roomHoldMaxSeconds: 0", 1)
+	require.NotEqual(t, lruRoomRunConfig, noforce)
+	// the displace arm (epp-cm/t2l-q8-lru-displace-plugins.yaml): no forced seat, eligible tail blocks count as room
+	displace := strings.Replace(lruRoomRunConfig, "roomHoldMaxSeconds: 90", "roomHoldMaxSeconds: 0\n    roomDisplace: true", 1)
+	for name, cfg := range map[string]string{"gate": lruRoomRunConfig, "control": lruRoomControlConfig, "noforce": noforce, "displace": displace} {
 		t.Run(name, func(t *testing.T) { loadLRURoomConfig(t, cfg) })
 	}
 }

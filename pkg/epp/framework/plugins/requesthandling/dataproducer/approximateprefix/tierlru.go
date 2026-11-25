@@ -95,6 +95,13 @@ func (t *TierLRU) Gen() uint64 { return t.gen }
 // reports are walked over but not counted (the inserting chain's own blocks: evicting them would cost
 // the insert itself). The walk ends early once need blocks are counted; the result is then >= need.
 func (t *TierLRU) TailRoom(need int, skip, stop func(prefixhash.BlockHash) bool) int {
+	room, _, _ := t.TailRoomStop(need, skip, stop)
+	return room
+}
+
+// TailRoomStop is TailRoom plus the key that ended the walk (stopped = a protected block ended it before
+// need was reached): the room gate's diagnostic of WHAT holds a head.
+func (t *TierLRU) TailRoomStop(need int, skip, stop func(prefixhash.BlockHash) bool) (int, prefixhash.BlockHash, bool) {
 	room := t.l.capacity - len(t.l.index)
 	if room < 0 {
 		room = 0
@@ -107,9 +114,9 @@ func (t *TierLRU) TailRoom(need int, skip, stop func(prefixhash.BlockHash) bool)
 			continue
 		}
 		if stop != nil && stop(k) {
-			break
+			return room, k, true
 		}
 		room++
 	}
-	return room
+	return room, 0, false
 }

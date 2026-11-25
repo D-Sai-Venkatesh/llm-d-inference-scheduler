@@ -80,9 +80,17 @@ type Config struct {
 	RoomGate bool `json:"roomGate,omitempty"`
 	// RoomReserveTokens is held back from the room on every room test (0 = none).
 	RoomReserveTokens int64 `json:"roomReserveTokens,omitempty"`
-	// RoomHoldMaxSeconds is the room gate's last resort: a head the room has held this long (measured
-	// from the first pass the room held it) is admitted anyway.
+	// RoomHoldMaxSeconds is the room gate's optional last resort: a head the room has held this long
+	// (measured from the first pass the room held it) is admitted anyway. 0 = OFF: a held head waits
+	// until the room opens (a dispatch moves the tail blocker's chain off the tail, or the blocker turns
+	// eligible and a room rotation moves it out; an empty group always seats).
 	RoomHoldMaxSeconds float64 `json:"roomHoldMaxSeconds,omitempty"`
+	// RoomDisplace (roomGate) counts the ELIGIBLE members' blocks (quantum-complete or idle, exactly as
+	// the rotation reads them) as room too: the room walk stops only at the first block a NON-eligible
+	// staying member holds. A head that fits is seated, and the eligible members whose blocks its
+	// recorded write pushed out of the tier are rotated out at once (exit reason "displaced"): admit
+	// first, then remove the members whose KV the newcomer displaced. The room-driven rotation is off.
+	RoomDisplace bool `json:"roomDisplace,omitempty"`
 	// NewcomersFirst orders the shared admission queue: true (the default) seats a thread's FIRST turn
 	// before returning threads, then oldest first; false is plain oldest-first for every head.
 	NewcomersFirst bool `json:"newcomersFirst"`
@@ -147,8 +155,11 @@ func (c Config) validate() error {
 	if c.RoomReserveTokens < 0 {
 		return fmt.Errorf("roomReserveTokens must be >= 0, got %d", c.RoomReserveTokens)
 	}
-	if c.RoomGate && c.RoomHoldMaxSeconds <= 0 {
-		return fmt.Errorf("roomHoldMaxSeconds must be > 0 with roomGate (the gate's last resort), got %v", c.RoomHoldMaxSeconds)
+	if c.RoomDisplace && !c.RoomGate {
+		return fmt.Errorf("roomDisplace needs roomGate: it changes what the room gate counts as room")
+	}
+	if c.RoomHoldMaxSeconds < 0 {
+		return fmt.Errorf("roomHoldMaxSeconds must be >= 0 (0 = no last resort), got %v", c.RoomHoldMaxSeconds)
 	}
 	if c.InflightReapSeconds < 60 {
 		return fmt.Errorf("inflightReapSeconds must be >= 60 (it is the belt over an unobserved termination, not a timeout: it must sit above the client's own request timeout; got %v)", c.InflightReapSeconds)

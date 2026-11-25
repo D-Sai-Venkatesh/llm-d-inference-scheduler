@@ -170,6 +170,11 @@ type waiter struct {
 	// own request record (see Head.WireID).
 	fairnessID string
 	wireID     string
+	// floor is the queue-ORDER floor a rotation leaves on its victim (newcomersFirst false): the victim
+	// queues no earlier than just behind the head that asked for its seat. since stays the TRUE arrival
+	// (the wait metrics and the SEAT event read it); the queue orders by entryKey = max(since, floor).
+	// syncQueue never touches it, and the waiter is dropped at its seat or when it vanishes.
+	floor time.Time
 	// roomHeldSince is the first pass the room gate held this head (zero while it is not held): the
 	// roomHoldMaxSeconds last resort is measured from it, never from since (a returner's since is its
 	// whole exile).

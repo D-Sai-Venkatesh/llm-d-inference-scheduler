@@ -362,8 +362,10 @@ func (s *Scheduler) seatWaiters(now time.Time) {
 			// turn at its ORIGINAL waitingSince; in a plain oldest-first queue that can be older than the
 			// head, and the victim would re-seat at once with a fresh quantum while the head gains nothing.
 			// It keeps its place ahead of every later waiter, but behind this head.
-			if w, ok := s.waiters[victim.id]; ok && !w.since.After(head.since) {
-				w.since = head.since.Add(time.Nanosecond)
+			// The FLOOR (not since: syncQueue lowers since back to the true arrival on the next pass) holds
+			// across passes until the victim seats, and since stays the true arrival for the wait metrics.
+			if w, ok := s.waiters[victim.id]; ok && !entryKey(w).After(entryKey(head)) {
+				w.floor = entryKey(head).Add(time.Nanosecond)
 			}
 		}
 	}

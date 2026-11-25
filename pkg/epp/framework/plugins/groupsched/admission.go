@@ -286,10 +286,20 @@ func (s *Scheduler) entryLess(a, b *waiter) bool {
 	if s.cfg.NewcomersFirst {
 		return newcomerLess(a, b)
 	}
-	if !a.since.Equal(b.since) {
-		return a.since.Before(b.since)
+	ka, kb := entryKey(a), entryKey(b)
+	if !ka.Equal(kb) {
+		return ka.Before(kb)
 	}
 	return a.id < b.id
+}
+
+// entryKey is a waiter's position in the plain oldest-first queue: its arrival, raised to the floor a
+// rotation left on it (see waiter.floor).
+func entryKey(w *waiter) time.Time {
+	if w.floor.After(w.since) {
+		return w.floor
+	}
+	return w.since
 }
 
 // newcomerLess is the entry order's total comparison (lower wins): a total order, so map

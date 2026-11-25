@@ -383,3 +383,47 @@ func TestRotationVictimRequeuesBehindTheHead(t *testing.T) {
 		}
 	}
 }
+
+// The floor holds ACROSS passes: a head that needs more than one pass (here its seat needs more than m's
+// exit, and no other member is eligible yet) still goes before the victim it displaced, and the victim's
+// wait is still measured from its true arrival.
+func TestRotationVictimFloorHoldsAcrossPasses(t *testing.T) {
+	for _, gate := range []bool{false, true} {
+		s := roomSched(t, gate, func(c *Config) { c.NewcomersFirst = false; c.VictimOldestDispatch = true })
+		at := func(sec int) time.Time { return epoch.Add(time.Duration(sec) * time.Second) }
+		hd := func(id string, n int, arr time.Time, c []Chain) Head {
+			return Head{Thread: id, ReqID: fmt.Sprintf("%s#%d", id, n), Arrival: arr, Chains: c, Returner: n > 0}
+		}
+		turn := func(h Head, now time.Time) {
+			if i := s.Pass([]Head{h}, now); i != 0 {
+				t.Fatalf("%s must dispatch, got %d", h.ReqID, i)
+			}
+			s.AtPod(h.ReqID, "", now)
+			s.FirstChunk(h.ReqID, now)
+			s.Settle(h.ReqID, "", now)
+		}
+		for i := 0; i < 8; i++ {
+			turn(hd("m", i, at(i), chain("m", 300)), at(i))
+		}
+		turn(hd("f", 0, at(20), chain("f", 500)), at(20))
+		r := hd("r", 0, at(21), chain("r", 800))
+		if i := s.Pass([]Head{r}, at(21)); i != 0 {
+			t.Fatal("r must dispatch")
+		}
+		s.AtPod(r.ReqID, "", at(21))
+		s.FirstChunk(r.ReqID, at(21))
+		mh := hd("m", 8, at(20), chain("m", 300))
+		h := hd("h", 0, at(24), chain("h", 700)) // 1600 - 300 + 700 = 2000 > 1900: m's exit is not enough
+		s.Pass([]Head{mh, h}, at(25))
+		s.Pass([]Head{mh, h}, at(25).Add(time.Millisecond))
+		if seated(s, "m") {
+			t.Fatalf("gate=%v: the next pass must not re-seat the victim ahead of the head (the floor holds)", gate)
+		}
+		s.mu.Lock()
+		w := s.waiters["m"]
+		s.mu.Unlock()
+		if w == nil || !w.since.Equal(at(20)) || !entryKey(w).After(at(24)) {
+			t.Fatalf("gate=%v: the victim keeps its true arrival (20 s) and queues behind the head (24 s): %+v", gate, w)
+		}
+	}
+}

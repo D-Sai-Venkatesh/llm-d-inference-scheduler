@@ -152,6 +152,7 @@ func (r *GroupScheduler) PreRequest(ctx context.Context, request *fwksched.Infer
 	}
 	// The engine here is AUTHORITATIVE: the seat was placed on the thread's engine at Pick, and
 	// the framework's actual choice moves it if it disagrees.
+	r.sched.RecordUntracked(request.RequestID, engine, chargeChains(request), r.now())
 	obs := r.sched.AtPod(request.RequestID, engine, r.now())
 	annotateSpan(ctx, engine, obs)
 	return nil

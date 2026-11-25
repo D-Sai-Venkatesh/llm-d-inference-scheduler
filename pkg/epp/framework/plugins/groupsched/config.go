@@ -64,6 +64,32 @@ type Config struct {
 	// 0). With it, placement prefers the engine whose tier still holds the most of the head's prompt
 	// (the fewest tokens to really prefill); "" = off, placement exactly as without it.
 	CPUResidencyProducer string `json:"cpuResidencyProducer,omitempty"`
+
+	// OwnTierIndex makes the group OWN its model of each engine's CPU tier: one block LRU per engine
+	// (approximateprefix.TierLRU, capacity = tierCapacityTokens / blockSizeTokens), updated by the group
+	// itself — at every dispatch (the turn's chain is touched, as vLLM's lookup touches it) and, with
+	// roomGate, at every seat. It feeds placement exactly as cpuResidencyProducer does, and replaces it
+	// (the two are exclusive). Needs a tier.
+	OwnTierIndex bool `json:"ownTierIndex,omitempty"`
+	// RoomGate admits a head only when the engine's tier can absorb what the head will WRITE without
+	// evicting a seated thread's block: write (its prompt beyond the tier's resident prefix) +
+	// roomReserveTokens <= room (free tier capacity + the run of non-seated blocks at the LRU's eviction
+	// end). A seated head's whole chain is recorded in the index AT THE SEAT, so the next head sees the
+	// room it leaves. It replaces the cold-entry valve. A room-held head may rotate ONE eligible member
+	// out per pass, and only when that member's blocks would make room. Needs ownTierIndex.
+	RoomGate bool `json:"roomGate,omitempty"`
+	// RoomReserveTokens is held back from the room on every room test (0 = none).
+	RoomReserveTokens int64 `json:"roomReserveTokens,omitempty"`
+	// RoomHoldMaxSeconds is the room gate's last resort: a head the room has held this long (measured
+	// from the first pass the room held it) is admitted anyway.
+	RoomHoldMaxSeconds float64 `json:"roomHoldMaxSeconds,omitempty"`
+	// NewcomersFirst orders the shared admission queue: true (the default) seats a thread's FIRST turn
+	// before returning threads, then oldest first; false is plain oldest-first for every head.
+	NewcomersFirst bool `json:"newcomersFirst"`
+	// VictimOldestDispatch orders the rotation victims (eligibility unchanged: quantum-complete or
+	// idle) by the oldest last dispatch — the oldest tier recency — instead of queued-turn-first then
+	// earliest-seated.
+	VictimOldestDispatch bool `json:"victimOldestDispatch,omitempty"`
 }
 
 // defaultConfig is what a config that omits every key gets: the shipped arm's own numbers.
@@ -77,6 +103,8 @@ func defaultConfig() Config {
 		InFlightCap:         64,
 		BlockSizeTokens:     64,
 		InflightReapSeconds: defaultInflightReapSeconds,
+		RoomHoldMaxSeconds:  90,
+		NewcomersFirst:      true,
 	}
 }
 
@@ -106,6 +134,21 @@ func (c Config) validate() error {
 	}
 	if c.CPUResidencyProducer != "" && c.TierCapacityTokens <= 0 {
 		return fmt.Errorf("cpuResidencyProducer %q needs tierCapacityTokens: the residency index models each engine's CPU tier, and without a tier there is none to model", c.CPUResidencyProducer)
+	}
+	if c.OwnTierIndex && c.TierCapacityTokens <= 0 {
+		return fmt.Errorf("ownTierIndex needs tierCapacityTokens: the index models each engine's CPU tier, and without a tier there is none to model")
+	}
+	if c.OwnTierIndex && c.CPUResidencyProducer != "" {
+		return fmt.Errorf("ownTierIndex and cpuResidencyProducer %q are exclusive: both answer placement's residency read — keep one", c.CPUResidencyProducer)
+	}
+	if c.RoomGate && !c.OwnTierIndex {
+		return fmt.Errorf("roomGate needs ownTierIndex: the gate records each seat in the group's own tier index, and reads the room from it")
+	}
+	if c.RoomReserveTokens < 0 {
+		return fmt.Errorf("roomReserveTokens must be >= 0, got %d", c.RoomReserveTokens)
+	}
+	if c.RoomGate && c.RoomHoldMaxSeconds <= 0 {
+		return fmt.Errorf("roomHoldMaxSeconds must be > 0 with roomGate (the gate's last resort), got %v", c.RoomHoldMaxSeconds)
 	}
 	if c.InflightReapSeconds < 60 {
 		return fmt.Errorf("inflightReapSeconds must be >= 60 (it is the belt over an unobserved termination, not a timeout: it must sit above the client's own request timeout; got %v)", c.InflightReapSeconds)

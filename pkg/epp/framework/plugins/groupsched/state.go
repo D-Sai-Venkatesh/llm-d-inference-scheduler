@@ -32,6 +32,8 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/dataproducer/approximateprefix"
 )
 
 // ---- the queue-head snapshot (waiting state comes from the flow-control
@@ -109,6 +111,15 @@ type thread struct {
 	// wireID is the last client request id this thread was seen with: the field a SEAT/EXIT line
 	// joins a request record on (see Head.WireID).
 	wireID string
+	// lastDispatch is when this thread's chain was last touched in the engine's tier: its last
+	// dispatch, or its seat (with roomGate the seat records the chain). victimOldestDispatch orders the
+	// rotation victims by it.
+	lastDispatch time.Time
+	// seatTierResident is the tier-resident prefix (tokens) the group's own index read for this
+	// thread's head at the seat, BEFORE the seat recorded it; seatTierPending marks that the first
+	// dispatch after the seat must report it (a read after the seat's record would say "all resident").
+	seatTierResident int64
+	seatTierPending  bool
 }
 
 // busy reports whether the thread has work in progress: a request at a pod, or a LIVE released
@@ -159,6 +170,37 @@ type waiter struct {
 	// own request record (see Head.WireID).
 	fairnessID string
 	wireID     string
+	// roomHeldSince is the first pass the room gate held this head (zero while it is not held): the
+	// roomHoldMaxSeconds last resort is measured from it, never from since (a returner's since is its
+	// whole exile).
+	roomHeldSince time.Time
+	// keySet caches the head's own chain keys for the room walk (rebuilt when keySetOf changes).
+	keySet   map[Hash]struct{}
+	keySetOf *Hash
+	keySetN  int
+}
+
+// ownKeys is the head's chain keys as a set, cached on the waiter: the room walk skips them.
+func (w *waiter) ownKeys() map[Hash]struct{} {
+	var first *Hash
+	n := 0
+	for _, c := range w.chains {
+		if len(c.Keys) > 0 && first == nil {
+			first = &c.Keys[0]
+		}
+		n += len(c.Keys)
+	}
+	if w.keySet != nil && w.keySetOf == first && w.keySetN == n {
+		return w.keySet
+	}
+	set := make(map[Hash]struct{}, n)
+	for _, c := range w.chains {
+		for _, k := range c.Keys {
+			set[k] = struct{}{}
+		}
+	}
+	w.keySet, w.keySetOf, w.keySetN = set, first, n
+	return set
 }
 
 // engineGroup is everything that is a fact about ONE engine's HBM: its block index (dedup is per
@@ -185,6 +227,13 @@ type engineGroup struct {
 	// coldInFlight is this engine's outstanding cold-entry charge against its own stagger cap, so
 	// N engines allow N concurrent cold prefills and no more.
 	coldInFlight int64
+
+	// tier is the group's OWN model of this engine's CPU tier (ownTierIndex): created with the
+	// engine's capacity, touched at every dispatch and (roomGate) recorded at every seat. nil = off.
+	tier *approximateprefix.TierLRU
+	// tierCause names what the tier index is being written for right now (seat / dispatch /
+	// passthrough / rebind), so its eviction observer can book a seated block's eviction by cause.
+	tierCause string
 
 	counters struct {
 		served int64 // dispatches served on this engine
@@ -277,7 +326,54 @@ type Scheduler struct {
 		placements   map[string]int64
 		seatResident int64
 		seatCold     int64
+		// THE ROOM GATE's own proof that it fired (roomGate): heads it held (once per held head, not
+		// per pass), heads its last resort admitted, members rotated out to make room, and index
+		// writes by cause; seatedEvicted is the index's eviction of a SEATED (staying) block, by cause
+		// — the in-group loss the gate exists to prevent.
+		roomHeld      int64
+		roomForced    int64
+		roomRotations int64
+		tierWrites    map[string]int64
+		seatedEvicted map[string]int64
 	}
+}
+
+// tier write causes (index writes and seated-block evictions are booked by them).
+const (
+	tierCauseSeat        = "seat"
+	tierCauseDispatch    = "dispatch"
+	tierCausePassthrough = "passthrough"
+	tierCauseRebind      = "rebind"
+)
+
+var tierCauses = []string{tierCauseSeat, tierCauseDispatch, tierCausePassthrough, tierCauseRebind}
+
+// recordTier writes a chain set into the engine's own tier index (ownTierIndex; a no-op otherwise),
+// booking the write and any SEATED block it evicts under cause.
+func (s *Scheduler) recordTier(g *engineGroup, chains []Chain, cause string) {
+	if g == nil || g.tier == nil {
+		return
+	}
+	g.tierCause = cause
+	for _, c := range chains {
+		g.tier.AddChain(c.Keys)
+	}
+	g.tierCause = ""
+	s.counters.tierWrites[cause]++
+	s.metrics.ObserveTierWrite(engineLabel(g.id), cause)
+}
+
+// ownResidency is the residency read of the group's OWN tier index: per engine id (positional), the
+// leading blocks of keys that engine's index holds. It is placement's residency read with
+// ownTierIndex on.
+func (s *Scheduler) ownResidency(keys []Hash, engines []string) []int {
+	out := make([]int, len(engines))
+	for i, id := range engines {
+		if g, ok := s.groups[id]; ok && g.tier != nil {
+			out[i] = g.tier.ResidentPrefix(keys)
+		}
+	}
+	return out
 }
 
 // SetResidency installs the CPU-residency read (nil removes it). Called once at startup, before any
@@ -301,6 +397,12 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 	s.counters.exits = map[string]int64{}
 	s.counters.anomalies = map[string]int64{}
 	s.counters.placements = map[string]int64{}
+	s.counters.tierWrites = map[string]int64{}
+	s.counters.seatedEvicted = map[string]int64{}
+	if cfg.OwnTierIndex {
+		// the group's own tier index is placement's residency read (it replaces cpuResidencyProducer)
+		s.residency = s.ownResidency
+	}
 	return s, nil
 }
 
@@ -376,6 +478,17 @@ func (s *Scheduler) SetNumBlocksFor(engine string, blockSizeTokens, numBlocks in
 	if s.cfg.TierCapacityTokens > 0 {
 		tierBlocks := s.cfg.TierCapacityTokens / int64(s.blockSize)
 		g.budgetBlocks = max(g.runBudgetBlocks, int(s.cfg.TierBudgetFraction*float64(tierBlocks)))
+		if s.cfg.OwnTierIndex && g.tier == nil {
+			g.tier = approximateprefix.NewTierLRU(int(tierBlocks))
+			gg := g
+			g.tier.OnEvict(func(k Hash) {
+				if gg.index.Staying(k) {
+					cause := gg.tierCause
+					s.counters.seatedEvicted[cause]++
+					s.metrics.ObserveSeatedEvicted(engineLabel(gg.id), cause)
+				}
+			})
+		}
 	}
 	return nil
 }
@@ -523,6 +636,8 @@ type Snapshot struct {
 	Anomalies map[string]int64 `json:"anomalies,omitempty"`
 	// Residency is the CPU-residency placement ledger (absent when the index is not configured).
 	Residency *ResidencySnapshot `json:"residency,omitempty"`
+	// Room is the room gate's ledger (absent without ownTierIndex).
+	Room *RoomSnapshot `json:"room,omitempty"`
 }
 
 // ResidencySnapshot is what the CPU-residency index did to placement: seats by outcome, and the
@@ -558,6 +673,19 @@ type EngineSnapshot struct {
 	Served            int64            `json:"served"`
 	Exits             map[string]int64 `json:"exits,omitempty"`
 	BlockSizeErr      string           `json:"blockSizeMismatch,omitempty"`
+	// TierIndexBlocks / TierIndexCapBlocks: the group's own tier index (ownTierIndex; 0 when off).
+	TierIndexBlocks    int `json:"tierIndexBlocks,omitempty"`
+	TierIndexCapBlocks int `json:"tierIndexCapBlocks,omitempty"`
+}
+
+// RoomSnapshot is the room gate's ledger (roomGate / ownTierIndex): heads held, last-resort seats,
+// rotations for room, the index's writes and the seated blocks they evicted, by cause.
+type RoomSnapshot struct {
+	Held          int64            `json:"held"`
+	Forced        int64            `json:"forced"`
+	Rotations     int64            `json:"rotations"`
+	TierWrites    map[string]int64 `json:"tierWrites"`
+	SeatedEvicted map[string]int64 `json:"seatedEvicted"`
 }
 
 // Snapshot is the whole-policy view of the state machine: DumpState serialises it and the scrape
@@ -613,6 +741,9 @@ func (s *Scheduler) snapshot(now time.Time) Snapshot {
 		if g.blockSizeMismatch != nil {
 			es.BlockSizeErr = g.blockSizeMismatch.Error()
 		}
+		if g.tier != nil {
+			es.TierIndexBlocks, es.TierIndexCapBlocks = g.tier.Len(), g.tier.Cap()
+		}
 		if len(g.counters.exits) > 0 {
 			es.Exits = map[string]int64{}
 			for k, v := range g.counters.exits {
@@ -633,6 +764,15 @@ func (s *Scheduler) snapshot(now time.Time) Snapshot {
 			rs.Placements[k] = s.counters.placements[k]
 		}
 		snap.Residency = rs
+	}
+	if s.cfg.OwnTierIndex {
+		room := &RoomSnapshot{Held: s.counters.roomHeld, Forced: s.counters.roomForced,
+			Rotations: s.counters.roomRotations, TierWrites: map[string]int64{}, SeatedEvicted: map[string]int64{}}
+		for _, c := range tierCauses {
+			room.TierWrites[c] = s.counters.tierWrites[c]
+			room.SeatedEvicted[c] = s.counters.seatedEvicted[c]
+		}
+		snap.Room = room
 	}
 	return snap
 }

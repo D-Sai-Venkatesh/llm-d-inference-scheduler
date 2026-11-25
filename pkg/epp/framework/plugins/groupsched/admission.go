@@ -34,6 +34,9 @@ func (s *Scheduler) freeBudget(g *engineGroup) int64 {
 // coldAllowsTokens asks whether this head's cold prefill fits the engine's stagger, for the
 // exact cost it brings.
 func (s *Scheduler) coldAllowsTokens(g *engineGroup, tokens int64) bool {
+	if s.cfg.RoomGate {
+		return true // the room gate replaces the valve: the tier's room paces cold entries
+	}
 	cap := g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize)
 	if cap <= 0 {
 		return true // no measured capacity: the admission pass already refuses these engines
@@ -52,6 +55,55 @@ type seatChoice struct {
 	// resident is the head's prompt tokens the CPU-residency index says THIS engine's tier still
 	// holds, and bestResident the most any candidate engine holds (both 0 with residency off).
 	resident, bestResident int64
+	// roomHeld (roomGate): the budget takes the head on this engine but the tier's room does not;
+	// roomForced: the room did not fit but the head's hold reached roomHoldMaxSeconds, so it is admitted.
+	roomHeld, roomForced bool
+	// writeBlocks is what the head will write into this engine's tier, in blocks, reserve included.
+	writeBlocks int
+	// heldOn names the engine whose room held the head when no engine was chosen (g nil).
+	heldOn string
+}
+
+// roomNeed is the blocks a head's write takes from the tier (its prompt beyond the resident prefix,
+// plus the reserve), rounded up to whole blocks.
+func (s *Scheduler) roomNeed(writeTokens int64) int {
+	t := max(writeTokens, 0) + s.cfg.RoomReserveTokens
+	bs := int64(s.blockSize)
+	return int((t + bs - 1) / bs)
+}
+
+// tierRoom is the engine's tier room for the head: free capacity plus the run of non-seated blocks at
+// the eviction end, skipping the head's own blocks, up to the first STAYING (seated, not exiting) block
+// — blocks of also are treated as not seated (the rotation guard's "if this member left" read). The
+// walk stops once need is reached.
+func (s *Scheduler) tierRoom(g *engineGroup, w *waiter, need int, also map[Hash]struct{}) int {
+	if g.tier == nil {
+		return 0
+	}
+	own := w.ownKeys()
+	skip := func(k Hash) bool { _, ok := own[k]; return ok }
+	stop := func(k Hash) bool {
+		if also != nil {
+			if _, ok := also[k]; ok {
+				return false
+			}
+		}
+		return g.index.Staying(k)
+	}
+	return g.tier.TailRoom(need, skip, stop)
+}
+
+// roomGrowsWithout is the room-rotation guard: would rotating victim out give the head more room?
+// Only if victim's blocks lie below the first staying block of somebody else (a busy member at the
+// eviction end — a long decode — blocks every rotation behind it, and then none is made).
+func (s *Scheduler) roomGrowsWithout(g *engineGroup, w *waiter, victim *thread, need int) bool {
+	keys := map[Hash]struct{}{}
+	for _, c := range g.index.Chains(victim.id) {
+		for _, k := range c.Keys {
+			keys[k] = struct{}{}
+		}
+	}
+	return s.tierRoom(g, w, need, keys) > s.tierRoom(g, w, need, nil)
 }
 
 // seatEngine is THE seat-time engine choice: the scheduler gathers the FACTS (per-engine
@@ -78,13 +130,30 @@ func (s *Scheduler) seatEngine(head *waiter, now time.Time) *seatChoice {
 		// RULE O — the EMPTY ENGINE ADMITS ONE.
 		ruleO := len(g.threads) == 0 && blocks > budget
 		gg := g
+		// THE ROOM GATE (roomGate): the tier must absorb what the head will write without evicting a
+		// seated block. Measured only where the budget already takes the head (an empty engine admits
+		// as Rule O always has); the hold's last resort admits it anyway.
+		roomFits, roomHeld, roomForced, need := true, false, false, 0
+		if s.cfg.RoomGate && gg.tier != nil && (budgetFits || ruleO) && len(gg.threads) > 0 {
+			need = s.roomNeed(physCold(prompt, resident, gi))
+			if s.tierRoom(gg, head, need, nil) < need {
+				if !head.roomHeldSince.IsZero() && now.Sub(head.roomHeldSince).Seconds() >= s.cfg.RoomHoldMaxSeconds {
+					roomForced = true
+				} else {
+					roomFits, roomHeld = false, true
+				}
+			}
+		}
 		cands = append(cands, EngineCandidate{
 			Engine: gg.id, CostTokens: tokens, CostBlocks: blocks,
 			FreeBudget: free, Budget: budget, BudgetFits: budgetFits,
 			// FITS = (budget OR Rule O's empty engine) AND the cold valve: a head the valve holds must
 			// WAIT for the valve, never evict for it — evicting frees budget, and the valve is not
-			// budget.
-			Fits:      (budgetFits || ruleO) && s.coldAllowsTokens(g, tokens),
+			// budget. With roomGate the valve is off and the ROOM is the second condition instead.
+			Fits:      (budgetFits || ruleO) && s.coldAllowsTokens(g, tokens) && roomFits,
+			RoomHeld:  roomHeld,
+			RoomForce: roomForced,
+			Need:      need,
 			HasVictim: func() bool { return s.hasRotationVictim(gg, now) },
 			// what this engine would REALLY prefill: the prompt beyond what its CPU tier still holds
 			// (0 for every engine with residency off, so the orders below are today's exactly)
@@ -95,6 +164,13 @@ func (s *Scheduler) seatEngine(head *waiter, now time.Time) *seatChoice {
 	}
 	idx := chooseEngine(cands)
 	if idx < 0 || idx >= len(cands) {
+		// nothing to seat and no eviction to make: say whether the ROOM is (part of) why, so the pass
+		// can book the hold (roomGate)
+		for _, c := range cands {
+			if c.RoomHeld {
+				return &seatChoice{roomHeld: true, heldOn: c.Engine}
+			}
+		}
 		return nil
 	}
 	var best int64
@@ -102,7 +178,8 @@ func (s *Scheduler) seatEngine(head *waiter, now time.Time) *seatChoice {
 		best = max(best, c.Resident)
 	}
 	return &seatChoice{g: owners[idx], costTokens: cands[idx].CostTokens, fits: cands[idx].Fits,
-		resident: cands[idx].Resident, bestResident: best}
+		resident: cands[idx].Resident, bestResident: best,
+		roomHeld: cands[idx].RoomHeld, roomForced: cands[idx].RoomForce, writeBlocks: cands[idx].Need}
 }
 
 // residentTokens is the CPU-residency read for one head, per group (positional): the prompt tokens
@@ -179,11 +256,23 @@ func (s *Scheduler) hasRotationVictim(g *engineGroup, now time.Time) bool {
 func (s *Scheduler) headWaiter() *waiter {
 	var head *waiter
 	for _, w := range s.waiters {
-		if head == nil || newcomerLess(w, head) {
+		if head == nil || s.entryLess(w, head) {
 			head = w
 		}
 	}
 	return head
+}
+
+// entryLess is the shared queue's order: newcomerLess, or with newcomersFirst false plain oldest
+// arrival first (then id) for every head.
+func (s *Scheduler) entryLess(a, b *waiter) bool {
+	if s.cfg.NewcomersFirst {
+		return newcomerLess(a, b)
+	}
+	if !a.since.Equal(b.since) {
+		return a.since.Before(b.since)
+	}
+	return a.id < b.id
 }
 
 // newcomerLess is the entry order's total comparison (lower wins): a total order, so map
@@ -237,6 +326,9 @@ func (s *Scheduler) seat(g *engineGroup, w *waiter, coldTokens int64, now time.T
 	// valve's job is to serialise cold prefills inside the budget's headroom, not to account the
 	// entry's whole footprint (the seat's blocks do that).
 	m.coldEntry = min(coldTokens, g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize))
+	if s.cfg.RoomGate {
+		m.coldEntry = 0 // no valve: nothing to charge or release
+	}
 	g.coldInFlight += m.coldEntry
 	// record EVERY seat wait, split by kind (a thread's first turn vs a returning thread): both
 	// answer "how long did admission make this thread wait".
@@ -281,6 +373,13 @@ type EngineCandidate struct {
 	PhysColdTokens int64
 	// Resident is the head's prompt tokens that tier holds (observability).
 	Resident int64
+	// RoomHeld (roomGate): BudgetFits, but the tier's room does not absorb the head's write. It is the
+	// ONE "does not fit" that may still rotate a member out (the room-rotation guard decides), where a
+	// valve-held head only waits. RoomForce: admitted by the hold's last resort. Need: the write in
+	// blocks.
+	RoomHeld  bool
+	RoomForce bool
+	Need      int
 }
 
 // chooseEngine answers "which engine takes this head?": among the engines where the head FITS
@@ -316,9 +415,11 @@ func chooseEngine(cands []EngineCandidate) int {
 		return best
 	}
 	// The cold valve is holding this head somewhere: WAIT — never evict — because evicting frees
-	// budget and never the valve.
+	// budget and never the valve. A ROOM-held head (roomGate) is different: a member leaving can make
+	// room, so it falls through to the eviction choice (the room-rotation guard in seatWaiters decides
+	// whether that exit is made).
 	for i := range cands {
-		if cands[i].BudgetFits {
+		if cands[i].BudgetFits && !cands[i].RoomHeld {
 			return -1
 		}
 	}

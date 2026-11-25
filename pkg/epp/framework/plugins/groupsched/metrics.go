@@ -63,6 +63,16 @@ type groupMetrics struct {
 	// (cpuResidencyProducer set; zero series otherwise).
 	residencyPlacements *prometheus.CounterVec
 	residencySeatTokens *prometheus.CounterVec
+	// THE ROOM GATE and the group's own tier index (ownTierIndex / roomGate): proof the gate fired
+	// (heads held, last-resort seats, members rotated for room), the index's writes and the SEATED
+	// blocks they evicted (by cause), and the index's prediction at dispatch for the accuracy check.
+	roomHeld        *prometheus.CounterVec
+	roomForced      *prometheus.CounterVec
+	roomRotations   *prometheus.CounterVec
+	tierWrites      *prometheus.CounterVec
+	seatedEvicted   *prometheus.CounterVec
+	tierPredicted   *prometheus.CounterVec
+	tierPromptTotal *prometheus.CounterVec
 }
 
 // subsystem namespaces every series (llm_d_epp_group_*).
@@ -115,6 +125,20 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	for _, o := range placementOutcomes {
 		g.residencyPlacements.WithLabelValues(o).Add(0)
 	}
+	g.roomHeld = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "room_held_total",
+		Help: "HEADS the room gate (roomGate) held at the seat: the budget took them but this engine's CPU tier had no room for their write without evicting a seated block. Once per held head, not per pass"}, engineLabels)
+	g.roomForced = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "room_forced_seats_total",
+		Help: "heads the room gate admitted by its last resort (held roomHoldMaxSeconds): a nonzero rate means the room did not open in time — read with tier_seated_evictions_total"}, engineLabels)
+	g.roomRotations = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "room_rotations_total",
+		Help: "members rotated out (quantum-complete or idle, as always) to make ROOM for a room-held head — at most one per pass, and only when the member's blocks would make room"}, engineLabels)
+	g.tierWrites = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_writes_total",
+		Help: "writes into the group's own CPU-tier index (ownTierIndex), by cause: seat = a seated head's chain recorded at the seat (roomGate), dispatch = a dispatched turn's chain touched, passthrough = an untracked request's chain, rebind = a moved thread's chain on its new engine"}, []string{"engine", "cause"})
+	g.seatedEvicted = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_seated_evictions_total",
+		Help: "blocks of a SEATED (staying) thread that a write into the group's own tier index evicted, by the write's cause — the in-group loss the room gate exists to prevent (its model of it)"}, []string{"engine", "cause"})
+	g.tierPredicted = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_predicted_cached_tokens_total",
+		Help: "prompt tokens the group's own tier index predicted the engine's CPU tier held for each dispatched turn (read before the turn's touch; a seat-recorded first turn reports the read taken before the seat's record). Its ratio to tier_dispatched_prompt_tokens_total is comparable with the engine's own cached share (local_cache_hit + external_kv_transfer over prompt tokens)"}, engineLabels)
+	g.tierPromptTotal = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_dispatched_prompt_tokens_total",
+		Help: "prompt tokens of every turn tier_predicted_cached_tokens_total was read for — its denominator"}, engineLabels)
 
 	// The GLOBAL zero series: a zero is a fact, an absent series is a question (and a
 	// should-be-zero count with no series is the shape of a bug nobody notices).
@@ -126,6 +150,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.exits, g.entryWait, g.served, g.queueWait, g.predictedCached, g.dispatchedPrompt,
 		g.affinityViolations, g.engineGone, g.coldValveHeld, g.anomalies, g.runGateHeld,
 		g.residencyPlacements, g.residencySeatTokens,
+		g.roomHeld, g.roomForced, g.roomRotations, g.tierWrites, g.seatedEvicted, g.tierPredicted, g.tierPromptTotal,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
@@ -164,6 +189,67 @@ func (g *groupMetrics) preInstantiateEngine(engine string) {
 	for _, reason := range exitReasons {
 		g.exits.WithLabelValues(label, reason).Add(0)
 	}
+	// the room gate's zero series: a gate that never fired must read as a 0, not as nothing
+	if g.roomHeld != nil {
+		g.roomHeld.WithLabelValues(label).Add(0)
+		g.roomForced.WithLabelValues(label).Add(0)
+		g.roomRotations.WithLabelValues(label).Add(0)
+		g.tierPredicted.WithLabelValues(label).Add(0)
+		g.tierPromptTotal.WithLabelValues(label).Add(0)
+		for _, c := range tierCauses {
+			g.tierWrites.WithLabelValues(label, c).Add(0)
+			g.seatedEvicted.WithLabelValues(label, c).Add(0)
+		}
+	}
+}
+
+// ObserveRoomHeld counts a head the room gate held (once per head).
+func (g *groupMetrics) ObserveRoomHeld(engine string) {
+	if g == nil || g.roomHeld == nil {
+		return
+	}
+	g.roomHeld.WithLabelValues(engine).Inc()
+}
+
+// ObserveRoomForced counts a head admitted by the room gate's last resort.
+func (g *groupMetrics) ObserveRoomForced(engine string) {
+	if g == nil || g.roomForced == nil {
+		return
+	}
+	g.roomForced.WithLabelValues(engine).Inc()
+}
+
+// ObserveRoomRotation counts a member rotated out to make room.
+func (g *groupMetrics) ObserveRoomRotation(engine string) {
+	if g == nil || g.roomRotations == nil {
+		return
+	}
+	g.roomRotations.WithLabelValues(engine).Inc()
+}
+
+// ObserveTierWrite counts one write into the group's own tier index, by cause.
+func (g *groupMetrics) ObserveTierWrite(engine, cause string) {
+	if g == nil || g.tierWrites == nil {
+		return
+	}
+	g.tierWrites.WithLabelValues(engine, cause).Inc()
+}
+
+// ObserveSeatedEvicted counts one seated block a tier-index write evicted, by the write's cause.
+func (g *groupMetrics) ObserveSeatedEvicted(engine, cause string) {
+	if g == nil || g.seatedEvicted == nil {
+		return
+	}
+	g.seatedEvicted.WithLabelValues(engine, cause).Inc()
+}
+
+// ObserveTierPredicted books one dispatched turn's tier-index prediction and its prompt tokens.
+func (g *groupMetrics) ObserveTierPredicted(engine string, predicted, prompt int64) {
+	if g == nil || g.tierPredicted == nil {
+		return
+	}
+	g.tierPredicted.WithLabelValues(engine).Add(float64(predicted))
+	g.tierPromptTotal.WithLabelValues(engine).Add(float64(prompt))
 }
 
 // ObserveExit records a thread exit (the reason + engine).
@@ -288,6 +374,7 @@ type stateGauges struct {
 	runBudget       *prometheus.Desc
 	runningBlocks   *prometheus.Desc
 	runningThreads  *prometheus.Desc
+	tierBlocks      *prometheus.Desc
 }
 
 // gaugeDesc builds one per-engine gauge descriptor under the plugin's subsystem.
@@ -312,6 +399,8 @@ func newStateGauges(r *GroupScheduler) *stateGauges {
 			"distinct blocks of the seats with a turn running (released or at a pod)"),
 		runningThreads: gaugeDesc("running_threads",
 			"seats with a turn running"),
+		tierBlocks: gaugeDesc("tier_index_blocks",
+			"blocks held by the group's own model of this engine's CPU tier (ownTierIndex; 0 when off). Capacity = tierCapacityTokens / blockSizeTokens"),
 		exiting: gaugeDesc("exiting_threads",
 			"threads on this engine that have been marked exiting and still hold their seat until their in-flight requests drain"),
 		exitingBlks: gaugeDesc("exiting_blocks",
@@ -333,7 +422,7 @@ func newStateGauges(r *GroupScheduler) *stateGauges {
 func (c *stateGauges) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{c.seats, c.neBlocks, c.budgetBlocks, c.exiting,
 		c.exitingBlks, c.exitingAge, c.coldInFlight, c.coldCap, c.capacityMissing, c.waiters,
-		c.runBudget, c.runningBlocks, c.runningThreads} {
+		c.runBudget, c.runningBlocks, c.runningThreads, c.tierBlocks} {
 		ch <- d
 	}
 }
@@ -364,6 +453,7 @@ func (c *stateGauges) Collect(ch chan<- prometheus.Metric) {
 		gauge(c.runBudget, float64(es.RunBudgetBlocks), es.ID)
 		gauge(c.runningBlocks, float64(es.RunningBlocks), es.ID)
 		gauge(c.runningThreads, float64(es.RunningThreads), es.ID)
+		gauge(c.tierBlocks, float64(es.TierIndexBlocks), es.ID)
 	}
 	// capacity_missing: every KNOWN endpoint whose geometry the scheduler has not measured. An engine
 	// counts as measured only once it has blocks; one with no group at all is the pre-capacity case.

@@ -222,6 +222,14 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		if len(winner.c.h.Chains) > 0 {
 			g.index.Grow(m.id, winner.c.h.Chains)
 		}
+		// THE GROUP'S OWN TIER INDEX (ownTierIndex) follows the engine: the dispatched chain is touched
+		// as vLLM's lookup touches it, after the prediction is read (before the touch it says what the
+		// tier holds; after, everything).
+		if g.tier != nil {
+			s.observeTierPrediction(g, m, winner.c.h.Chains)
+			s.recordTier(g, winner.c.h.Chains, tierCauseDispatch)
+		}
+		m.lastDispatch = now
 		// The request is RELEASED: it is neither queued nor in flight until PreRequest records it,
 		// and the record written here is what every later hook resolves it by.
 		s.release(m, winner.c.h.ReqID, winner.c.h.Chains, now, obs)
@@ -292,6 +300,9 @@ func (s *Scheduler) seatWaiters(now time.Time) {
 	for _, g := range s.activeGroups() {
 		budget += len(g.threads)
 	}
+	// THE ROOM GATE's rotation is rationed: at most ONE member leaves per pass to make ROOM (budget-
+	// driven exits are not counted here), and only when its leaving makes room.
+	roomExitDone := false
 	for ; budget > 0; budget-- {
 		head := s.headWaiter()
 		if head == nil {
@@ -302,6 +313,9 @@ func (s *Scheduler) seatWaiters(now time.Time) {
 			// nothing to do this pass.
 			if engine, held := s.coldValveHeldOn(head); held {
 				s.metrics.ObserveColdValveHeld(engineLabel(engine))
+			}
+			if cand != nil && cand.roomHeld {
+				s.noteRoomHold(head, cand.heldOn, now)
 			}
 			return
 		}
@@ -314,19 +328,88 @@ func (s *Scheduler) seatWaiters(now time.Time) {
 				return
 			}
 			s.notePlacement(cand, head, now)
+			s.afterSeat(cand, head, now)
 			continue
 		}
-		// Nothing fits BY BUDGET on the chosen engine: eviction is the only way a budget-blocked
-		// head ever runs, and it is demand-driven (a head is waiting right now).
+		// Nothing fits BY BUDGET on the chosen engine — or (roomGate) its tier has no room for the
+		// head's write: eviction is the only way such a head ever runs, and it is demand-driven (a head
+		// is waiting right now).
 		reason, victim := s.rotationVictim(cand.g, now)
 		if victim == nil {
+			if cand.roomHeld {
+				s.noteRoomHold(head, cand.g.id, now)
+			}
 			return // this engine can free nothing; another pass will re-evaluate
+		}
+		if cand.roomHeld {
+			// THE ROOM-ROTATION GUARD: a member leaves for ROOM only if its blocks would make room (a busy
+			// member at the eviction end — a long decode — makes every rotation behind it useless), and
+			// at most one per pass.
+			if roomExitDone || !s.roomGrowsWithout(cand.g, head, victim, cand.writeBlocks) {
+				s.noteRoomHold(head, cand.g.id, now)
+				return
+			}
+			roomExitDone = true
+			s.counters.roomRotations++
+			s.metrics.ObserveRoomRotation(engineLabel(cand.g.id))
 		}
 		// NOTE: a rotation victim is never in flight — the tenure rule refuses in-flight threads — so
 		// there is no mid-flight exit to handle here; that class lives in budgetVictim (eviction.go),
 		// which does reach running threads.
 		s.exit(cand.g, victim, reason, now)
 	}
+}
+
+// observeTierPrediction books, for one dispatched turn, the prompt tokens the group's own tier index
+// predicts the engine's tier holds — read BEFORE the turn's touch; for the first turn after a seat
+// that recorded the chain, the read the seat took before its record — next to the prompt tokens, so
+// tier_predicted_cached / tier_dispatched_prompt is comparable with the engine's own cached share.
+func (s *Scheduler) observeTierPrediction(g *engineGroup, m *thread, chains []Chain) {
+	var pred, prompt int64
+	for _, c := range chains {
+		prompt += int64(c.Tokens)
+	}
+	if m.seatTierPending {
+		pred, m.seatTierPending = m.seatTierResident, false
+	} else {
+		for _, c := range chains {
+			pred += min(int64(g.tier.ResidentPrefix(c.Keys))*int64(s.blockSize), int64(c.Tokens))
+		}
+	}
+	s.metrics.ObserveTierPredicted(engineLabel(g.id), pred, prompt)
+}
+
+// noteRoomHold books a head the room gate is holding: its hold starts at the first such pass (the
+// roomHoldMaxSeconds last resort is measured from it), and the hold is counted ONCE per head, not per
+// pass.
+func (s *Scheduler) noteRoomHold(w *waiter, engine string, now time.Time) {
+	if !w.roomHeldSince.IsZero() {
+		return
+	}
+	w.roomHeldSince = now
+	s.counters.roomHeld++
+	s.metrics.ObserveRoomHeld(engineLabel(engine))
+}
+
+// afterSeat is what a seat leaves in the group's own tier index (ownTierIndex): the thread's tier
+// recency starts at the seat, and with roomGate the head's WHOLE chain is recorded now — the write it
+// is about to make, reserved before the next head reads the room. The resident prefix the index held
+// BEFORE this record is kept for the first dispatch's prediction.
+func (s *Scheduler) afterSeat(c *seatChoice, w *waiter, now time.Time) {
+	m := c.g.threads[w.id]
+	if m == nil {
+		return
+	}
+	m.lastDispatch = now
+	if c.roomForced {
+		s.counters.roomForced++
+		s.metrics.ObserveRoomForced(engineLabel(c.g.id))
+	}
+	if !s.cfg.RoomGate || c.g.tier == nil {
+		return
+	}
+	m.seatTierResident, m.seatTierPending = c.resident, true
+	s.recordTier(c.g, w.chains, tierCauseSeat)
 }
 
 // FCFSPick returns the index of the oldest head, or -1: the pre-capacity pass-through's order.

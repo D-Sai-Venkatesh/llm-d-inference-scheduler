@@ -95,10 +95,18 @@ func (s *Scheduler) rotationVictim(g *engineGroup, now time.Time) (string, *thre
 			continue
 		}
 		hasWaiting := !m.waitingSince.IsZero()
-		better := best == nil ||
-			(hasWaiting && !bestHasWaiting) ||
-			(hasWaiting == bestHasWaiting && m.seatTime.Before(best.seatTime)) ||
-			(hasWaiting == bestHasWaiting && m.seatTime.Equal(best.seatTime) && m.id < best.id)
+		var better bool
+		if s.cfg.VictimOldestDispatch {
+			// the OLDEST TIER RECENCY first: the member whose chain the engine's tier touched longest
+			// ago, whose blocks are therefore the nearest the eviction end (then id)
+			better = best == nil || touchedAt(m).Before(touchedAt(best)) ||
+				(touchedAt(m).Equal(touchedAt(best)) && m.id < best.id)
+		} else {
+			better = best == nil ||
+				(hasWaiting && !bestHasWaiting) ||
+				(hasWaiting == bestHasWaiting && m.seatTime.Before(best.seatTime)) ||
+				(hasWaiting == bestHasWaiting && m.seatTime.Equal(best.seatTime) && m.id < best.id)
+		}
 		if better {
 			best, bestReason, bestHasWaiting = m, reason, hasWaiting
 		}
@@ -127,6 +135,15 @@ func (s *Scheduler) rotationVictim(g *engineGroup, now time.Time) (string, *thre
 		}
 	}
 	return bestReason, best
+}
+
+// touchedAt is when a member's chain was last touched in its engine's tier: its last dispatch, or its
+// seat (stamped there) — the seat time for a record that predates the stamp.
+func touchedAt(m *thread) time.Time {
+	if m.lastDispatch.IsZero() {
+		return m.seatTime
+	}
+	return m.lastDispatch
 }
 
 // olderCompletion breaks a tie between two equally-costly victims: a REAL last completion

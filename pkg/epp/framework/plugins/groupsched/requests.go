@@ -242,6 +242,25 @@ func (s *Scheduler) AtPod(reqID, engine string, now time.Time) dispatchObservabl
 	return s.atPod(rec, s.groups[s.bindings[id]].threads[id], engine, now)
 }
 
+// RecordUntracked keeps the group's own tier index (ownTierIndex) whole for a request this policy does
+// not track — anonymous traffic, a pre-capacity FCFS dispatch, a thread head with no seat — that reached
+// engine with chains: the engine's tier will hold them all the same. A tracked request was already
+// touched at its dispatch.
+func (s *Scheduler) RecordUntracked(reqID, engine string, chains []Chain, now time.Time) {
+	if engine == "" || len(chains) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, tracked := s.reqs[reqID]; tracked {
+		return
+	}
+	if g, ok := s.groups[engine]; ok && g.tier != nil {
+		s.now = now
+		s.recordTier(g, chains, tierCausePassthrough)
+	}
+}
+
 // Abandon ends a request's record from OUTSIDE the decision path: the request is gone before a
 // pod served it (the pinned engine vanished, a screener refused it, scheduling failed), so the
 // thread is not waiting on anything any more.
@@ -364,6 +383,8 @@ func (s *Scheduler) rebind(id, observed string, now time.Time) *engineGroup {
 	// and let enforcement reconcile the budget (an over-budget counter is recoverable; a thread
 	// absent from the engine that is serving it is not).
 	to.index.SeatForce(id, chains)
+	// the turn runs on `to`: its tier will hold the chain (ownTierIndex)
+	s.recordTier(to, chains, tierCauseRebind)
 	s.recordEvent("REBIND", id, fmt.Sprintf("from=%s to=%s", engineLabel(from.id), engineLabel(to.id)), now)
 	s.metrics.ObserveAffinityViolation(engineLabel(from.id), engineLabel(to.id))
 	s.logger.V(logutil.DEFAULT).Info("group-scheduler: AFFINITY VIOLATION — a request landed off its seat; rebound to the observed endpoint",

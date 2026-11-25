@@ -353,6 +353,13 @@ func (b *BlockIndex) RunCost(chains []Chain) int {
 
 // ---- the counted views ----
 
+// Staying reports whether h is a block of a seated thread that is NOT exiting: the blocks the room
+// gate protects (an exiting thread's blocks are already leaving, so they count as room).
+func (b *BlockIndex) Staying(h Hash) bool {
+	_, ok := b.blocksStay[h]
+	return ok
+}
+
 // UniqueBlocks is the USED side: every seated thread's blocks, exiting included.
 func (b *BlockIndex) UniqueBlocks() int { return len(b.blocks) }
 

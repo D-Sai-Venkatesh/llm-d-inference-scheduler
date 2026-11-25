@@ -60,6 +60,8 @@ The producer must model the tier: `autoTune: false`, `blockSizeTokens` equal to 
     cpuResidencyProducer: cpu-residency
 ```
 
+**The room gate (optional, with a tier).** The seat budget says the seated threads *fit* the CPU tier; it does not make the tier *keep* them — vLLM's tier is an LRU over every block it was handed, seated or not, and a cold prefill's write evicts whatever is oldest, often a seated thread waiting for its turn. With `ownTierIndex` the group keeps its own model of each engine's tier (one block LRU per engine, the residency index's own `TierLRU`, capacity `tierCapacityTokens / blockSizeTokens`), touched at every dispatch; it is also placement's residency read (it replaces `cpuResidencyProducer`). With `roomGate` a head is seated only when what it will **write** (its prompt beyond the tier's resident prefix, plus `roomReserveTokens`) fits the **room** — free capacity plus the run of non-seated blocks at the LRU's eviction end, up to the first seated block — and its whole chain is recorded **at the seat**, so the next head sees the room it took. The cold-entry valve is off under the gate. A room-held head may rotate one eligible member (quantum-complete or idle, as always) out per pass, and only when that member's blocks would make room; a head held `roomHoldMaxSeconds` is seated anyway. `victimOldestDispatch` orders the eligible victims by the oldest last dispatch (the oldest tier recency); `newcomersFirst: false` makes the shared queue plain oldest-first.
+
 **Rotation.** A seat is held for `quantum` completed busy periods (a busy period is one turn's work: released, run, settled) or until the thread has been idle for `idleSeconds`. Either makes the resident rotation-eligible — and a seat is only given up when a waiter needs it: the rotation is demand-driven, so an idle fleet keeps its seats. A thread that returns finds its seat if it is still there, and re-enters as a returner if it is not.
 
 **The observed engine wins.** If a request's `PreRequest` reports an endpoint other than the seat, the thread is moved to the observed engine and the blocks are re-seated there (`affinity_violations_total` counts the event). The framework's choice is authoritative about where the request ran; the policy's model follows it.
@@ -106,6 +108,12 @@ The producer must model the tier: `autoTune: false`, `blockSizeTokens` equal to 
 | `blockSizeTokens` | int | `64` | The engine's KV block size in tokens. Must equal vLLM's `--block-size` and thread identity's `blockSizeTokens`; the startup refuses a disagreement, naming both numbers. |
 | `inflightReapSeconds` | float | `9300` | Age beyond which a tracked request is closed by the reap. Must exceed the client's request timeout. |
 | `cpuResidencyProducer` | string | `""` | Name of an `approx-prefix-cache-producer` sized to the CPU tier; orders placement by the tokens each engine would really prefill. Requires `tierCapacityTokens`. `""` = off. |
+| `ownTierIndex` | bool | `false` | The group owns one CPU-tier block LRU per engine, touched at every dispatch (and, with `roomGate`, recorded at every seat); placement's residency read. Requires `tierCapacityTokens`; exclusive with `cpuResidencyProducer`. |
+| `roomGate` | bool | `false` | Seat a head only when its tier write fits the room without evicting a seated block; record its chain at the seat; the cold valve off; room-driven rotation (one per pass, only if it makes room). Requires `ownTierIndex`. |
+| `roomReserveTokens` | int | `0` | Held back from the room on every room test. |
+| `roomHoldMaxSeconds` | float | `90` | The room gate's last resort: a head held this long (from its first room-held pass) is seated anyway. |
+| `newcomersFirst` | bool | `true` | Shared queue order: a thread's first turn before returning threads, then oldest. `false` = oldest first for every head. |
+| `victimOldestDispatch` | bool | `false` | Rotation victims (eligibility unchanged) ordered by the oldest last dispatch instead of queued-turn-first then earliest-seated. |
 
 The parameters are decoded **strictly**: an unknown key fails the startup instead of being ignored.
 
@@ -201,6 +209,13 @@ All series are under `llm_d_epp_group_`. Gauges are rendered at scrape from one 
 | `engine_gone_total` | counter | — | engines torn down by an endpoint delete | follows endpoint churn |
 | `residency_placements_total` | counter | `outcome` (`warmest`, `cold-everywhere`, `not-warmest`) | seats by what the CPU-residency index said about the chosen engine | `not-warmest` small: a warmer engine could not take the head (no fit, its valve, no eligible victim) |
 | `residency_seat_tokens_total` | counter | `engine`, `kind` (`resident`, `cold`) | seated heads' prompt tokens the chosen engine's tier held vs had to prefill | `resident` ≫ 0 for returners; all `cold` means the index keys do not match the chains |
+| `room_held_total` | counter | `engine` | heads the room gate held (once per head) | > 0 under tier pressure; 0 with the gate off |
+| `room_forced_seats_total` | counter | `engine` | heads seated by the gate's last resort | small; a steady rate means the room does not open in time |
+| `room_rotations_total` | counter | `engine` | members rotated out to make room | ≤ room holds |
+| `tier_writes_total` | counter | `engine`, `cause` (`seat`, `dispatch`, `passthrough`, `rebind`) | writes into the group's own tier index | `dispatch` ≈ dispatches; `seat` ≈ seats with the gate |
+| `tier_seated_evictions_total` | counter | `engine`, `cause` | seated (staying) blocks a tier-index write evicted — the in-group loss the gate prevents, in the index's model | ≈ 0 with the gate (a `dispatch` residue is per-turn deltas) |
+| `tier_predicted_cached_tokens_total` / `tier_dispatched_prompt_tokens_total` | counter | `engine` | the own index's prediction at dispatch (before the touch) and its denominator | ratio ≈ the engine's own cached share |
+| `tier_index_blocks` | gauge | `engine` | blocks held by the own tier index | ≤ capacity |
 
 **Anomaly kinds.** `no_tokens_head` — one Pick **pass** saw a thread head with no rendered tokens, so it could not be seated or charged; a render failure, and a rate rather than a request count. `no_request_id` — a turn was released for a request with no id; a boundary guard, 0 in practice because the router assigns every request one. `reaped_inflight` / `reaped_window` — a request (or a released window) outlived the reap and had to be closed by it. They are the signals that a termination was never reported, and **`reaped_window` can be non-zero without anything being wrong**: two framework paths (a head finalised but not swept, and a dispatch whose candidate set came back empty after admission) leave a released request with no later hook, so its window simply ages out and the reap closes it. Read them as "how many records the framework did not come back for", not as a leak.
 

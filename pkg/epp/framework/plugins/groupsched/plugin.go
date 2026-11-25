@@ -180,6 +180,18 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	// The decoded config is echoed at the DEFAULT level, always: a run's configuration must be
 	// verifiable from its own log.
 	r.logger.V(logutil.DEFAULT).Info("group-scheduler: effective config " + configEcho(cfg))
+	if cfg.OwnTierIndex {
+		// THE GATE MUST BE VERIFIABLE FROM THE LOG: a run that cannot show the room gate was on cannot be
+		// read as a result of it.
+		r.logger.V(logutil.DEFAULT).Info("group-scheduler: OWN TIER INDEX ON — one CPU-tier block LRU per engine (capacity tierCapacityTokens/blockSizeTokens), touched at every dispatch; it is placement's residency read",
+			"capacityBlocks", cfg.TierCapacityTokens/int64(cfg.BlockSizeTokens), "roomGate", cfg.RoomGate)
+	}
+	if cfg.RoomGate {
+		r.logger.V(logutil.DEFAULT).Info("group-scheduler: ROOM GATE ON — a head seats only when its tier write fits the room without evicting a seated block; its chain is recorded at the seat; the cold-entry valve is OFF",
+			"roomReserveTokens", cfg.RoomReserveTokens, "roomHoldMaxSeconds", cfg.RoomHoldMaxSeconds,
+			"newcomersFirst", cfg.NewcomersFirst, "victimOldestDispatch", cfg.VictimOldestDispatch,
+			"idleSeconds", cfg.IdleSeconds, "quantum", cfg.Quantum)
+	}
 
 	// The observation wiring is TWO assignments: the core calls the metrics directly (every method
 	// is nil-safe, so a unit-mode run records the same accounting as a live one — the affinity and

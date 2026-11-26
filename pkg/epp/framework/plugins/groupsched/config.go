@@ -117,6 +117,11 @@ type Config struct {
 	// out at once (seat budget freed; an in-flight request finishes and counts on the GPU until it ends)
 	// and queues behind the head. Needs roomGate + roomDisplace; exclusive with the older rotation knobs.
 	FairRotation bool `json:"fairRotation,omitempty"`
+	// CostFairRotation (fairRotation) changes ONE thing — the victim order among quantum-done members: the
+	// highest SEAT TIME ÷ CONTEXT SIZE (time in the group since joining, per tier block it holds) leaves first —
+	// "how much you've had, per what it costs to send you out". Idle members still go first. No constant: both
+	// quantities are measured and the ratio only ranks.
+	CostFairRotation bool `json:"costFairRotation,omitempty"`
 	// NewcomersFirst orders the shared admission queue: true (the default) seats a thread's FIRST turn
 	// before returning threads, then oldest first; false is plain oldest-first for every head.
 	NewcomersFirst bool `json:"newcomersFirst"`
@@ -189,6 +194,9 @@ func (c Config) validate() error {
 		if c.RoomVictims || c.QuantumLastTurn || c.QuantumDoneLast || c.RoomHoldMaxSeconds > 0 {
 			return fmt.Errorf("fairRotation is exclusive with roomVictims, quantumLastTurn, quantumDoneLast and roomHoldMaxSeconds > 0")
 		}
+	}
+	if c.CostFairRotation && !c.FairRotation {
+		return fmt.Errorf("costFairRotation needs fairRotation: it is fair rotation's victim order")
 	}
 	if c.RoomVictims && !c.RoomGate {
 		return fmt.Errorf("roomVictims needs roomGate: it removes members for a head the room gate holds")

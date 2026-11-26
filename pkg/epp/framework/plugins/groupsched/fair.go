@@ -23,7 +23,8 @@ package groupsched
 //   eligible   = quantum done (Q turns this stay, or running the turn that completes them, past its first
 //                token) OR idle (nothing in flight, nothing queued, idleSeconds quiet)
 //   BUDGET     — the head does not fit: remove idle members first (longest idle first), then quantum-done
-//                members by the LONGEST TIME IN THE GROUP since they joined, until it fits
+//                members by the LONGEST TIME IN THE GROUP since they joined (costFairRotation: the highest
+//                seat time ÷ context size), until it fits
 //   ROOM       — counted free + non-member + idle + removed blocks from the tail; a held head removes only
 //                the member whose block ends the walk, and only if it is eligible; otherwise it WAITS
 //   REMOVED    — out at once: no further turns, seat budget free, blocks room; an in-flight request
@@ -73,15 +74,23 @@ func (s *Scheduler) roomEligible(m *thread, now time.Time) bool {
 	return ok
 }
 
-// fairBefore is the budget's victim order: idle first (longest idle first), then the longest time in
-// the group since joining, then the oldest dispatch, then id.
-func fairBefore(ia bool, a *thread, ib bool, b *thread) bool {
+// fairBefore is the budget's victim order: idle first (longest idle first); then among quantum-done members
+// the longest time in the group since joining — or, with costFairRotation, the highest seat time ÷ context
+// size (compared by cross-multiplication: no division, a zero size counts as one block); then the oldest
+// dispatch, then id.
+func (s *Scheduler) fairBefore(g *engineGroup, ia bool, a *thread, ib bool, b *thread, now time.Time) bool {
 	if ia != ib {
 		return ia
 	}
 	if ia {
 		if !a.lastActivity.Equal(b.lastActivity) {
 			return a.lastActivity.Before(b.lastActivity)
+		}
+	} else if s.cfg.CostFairRotation {
+		sa, sb := nonNegative(now.Sub(a.seatTime)), nonNegative(now.Sub(b.seatTime))
+		za, zb := float64(max(1, g.index.ChargedBlocks(a.id))), float64(max(1, g.index.ChargedBlocks(b.id)))
+		if l, r := sa*zb, sb*za; l != r {
+			return l > r
 		}
 	} else if !a.seatTime.Equal(b.seatTime) {
 		return a.seatTime.Before(b.seatTime)
@@ -104,7 +113,7 @@ func (s *Scheduler) fairVictim(g *engineGroup, head *waiter, now time.Time) *thr
 		if !idle && !s.fairQuantumDone(m) {
 			continue
 		}
-		if best == nil || fairBefore(idle, m, bestIdle, best) {
+		if best == nil || s.fairBefore(g, idle, m, bestIdle, best, now) {
 			best, bestIdle = m, idle
 		}
 	}

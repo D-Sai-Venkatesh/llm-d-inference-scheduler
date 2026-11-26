@@ -175,3 +175,61 @@ func TestFairRotationRoomTakesOnlyTheBottom(t *testing.T) {
 		}
 	}
 }
+
+// costFairRotation needs fairRotation (it is fair rotation's victim order, not a design of its own).
+func TestCostFairRotationNeedsFairRotation(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.TierCapacityTokens = 64000
+	cfg.OwnTierIndex = true
+	cfg.RoomGate = true
+	cfg.RoomDisplace = true
+	cfg.RoomHoldMaxSeconds = 0
+	cfg.CostFairRotation = true
+	if _, err := NewScheduler(cfg); err == nil {
+		t.Fatal("costFairRotation without fairRotation must be refused")
+	}
+	cfg.FairRotation = true
+	if _, err := NewScheduler(cfg); err != nil {
+		t.Fatalf("costFairRotation with fairRotation must load: %v", err)
+	}
+}
+
+// The one change: among quantum-done members the highest seat time ÷ context size leaves first. A big member
+// seated long ago (100 s, 300 blocks → 0.33 s/block) stays before a small one seated later (30 s, 50 blocks →
+// 0.6 s/block); plain fair rotation (seat time alone) takes the big one. Idle still goes first in both.
+func TestCostFairRotationOrderIsSeatTimePerBlock(t *testing.T) {
+	for _, cost := range []bool{false, true} {
+		s := roomSched(t, true, func(c *Config) {
+			c.RoomDisplace = true
+			c.RoomHoldMaxSeconds = 0
+			c.Quantum = 4
+			c.NewcomersFirst = true
+			c.FairRotation = true
+			c.CostFairRotation = cost
+		})
+		runTurn(t, s, headN("i", 0, time.Second, chain("i", 40)), epoch) // i: one turn, then silent (idle)
+		for k, at := range []int{0, 30, 60, 90} {                        // big: seated at 0, 4 turns
+			runTurn(t, s, headN("big", k, time.Second, chain("big", 300)), epoch.Add(time.Duration(at)*time.Second))
+		}
+		for k, at := range []int{70, 80, 90, 95} { // small: seated at 70, 4 turns
+			runTurn(t, s, headN("small", k, time.Second, chain("small", 50)), epoch.Add(time.Duration(at)*time.Second))
+		}
+		now := epoch.Add(100 * time.Second)
+		var order []string
+		for k := 0; k < 3; k++ {
+			s.mu.Lock()
+			if v := s.fairVictim(s.groups[""], nil, now); v != nil {
+				order = append(order, v.id)
+				s.exit(s.groups[""], v, "test", now)
+			}
+			s.mu.Unlock()
+		}
+		want := "[i big small]"
+		if cost {
+			want = "[i small big]"
+		}
+		if fmt.Sprint(order) != want {
+			t.Fatalf("costFairRotation=%v: victim order %v, want %s", cost, order, want)
+		}
+	}
+}

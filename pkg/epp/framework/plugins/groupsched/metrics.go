@@ -79,6 +79,7 @@ type groupMetrics struct {
 	qlMarks         *prometheus.CounterVec
 	stayTurns       *prometheus.HistogramVec
 	staySeconds     *prometheus.HistogramVec
+	stayBlocks      *prometheus.HistogramVec
 }
 
 // subsystem namespaces every series (llm_d_epp_group_*).
@@ -158,6 +159,9 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.staySeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "exit_stay_seconds",
 		Help:    "wall-clock seconds a member spent in the group in the stay it is leaving, by exit reason (fairRotation shares this)",
 		Buckets: []float64{30, 60, 120, 240, 480, 900, 1800, 3600, 7200}}, []string{"engine", "reason"})
+	g.stayBlocks = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "exit_stay_blocks",
+		Help:    "tier blocks a member held when it left (its context size), by exit reason (costFairRotation picks smaller ones)",
+		Buckets: []float64{250, 500, 750, 1000, 1250, 1500, 2000, 3000, 4000}}, []string{"engine", "reason"})
 	g.tierPromptTotal = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_dispatched_prompt_tokens_total",
 		Help: "prompt tokens of every turn tier_predicted_cached_tokens_total was read for — its denominator"}, engineLabels)
 
@@ -172,7 +176,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.affinityViolations, g.engineGone, g.coldValveHeld, g.anomalies, g.runGateHeld,
 		g.residencyPlacements, g.residencySeatTokens,
 		g.roomHeld, g.roomForced, g.roomRotations, g.tierWrites, g.seatedEvicted, g.tierPredicted, g.tierPromptTotal,
-		g.roomHold, g.roomBlocker, g.qdDeferred, g.qlMarks, g.stayTurns, g.staySeconds,
+		g.roomHold, g.roomBlocker, g.qdDeferred, g.qlMarks, g.stayTurns, g.staySeconds, g.stayBlocks,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
@@ -278,6 +282,14 @@ func (g *groupMetrics) ObserveStayTurns(engine, reason string, turns int) {
 		return
 	}
 	g.stayTurns.WithLabelValues(engine, reason).Observe(float64(turns))
+}
+
+// ObserveStayBlocks records the tier blocks a leaving member held.
+func (g *groupMetrics) ObserveStayBlocks(engine, reason string, blocks int) {
+	if g == nil || g.stayBlocks == nil {
+		return
+	}
+	g.stayBlocks.WithLabelValues(engine, reason).Observe(float64(blocks))
 }
 
 // ObserveStaySeconds records the wall-clock seconds of the stay a leaving member had.

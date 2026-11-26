@@ -229,6 +229,7 @@ func (s *Scheduler) budgetVictim(g *engineGroup, now time.Time) (string, *thread
 
 // exit unseats one thread.
 func (s *Scheduler) exit(g *engineGroup, m *thread, reason string, now time.Time) {
+	s.metrics.ObserveStayBlocks(engineLabel(g.id), reason, g.index.ChargedBlocks(m.id))
 	s.releaseCold(g, m.id) // unseat releases the charge
 	g.index.Unseat(m.id)   // and the exact chains leave the budget here
 	delete(g.threads, m.id)

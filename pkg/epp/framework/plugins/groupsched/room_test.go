@@ -367,6 +367,9 @@ func TestRoomGateReplay(t *testing.T) {
 		if len(qdLast) > 3 { // (false, false, false, true) = newcomers-first + fairRotation
 			cfg.FairRotation = qdLast[3]
 		}
+		if len(qdLast) > 4 { // (…, true, true) = + costFairRotation
+			cfg.CostFairRotation = qdLast[4]
+		}
 		cfg.TierCapacityTokens = tierBlocks * 64
 		cfg.OwnTierIndex = true
 		cfg.RoomGate = true
@@ -470,6 +473,16 @@ func TestRoomGateReplay(t *testing.T) {
 		t.Logf("seed %d tier %d: NF+fairRotation: staying evicted %d (dispatch protected %d / eligible %d), displaced %d; held %d; head victims %d; exits %v; served %d",
 			seed, tc.tier, fr, frSnap.Room.SeatedEvicted[tierCauseDispatch], frSnap.Room.SeatedEvicted[tierCauseDispatch+"-eligible"],
 			frSnap.Room.SeatedEvicted[tierCauseDisplaced], frSnap.Room.Held, frSnap.Room.HeadVictims, frSnap.Exits, frSnap.Served)
+		cf, cfSnap := seatedEvictedDisplace(seed, tc.tier, false, false, false, true, true)
+		if cfSnap.Room.Forced != 0 || cfSnap.Room.Rotations != 0 || cfSnap.Room.SeatedEvicted[tierCauseSeat] != 0 {
+			t.Fatalf("seed %d: costFairRotation: no forced seat, no room rotation, no seat-caused protected eviction, got %+v", seed, cfSnap.Room)
+		}
+		if cfSnap.Served < offSnap.Served/2 {
+			t.Fatalf("seed %d: costFairRotation must not starve the workload: served %d vs %d", seed, cfSnap.Served, offSnap.Served)
+		}
+		t.Logf("seed %d tier %d: costFairRotation: staying evicted %d (dispatch protected %d / eligible %d), displaced %d; held %d; exits %v; served %d",
+			seed, tc.tier, cf, cfSnap.Room.SeatedEvicted[tierCauseDispatch], cfSnap.Room.SeatedEvicted[tierCauseDispatch+"-eligible"],
+			cfSnap.Room.SeatedEvicted[tierCauseDisplaced], cfSnap.Room.Held, cfSnap.Exits, cfSnap.Served)
 		t.Logf("seed %d tier %d: NF+qLastTurn: staying blocks evicted %d (dispatch protected %d / eligible %d), displaced %d; held %d; marks %d; served %d",
 			seed, tc.tier, ln, lnSnap.Room.SeatedEvicted[tierCauseDispatch], lnSnap.Room.SeatedEvicted[tierCauseDispatch+"-eligible"],
 			lnSnap.Room.SeatedEvicted[tierCauseDisplaced], lnSnap.Room.Held, lnSnap.Room.QuantumLastMarks, lnSnap.Served)

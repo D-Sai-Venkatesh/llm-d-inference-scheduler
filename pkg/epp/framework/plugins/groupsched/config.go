@@ -135,6 +135,13 @@ type Config struct {
 	// and a waiting turn's priority keeps growing, so nobody starves. No constant: both are measured. Plain
 	// oldest-first without it. Exclusive with quantumDoneLast (one in-group order).
 	SizeWaitOrder bool `json:"sizeWaitOrder,omitempty"`
+	// LeastRecentlyServed is THE STRICT RULE for the order of the SEATED members' turns at the dispatch gate
+	// (protect.go): the member served longest ago (the router's own clock; the first turn of a stay first of
+	// all; ties by arrival) is the candidate — unless its write would evict blocks of a protectable queued
+	// member and serving that member first is a net save in blocks; then that member goes first. No constant,
+	// no exchange rate; cache state decides only who is in a write's danger zone. Needs ownTierIndex. Exclusive
+	// with the other in-group orders (sizeWaitOrder, quantumDoneLast).
+	LeastRecentlyServed bool `json:"leastRecentlyServed,omitempty"`
 	// NewcomersFirst orders the shared admission queue: true (the default) seats a thread's FIRST turn
 	// before returning threads, then oldest first; false is plain oldest-first for every head.
 	NewcomersFirst bool `json:"newcomersFirst"`
@@ -211,8 +218,11 @@ func (c Config) validate() error {
 			return fmt.Errorf("fairRotation is exclusive with roomVictims, quantumLastTurn, quantumDoneLast and roomHoldMaxSeconds > 0")
 		}
 	}
-	if c.SizeWaitOrder && c.QuantumDoneLast {
-		return fmt.Errorf("sizeWaitOrder and quantumDoneLast are both in-group orders: choose one")
+	if c.LeastRecentlyServed && !c.OwnTierIndex {
+		return fmt.Errorf("leastRecentlyServed needs ownTierIndex: its protection step reads each write's danger zone from the group's own tier index")
+	}
+	if n := btoi(c.SizeWaitOrder) + btoi(c.QuantumDoneLast) + btoi(c.LeastRecentlyServed); n > 1 {
+		return fmt.Errorf("sizeWaitOrder, quantumDoneLast and leastRecentlyServed are in-group orders: choose one")
 	}
 	if c.CostFairRotation && !c.FairRotation {
 		return fmt.Errorf("costFairRotation needs fairRotation: it is fair rotation's victim order")
@@ -256,4 +266,11 @@ func configEcho(cfg Config) string {
 		parts = append(parts, fmt.Sprintf("%s=%v", k, fields[k]))
 	}
 	return strings.Join(parts, " ")
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

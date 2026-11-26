@@ -117,6 +117,11 @@ type thread struct {
 	// dispatch, or its seat (with roomGate the seat records the chain). victimOldestDispatch orders the
 	// rotation victims by it.
 	lastDispatch time.Time
+	// lastServed is this thread's last DISPATCH in this stay — set only at dispatch (never at the seat), so it is
+	// zero until the stay's first turn goes out. It is when vLLM last touched the chain (its lookup touches the
+	// whole chain; the turn's new prompt blocks are stored right after; decode output never is), so "served
+	// longest ago" is "closest to the tier's eviction end". leastRecentlyServed orders the seated turns by it.
+	lastServed time.Time
 	// seatTierResident is the tier-resident prefix (tokens) the group's own index read for this
 	// thread's head at the seat, BEFORE the seat recorded it; seatTierPending marks that the first
 	// dispatch after the seat must report it (a read after the seat's record would say "all resident").
@@ -252,6 +257,11 @@ type engineGroup struct {
 	// tier is the group's OWN model of this engine's CPU tier (ownTierIndex): created with the
 	// engine's capacity, touched at every dispatch and (roomGate) recorded at every seat. nil = off.
 	tier *approximateprefix.TierLRU
+	// protectStreak / protectSince (leastRecentlyServed): protections in a row on this engine since its last
+	// unprotected dispatch, and when the first of them happened — observed when the next candidate is served
+	// (the strict rule has no bound; this measures what one would have capped).
+	protectStreak int
+	protectSince  time.Time
 	// tierCause names what the tier index is being written for right now (seat / dispatch /
 	// passthrough / rebind), so its eviction observer can book a seated block's eviction by cause.
 	tierCause string
@@ -304,6 +314,9 @@ func engineLabel(id string) string { return id }
 type Scheduler struct {
 	mu  sync.Mutex
 	cfg Config
+	// plainLRS (tests only) turns the strict rule's protection off — leastRecentlyServed becomes the bare time
+	// order, so the replay can compare the two on the same seeds. Never set by configuration.
+	plainLRS bool
 	// metrics is the Prometheus surface. Every observation is a DIRECT call on it, and every
 	// method is nil-safe, so a bare Scheduler (the unit tests) records nothing without any
 	// wiring.
@@ -382,8 +395,13 @@ type Scheduler struct {
 		// fairTailSaved sums, over budget victims (costFairRotation), the staying blocks at the tail that their
 		// leaving took off the head's write (thrash avoided ungated; room unblocked gated)
 		fairTailSaved int64
-		// sizeWaitOvertakes counts dispatches where sizeWaitOrder's head was not the oldest seated turn
+		// sizeWaitOvertakes counts dispatches where the in-group order's head (sizeWaitOrder or
+		// leastRecentlyServed) was not the oldest seated turn
 		sizeWaitOvertakes int64
+		// protected / protectedBlocks / protectDeclined (leastRecentlyServed): dispatches where a member at risk
+		// was served before the candidate, the blocks that saved, and dispatches where members were at risk but
+		// no protection was a net save
+		protected, protectedBlocks, protectDeclined int64
 	}
 }
 
@@ -770,8 +788,13 @@ type RoomSnapshot struct {
 	FairRemovals map[string]int64 `json:"fairRemovals,omitempty"`
 	// FairTailSaved: staying tail blocks the cost-fair victims' leaving took off heads' writes
 	FairTailSaved int64 `json:"fairTailSaved,omitempty"`
-	// SizeWaitOvertakes: dispatches whose head (sizeWaitOrder) overtook an older seated turn
+	// SizeWaitOvertakes: dispatches whose head (sizeWaitOrder / leastRecentlyServed) overtook an older seated turn
 	SizeWaitOvertakes int64 `json:"sizeWaitOvertakes,omitempty"`
+	// Protected / ProtectedBlocks / ProtectDeclined: the strict rule's protections, the blocks they saved, and
+	// the at-risk cases where no protection was a net save
+	Protected       int64 `json:"protected,omitempty"`
+	ProtectedBlocks int64 `json:"protectedBlocks,omitempty"`
+	ProtectDeclined int64 `json:"protectDeclined,omitempty"`
 }
 
 // Snapshot is the whole-policy view of the state machine: DumpState serialises it and the scrape
@@ -876,6 +899,9 @@ func (s *Scheduler) snapshot(now time.Time) Snapshot {
 			}
 			room.FairTailSaved = s.counters.fairTailSaved
 			room.SizeWaitOvertakes = s.counters.sizeWaitOvertakes
+			room.Protected = s.counters.protected
+			room.ProtectedBlocks = s.counters.protectedBlocks
+			room.ProtectDeclined = s.counters.protectDeclined
 		}
 		room.Blockers = map[string]int64{}
 		for _, b := range blockerStates {

@@ -387,9 +387,15 @@ func TestRoomGateReplay(t *testing.T) {
 			cfg.SizeWaitOrder = true
 			cfg.Quantum = 4
 		}
+		if len(qdLast) > 8 && qdLast[8] { // (…, false, true) = + leastRecentlyServed: arm B + the inside-group order
+			cfg.LeastRecentlyServed = true
+		}
 		s, err := NewScheduler(cfg)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if len(qdLast) > 9 && qdLast[9] { // (…, true, true) = leastRecentlyServed WITHOUT protection (plain time order)
+			s.plainLRS = true
 		}
 		var out strings.Builder
 		var bad error
@@ -513,6 +519,24 @@ func TestRoomGateReplay(t *testing.T) {
 		}
 		t.Logf("seed %d tier %d: UNGATED cost-fair VALVE OFF: staying evicted %d (dispatch %d) vs valve on %d; tail saved %d; exits %v; served %d",
 			seed, tc.tier, uv, uvSnap.Room.SeatedEvicted[tierCauseDispatch], ug, uvSnap.Room.FairTailSaved, uvSnap.Exits, uvSnap.Served)
+		lr, lrSnap := seatedEvictedDisplace(seed, tc.tier, false, false, false, true, true, true, true, false, true)
+		if lrSnap.Room.Forced != 0 || lrSnap.Room.Held != 0 {
+			t.Fatalf("seed %d: arm B + leastRecentlyServed never holds or forces, got %+v", seed, lrSnap.Room)
+		}
+		if lrSnap.Served < offSnap.Served/2 {
+			t.Fatalf("seed %d: arm B + leastRecentlyServed must not starve the workload: served %d vs %d", seed, lrSnap.Served, offSnap.Served)
+		}
+		if lrSnap.Room.SizeWaitOvertakes == 0 {
+			t.Fatalf("seed %d: leastRecentlyServed must reorder at least once", seed)
+		}
+		pl, plSnap := seatedEvictedDisplace(seed, tc.tier, false, false, false, true, true, true, true, false, true, true)
+		per := func(n int64, sn Snapshot) float64 { return float64(n) / float64(max(sn.Served, 1)) }
+		t.Logf("seed %d tier %d: STAYING EVICTED PER SERVED  arm B %.2f | plain LRS %.2f | STRICT RULE %.2f   (served %d | %d | %d; protected %d (%d blocks), declined %d)",
+			seed, tc.tier, per(uv, uvSnap), per(pl, plSnap), per(lr, lrSnap), uvSnap.Served, plSnap.Served, lrSnap.Served,
+			lrSnap.Room.Protected, lrSnap.Room.ProtectedBlocks, lrSnap.Room.ProtectDeclined)
+		if plSnap.Room.Protected != 0 {
+			t.Fatalf("seed %d: plain LRS must never protect", seed)
+		}
 		sw, swSnap := seatedEvictedDisplace(seed, tc.tier, false, false, false, true, false, false, false, true)
 		if swSnap.Room.Forced != 0 || swSnap.Room.Rotations != 0 || swSnap.Room.SeatedEvicted[tierCauseSeat] != 0 {
 			t.Fatalf("seed %d: fair q4 + sizeWaitOrder: no forced seat, no rotation, no seat-caused protected eviction, got %+v", seed, swSnap.Room)

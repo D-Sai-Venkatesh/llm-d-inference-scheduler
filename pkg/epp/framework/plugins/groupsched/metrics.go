@@ -82,6 +82,10 @@ type groupMetrics struct {
 	stayBlocks      *prometheus.HistogramVec
 	fairTailSaved   *prometheus.CounterVec
 	sizeWaitOver    *prometheus.CounterVec
+	protect         *prometheus.CounterVec
+	protectBlocks   *prometheus.CounterVec
+	protectStreak   *prometheus.HistogramVec
+	protectStreakS  *prometheus.HistogramVec
 }
 
 // subsystem namespaces every series (llm_d_epp_group_*).
@@ -167,9 +171,21 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.fairTailSaved = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "fair_tail_saved_blocks_total",
 		Help: "staying blocks at the tier tail that cost-fair budget victims' leaving took off the head's write (ungated: thrash avoided; gated: room unblocked)"},
 		[]string{"engine"})
-	g.sizeWaitOver = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "size_wait_overtakes_total",
-		Help: "dispatches where sizeWaitOrder's head (a first turn, or the highest prompt tokens × time waited) overtook an older seated turn"},
+	g.sizeWaitOver = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "dispatch_overtakes_total",
+		Help: "dispatches where the in-group order's head (sizeWaitOrder / leastRecentlyServed) overtook an older seated turn, by order"},
+		[]string{"engine", "order"})
+	g.protect = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "protect_first_total",
+		Help: "leastRecentlyServed's protection step, by outcome: protected (a member at risk from the candidate's write served first) / declined (at risk, but no net save)"},
+		[]string{"engine", "outcome"})
+	g.protectBlocks = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "protect_first_blocks_total",
+		Help: "blocks of protected members that were in the candidate's danger zone (what the protections saved)"},
 		[]string{"engine"})
+	g.protectStreak = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "protect_streak",
+		Help:    "protections in a row before the next unprotected dispatch (the strict rule has no bound: this is what one would cap)",
+		Buckets: []float64{1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64}}, []string{"engine"})
+	g.protectStreakS = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "protect_streak_seconds",
+		Help:    "seconds from a streak's first protection to the next unprotected dispatch (the candidate's extra wait)",
+		Buckets: []float64{0.5, 1, 2, 4, 8, 16, 30, 60, 120, 240}}, []string{"engine"})
 	g.tierPromptTotal = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_dispatched_prompt_tokens_total",
 		Help: "prompt tokens of every turn tier_predicted_cached_tokens_total was read for — its denominator"}, engineLabels)
 
@@ -185,6 +201,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.residencyPlacements, g.residencySeatTokens,
 		g.roomHeld, g.roomForced, g.roomRotations, g.tierWrites, g.seatedEvicted, g.tierPredicted, g.tierPromptTotal,
 		g.roomHold, g.roomBlocker, g.qdDeferred, g.qlMarks, g.stayTurns, g.staySeconds, g.stayBlocks, g.fairTailSaved, g.sizeWaitOver,
+		g.protect, g.protectBlocks, g.protectStreak, g.protectStreakS,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
@@ -292,12 +309,32 @@ func (g *groupMetrics) ObserveStayTurns(engine, reason string, turns int) {
 	g.stayTurns.WithLabelValues(engine, reason).Observe(float64(turns))
 }
 
-// ObserveSizeWaitOvertake counts one dispatch whose head overtook an older seated turn (sizeWaitOrder).
-func (g *groupMetrics) ObserveSizeWaitOvertake(engine string) {
+// ObserveProtect counts one protection-step outcome (protected / declined) and, for a protection, its blocks.
+func (g *groupMetrics) ObserveProtect(engine, outcome string, blocks int) {
+	if g == nil || g.protect == nil {
+		return
+	}
+	g.protect.WithLabelValues(engine, outcome).Inc()
+	if blocks > 0 {
+		g.protectBlocks.WithLabelValues(engine).Add(float64(blocks))
+	}
+}
+
+// ObserveProtectStreak records one ended streak: its protections and the candidate's extra wait.
+func (g *groupMetrics) ObserveProtectStreak(engine string, n int, seconds float64) {
+	if g == nil || g.protectStreak == nil {
+		return
+	}
+	g.protectStreak.WithLabelValues(engine).Observe(float64(n))
+	g.protectStreakS.WithLabelValues(engine).Observe(seconds)
+}
+
+// ObserveDispatchOvertake counts one dispatch whose head overtook an older seated turn, by in-group order.
+func (g *groupMetrics) ObserveDispatchOvertake(engine, order string) {
 	if g == nil || g.sizeWaitOver == nil {
 		return
 	}
-	g.sizeWaitOver.WithLabelValues(engine).Inc()
+	g.sizeWaitOver.WithLabelValues(engine, order).Inc()
 }
 
 // ObserveFairTailSaved adds the staying tail blocks a cost-fair victim's leaving took off a head's write.

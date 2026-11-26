@@ -184,8 +184,9 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		perEngine[g.id] = append(perEngine[g.id], cand{i: i, h: h, engine: g.id})
 	}
 	type best struct {
-		c     cand
-		score float64
+		c         cand
+		score     float64
+		protected bool
 	}
 	var winner *best
 	for _, g := range groups {
@@ -197,7 +198,16 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		// other member's (oldest-first within each class); with nobody waiting, plain oldest-first
 		qdLast := s.cfg.QuantumDoneLast && len(s.waiters) > 0
 		sizeWait := s.cfg.SizeWaitOrder
+		lrs := s.cfg.LeastRecentlyServed
 		sort.SliceStable(cands, func(x, y int) bool {
+			if lrs {
+				// least recently served first (the stalest chain); a member not yet served this stay (zero) before
+				// everyone; ties fall through to arrival order
+				lx, ly := g.threads[cands[x].h.Thread].lastServed, g.threads[cands[y].h.Thread].lastServed
+				if !lx.Equal(ly) {
+					return lx.Before(ly)
+				}
+			}
 			if qdLast {
 				dx, dy := s.quantumDone(g, cands[x].h.Thread), s.quantumDone(g, cands[y].h.Thread)
 				if dx != dy {
@@ -221,14 +231,37 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		})
 		// the head of the order (oldest-first, or sizeWaitOrder's) is the first one
 		chosen := &cands[0]
-		if sizeWait {
+		if sizeWait || lrs {
 			for _, c := range cands[1:] {
 				if c.h.Arrival.Before(chosen.h.Arrival) {
-					// an older turn was overtaken by a bigger (or a first) one: count it (proof it fires)
+					// an older turn was overtaken by the in-group order's choice: count it (proof it fires)
+					order := "size-wait"
+					if lrs {
+						order = "least-recently-served"
+					}
 					s.counters.sizeWaitOvertakes++
-					s.metrics.ObserveSizeWaitOvertake(engineLabel(g.id))
+					s.metrics.ObserveDispatchOvertake(engineLabel(g.id), order)
 					break
 				}
+			}
+		}
+		// THE STRICT RULE's step 2 (protect.go): the time order's candidate goes, unless its write would evict a
+		// protectable queued member's blocks and serving that member first is a net save
+		protected := false
+		if lrs && !s.plainLRS && g.tier != nil && len(cands) > 1 {
+			rest := make([]Head, len(cands)-1)
+			for k := range rest {
+				rest[k] = cands[k+1].h
+			}
+			j, a, declined := s.protectFirst(g, cands[0].h, rest)
+			if j >= 0 {
+				chosen, protected = &cands[j+1], true
+				s.counters.protected++
+				s.counters.protectedBlocks += int64(a)
+				s.metrics.ObserveProtect(engineLabel(g.id), "protected", a)
+			} else if declined {
+				s.counters.protectDeclined++
+				s.metrics.ObserveProtect(engineLabel(g.id), "declined", 0)
 			}
 		}
 		if qdLast && !s.quantumDone(g, chosen.h.Thread) {
@@ -252,12 +285,22 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		if winner == nil || score > winner.score ||
 			(score == winner.score && chosen.h.Arrival.Before(winner.c.h.Arrival)) ||
 			(score == winner.score && chosen.h.Arrival.Equal(winner.c.h.Arrival) && g.id < winner.c.engine) {
-			winner = &best{c: *chosen, score: score}
+			winner = &best{c: *chosen, score: score, protected: protected}
 		}
 	}
 	if winner != nil {
 		g := s.groups[winner.c.engine]
 		m := g.threads[winner.c.h.Thread]
+		// the strict rule's streak: protections in a row, closed (and observed) by the next unprotected dispatch
+		if winner.protected {
+			if g.protectStreak == 0 {
+				g.protectSince = now
+			}
+			g.protectStreak++
+		} else if g.protectStreak > 0 {
+			s.metrics.ObserveProtectStreak(engineLabel(g.id), g.protectStreak, now.Sub(g.protectSince).Seconds())
+			g.protectStreak = 0
+		}
 		// THE OBSERVABLES ARE READ BEFORE THE CHARGE: the resident prefix as the decision found it.
 		// Read after the Grow it would be the whole chain every time — a 100% predicted hit rate
 		// that measures nothing.
@@ -275,6 +318,7 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 			s.recordTier(g, winner.c.h.Chains, tierCauseDispatch)
 		}
 		m.lastDispatch = now
+		m.lastServed = now
 		// The request is RELEASED: it is neither queued nor in flight until PreRequest records it,
 		// and the record written here is what every later hook resolves it by.
 		s.release(m, winner.c.h.ReqID, winner.c.h.Chains, now, obs)

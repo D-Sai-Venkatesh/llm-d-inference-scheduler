@@ -136,3 +136,17 @@ func TestTierLRUTailRoomSkipBeforeStop(t *testing.T) {
 	// free 2 + walk: shared (own: skipped, not a stop) then the 2 outside blocks
 	require.Equal(t, 4, tl.TailRoom(100, is(shared), is(shared)))
 }
+
+// TailKeys walks from the eviction end, skipping what skip reports, and stops at n.
+func TestTierLRUTailKeys(t *testing.T) {
+	l := NewTierLRU(10)
+	l.AddChain([]prefixhash.BlockHash{1, 2, 3})
+	l.AddChain([]prefixhash.BlockHash{4, 5})
+	got := l.TailKeys(3, func(k prefixhash.BlockHash) bool { return k == 2 })
+	if len(got) != 3 || got[0] == 2 || got[1] == 2 || got[2] == 2 {
+		t.Fatalf("TailKeys must skip 2 and return 3 keys from the tail, got %v", got)
+	}
+	if n := len(l.TailKeys(99, nil)); n != 5 {
+		t.Fatalf("TailKeys is bounded by the resident keys: got %d", n)
+	}
+}

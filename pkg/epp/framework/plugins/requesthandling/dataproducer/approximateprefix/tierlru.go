@@ -99,6 +99,20 @@ func (t *TierLRU) TailRoom(need int, skip, stop func(prefixhash.BlockHash) bool)
 	return room
 }
 
+// TailKeys is the first n keys from the eviction end, skipping those skip reports (the inserting chain's own
+// blocks, refreshed by its own touch): the blocks a write of n blocks beyond the free capacity evicts.
+func (t *TierLRU) TailKeys(n int, skip func(prefixhash.BlockHash) bool) []prefixhash.BlockHash {
+	out := make([]prefixhash.BlockHash, 0, max(n, 0))
+	for i := t.l.tail; i != nodeNil && len(out) < n; i = t.l.nodes[i].prev {
+		k := t.l.nodes[i].key
+		if skip != nil && skip(k) {
+			continue
+		}
+		out = append(out, k)
+	}
+	return out
+}
+
 // TailRoomStop is TailRoom plus the key that ended the walk (stopped = a protected block ended it before
 // need was reached): the room gate's diagnostic of WHAT holds a head.
 func (t *TierLRU) TailRoomStop(need int, skip, stop func(prefixhash.BlockHash) bool) (int, prefixhash.BlockHash, bool) {

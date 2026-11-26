@@ -80,6 +80,7 @@ type groupMetrics struct {
 	stayTurns       *prometheus.HistogramVec
 	staySeconds     *prometheus.HistogramVec
 	stayBlocks      *prometheus.HistogramVec
+	fairTailSaved   *prometheus.CounterVec
 }
 
 // subsystem namespaces every series (llm_d_epp_group_*).
@@ -162,6 +163,9 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.stayBlocks = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "exit_stay_blocks",
 		Help:    "tier blocks a member held when it left (its context size), by exit reason (costFairRotation picks smaller ones)",
 		Buckets: []float64{250, 500, 750, 1000, 1250, 1500, 2000, 3000, 4000}}, []string{"engine", "reason"})
+	g.fairTailSaved = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "fair_tail_saved_blocks_total",
+		Help: "staying blocks at the tier tail that cost-fair budget victims' leaving took off the head's write (ungated: thrash avoided; gated: room unblocked)"},
+		[]string{"engine"})
 	g.tierPromptTotal = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_dispatched_prompt_tokens_total",
 		Help: "prompt tokens of every turn tier_predicted_cached_tokens_total was read for — its denominator"}, engineLabels)
 
@@ -176,7 +180,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.affinityViolations, g.engineGone, g.coldValveHeld, g.anomalies, g.runGateHeld,
 		g.residencyPlacements, g.residencySeatTokens,
 		g.roomHeld, g.roomForced, g.roomRotations, g.tierWrites, g.seatedEvicted, g.tierPredicted, g.tierPromptTotal,
-		g.roomHold, g.roomBlocker, g.qdDeferred, g.qlMarks, g.stayTurns, g.staySeconds, g.stayBlocks,
+		g.roomHold, g.roomBlocker, g.qdDeferred, g.qlMarks, g.stayTurns, g.staySeconds, g.stayBlocks, g.fairTailSaved,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
@@ -282,6 +286,14 @@ func (g *groupMetrics) ObserveStayTurns(engine, reason string, turns int) {
 		return
 	}
 	g.stayTurns.WithLabelValues(engine, reason).Observe(float64(turns))
+}
+
+// ObserveFairTailSaved adds the staying tail blocks a cost-fair victim's leaving took off a head's write.
+func (g *groupMetrics) ObserveFairTailSaved(engine string, blocks int) {
+	if g == nil || g.fairTailSaved == nil {
+		return
+	}
+	g.fairTailSaved.WithLabelValues(engine).Add(float64(blocks))
 }
 
 // ObserveStayBlocks records the tier blocks a leaving member held.

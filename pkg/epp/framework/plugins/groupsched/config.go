@@ -118,9 +118,11 @@ type Config struct {
 	// and queues behind the head. Needs roomGate + roomDisplace; exclusive with the older rotation knobs.
 	FairRotation bool `json:"fairRotation,omitempty"`
 	// CostFairRotation (fairRotation) changes ONE thing — the victim order among quantum-done members: the
-	// highest SEAT TIME ÷ CONTEXT SIZE (time in the group since joining, per tier block it holds) leaves first —
-	// "how much you've had, per what it costs to send you out". Idle members still go first. No constant: both
-	// quantities are measured and the ratio only ranks.
+	// highest SEAT TIME ÷ COST leaves first, cost = the blocks only it holds among staying members (what its
+	// leaving frees and it will rebuild) + the staying members' blocks the head's write evicts from the tail
+	// anyway − those it alone holds there (its leaving turns that thrash, or that room-blocking, into its own
+	// loss). "How much you've had, per what sending you out costs." Idle members still go first. No constant:
+	// every term is measured blocks and the ratio only ranks. Gated or not (roomGate) — the same formula.
 	CostFairRotation bool `json:"costFairRotation,omitempty"`
 	// NewcomersFirst orders the shared admission queue: true (the default) seats a thread's FIRST turn
 	// before returning threads, then oldest first; false is plain oldest-first for every head.
@@ -187,8 +189,11 @@ func (c Config) validate() error {
 		return fmt.Errorf("roomReserveTokens must be >= 0, got %d", c.RoomReserveTokens)
 	}
 	if c.FairRotation {
-		if !c.RoomGate || !c.RoomDisplace {
-			return fmt.Errorf("fairRotation needs roomGate and roomDisplace: it is the room gate's rotation, and its room counts idle members' blocks")
+		if !c.OwnTierIndex {
+			return fmt.Errorf("fairRotation needs ownTierIndex: its order and removal read the group's own tier index")
+		}
+		if c.RoomGate && !c.RoomDisplace {
+			return fmt.Errorf("fairRotation with roomGate needs roomDisplace: its room counts idle members' blocks")
 		}
 		// ONE design, not a stack: the earlier experimental rotation switches cannot ride along
 		if c.RoomVictims || c.QuantumLastTurn || c.QuantumDoneLast || c.RoomHoldMaxSeconds > 0 {

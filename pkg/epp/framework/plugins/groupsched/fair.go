@@ -74,11 +74,60 @@ func (s *Scheduler) roomEligible(m *thread, now time.Time) bool {
 	return ok
 }
 
+// fairTail is what a head's write would evict on g (costFairRotation): the blocks beyond the tier's free
+// capacity, from the eviction end, the head's own blocks skipped (its own touch refreshes them), and how
+// many of them a STAYING member holds (t0). Empty with no head (the growth path) or no tier.
+type fairTail struct {
+	bottom map[Hash]struct{}
+	t0     int
+}
+
+func (s *Scheduler) fairTailFor(g *engineGroup, head *waiter) fairTail {
+	var ft fairTail
+	if head == nil || g.tier == nil {
+		return ft
+	}
+	resident := s.residentTokens(head.chains, []*engineGroup{g})
+	n := s.roomNeed(physCold(PromptTokens(head.chains), resident, 0)) - (g.tier.Cap() - g.tier.Len())
+	if n <= 0 {
+		return ft
+	}
+	own := head.ownKeys()
+	keys := g.tier.TailKeys(n, func(k Hash) bool { _, ok := own[k]; return ok })
+	ft.bottom = make(map[Hash]struct{}, len(keys))
+	for _, k := range keys {
+		ft.bottom[k] = struct{}{}
+		if g.index.blocksStay[k] > 0 {
+			ft.t0++
+		}
+	}
+	return ft
+}
+
+// fairCost is what sending m out costs, in blocks (>= 1): the blocks only m holds among staying members
+// (what its leaving frees, and what it will rebuild) + the staying blocks the head's write evicts anyway −
+// those m alone holds there; saved = that last term (the thrash, or the room block, its leaving removes).
+func (s *Scheduler) fairCost(g *engineGroup, m *thread, ft fairTail) (cost, saved int) {
+	sb := g.index.seats[m.id]
+	if sb == nil {
+		return 1, 0
+	}
+	excl := 0
+	for h := range sb.charged {
+		if g.index.blocksStay[h] == 1 { // m is the only staying holder
+			excl++
+			if _, ok := ft.bottom[h]; ok {
+				saved++
+			}
+		}
+	}
+	return max(1, excl+ft.t0-saved), saved
+}
+
 // fairBefore is the budget's victim order: idle first (longest idle first); then among quantum-done members
-// the longest time in the group since joining — or, with costFairRotation, the highest seat time ÷ context
-// size (compared by cross-multiplication: no division, a zero size counts as one block); then the oldest
-// dispatch, then id.
-func (s *Scheduler) fairBefore(g *engineGroup, ia bool, a *thread, ib bool, b *thread, now time.Time) bool {
+// the longest time in the group since joining — or, with costFairRotation, the highest seat time ÷ cost
+// (compared by cross-multiplication: no division); then the oldest dispatch, then id.
+func (s *Scheduler) fairBefore(ia bool, a *thread, ca int, ib bool, b *thread, cb int, now time.Time) bool {
 	if ia != ib {
 		return ia
 	}
@@ -88,8 +137,7 @@ func (s *Scheduler) fairBefore(g *engineGroup, ia bool, a *thread, ib bool, b *t
 		}
 	} else if s.cfg.CostFairRotation {
 		sa, sb := nonNegative(now.Sub(a.seatTime)), nonNegative(now.Sub(b.seatTime))
-		za, zb := float64(max(1, g.index.ChargedBlocks(a.id))), float64(max(1, g.index.ChargedBlocks(b.id)))
-		if l, r := sa*zb, sb*za; l != r {
+		if l, r := sa*float64(cb), sb*float64(ca); l != r {
 			return l > r
 		}
 	} else if !a.seatTime.Equal(b.seatTime) {
@@ -103,8 +151,18 @@ func (s *Scheduler) fairBefore(g *engineGroup, ia bool, a *thread, ib bool, b *t
 
 // fairVictim is the budget's next victim on g (nil = none eligible). head may be nil.
 func (s *Scheduler) fairVictim(g *engineGroup, head *waiter, now time.Time) *thread {
+	v, _ := s.fairVictimSaved(g, head, now)
+	return v
+}
+
+// fairVictimSaved is fairVictim plus the staying blocks at the tail its leaving takes off the head's write.
+func (s *Scheduler) fairVictimSaved(g *engineGroup, head *waiter, now time.Time) (*thread, int) {
+	var ft fairTail
+	if s.cfg.CostFairRotation {
+		ft = s.fairTailFor(g, head)
+	}
 	var best *thread
-	bestIdle := false
+	bestIdle, bestCost, bestSaved := false, 1, 0
 	for _, m := range g.threads {
 		if (head != nil && m.id == head.id) || g.index.Exiting(m.id) {
 			continue
@@ -113,11 +171,15 @@ func (s *Scheduler) fairVictim(g *engineGroup, head *waiter, now time.Time) *thr
 		if !idle && !s.fairQuantumDone(m) {
 			continue
 		}
-		if best == nil || s.fairBefore(g, idle, m, bestIdle, best, now) {
-			best, bestIdle = m, idle
+		cost, saved := 1, 0
+		if s.cfg.CostFairRotation && !idle {
+			cost, saved = s.fairCost(g, m, ft)
+		}
+		if best == nil || s.fairBefore(idle, m, cost, bestIdle, best, bestCost, now) {
+			best, bestIdle, bestCost, bestSaved = m, idle, cost, saved
 		}
 	}
-	return best
+	return best, bestSaved
 }
 
 // fairBottom is the member(s) holding the block that ends head's room walk on g, when EVERY staying
@@ -185,10 +247,12 @@ func (s *Scheduler) fairStep(c *seatChoice, head *waiter, now time.Time) bool {
 		}
 		return len(vs) > 0
 	}
-	v := s.fairVictim(g, head, now)
+	v, saved := s.fairVictimSaved(g, head, now)
 	if v == nil {
 		return false
 	}
+	s.counters.fairTailSaved += int64(saved)
+	s.metrics.ObserveFairTailSaved(engineLabel(g.id), saved)
 	reason := "fair-budget"
 	if s.fairIdle(v, now) {
 		reason = "idle"

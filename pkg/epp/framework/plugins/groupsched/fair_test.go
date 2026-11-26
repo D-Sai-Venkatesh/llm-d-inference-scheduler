@@ -50,6 +50,7 @@ func TestFairRotationIsExclusive(t *testing.T) {
 		"with quantumDoneLast": func(c *Config) { c.QuantumDoneLast = true },
 		"with a forced seat":   func(c *Config) { c.RoomHoldMaxSeconds = 90 },
 		"without roomDisplace": func(c *Config) { c.RoomDisplace = false },
+		"without ownTierIndex": func(c *Config) { c.OwnTierIndex = false },
 	} {
 		cfg := defaultConfig()
 		base(&cfg)
@@ -62,6 +63,11 @@ func TestFairRotationIsExclusive(t *testing.T) {
 	base(&cfg)
 	if _, err := NewScheduler(cfg); err != nil {
 		t.Fatalf("the plain fair config must load: %v", err)
+	}
+	// ungated (the CPU-warm group's successor): no room gate, no displace — loads with the own tier index
+	cfg.RoomGate, cfg.RoomDisplace = false, false
+	if _, err := NewScheduler(cfg); err != nil {
+		t.Fatalf("ungated fair rotation must load: %v", err)
 	}
 }
 
@@ -230,6 +236,96 @@ func TestCostFairRotationOrderIsSeatTimePerBlock(t *testing.T) {
 		}
 		if fmt.Sprint(order) != want {
 			t.Fatalf("costFairRotation=%v: victim order %v, want %s", cost, order, want)
+		}
+	}
+}
+
+// The cost counts only blocks the member ALONE holds among staying members: a shared prefix stays cached and
+// charged by the others, so it is neither freed nor rebuilt when this member leaves.
+func TestCostFairCostIsExclusiveBlocks(t *testing.T) {
+	s := roomSched(t, true, func(c *Config) {
+		c.RoomDisplace, c.RoomHoldMaxSeconds, c.Quantum, c.NewcomersFirst = true, 0, 4, true
+		c.FairRotation, c.CostFairRotation = true, true
+	})
+	at := epoch
+	for k := 0; k < 4; k++ { // p: a parent with a 200-block prefix
+		runTurn(t, s, headN("p", k, time.Second, chain("p", 200)), at)
+		at = at.Add(time.Second)
+	}
+	for k := 0; k < 4; k++ { // sub: 200 shared + 100 own = 300 charged, 100 exclusive
+		runTurn(t, s, headN("sub", k, time.Second, chainWithPrefix("p", 200, "sub", 100)), at)
+		at = at.Add(time.Second)
+	}
+	for k := 0; k < 4; k++ { // solo: 250 own, all exclusive
+		runTurn(t, s, headN("solo", k, time.Second, chain("solo", 250)), at)
+		at = at.Add(time.Second)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g := s.groups[""]
+	cSub, _ := s.fairCost(g, g.threads["sub"], fairTail{})
+	cSolo, _ := s.fairCost(g, g.threads["solo"], fairTail{})
+	if cSub != 100 || cSolo != 250 {
+		t.Fatalf("exclusive cost: sub %d (want 100 — its 200 shared blocks stay), solo %d (want 250)", cSub, cSolo)
+	}
+}
+
+func stayingEvicted(s *Scheduler) int64 {
+	var n int64
+	for _, v := range s.Snapshot(epoch).Room.SeatedEvicted {
+		n += v
+	}
+	return n
+}
+
+// UNGATED, the tail term: a head's write evicts the bottom of the LRU whoever owns it. Choosing as victim the
+// eligible member whose blocks are there turns that thrash into its own loss — no staying block evicted —
+// while seat time alone takes the longest-seated member and the write thrashes the one at the bottom.
+func TestCostFairUngatedVictimAtTheBottomSavesThrash(t *testing.T) {
+	for _, cost := range []bool{false, true} {
+		s := roomSched(t, false, func(c *Config) {
+			c.TierCapacityTokens = 1000 * 64
+			c.RoomGate, c.RoomDisplace, c.RoomHoldMaxSeconds, c.RoomReserveTokens = false, false, 0, 0
+			c.Quantum, c.NewcomersFirst = 4, true
+			c.FairRotation, c.CostFairRotation = true, cost
+		})
+		// d: joined first (longest seat time); c: joined later, its LAST dispatch is the oldest -> its blocks
+		// are at the bottom. Both run their 4th (quantum-completing) turn, past first token: both eligible.
+		for k, at := range []int{0, 10, 20} {
+			runTurn(t, s, headN("d", k, time.Second, chain("d", 300)), epoch.Add(time.Duration(at)*time.Second))
+		}
+		for k, at := range []int{5, 6, 7} {
+			runTurn(t, s, headN("c", k, time.Second, chain("c", 300)), epoch.Add(time.Duration(at)*time.Second))
+		}
+		c4 := headN("c", 3, time.Second, chain("c", 300))
+		s.Pass([]Head{c4}, epoch.Add(8*time.Second))
+		s.AtPod(c4.ReqID, "", epoch.Add(8*time.Second))
+		s.FirstChunk(c4.ReqID, epoch.Add(9*time.Second))
+		d4 := headN("d", 3, time.Second, chain("d", 300))
+		s.Pass([]Head{d4}, epoch.Add(30*time.Second))
+		s.AtPod(d4.ReqID, "", epoch.Add(30*time.Second))
+		s.FirstChunk(d4.ReqID, epoch.Add(31*time.Second))
+		before := stayingEvicted(s)
+		// z: 500 cold blocks; free tier 400 -> its write evicts the bottom 100 (c's); budget 600+500 > 950
+		z := headN("z", 0, time.Second, chain("z", 500))
+		s.Pass([]Head{z}, epoch.Add(40*time.Second))
+		s.AtPod(z.ReqID, "", epoch.Add(40*time.Second))
+		thrash := stayingEvicted(s) - before
+		if !seated(s, "z") {
+			t.Fatalf("cost=%v: ungated, the head is admitted once the budget fits", cost)
+		}
+		s.mu.Lock()
+		cOut, dOut := s.groups[""].index.Exiting("c"), s.groups[""].index.Exiting("d")
+		s.mu.Unlock()
+		saved := s.Snapshot(epoch).Room.FairTailSaved
+		if cost {
+			if !cOut || dOut || thrash != 0 || saved != 100 {
+				t.Fatalf("cost-fair: c (at the bottom) leaves, nothing staying is evicted: c out %v d out %v thrash %d saved %d",
+					cOut, dOut, thrash, saved)
+			}
+		} else if !dOut || cOut || thrash != 100 {
+			t.Fatalf("seat time alone: d (longest seated) leaves and the write thrashes c's 100 bottom blocks: c out %v d out %v thrash %d",
+				cOut, dOut, thrash)
 		}
 	}
 }

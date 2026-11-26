@@ -376,6 +376,10 @@ func TestRoomGateReplay(t *testing.T) {
 		cfg.VictimOldestDispatch = true
 		cfg.RoomDisplace = true
 		cfg.RoomHoldMaxSeconds = 0
+		if len(qdLast) > 5 && qdLast[5] { // (…, true, true, true) = UNGATED cost-fair (the CPU-warm group's successor)
+			cfg.RoomGate = false
+			cfg.RoomDisplace = false
+		}
 		s, err := NewScheduler(cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -483,6 +487,16 @@ func TestRoomGateReplay(t *testing.T) {
 		t.Logf("seed %d tier %d: costFairRotation: staying evicted %d (dispatch protected %d / eligible %d), displaced %d; held %d; exits %v; served %d",
 			seed, tc.tier, cf, cfSnap.Room.SeatedEvicted[tierCauseDispatch], cfSnap.Room.SeatedEvicted[tierCauseDispatch+"-eligible"],
 			cfSnap.Room.SeatedEvicted[tierCauseDisplaced], cfSnap.Room.Held, cfSnap.Exits, cfSnap.Served)
+		ug, ugSnap := seatedEvictedDisplace(seed, tc.tier, false, false, false, true, true, true)
+		if ugSnap.Room.Forced != 0 || ugSnap.Room.Held != 0 {
+			t.Fatalf("seed %d: ungated cost-fair never holds or forces, got %+v", seed, ugSnap.Room)
+		}
+		if ugSnap.Served < offSnap.Served/2 {
+			t.Fatalf("seed %d: ungated cost-fair must not starve the workload: served %d vs %d", seed, ugSnap.Served, offSnap.Served)
+		}
+		t.Logf("seed %d tier %d: UNGATED cost-fair: staying evicted %d (seat %d / dispatch %d) vs gate-off %d; tail saved %d; exits %v; served %d vs %d",
+			seed, tc.tier, ug, ugSnap.Room.SeatedEvicted[tierCauseSeat], ugSnap.Room.SeatedEvicted[tierCauseDispatch], off,
+			ugSnap.Room.FairTailSaved, ugSnap.Exits, ugSnap.Served, offSnap.Served)
 		t.Logf("seed %d tier %d: NF+qLastTurn: staying blocks evicted %d (dispatch protected %d / eligible %d), displaced %d; held %d; marks %d; served %d",
 			seed, tc.tier, ln, lnSnap.Room.SeatedEvicted[tierCauseDispatch], lnSnap.Room.SeatedEvicted[tierCauseDispatch+"-eligible"],
 			lnSnap.Room.SeatedEvicted[tierCauseDisplaced], lnSnap.Room.Held, lnSnap.Room.QuantumLastMarks, lnSnap.Served)

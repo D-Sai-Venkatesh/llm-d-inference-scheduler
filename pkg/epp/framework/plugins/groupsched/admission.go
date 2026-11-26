@@ -474,8 +474,11 @@ func newcomerLess(a, b *waiter) bool {
 	if a.returner != b.returner {
 		return !a.returner // newcomers first
 	}
-	if !a.since.Equal(b.since) {
-		return a.since.Before(b.since) // oldest first
+	// oldest first, by the entry key: a waiter's arrival raised to any floor a rotation left on it (zero
+	// floors everywhere = plain arrival order, as before)
+	ka, kb := entryKey(a), entryKey(b)
+	if !ka.Equal(kb) {
+		return ka.Before(kb)
 	}
 	return a.id < b.id
 }

@@ -282,6 +282,39 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 	return fcfs
 }
 
+// sendVictimsFor (roomVictims) sends out, for one room-held head, quantum-complete members that are
+// between turns (not in flight, not exiting), oldest dispatch first, while the blocks already sent out
+// for this head are below its write. It reports whether it sent anyone (the caller re-evaluates).
+func (s *Scheduler) sendVictimsFor(g *engineGroup, head *waiter, need int, now time.Time) bool {
+	sent := false
+	for head.victimBlocks < need {
+		var best *thread
+		for _, m := range g.threads {
+			if m.id == head.id || m.busy() || g.index.Exiting(m.id) || m.busyPeriods < s.cfg.Quantum {
+				continue
+			}
+			if best == nil || touchedAt(m).Before(touchedAt(best)) ||
+				(touchedAt(m).Equal(touchedAt(best)) && m.id < best.id) {
+				best = m
+			}
+		}
+		if best == nil {
+			break
+		}
+		head.victimBlocks += g.index.ChargedBlocks(best.id)
+		s.counters.headVictims++
+		s.exit(g, best, "quantum-head", now)
+		// BEHIND THE HEAD IT LEFT FOR, in either queue order: its context is still in the tier, so its
+		// write is small and — ahead of the head — it would re-seat at once with a fresh quantum, leaving
+		// the head to wait with its victims spent (newcomerLess orders returners by the same entry key)
+		if w, ok := s.waiters[best.id]; ok && !entryKey(w).After(entryKey(head)) {
+			w.floor = entryKey(head).Add(time.Nanosecond)
+		}
+		sent = true
+	}
+	return sent
+}
+
 // quantumDone reports whether a seated member has completed its quantum (the rotation's own test).
 func (s *Scheduler) quantumDone(g *engineGroup, id string) bool {
 	m := g.threads[id]
@@ -361,6 +394,16 @@ func (s *Scheduler) seatWaiters(now time.Time) {
 		// Nothing fits BY BUDGET on the chosen engine — or (roomGate) its tier has no room for the
 		// head's write: eviction is the only way such a head ever runs, and it is demand-driven (a head
 		// is waiting right now).
+		if cand.roomHeld && s.cfg.RoomVictims {
+			// THE HEAD-DRIVEN BINDING QUANTUM: send out quantum-complete members (between turns, oldest
+			// dispatch first) for THIS head, up to its write; then re-evaluate it (their blocks may
+			// already be room) — and if still held, wait: their blocks sink while they are not served.
+			if s.sendVictimsFor(cand.g, head, cand.writeBlocks, now) {
+				continue
+			}
+			s.noteRoomHold(head, cand.g.id, cand.writeBlocks, now)
+			return
+		}
 		reason, victim := s.rotationVictim(cand.g, now)
 		if victim == nil {
 			if cand.roomHeld {

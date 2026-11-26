@@ -361,6 +361,9 @@ func TestRoomGateReplay(t *testing.T) {
 			cfg.QuantumLastTurn = qdLast[1]
 			cfg.NewcomersFirst = true
 		}
+		if len(qdLast) > 2 { // (false, false, true) = newcomers-first + roomVictims
+			cfg.RoomVictims = qdLast[2]
+		}
 		cfg.TierCapacityTokens = tierBlocks * 64
 		cfg.OwnTierIndex = true
 		cfg.RoomGate = true
@@ -442,6 +445,18 @@ func TestRoomGateReplay(t *testing.T) {
 		if lnSnap.Served < offSnap.Served/2 {
 			t.Fatalf("seed %d: NF+quantumLastTurn must not starve the workload: served %d vs %d", seed, lnSnap.Served, offSnap.Served)
 		}
+		vn, vnSnap := seatedEvictedDisplace(seed, tc.tier, false, false, true)
+		if vnSnap.Room.Forced != 0 || vnSnap.Room.Rotations != 0 || vnSnap.Room.SeatedEvicted[tierCauseSeat] != 0 {
+			t.Fatalf("seed %d: NF+roomVictims: no forced seat, no room rotation, no seat-caused protected eviction, got %+v", seed, vnSnap.Room)
+		}
+		if vnSnap.Served < offSnap.Served/2 {
+			t.Fatalf("seed %d: NF+roomVictims must not starve the workload: served %d vs %d", seed, vnSnap.Served, offSnap.Served)
+		}
+		nfn, nfSnap := seatedEvictedDisplace(seed, tc.tier, false, false, false)
+		t.Logf("seed %d tier %d: NF only: staying evicted %d, displaced %d; held %d; served %d | NF+roomVictims: staying evicted %d (dispatch protected %d / eligible %d), displaced %d; held %d; victims %d; served %d",
+			seed, tc.tier, nfn, nfSnap.Room.SeatedEvicted[tierCauseDisplaced], nfSnap.Room.Held, nfSnap.Served,
+			vn, vnSnap.Room.SeatedEvicted[tierCauseDispatch], vnSnap.Room.SeatedEvicted[tierCauseDispatch+"-eligible"],
+			vnSnap.Room.SeatedEvicted[tierCauseDisplaced], vnSnap.Room.Held, vnSnap.Room.HeadVictims, vnSnap.Served)
 		t.Logf("seed %d tier %d: NF+qLastTurn: staying blocks evicted %d (dispatch protected %d / eligible %d), displaced %d; held %d; marks %d; served %d",
 			seed, tc.tier, ln, lnSnap.Room.SeatedEvicted[tierCauseDispatch], lnSnap.Room.SeatedEvicted[tierCauseDispatch+"-eligible"],
 			lnSnap.Room.SeatedEvicted[tierCauseDisplaced], lnSnap.Room.Held, lnSnap.Room.QuantumLastMarks, lnSnap.Served)
@@ -768,5 +783,77 @@ func TestQuantumLastTurnNeedsAWaiterAndTheLastTurn(t *testing.T) {
 	}
 	if s.Snapshot(at).Room.QuantumLastMarks != 0 {
 		t.Fatal("no marks without a waiter")
+	}
+}
+
+// roomVictims (head-driven binding): a room-held head sends out quantum-complete members that are between
+// turns — oldest dispatch first, only until their blocks cover its write — and never a running or a
+// mid-quantum member; each victim queues BEHIND the head it left for (even under newcomers-first), so its
+// small warm write cannot re-seat it ahead of the head. Off: nobody is sent out.
+func TestRoomVictimsAreHeadDrivenAndBounded(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		on     bool
+		need   int
+		victim []string
+	}{{"on, write 500", true, 500, []string{"q1", "q2"}}, {"on, write 260", true, 260, []string{"q1"}}, {"off", false, 500, nil}} {
+		s := roomSched(t, true, func(c *Config) {
+			c.RoomDisplace = true
+			c.RoomHoldMaxSeconds = 0
+			c.Quantum = 4
+			c.NewcomersFirst = true
+			c.RoomVictims = tc.on
+		})
+		at := epoch
+		d := headN("d", 0, time.Second, chain("d", 400))
+		if i := s.Pass([]Head{d}, at); i != 0 {
+			t.Fatal("d must dispatch")
+		}
+		s.AtPod(d.ReqID, "", at) // running at the bottom: the room blocker
+		at = at.Add(time.Second)
+		for _, id := range []string{"q1", "q2"} { // two quantum-complete members, q1 the older
+			for i := 0; i < 4; i++ {
+				runTurn(t, s, headN(id, i, time.Second, chain(id, 300)), at)
+				at = at.Add(time.Second)
+			}
+		}
+		runTurn(t, s, headN("r", 0, time.Second, chain("r", 200)), at) // mid-quantum, between turns
+		at = at.Add(time.Second)
+		// fill the tier's free space with a non-member so the head is room-held (x fits the GPU beside d)
+		runTurn(t, s, headN("x", 0, time.Second, chain("x", 550)), at)
+		evict(t, s, "x") // free 2000-400-600-200-550 = 250
+		at = at.Add(time.Second)
+		// q1's next (5th) turn arrived BEFORE the head: without the floor it would sort ahead of the head
+		q1h := Head{Thread: "q1", ReqID: "q1#4", Arrival: at, Chains: chain("q1", 300), Returner: true}
+		z := Head{Thread: "z", ReqID: "z#1", Arrival: at.Add(time.Second), Chains: chain("z", tc.need), Returner: true}
+		heads := []Head{z, q1h}
+		// z (cold): budget 400+600+200+write <= 1900; room 250 (d stops the walk) < its write
+		s.Pass(heads, at.Add(2*time.Second))
+		snap := s.Snapshot(at)
+		var gone []string
+		for _, id := range []string{"q1", "q2", "r", "d"} {
+			if !seated(s, id) {
+				gone = append(gone, id)
+			}
+		}
+		if fmt.Sprint(gone) != fmt.Sprint(tc.victim) && !(len(gone) == 0 && tc.victim == nil) {
+			t.Fatalf("%s: sent out %v, want %v", tc.name, gone, tc.victim)
+		}
+		if got := snap.Exits["quantum-head"]; got != int64(len(tc.victim)) {
+			t.Fatalf("%s: quantum-head exits %d, want %d", tc.name, got, len(tc.victim))
+		}
+		if tc.on {
+			s.mu.Lock()
+			w1, wz := s.waiters["q1"], s.waiters["z"]
+			s.mu.Unlock()
+			if w1 == nil || wz == nil || !entryKey(w1).After(entryKey(wz)) {
+				t.Fatalf("%s: q1 must queue behind z (the head it left for): q1 %+v z %+v", tc.name, w1, wz)
+			}
+			// the next pass must not re-seat q1 ahead of z
+			s.Pass(heads, at.Add(3*time.Second))
+			if seated(s, "q1") && !seated(s, "z") {
+				t.Fatalf("%s: q1 re-seated ahead of the head it left for", tc.name)
+			}
+		}
 	}
 }

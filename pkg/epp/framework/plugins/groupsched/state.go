@@ -189,6 +189,9 @@ type waiter struct {
 	// roomHoldMaxSeconds last resort is measured from it, never from since (a returner's since is its
 	// whole exile).
 	roomHeldSince time.Time
+	// victimBlocks (roomVictims) is the blocks of the members already sent out for THIS head: it takes
+	// victims only while this is below its write, so one head never empties more than it needs.
+	victimBlocks int
 	// keySet caches the head's own chain keys for the room walk (rebuilt when keySetOf changes).
 	keySet   map[Hash]struct{}
 	keySetOf *Hash
@@ -369,6 +372,8 @@ type Scheduler struct {
 		quantumDoneDeferred int64
 		// quantumLastMarks counts members quantumLastTurn marked at the first chunk of their last turn
 		quantumLastMarks int64
+		// headVictims counts members roomVictims sent out for a room-held head
+		headVictims int64
 	}
 }
 
@@ -748,6 +753,8 @@ type RoomSnapshot struct {
 	QuantumDoneDeferred int64 `json:"quantumDoneDeferred"`
 	// QuantumLastMarks: members quantumLastTurn marked exiting at their last turn's first chunk
 	QuantumLastMarks int64 `json:"quantumLastMarks"`
+	// HeadVictims: members roomVictims sent out for a room-held head (exit reason "quantum-head")
+	HeadVictims int64 `json:"headVictims"`
 }
 
 // Snapshot is the whole-policy view of the state machine: DumpState serialises it and the scrape
@@ -844,6 +851,7 @@ func (s *Scheduler) snapshot(now time.Time) Snapshot {
 		}
 		room.QuantumDoneDeferred = s.counters.quantumDoneDeferred
 		room.QuantumLastMarks = s.counters.quantumLastMarks
+		room.HeadVictims = s.counters.headVictims
 		room.Blockers = map[string]int64{}
 		for _, b := range blockerStates {
 			room.Blockers[b] = s.counters.roomBlocker[b]

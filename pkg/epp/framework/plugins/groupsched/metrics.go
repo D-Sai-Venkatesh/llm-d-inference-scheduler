@@ -186,7 +186,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 // absent on purpose: the valve RETURNS it for a class-4 victim but the exit is booked later, as
 // "exiting-drain" when the thread actually leaves.
 var exitReasons = []string{"quantum-complete", "idle", "engine-idle",
-	"exiting-drain", "budget-idle", "budget-noqueue", "engine-gone", "displaced", "quantum-last"}
+	"exiting-drain", "budget-idle", "budget-noqueue", "engine-gone", "displaced", "quantum-last", "quantum-head"}
 
 // preInstantiateEngine creates this engine's zero-valued COUNTER series at the moment its group
 // is created, so "no dispatch", "no exit of this reason" are readable as zeros from the first

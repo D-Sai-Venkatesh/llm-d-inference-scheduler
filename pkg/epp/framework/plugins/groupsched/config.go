@@ -102,6 +102,13 @@ type Config struct {
 	// so its CPU-tier blocks no longer serve an in-group turn and count as room — and it leaves when the
 	// turn ends (exit reason "quantum-last"). With nobody waiting nothing changes.
 	QuantumLastTurn bool `json:"quantumLastTurn,omitempty"`
+	// RoomVictims (roomGate) is the HEAD-DRIVEN binding quantum: when the queue's head is held for room,
+	// quantum-complete members that are between turns leave the group for it — oldest dispatch first,
+	// just enough that their blocks cover the head's write (counted per head, so one head never takes
+	// more). They stop being served, so their blocks stop being refreshed and sink to the tail, where they
+	// are room once the bottom blocker clears; then the head is admitted and the next head does the same.
+	// One out per one in, at the admission's pace (exit reason "quantum-head").
+	RoomVictims bool `json:"roomVictims,omitempty"`
 	// NewcomersFirst orders the shared admission queue: true (the default) seats a thread's FIRST turn
 	// before returning threads, then oldest first; false is plain oldest-first for every head.
 	NewcomersFirst bool `json:"newcomersFirst"`
@@ -165,6 +172,9 @@ func (c Config) validate() error {
 	}
 	if c.RoomReserveTokens < 0 {
 		return fmt.Errorf("roomReserveTokens must be >= 0, got %d", c.RoomReserveTokens)
+	}
+	if c.RoomVictims && !c.RoomGate {
+		return fmt.Errorf("roomVictims needs roomGate: it removes members for a head the room gate holds")
 	}
 	if c.RoomDisplace && !c.RoomGate {
 		return fmt.Errorf("roomDisplace needs roomGate: it changes what the room gate counts as room")

@@ -189,7 +189,7 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 	if cfg.RoomGate {
 		r.logger.V(logutil.DEFAULT).Info("group-scheduler: ROOM GATE ON — a head seats only when its tier write fits the room without evicting a seated block; its chain is recorded at the seat; the cold-entry valve is OFF",
 			"roomReserveTokens", cfg.RoomReserveTokens, "roomHoldMaxSeconds", cfg.RoomHoldMaxSeconds,
-			"forcedSeat", cfg.RoomHoldMaxSeconds > 0, "roomDisplace", cfg.RoomDisplace, "quantumDoneLast", cfg.QuantumDoneLast, "quantumLastTurn", cfg.QuantumLastTurn,
+			"forcedSeat", cfg.RoomHoldMaxSeconds > 0, "roomDisplace", cfg.RoomDisplace, "quantumDoneLast", cfg.QuantumDoneLast, "quantumLastTurn", cfg.QuantumLastTurn, "roomVictims", cfg.RoomVictims,
 			"newcomersFirst", cfg.NewcomersFirst, "victimOldestDispatch", cfg.VictimOldestDispatch,
 			"idleSeconds", cfg.IdleSeconds, "quantum", cfg.Quantum)
 	}

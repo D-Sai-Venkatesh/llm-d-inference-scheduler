@@ -383,6 +383,10 @@ func TestRoomGateReplay(t *testing.T) {
 		if len(qdLast) > 6 && qdLast[6] { // (…, true) = + coldValveOff
 			cfg.ColdValveOff = true
 		}
+		if len(qdLast) > 7 && qdLast[7] { // fair rotation q4 (gated) + sizeWaitOrder: the third wave-3 arm
+			cfg.SizeWaitOrder = true
+			cfg.Quantum = 4
+		}
 		s, err := NewScheduler(cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -509,6 +513,15 @@ func TestRoomGateReplay(t *testing.T) {
 		}
 		t.Logf("seed %d tier %d: UNGATED cost-fair VALVE OFF: staying evicted %d (dispatch %d) vs valve on %d; tail saved %d; exits %v; served %d",
 			seed, tc.tier, uv, uvSnap.Room.SeatedEvicted[tierCauseDispatch], ug, uvSnap.Room.FairTailSaved, uvSnap.Exits, uvSnap.Served)
+		sw, swSnap := seatedEvictedDisplace(seed, tc.tier, false, false, false, true, false, false, false, true)
+		if swSnap.Room.Forced != 0 || swSnap.Room.Rotations != 0 || swSnap.Room.SeatedEvicted[tierCauseSeat] != 0 {
+			t.Fatalf("seed %d: fair q4 + sizeWaitOrder: no forced seat, no rotation, no seat-caused protected eviction, got %+v", seed, swSnap.Room)
+		}
+		if swSnap.Served < offSnap.Served/2 {
+			t.Fatalf("seed %d: fair q4 + sizeWaitOrder must not starve the workload: served %d vs %d", seed, swSnap.Served, offSnap.Served)
+		}
+		t.Logf("seed %d tier %d: FAIR q4 + SIZE-WAIT: staying evicted %d; held %d; overtakes %d; exits %v; served %d",
+			seed, tc.tier, sw, swSnap.Room.Held, swSnap.Room.SizeWaitOvertakes, swSnap.Exits, swSnap.Served)
 		t.Logf("seed %d tier %d: NF+qLastTurn: staying blocks evicted %d (dispatch protected %d / eligible %d), displaced %d; held %d; marks %d; served %d",
 			seed, tc.tier, ln, lnSnap.Room.SeatedEvicted[tierCauseDispatch], lnSnap.Room.SeatedEvicted[tierCauseDispatch+"-eligible"],
 			lnSnap.Room.SeatedEvicted[tierCauseDisplaced], lnSnap.Room.Held, lnSnap.Room.QuantumLastMarks, lnSnap.Served)

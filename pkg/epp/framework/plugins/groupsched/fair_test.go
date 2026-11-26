@@ -350,3 +350,50 @@ func TestColdValveOffAdmitsOnBudgetAlone(t *testing.T) {
 		}
 	}
 }
+
+// sizeWaitOrder (the in-group dispatch order): among SEATED members' turns, a thread's first turn first, then
+// the highest prompt tokens × time waited. A big turn that arrived later overtakes a small older one; aging lets
+// the small one win once it has waited long enough; a first turn goes before a big returning turn. Without it:
+// plain oldest-first.
+func TestSizeWaitOrderBigFirstWithAgingAndFirstTurns(t *testing.T) {
+	type tc struct {
+		name             string
+		on               bool
+		smallAgo, bigAgo time.Duration
+		withFirst        bool
+		want             string
+	}
+	for _, c := range []tc{
+		{"FIFO without the order", false, 10 * time.Second, 3 * time.Second, false, "small"},
+		{"big first (130 blocks x 3 s > 22 x 10 s)", true, 10 * time.Second, 3 * time.Second, false, "big"},
+		{"aging: the small turn waited long enough (22 x 30 s > 130 x 3 s)", true, 30 * time.Second, 3 * time.Second, false, "small"},
+		{"a first turn goes before a big returning turn", true, 10 * time.Second, 3 * time.Second, true, "n"},
+	} {
+		s := fairSched(t)
+		s.cfg.SizeWaitOrder = c.on
+		at := epoch.Add(-time.Hour)
+		runTurn(t, s, headN("small", 0, time.Second, chain("small", 22)), at)
+		runTurn(t, s, headN("big", 0, time.Second, chain("big", 130)), at.Add(time.Second))
+		heads := []Head{
+			headN("small", 1, c.smallAgo, chain("small", 22)),
+			headN("big", 1, c.bigAgo, chain("big", 130)),
+		}
+		if c.withFirst {
+			heads = append(heads, headN("n", 0, time.Second, chain("n", 10)))
+			s.Pass(heads, epoch) // the first pass seats n (admission), the dispatch pass below orders
+		}
+		i := s.Pass(heads, epoch)
+		if i < 0 || heads[i].Thread != c.want {
+			got := "none"
+			if i >= 0 {
+				got = heads[i].Thread
+			}
+			t.Fatalf("%s: dispatched %s, want %s", c.name, got, c.want)
+		}
+	}
+	cfg := defaultConfig()
+	cfg.SizeWaitOrder, cfg.QuantumDoneLast = true, true
+	if _, err := NewScheduler(cfg); err == nil {
+		t.Fatal("sizeWaitOrder with quantumDoneLast must be refused (one in-group order)")
+	}
+}

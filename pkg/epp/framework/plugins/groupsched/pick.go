@@ -196,6 +196,7 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		// quantumDoneLast: while anyone waits outside, a quantum-complete member's turn goes behind every
 		// other member's (oldest-first within each class); with nobody waiting, plain oldest-first
 		qdLast := s.cfg.QuantumDoneLast && len(s.waiters) > 0
+		sizeWait := s.cfg.SizeWaitOrder
 		sort.SliceStable(cands, func(x, y int) bool {
 			if qdLast {
 				dx, dy := s.quantumDone(g, cands[x].h.Thread), s.quantumDone(g, cands[y].h.Thread)
@@ -203,10 +204,33 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 					return !dx
 				}
 			}
+			if sizeWait {
+				hx, hy := cands[x].h, cands[y].h
+				if hx.Returner != hy.Returner {
+					return !hx.Returner // a thread's first turn first: newcomers first, inside the group too
+				}
+				if hx.Returner {
+					px := float64(PromptTokens(hx.Chains)) * nonNegative(now.Sub(hx.Arrival))
+					py := float64(PromptTokens(hy.Chains)) * nonNegative(now.Sub(hy.Arrival))
+					if px != py {
+						return px > py
+					}
+				}
+			}
 			return cands[x].h.Arrival.Before(cands[y].h.Arrival)
 		})
-		// FIFO: the candidates are oldest-first, so the head is the first one
+		// the head of the order (oldest-first, or sizeWaitOrder's) is the first one
 		chosen := &cands[0]
+		if sizeWait {
+			for _, c := range cands[1:] {
+				if c.h.Arrival.Before(chosen.h.Arrival) {
+					// an older turn was overtaken by a bigger (or a first) one: count it (proof it fires)
+					s.counters.sizeWaitOvertakes++
+					s.metrics.ObserveSizeWaitOvertake(engineLabel(g.id))
+					break
+				}
+			}
+		}
 		if qdLast && !s.quantumDone(g, chosen.h.Thread) {
 			// the order deferred a quantum-complete member's OLDER turn: count it (proof it fires)
 			for _, c := range cands[1:] {
@@ -217,9 +241,9 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 				}
 			}
 		}
-		// THE GPU SIDE (with a CPU tier the seats outgrow the GPU): the oldest seated head runs only if
-		// it fits the GPU budget beside the seats already running. Strict FIFO: a held head holds the
-		// younger ones, so a large context is never overtaken by small ones.
+		// THE GPU SIDE (with a CPU tier the seats outgrow the GPU): the head of the order runs only if it
+		// fits the GPU budget beside the seats already running. Strict head-of-line: a held head holds the
+		// ones behind it, so a large context is never overtaken by small ones.
 		if s.gpuHolds(g, chosen.h) {
 			s.metrics.ObserveRunGateHeld(engineLabel(g.id))
 			continue

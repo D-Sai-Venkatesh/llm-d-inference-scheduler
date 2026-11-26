@@ -382,6 +382,8 @@ type Scheduler struct {
 		// fairTailSaved sums, over budget victims (costFairRotation), the staying blocks at the tail that their
 		// leaving took off the head's write (thrash avoided ungated; room unblocked gated)
 		fairTailSaved int64
+		// sizeWaitOvertakes counts dispatches where sizeWaitOrder's head was not the oldest seated turn
+		sizeWaitOvertakes int64
 	}
 }
 
@@ -768,6 +770,8 @@ type RoomSnapshot struct {
 	FairRemovals map[string]int64 `json:"fairRemovals,omitempty"`
 	// FairTailSaved: staying tail blocks the cost-fair victims' leaving took off heads' writes
 	FairTailSaved int64 `json:"fairTailSaved,omitempty"`
+	// SizeWaitOvertakes: dispatches whose head (sizeWaitOrder) overtook an older seated turn
+	SizeWaitOvertakes int64 `json:"sizeWaitOvertakes,omitempty"`
 }
 
 // Snapshot is the whole-policy view of the state machine: DumpState serialises it and the scrape
@@ -871,6 +875,7 @@ func (s *Scheduler) snapshot(now time.Time) Snapshot {
 				room.FairRemovals[k] = v
 			}
 			room.FairTailSaved = s.counters.fairTailSaved
+			room.SizeWaitOvertakes = s.counters.sizeWaitOvertakes
 		}
 		room.Blockers = map[string]int64{}
 		for _, b := range blockerStates {

@@ -129,6 +129,12 @@ type Config struct {
 	// with a SEATED member as cold — a returner whose chain the CPU tier still holds included — and holding a
 	// head only concentrates the waiting; vLLM itself schedules only what fits its KV and chunks prefills.
 	ColdValveOff bool `json:"coldValveOff,omitempty"`
+	// SizeWaitOrder is the order of the SEATED members' turns at the dispatch gate (about half of all waiting
+	// happens there): a thread's FIRST turn first (newcomers first, inside the group too), then the highest
+	// PROMPT TOKENS × TIME WAITED — big contexts go first so advanced sessions finish and the footprint shrinks,
+	// and a waiting turn's priority keeps growing, so nobody starves. No constant: both are measured. Plain
+	// oldest-first without it. Exclusive with quantumDoneLast (one in-group order).
+	SizeWaitOrder bool `json:"sizeWaitOrder,omitempty"`
 	// NewcomersFirst orders the shared admission queue: true (the default) seats a thread's FIRST turn
 	// before returning threads, then oldest first; false is plain oldest-first for every head.
 	NewcomersFirst bool `json:"newcomersFirst"`
@@ -204,6 +210,9 @@ func (c Config) validate() error {
 		if c.RoomVictims || c.QuantumLastTurn || c.QuantumDoneLast || c.RoomHoldMaxSeconds > 0 {
 			return fmt.Errorf("fairRotation is exclusive with roomVictims, quantumLastTurn, quantumDoneLast and roomHoldMaxSeconds > 0")
 		}
+	}
+	if c.SizeWaitOrder && c.QuantumDoneLast {
+		return fmt.Errorf("sizeWaitOrder and quantumDoneLast are both in-group orders: choose one")
 	}
 	if c.CostFairRotation && !c.FairRotation {
 		return fmt.Errorf("costFairRotation needs fairRotation: it is fair rotation's victim order")

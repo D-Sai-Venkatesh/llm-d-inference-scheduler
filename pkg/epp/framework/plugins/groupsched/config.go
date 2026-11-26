@@ -97,6 +97,11 @@ type Config struct {
 	// the order is plain oldest-first, as without it. A held-back member's blocks are not refreshed, so
 	// they sink to the tier's tail, where roomDisplace counts them as room.
 	QuantumDoneLast bool `json:"quantumDoneLast,omitempty"`
+	// QuantumLastTurn makes the quantum BINDING while anyone waits outside: at the first chunk of a
+	// member's quantum-ending (or later) turn it is marked exiting — its prompt KV is in the GPU by then,
+	// so its CPU-tier blocks no longer serve an in-group turn and count as room — and it leaves when the
+	// turn ends (exit reason "quantum-last"). With nobody waiting nothing changes.
+	QuantumLastTurn bool `json:"quantumLastTurn,omitempty"`
 	// NewcomersFirst orders the shared admission queue: true (the default) seats a thread's FIRST turn
 	// before returning threads, then oldest first; false is plain oldest-first for every head.
 	NewcomersFirst bool `json:"newcomersFirst"`

@@ -105,6 +105,8 @@ type thread struct {
 	// retiree is the time between "nothing more will be admitted for it" and "its blocks are off
 	// the budget", i.e. how long the engine pays for a seat it has already written off.
 	exitingSince time.Time
+	// exitReason is the reason a MARKED thread's drain books (empty = "exiting-drain")
+	exitReason string
 	// fairnessID is the last fairness id (queue key) this thread was seen with — the queue key
 	// its SEAT/EXIT events name (see Head.FairnessID).
 	fairnessID string
@@ -125,6 +127,14 @@ type thread struct {
 // busy reports whether the thread has work in progress: a request at a pod, or a LIVE released
 // window (a turn that a Pick released and PreRequest has not yet brought to a pod).
 func (m *thread) busy() bool { return m.inflight > 0 || m.pending > 0 }
+
+// drainReason is the exit reason a marked thread's drain books.
+func (m *thread) drainReason() string {
+	if m.exitReason != "" {
+		return m.exitReason
+	}
+	return "exiting-drain"
+}
 
 // noQueuedHead reports that this thread has nothing waiting in the queue. It is NOT the same
 // question as "no turn waiting": a thread whose head a Pick has already released has no queued
@@ -357,6 +367,8 @@ type Scheduler struct {
 		// quantumDoneDeferred counts dispatches where quantumDoneLast served a member within its quantum
 		// ahead of an OLDER turn of a quantum-complete member
 		quantumDoneDeferred int64
+		// quantumLastMarks counts members quantumLastTurn marked at the first chunk of their last turn
+		quantumLastMarks int64
 	}
 }
 
@@ -734,6 +746,8 @@ type RoomSnapshot struct {
 	Blockers map[string]int64 `json:"blockers"`
 	// QuantumDoneDeferred: dispatches where quantumDoneLast put a quantum-complete member's older turn back
 	QuantumDoneDeferred int64 `json:"quantumDoneDeferred"`
+	// QuantumLastMarks: members quantumLastTurn marked exiting at their last turn's first chunk
+	QuantumLastMarks int64 `json:"quantumLastMarks"`
 }
 
 // Snapshot is the whole-policy view of the state machine: DumpState serialises it and the scrape
@@ -829,6 +843,7 @@ func (s *Scheduler) snapshot(now time.Time) Snapshot {
 			}
 		}
 		room.QuantumDoneDeferred = s.counters.quantumDoneDeferred
+		room.QuantumLastMarks = s.counters.quantumLastMarks
 		room.Blockers = map[string]int64{}
 		for _, b := range blockerStates {
 			room.Blockers[b] = s.counters.roomBlocker[b]

@@ -50,7 +50,7 @@ func (s *Scheduler) drainExiting(now time.Time) {
 		sort.Strings(ids)
 		for _, id := range ids {
 			if m, ok := g.threads[id]; ok {
-				s.exit(g, m, "exiting-drain", now)
+				s.exit(g, m, m.drainReason(), now)
 			}
 		}
 	}

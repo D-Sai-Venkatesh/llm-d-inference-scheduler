@@ -76,6 +76,7 @@ type groupMetrics struct {
 	roomHold        *prometheus.HistogramVec
 	roomBlocker     *prometheus.CounterVec
 	qdDeferred      *prometheus.CounterVec
+	qlMarks         *prometheus.CounterVec
 }
 
 // subsystem namespaces every series (llm_d_epp_group_*).
@@ -147,6 +148,8 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		Help: "once per room-held head, what held it: the state of the member whose block ended the room walk — running-last (in flight on its quantum's last turn), running (in flight, mid-quantum), between-turns (not in flight, not eligible), eligible (without roomDisplace only), none (no protected block: the write is bigger than the tier)"}, []string{"engine", "state"})
 	g.qdDeferred = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "quantum_done_deferred_total",
 		Help: "dispatches where quantumDoneLast (anyone waiting outside) served a member within its quantum ahead of an OLDER queued turn of a quantum-complete member"}, engineLabels)
+	g.qlMarks = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "quantum_last_marks_total",
+		Help: "members quantumLastTurn marked exiting at the first chunk of their quantum-ending (or later) turn while anyone waited outside; they leave at the turn's end (exits_total{reason=\"quantum-last\"})"}, engineLabels)
 	g.tierPromptTotal = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_dispatched_prompt_tokens_total",
 		Help: "prompt tokens of every turn tier_predicted_cached_tokens_total was read for — its denominator"}, engineLabels)
 
@@ -161,7 +164,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.affinityViolations, g.engineGone, g.coldValveHeld, g.anomalies, g.runGateHeld,
 		g.residencyPlacements, g.residencySeatTokens,
 		g.roomHeld, g.roomForced, g.roomRotations, g.tierWrites, g.seatedEvicted, g.tierPredicted, g.tierPromptTotal,
-		g.roomHold, g.roomBlocker, g.qdDeferred,
+		g.roomHold, g.roomBlocker, g.qdDeferred, g.qlMarks,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
@@ -183,7 +186,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 // absent on purpose: the valve RETURNS it for a class-4 victim but the exit is booked later, as
 // "exiting-drain" when the thread actually leaves.
 var exitReasons = []string{"quantum-complete", "idle", "engine-idle",
-	"exiting-drain", "budget-idle", "budget-noqueue", "engine-gone"}
+	"exiting-drain", "budget-idle", "budget-noqueue", "engine-gone", "displaced", "quantum-last"}
 
 // preInstantiateEngine creates this engine's zero-valued COUNTER series at the moment its group
 // is created, so "no dispatch", "no exit of this reason" are readable as zeros from the first
@@ -209,6 +212,7 @@ func (g *groupMetrics) preInstantiateEngine(engine string) {
 			g.roomBlocker.WithLabelValues(label, b).Add(0)
 		}
 		g.qdDeferred.WithLabelValues(label).Add(0)
+		g.qlMarks.WithLabelValues(label).Add(0)
 		g.tierPredicted.WithLabelValues(label).Add(0)
 		g.tierPromptTotal.WithLabelValues(label).Add(0)
 		for _, c := range tierCauses {
@@ -249,6 +253,14 @@ func (g *groupMetrics) ObserveQuantumDoneDeferred(engine string) {
 		return
 	}
 	g.qdDeferred.WithLabelValues(engine).Inc()
+}
+
+// ObserveQuantumLastMark counts one member quantumLastTurn marked exiting.
+func (g *groupMetrics) ObserveQuantumLastMark(engine string) {
+	if g == nil || g.qlMarks == nil {
+		return
+	}
+	g.qlMarks.WithLabelValues(engine).Inc()
 }
 
 // ObserveRoomBlocker counts, once per room-held head, what held it.

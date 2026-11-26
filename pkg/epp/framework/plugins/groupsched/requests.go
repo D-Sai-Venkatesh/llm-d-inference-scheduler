@@ -285,7 +285,29 @@ func (s *Scheduler) FirstChunk(reqID string, now time.Time) {
 	}
 	if g := s.groupOf(id); g != nil {
 		s.releaseCold(g, id)
+		s.markQuantumLast(g, id, now)
 	}
+}
+
+// markQuantumLast (quantumLastTurn) marks a member exiting at the first chunk of its quantum-ending
+// (or later) turn while anyone waits outside: the turn's prompt KV is in the GPU by now, so its CPU-tier
+// blocks serve no further in-group turn — they stop being protected (room) — and the member leaves when
+// the turn ends ("quantum-last"). busyPeriods counts COMPLETED periods: >= Q-1 means the running one is
+// the Q-th or later.
+func (s *Scheduler) markQuantumLast(g *engineGroup, id string, now time.Time) {
+	if !s.cfg.QuantumLastTurn || len(s.waiters) == 0 {
+		return
+	}
+	m, ok := g.threads[id]
+	if !ok || g.index.Exiting(id) || m.busyPeriods < s.cfg.Quantum-1 {
+		return
+	}
+	g.index.MarkExiting(id)
+	m.exitingSince = now
+	m.exitReason = "quantum-last"
+	s.counters.quantumLastMarks++
+	s.metrics.ObserveQuantumLastMark(engineLabel(g.id))
+	s.recordEvent("QUANTUM-LAST", id, fmt.Sprintf("busy_periods=%d waiters=%d", m.busyPeriods, len(s.waiters)), now)
 }
 
 // releaseCold returns one thread's cold-entry charge to its engine's valve, once: at the first chunk,
@@ -353,7 +375,7 @@ func (s *Scheduler) Settle(reqID, engine string, now time.Time) {
 	// an exiting thread leaves when its work drains — the same question as the period above, so the
 	// same answer: a live released window keeps it seated
 	if g.index.Exiting(id) && !m.busy() {
-		s.exit(g, m, "exiting-drain", now)
+		s.exit(g, m, m.drainReason(), now)
 	}
 }
 

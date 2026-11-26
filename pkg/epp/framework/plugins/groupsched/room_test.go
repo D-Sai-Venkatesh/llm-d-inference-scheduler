@@ -357,6 +357,10 @@ func TestRoomGateReplay(t *testing.T) {
 	seatedEvictedDisplace := func(seed int64, tierBlocks int64, qdLast ...bool) (int64, Snapshot) {
 		cfg := defaultConfig()
 		cfg.QuantumDoneLast = len(qdLast) > 0 && qdLast[0]
+		if len(qdLast) > 1 { // (false, true) = newcomers-first + quantumLastTurn, no qdLast
+			cfg.QuantumLastTurn = qdLast[1]
+			cfg.NewcomersFirst = true
+		}
 		cfg.TierCapacityTokens = tierBlocks * 64
 		cfg.OwnTierIndex = true
 		cfg.RoomGate = true
@@ -431,6 +435,16 @@ func TestRoomGateReplay(t *testing.T) {
 		if qnSnap.Served < offSnap.Served/2 {
 			t.Fatalf("seed %d: displace+quantumDoneLast must not starve the workload: served %d vs %d", seed, qnSnap.Served, offSnap.Served)
 		}
+		ln, lnSnap := seatedEvictedDisplace(seed, tc.tier, false, true)
+		if lnSnap.Room.Forced != 0 || lnSnap.Room.Rotations != 0 || lnSnap.Room.SeatedEvicted[tierCauseSeat] != 0 {
+			t.Fatalf("seed %d: NF+quantumLastTurn: no forced seat, no room rotation, no seat-caused protected eviction, got %+v", seed, lnSnap.Room)
+		}
+		if lnSnap.Served < offSnap.Served/2 {
+			t.Fatalf("seed %d: NF+quantumLastTurn must not starve the workload: served %d vs %d", seed, lnSnap.Served, offSnap.Served)
+		}
+		t.Logf("seed %d tier %d: NF+qLastTurn: staying blocks evicted %d (dispatch protected %d / eligible %d), displaced %d; held %d; marks %d; served %d",
+			seed, tc.tier, ln, lnSnap.Room.SeatedEvicted[tierCauseDispatch], lnSnap.Room.SeatedEvicted[tierCauseDispatch+"-eligible"],
+			lnSnap.Room.SeatedEvicted[tierCauseDisplaced], lnSnap.Room.Held, lnSnap.Room.QuantumLastMarks, lnSnap.Served)
 		t.Logf("seed %d tier %d: displace+qdLast: staying blocks evicted %d (dispatch protected %d / eligible %d), displaced %d; held %d; deferred %d; served %d",
 			seed, tc.tier, qn, qnSnap.Room.SeatedEvicted[tierCauseDispatch], qnSnap.Room.SeatedEvicted[tierCauseDispatch+"-eligible"],
 			qnSnap.Room.SeatedEvicted[tierCauseDisplaced], qnSnap.Room.Held, qnSnap.Room.QuantumDoneDeferred, qnSnap.Served)
@@ -666,5 +680,93 @@ func TestQuantumDoneLastServesTheQuantumFirst(t *testing.T) {
 		if (tc.want == "r") != (deferred == 1) {
 			t.Fatalf("%s: deferred count %d", tc.name, deferred)
 		}
+	}
+}
+
+// quantumLastTurn: a member running its quantum-ending turn at the bottom of the tier holds a waiting
+// head; at that turn's FIRST CHUNK it is marked exiting, its blocks stop being protected, the head is
+// admitted into them, and the member leaves at the turn's end ("quantum-last"). Off: the head waits.
+func TestQuantumLastTurnReleasesALastTurnBlocker(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		s := roomSched(t, true, func(c *Config) {
+			c.RoomDisplace = true
+			c.RoomHoldMaxSeconds = 0
+			c.Quantum = 4
+			c.QuantumLastTurn = on
+		})
+		at := epoch
+		for i := 0; i < 3; i++ { // m: three completed busy periods (Q-1)
+			runTurn(t, s, headN("m", i, time.Second, chain("m", 400)), at)
+			at = at.Add(time.Second)
+		}
+		mh := headN("m", 3, time.Second, chain("m", 400)) // m's 4th = quantum-ending turn
+		if i := s.Pass([]Head{mh}, at); i != 0 {
+			t.Fatal("m's last turn must dispatch")
+		}
+		s.AtPod(mh.ReqID, "", at) // running, NO first chunk yet
+		at = at.Add(time.Second)
+		runTurn(t, s, headN("r", 0, time.Second, chain("r", 300)), at) // r: mid-quantum, between turns, newer
+		at = at.Add(time.Second)
+		runTurn(t, s, headN("x", 0, time.Second, chain("x", 500)), at)
+		evict(t, s, "x") // bottom -> top: m 400 | r 300 | x 500 | free 800
+		at = at.Add(time.Second)
+		z := headN("z", 0, time.Second, chain("z", 1000)) // budget 400+300+1000 <= 1900; room 800 < 1000
+		s.Pass([]Head{z}, at)
+		if seated(s, "z") {
+			t.Fatalf("on=%v: z must be held (m is running at the bottom)", on)
+		}
+		if got := s.Snapshot(at).Room.Blockers[blockerRunningLast]; got != 1 {
+			t.Fatalf("on=%v: the hold must name a running-last blocker, got %+v", on, s.Snapshot(at).Room.Blockers)
+		}
+		at = at.Add(time.Second)
+		s.FirstChunk(mh.ReqID, at) // m's prompt KV is in the GPU now
+		s.mu.Lock()
+		marked := s.groupOf("m").index.Exiting("m")
+		s.mu.Unlock()
+		if marked != on {
+			t.Fatalf("on=%v: m marked exiting at its last turn's first chunk = %v", on, marked)
+		}
+		at = at.Add(time.Second)
+		s.Pass([]Head{z}, at)
+		if seated(s, "z") != on {
+			t.Fatalf("on=%v: z admitted = %v (m's blocks are room only when m is marked)", on, seated(s, "z"))
+		}
+		s.Settle(mh.ReqID, "", at.Add(time.Second))
+		snap := s.Snapshot(at.Add(time.Second))
+		if on {
+			if seated(s, "m") || snap.Exits["quantum-last"] != 1 || snap.Room.QuantumLastMarks != 1 {
+				t.Fatalf("m must leave at its turn's end as quantum-last: seated %v exits %+v marks %d", seated(s, "m"), snap.Exits, snap.Room.QuantumLastMarks)
+			}
+			if !seated(s, "r") || snap.Room.SeatedEvicted[tierCauseSeat] != 0 {
+				t.Fatalf("r (mid-quantum) must stay untouched: seated %v evicted %+v", seated(s, "r"), snap.Room.SeatedEvicted)
+			}
+		} else if !seated(s, "m") {
+			t.Fatal("off: m stays seated after its turn (nobody needs its seat by budget)")
+		}
+	}
+}
+
+// quantumLastTurn marks nothing when nobody waits outside, and nothing before the quantum-ending turn.
+func TestQuantumLastTurnNeedsAWaiterAndTheLastTurn(t *testing.T) {
+	s := roomSched(t, true, func(c *Config) { c.RoomDisplace = true; c.Quantum = 4; c.QuantumLastTurn = true })
+	at := epoch
+	for i := 0; i < 4; i++ { // nobody waiting: even the 4th (last) turn is not marked
+		h := headN("m", i, time.Second, chain("m", 100))
+		if i := s.Pass([]Head{h}, at); i != 0 {
+			t.Fatal("m must dispatch")
+		}
+		s.AtPod(h.ReqID, "", at)
+		s.FirstChunk(h.ReqID, at)
+		s.mu.Lock()
+		marked := s.groupOf("m").index.Exiting("m")
+		s.mu.Unlock()
+		if marked {
+			t.Fatalf("turn %d: no waiter, no mark", i)
+		}
+		s.Settle(h.ReqID, "", at)
+		at = at.Add(time.Second)
+	}
+	if s.Snapshot(at).Room.QuantumLastMarks != 0 {
+		t.Fatal("no marks without a waiter")
 	}
 }

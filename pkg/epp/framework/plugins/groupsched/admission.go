@@ -139,13 +139,14 @@ func (s *Scheduler) roomPreds(g *engineGroup, own, also map[Hash]struct{}) (func
 // Room-blocker states: what holds a room-held head — the member whose block ends the room walk.
 const (
 	blockerRunningLast  = "running-last"  // in flight on the LAST turn of its quantum
+	blockerRunningPast  = "running-past"  // in flight on a turn PAST its quantum
 	blockerRunning      = "running"       // in flight, mid-quantum
 	blockerBetweenTurns = "between-turns" // not in flight, not eligible (mid-quantum, idle < idleSeconds)
 	blockerEligible     = "eligible"      // eligible (only without roomDisplace: the rotation's case)
 	blockerNone         = "none"          // no protected block ended the walk (the tier is smaller than the write)
 )
 
-var blockerStates = []string{blockerRunningLast, blockerRunning, blockerBetweenTurns, blockerEligible, blockerNone}
+var blockerStates = []string{blockerRunningLast, blockerRunningPast, blockerRunning, blockerBetweenTurns, blockerEligible, blockerNone}
 
 // roomBlocker classifies what holds w on g: the state of the member whose block ended the room walk.
 // A diagnostic only (read once per hold): it decides nothing.
@@ -159,7 +160,9 @@ func (s *Scheduler) roomBlocker(g *engineGroup, w *waiter, need int) string {
 		return blockerNone
 	}
 	state := ""
-	rank := map[string]int{blockerRunningLast: 4, blockerRunning: 3, blockerBetweenTurns: 2, blockerEligible: 1}
+	// a block several members hold reads as its MOST binding holder: mid-quantum running first (no
+	// quantum rule releases it), then between turns, then the on/after-quantum ones
+	rank := map[string]int{blockerRunning: 6, blockerBetweenTurns: 5, blockerRunningPast: 4, blockerRunningLast: 3, blockerEligible: 1}
 	for _, m := range g.threads {
 		if g.index.Exiting(m.id) {
 			continue
@@ -175,6 +178,8 @@ func (s *Scheduler) roomBlocker(g *engineGroup, w *waiter, need int) string {
 		switch {
 		case m.busy() && m.busyPeriods == s.cfg.Quantum-1:
 			st = blockerRunningLast
+		case m.busy() && m.busyPeriods >= s.cfg.Quantum:
+			st = blockerRunningPast
 		case m.busy():
 			st = blockerRunning
 		default:

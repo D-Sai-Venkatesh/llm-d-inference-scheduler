@@ -380,6 +380,9 @@ func TestRoomGateReplay(t *testing.T) {
 			cfg.RoomGate = false
 			cfg.RoomDisplace = false
 		}
+		if len(qdLast) > 6 && qdLast[6] { // (…, true) = + coldValveOff
+			cfg.ColdValveOff = true
+		}
 		s, err := NewScheduler(cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -497,6 +500,15 @@ func TestRoomGateReplay(t *testing.T) {
 		t.Logf("seed %d tier %d: UNGATED cost-fair: staying evicted %d (seat %d / dispatch %d) vs gate-off %d; tail saved %d; exits %v; served %d vs %d",
 			seed, tc.tier, ug, ugSnap.Room.SeatedEvicted[tierCauseSeat], ugSnap.Room.SeatedEvicted[tierCauseDispatch], off,
 			ugSnap.Room.FairTailSaved, ugSnap.Exits, ugSnap.Served, offSnap.Served)
+		uv, uvSnap := seatedEvictedDisplace(seed, tc.tier, false, false, false, true, true, true, true)
+		if uvSnap.Room.Forced != 0 || uvSnap.Room.Held != 0 {
+			t.Fatalf("seed %d: ungated cost-fair valve-off never holds or forces, got %+v", seed, uvSnap.Room)
+		}
+		if uvSnap.Served < offSnap.Served/2 {
+			t.Fatalf("seed %d: ungated cost-fair valve-off must not starve the workload: served %d vs %d", seed, uvSnap.Served, offSnap.Served)
+		}
+		t.Logf("seed %d tier %d: UNGATED cost-fair VALVE OFF: staying evicted %d (dispatch %d) vs valve on %d; tail saved %d; exits %v; served %d",
+			seed, tc.tier, uv, uvSnap.Room.SeatedEvicted[tierCauseDispatch], ug, uvSnap.Room.FairTailSaved, uvSnap.Exits, uvSnap.Served)
 		t.Logf("seed %d tier %d: NF+qLastTurn: staying blocks evicted %d (dispatch protected %d / eligible %d), displaced %d; held %d; marks %d; served %d",
 			seed, tc.tier, ln, lnSnap.Room.SeatedEvicted[tierCauseDispatch], lnSnap.Room.SeatedEvicted[tierCauseDispatch+"-eligible"],
 			lnSnap.Room.SeatedEvicted[tierCauseDisplaced], lnSnap.Room.Held, lnSnap.Room.QuantumLastMarks, lnSnap.Served)

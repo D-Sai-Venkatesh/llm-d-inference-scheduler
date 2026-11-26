@@ -329,3 +329,24 @@ func TestCostFairUngatedVictimAtTheBottomSavesThrash(t *testing.T) {
 		}
 	}
 }
+
+// coldValveOff: ungated, admission is the budget alone. Two cold heads whose cold tokens together exceed the
+// valve's cap (5 % of KV here: 3,200 tokens) but fit the budget: the valve seats one and holds the other; with
+// the valve off both are seated in the same pass.
+func TestColdValveOffAdmitsOnBudgetAlone(t *testing.T) {
+	for _, off := range []bool{false, true} {
+		s := roomSched(t, false, func(c *Config) {
+			c.RoomGate, c.RoomDisplace, c.RoomHoldMaxSeconds = false, false, 0
+			c.FairRotation, c.CostFairRotation, c.NewcomersFirst = true, true, true
+			c.ColdValveOff = off
+		})
+		h1 := headN("h1", 0, time.Second, chain("h1", 40)) // 2,560 cold tokens each
+		h2 := headN("h2", 0, 2*time.Second, chain("h2", 40))
+		s.Pass([]Head{h1, h2}, epoch)
+		s.Pass([]Head{h1, h2}, epoch)
+		both := seated(s, "h1") && seated(s, "h2")
+		if off != both {
+			t.Fatalf("coldValveOff=%v: both seated %v (h1 %v, h2 %v)", off, both, seated(s, "h1"), seated(s, "h2"))
+		}
+	}
+}

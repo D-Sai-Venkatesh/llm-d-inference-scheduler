@@ -124,6 +124,11 @@ type Config struct {
 	// loss). "How much you've had, per what sending you out costs." Idle members still go first. No constant:
 	// every term is measured blocks and the ratio only ranks. Gated or not (roomGate) — the same formula.
 	CostFairRotation bool `json:"costFairRotation,omitempty"`
+	// ColdValveOff turns the cold-entry valve (the cold-start stagger) off without the room gate: admission is
+	// the budget alone, as it already is under roomGate. The valve charged every token a head does not share
+	// with a SEATED member as cold — a returner whose chain the CPU tier still holds included — and holding a
+	// head only concentrates the waiting; vLLM itself schedules only what fits its KV and chunks prefills.
+	ColdValveOff bool `json:"coldValveOff,omitempty"`
 	// NewcomersFirst orders the shared admission queue: true (the default) seats a thread's FIRST turn
 	// before returning threads, then oldest first; false is plain oldest-first for every head.
 	NewcomersFirst bool `json:"newcomersFirst"`

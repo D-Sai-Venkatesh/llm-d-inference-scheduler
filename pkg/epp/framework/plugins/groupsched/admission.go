@@ -40,8 +40,8 @@ func (s *Scheduler) freeBudget(g *engineGroup) int64 {
 // coldAllowsTokens asks whether this head's cold prefill fits the engine's stagger, for the
 // exact cost it brings.
 func (s *Scheduler) coldAllowsTokens(g *engineGroup, tokens int64) bool {
-	if s.cfg.RoomGate {
-		return true // the room gate replaces the valve: the tier's room paces cold entries
+	if s.cfg.RoomGate || s.cfg.ColdValveOff {
+		return true // the room gate replaces the valve (the tier's room paces cold entries), or it is off
 	}
 	cap := g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize)
 	if cap <= 0 {
@@ -534,7 +534,7 @@ func (s *Scheduler) seat(g *engineGroup, w *waiter, coldTokens int64, now time.T
 	// valve's job is to serialise cold prefills inside the budget's headroom, not to account the
 	// entry's whole footprint (the seat's blocks do that).
 	m.coldEntry = min(coldTokens, g.coldCapTokens(s.cfg.GroupBudgetFraction, s.blockSize))
-	if s.cfg.RoomGate {
+	if s.cfg.RoomGate || s.cfg.ColdValveOff {
 		m.coldEntry = 0 // no valve: nothing to charge or release
 	}
 	g.coldInFlight += m.coldEntry

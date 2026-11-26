@@ -155,6 +155,9 @@ type reqRec struct {
 	released time.Time
 	// pod is when the request reached a pod (PreRequest); zero while it is pending.
 	pod time.Time
+	// firstToken is set at the request's first chunk: its prefill is done (fairRotation removes an
+	// in-flight member only after it, when the request no longer writes into the CPU tier).
+	firstToken bool
 	// counted is whether this record currently contributes to its thread's pending count. It is set
 	// when the record is opened, and corrected by the SAME liveness test at every decrement, so
 	// pending is always exactly "the records that counted at their last evaluation".
@@ -374,6 +377,8 @@ type Scheduler struct {
 		quantumLastMarks int64
 		// headVictims counts members roomVictims sent out for a room-held head
 		headVictims int64
+		// fairRemovals counts members fair rotation took out, by reason (idle / fair-budget / fair-room)
+		fairRemovals map[string]int64
 	}
 }
 
@@ -449,6 +454,7 @@ func NewScheduler(cfg Config) (*Scheduler, error) {
 	s.counters.tierWrites = map[string]int64{}
 	s.counters.seatedEvicted = map[string]int64{}
 	s.counters.roomBlocker = map[string]int64{}
+	s.counters.fairRemovals = map[string]int64{}
 	if cfg.OwnTierIndex {
 		// the group's own tier index is placement's residency read (it replaces cpuResidencyProducer)
 		s.residency = s.ownResidency
@@ -755,6 +761,8 @@ type RoomSnapshot struct {
 	QuantumLastMarks int64 `json:"quantumLastMarks"`
 	// HeadVictims: members roomVictims sent out for a room-held head (exit reason "quantum-head")
 	HeadVictims int64 `json:"headVictims"`
+	// FairRemovals: members fair rotation took out, by reason
+	FairRemovals map[string]int64 `json:"fairRemovals,omitempty"`
 }
 
 // Snapshot is the whole-policy view of the state machine: DumpState serialises it and the scrape
@@ -852,6 +860,12 @@ func (s *Scheduler) snapshot(now time.Time) Snapshot {
 		room.QuantumDoneDeferred = s.counters.quantumDoneDeferred
 		room.QuantumLastMarks = s.counters.quantumLastMarks
 		room.HeadVictims = s.counters.headVictims
+		if s.cfg.FairRotation {
+			room.FairRemovals = map[string]int64{}
+			for k, v := range s.counters.fairRemovals {
+				room.FairRemovals[k] = v
+			}
+		}
 		room.Blockers = map[string]int64{}
 		for _, b := range blockerStates {
 			room.Blockers[b] = s.counters.roomBlocker[b]

@@ -283,6 +283,9 @@ func (s *Scheduler) FirstChunk(reqID string, now time.Time) {
 	if id == "" {
 		return
 	}
+	if rec, ok := s.reqs[reqID]; ok {
+		rec.firstToken = true
+	}
 	if g := s.groupOf(id); g != nil {
 		s.releaseCold(g, id)
 		s.markQuantumLast(g, id, now)

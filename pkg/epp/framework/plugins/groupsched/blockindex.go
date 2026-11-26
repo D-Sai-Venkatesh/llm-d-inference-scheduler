@@ -180,6 +180,20 @@ func (b *BlockIndex) TrySeat(id string, chains []Chain, budgetBlocks int) (bool,
 	return true, cost
 }
 
+// TrySeatStay is TrySeat measured on the STAY side (exiting threads' blocks not counted): fairRotation's
+// budget, where a removed member's seat is free the moment it is removed.
+func (b *BlockIndex) TrySeatStay(id string, chains []Chain, budgetBlocks int) (bool, int) {
+	if _, seated := b.seats[id]; seated {
+		return true, 0
+	}
+	cost := b.Cost(chains)
+	if len(b.blocksStay)+cost > budgetBlocks {
+		return false, cost
+	}
+	b.insert(id, chains)
+	return true, cost
+}
+
 // insert creates the seat's record and charges its keys to both counters.
 func (b *BlockIndex) insert(id string, chains []Chain) {
 	b.gen++

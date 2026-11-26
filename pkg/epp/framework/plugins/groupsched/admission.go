@@ -29,6 +29,11 @@ import (
 // freeBudget is what the engine can still admit: its budget minus its USED side (every
 // seated thread's blocks, exiting ones included — they still hold them).
 func (s *Scheduler) freeBudget(g *engineGroup) int64 {
+	if s.cfg.FairRotation {
+		// a member fair rotation removed is OUT: its seat budget is free at once (its CPU blocks are
+		// already room, and its in-flight request still counts on the GPU side — the run gate)
+		return int64(g.budgetBlocks) - int64(g.index.StayBlocks())
+	}
 	return int64(g.budgetBlocks) - int64(g.index.UniqueBlocks())
 }
 
@@ -213,7 +218,7 @@ func (s *Scheduler) eligibleKeyCount(g *engineGroup) map[Hash]int {
 		if g.index.Exiting(t.id) {
 			continue
 		}
-		if _, ok := s.eligible(t, s.now); !ok {
+		if !s.roomEligible(t, s.now) {
 			continue
 		}
 		if sb := g.index.seats[t.id]; sb != nil {
@@ -246,7 +251,7 @@ func (s *Scheduler) displace(g *engineGroup, head *waiter, now time.Time) {
 		if sb == nil {
 			continue
 		}
-		if _, ok := s.eligible(m, now); !ok {
+		if !s.roomEligible(m, now) {
 			continue
 		}
 		lost := false
@@ -430,6 +435,9 @@ func (s *Scheduler) coldValveHeldOn(head *waiter) (string, bool) {
 // hasRotationVictim reports whether an engine can evict somebody right now (one
 // definition of the victim criteria, in rotationVictim).
 func (s *Scheduler) hasRotationVictim(g *engineGroup, now time.Time) bool {
+	if s.cfg.FairRotation {
+		return s.fairVictim(g, nil, now) != nil
+	}
 	_, v := s.rotationVictim(g, now)
 	return v != nil
 }
@@ -492,7 +500,11 @@ func (s *Scheduler) seat(g *engineGroup, w *waiter, coldTokens int64, now time.T
 		predictedCached: g.index.CachedTokens(w.chains),
 		promptTokens:    PromptTokens(w.chains),
 	}
-	if ok, cost := g.index.TrySeat(w.id, w.chains, g.budgetBlocks); !ok {
+	trySeat := g.index.TrySeat
+	if s.cfg.FairRotation {
+		trySeat = g.index.TrySeatStay // the same side freeBudget measures
+	}
+	if ok, cost := trySeat(w.id, w.chains, g.budgetBlocks); !ok {
 		// RULE O — AN EMPTY ENGINE ADMITS ONE OVERSIZE HEAD, charging its FULL exact chain.
 		if len(g.threads) != 0 || cost <= g.budgetBlocks {
 			// Not Rule O: the chooser and this seat read the same numbers in the same critical section,

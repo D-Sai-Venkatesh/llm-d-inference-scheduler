@@ -109,15 +109,13 @@ type Config struct {
 	// are room once the bottom blocker clears; then the head is admitted and the next head does the same.
 	// One out per one in, at the admission's pace (exit reason "quantum-head").
 	RoomVictims bool `json:"roomVictims,omitempty"`
-	// FairRotation (roomGate) is ONE rule for who leaves, the member furthest past its quantum first:
-	// - the BUDGET rotation takes idle members first (longest idle first: nothing is lost), then
-	//   quantum-complete members by MOST turns this stay (ties: oldest dispatch) — instead of oldest
-	//   dispatch, which never picks a fast session (it is never the oldest) and lets it overstay;
-	// - a ROOM-held head sends out quantum-complete members (between turns, or running the turn that
-	//   completes the quantum — that request is its last) by the same order, until the blocks removed
-	//   for THIS head (budget victims included) cover its write. Idle members are skipped there: their
-	//   blocks already count as room. A running victim is marked leaving and goes at its request's end.
-	// Every removed member queues behind the head it left for. Displace is unchanged.
+	// FairRotation is ONE design for who leaves (fair.go). Eligible = quantum done (Q turns this stay, or
+	// running the turn that completes them and past its first token) or idle. The BUDGET takes idle
+	// members first, then quantum-done members by the LONGEST TIME IN THE GROUP since they joined; the
+	// ROOM counts free + non-member + idle + removed blocks and, when a head is held, takes only the member
+	// actually at the bottom, and only if it is eligible — otherwise the head waits. A removed member is
+	// out at once (seat budget freed; an in-flight request finishes and counts on the GPU until it ends)
+	// and queues behind the head. Needs roomGate + roomDisplace; exclusive with the older rotation knobs.
 	FairRotation bool `json:"fairRotation,omitempty"`
 	// NewcomersFirst orders the shared admission queue: true (the default) seats a thread's FIRST turn
 	// before returning threads, then oldest first; false is plain oldest-first for every head.
@@ -183,8 +181,14 @@ func (c Config) validate() error {
 	if c.RoomReserveTokens < 0 {
 		return fmt.Errorf("roomReserveTokens must be >= 0, got %d", c.RoomReserveTokens)
 	}
-	if c.FairRotation && !c.RoomGate {
-		return fmt.Errorf("fairRotation needs roomGate: its room path removes members for a head the room gate holds")
+	if c.FairRotation {
+		if !c.RoomGate || !c.RoomDisplace {
+			return fmt.Errorf("fairRotation needs roomGate and roomDisplace: it is the room gate's rotation, and its room counts idle members' blocks")
+		}
+		// ONE design, not a stack: the earlier experimental rotation switches cannot ride along
+		if c.RoomVictims || c.QuantumLastTurn || c.QuantumDoneLast || c.RoomHoldMaxSeconds > 0 {
+			return fmt.Errorf("fairRotation is exclusive with roomVictims, quantumLastTurn, quantumDoneLast and roomHoldMaxSeconds > 0")
+		}
 	}
 	if c.RoomVictims && !c.RoomGate {
 		return fmt.Errorf("roomVictims needs roomGate: it removes members for a head the room gate holds")

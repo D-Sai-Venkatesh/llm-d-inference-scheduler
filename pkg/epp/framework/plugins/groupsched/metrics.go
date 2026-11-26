@@ -78,6 +78,7 @@ type groupMetrics struct {
 	qdDeferred      *prometheus.CounterVec
 	qlMarks         *prometheus.CounterVec
 	stayTurns       *prometheus.HistogramVec
+	staySeconds     *prometheus.HistogramVec
 }
 
 // subsystem namespaces every series (llm_d_epp_group_*).
@@ -154,6 +155,9 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.stayTurns = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "exit_stay_turns",
 		Help:    "settled turns a member had in the stay it is leaving, by exit reason: the quantum's real length (fairRotation should pull it towards quantum)",
 		Buckets: []float64{1, 2, 4, 6, 8, 10, 12, 16, 20, 30, 40, 60, 100}}, []string{"engine", "reason"})
+	g.staySeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "exit_stay_seconds",
+		Help:    "wall-clock seconds a member spent in the group in the stay it is leaving, by exit reason (fairRotation shares this)",
+		Buckets: []float64{30, 60, 120, 240, 480, 900, 1800, 3600, 7200}}, []string{"engine", "reason"})
 	g.tierPromptTotal = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_dispatched_prompt_tokens_total",
 		Help: "prompt tokens of every turn tier_predicted_cached_tokens_total was read for — its denominator"}, engineLabels)
 
@@ -168,7 +172,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.affinityViolations, g.engineGone, g.coldValveHeld, g.anomalies, g.runGateHeld,
 		g.residencyPlacements, g.residencySeatTokens,
 		g.roomHeld, g.roomForced, g.roomRotations, g.tierWrites, g.seatedEvicted, g.tierPredicted, g.tierPromptTotal,
-		g.roomHold, g.roomBlocker, g.qdDeferred, g.qlMarks, g.stayTurns,
+		g.roomHold, g.roomBlocker, g.qdDeferred, g.qlMarks, g.stayTurns, g.staySeconds,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
@@ -190,7 +194,8 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 // absent on purpose: the valve RETURNS it for a class-4 victim but the exit is booked later, as
 // "exiting-drain" when the thread actually leaves.
 var exitReasons = []string{"quantum-complete", "idle", "engine-idle",
-	"exiting-drain", "budget-idle", "budget-noqueue", "engine-gone", "displaced", "quantum-last", "quantum-head"}
+	"exiting-drain", "budget-idle", "budget-noqueue", "engine-gone", "displaced", "quantum-last", "quantum-head",
+	"fair-budget", "fair-room"}
 
 // preInstantiateEngine creates this engine's zero-valued COUNTER series at the moment its group
 // is created, so "no dispatch", "no exit of this reason" are readable as zeros from the first
@@ -273,6 +278,14 @@ func (g *groupMetrics) ObserveStayTurns(engine, reason string, turns int) {
 		return
 	}
 	g.stayTurns.WithLabelValues(engine, reason).Observe(float64(turns))
+}
+
+// ObserveStaySeconds records the wall-clock seconds of the stay a leaving member had.
+func (g *groupMetrics) ObserveStaySeconds(engine, reason string, seconds float64) {
+	if g == nil || g.staySeconds == nil {
+		return
+	}
+	g.staySeconds.WithLabelValues(engine, reason).Observe(seconds)
 }
 
 // ObserveRoomBlocker counts, once per room-held head, what held it.

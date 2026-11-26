@@ -17,6 +17,8 @@ limitations under the License.
 package groupsched
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -196,5 +198,66 @@ func TestStrictRuleSkipsQuantumCompleteWhileSomeoneWaits(t *testing.T) {
 	s.waiters["w"] = &waiter{id: "w", since: epoch}
 	if j, _, _ := s.protectFirst(g, n, []Head{y}); j != -1 {
 		t.Fatalf("someone waiting: a quantum-complete member is not protected, got j=%d", j)
+	}
+}
+
+// The memo changes WHEN the protection decision is computed, never WHAT it decides: repeated passes over an
+// unchanged state reuse it; a tier change, a waiter, or a changed queue recomputes it.
+func TestProtectMemoReusesAndRecomputes(t *testing.T) {
+	s := tinyTier(t, false, 1)
+	runTurn(t, s, headN("y", 0, time.Second, chain("y", 30)), epoch.Add(-300*time.Second))
+	runTurn(t, s, headN("f", 0, time.Second, chain("f", 165)), epoch.Add(-30*time.Second))
+	g := tierOf(s)
+	n, y := headN("n", 0, time.Second, chain("n", 60)), headN("y", 1, 10*time.Second, chain("y", 32))
+	j1, a1, d1 := s.protectDecision(g, n, []Head{y})
+	j2, a2, d2 := s.protectDecision(g, n, []Head{y})
+	if s.counters.protectEvals != 1 || j1 != j2 || a1 != a2 || d1 != d2 || j1 != 0 {
+		t.Fatalf("unchanged state must reuse the decision: evals %d, (%d %d %v) vs (%d %d %v)", s.counters.protectEvals, j1, a1, d1, j2, a2, d2)
+	}
+	s.waiters["w"] = &waiter{id: "w", since: epoch} // y is quantum-complete: now unprotectable
+	if j, _, _ := s.protectDecision(g, n, []Head{y}); j != -1 || s.counters.protectEvals != 2 {
+		t.Fatalf("a waiter must recompute (and y is no longer protectable): j %d evals %d", j, s.counters.protectEvals)
+	}
+	delete(s.waiters, "w")
+	g.tier.AddChain(keys(5, seedFor("other"))) // any tier change bumps its counter
+	if j, _, _ := s.protectDecision(g, n, []Head{y}); j != 0 || s.counters.protectEvals != 3 {
+		t.Fatalf("a tier change must recompute: j %d evals %d", j, s.counters.protectEvals)
+	}
+	if _, _, _ = s.protectDecision(g, n, nil); s.counters.protectEvals != 4 {
+		t.Fatalf("a changed queue must recompute: evals %d", s.counters.protectEvals)
+	}
+}
+
+// The memo is invisible to behaviour: the replay with it and without it is identical, seed by seed; and the
+// proofs are counted per DISPATCH (never more overtakes or protection outcomes than dispatches).
+func TestProtectMemoChangesNothing(t *testing.T) {
+	run := func(seed, tier int64, memo bool) Snapshot {
+		cfg := defaultConfig()
+		cfg.TierCapacityTokens = tier * 64
+		cfg.OwnTierIndex, cfg.RoomGate, cfg.RoomDisplace, cfg.RoomHoldMaxSeconds = true, false, false, 0
+		cfg.NewcomersFirst, cfg.FairRotation, cfg.CostFairRotation, cfg.ColdValveOff = true, true, true, true
+		cfg.VictimOldestDispatch, cfg.LeastRecentlyServed = true, true
+		s, err := NewScheduler(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.noProtectMemo = !memo
+		var out strings.Builder
+		driveReplay(t, s, seed, 500, &out, replayOpts{noMoves: true}, func(int) {})
+		return s.Snapshot(epoch)
+	}
+	for _, tier := range []int64{700, 1000, 1400} {
+		for seed := int64(21); seed <= 26; seed++ {
+			a, b := run(seed, tier, true), run(seed, tier, false)
+			if a.Served != b.Served || a.Room.Protected != b.Room.Protected || a.Room.ProtectedBlocks != b.Room.ProtectedBlocks ||
+				a.Room.ProtectDeclined != b.Room.ProtectDeclined || a.Room.SizeWaitOvertakes != b.Room.SizeWaitOvertakes ||
+				fmt.Sprint(a.Room.SeatedEvicted) != fmt.Sprint(b.Room.SeatedEvicted) || fmt.Sprint(a.Exits) != fmt.Sprint(b.Exits) {
+				t.Fatalf("tier %d seed %d: the memo changed behaviour:\n with    %d %+v %v\n without %d %+v %v", tier, seed, a.Served, a.Room, a.Exits, b.Served, b.Room, b.Exits)
+			}
+			if a.Room.SizeWaitOvertakes > a.Served || a.Room.Protected+a.Room.ProtectDeclined > a.Served {
+				t.Fatalf("tier %d seed %d: proofs must be counted per dispatch: overtakes %d, protections %d+%d, served %d",
+					tier, seed, a.Room.SizeWaitOvertakes, a.Room.Protected, a.Room.ProtectDeclined, a.Served)
+			}
+		}
 	}
 }

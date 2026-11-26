@@ -184,9 +184,14 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		perEngine[g.id] = append(perEngine[g.id], cand{i: i, h: h, engine: g.id})
 	}
 	type best struct {
-		c         cand
-		score     float64
-		protected bool
+		c     cand
+		score float64
+		// what this engine's choice did, counted only if it is the pass's DISPATCH (the loop runs ~1,000 passes a
+		// second while the GPU gate holds; counting per pass would count the same decision a thousand times)
+		overtook        string // the in-group order whose choice overtook an older seated turn ("" = none)
+		protected       bool
+		protectedBlocks int
+		declined        bool
 	}
 	var winner *best
 	for _, g := range groups {
@@ -231,37 +236,33 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		})
 		// the head of the order (oldest-first, or sizeWaitOrder's) is the first one
 		chosen := &cands[0]
-		if sizeWait || lrs {
-			for _, c := range cands[1:] {
-				if c.h.Arrival.Before(chosen.h.Arrival) {
-					// an older turn was overtaken by the in-group order's choice: count it (proof it fires)
-					order := "size-wait"
-					if lrs {
-						order = "least-recently-served"
-					}
-					s.counters.sizeWaitOvertakes++
-					s.metrics.ObserveDispatchOvertake(engineLabel(g.id), order)
-					break
-				}
-			}
-		}
 		// THE STRICT RULE's step 2 (protect.go): the time order's candidate goes, unless its write would evict a
-		// protectable queued member's blocks and serving that member first is a net save
-		protected := false
+		// protectable queued member's blocks and serving that member first is a net save. Decided per pass through
+		// the engine's memo; COUNTED only if this choice is the pass's dispatch (below).
+		protected, protectedBlocks, declined := false, 0, false
 		if lrs && !s.plainLRS && g.tier != nil && len(cands) > 1 {
 			rest := make([]Head, len(cands)-1)
 			for k := range rest {
 				rest[k] = cands[k+1].h
 			}
-			j, a, declined := s.protectFirst(g, cands[0].h, rest)
+			j, a, dec := s.protectDecision(g, cands[0].h, rest)
 			if j >= 0 {
-				chosen, protected = &cands[j+1], true
-				s.counters.protected++
-				s.counters.protectedBlocks += int64(a)
-				s.metrics.ObserveProtect(engineLabel(g.id), "protected", a)
-			} else if declined {
-				s.counters.protectDeclined++
-				s.metrics.ObserveProtect(engineLabel(g.id), "declined", 0)
+				chosen, protected, protectedBlocks = &cands[j+1], true, a
+			} else {
+				declined = dec
+			}
+		}
+		overtook := ""
+		if sizeWait || lrs {
+			for k := range cands {
+				if &cands[k] != chosen && cands[k].h.Arrival.Before(chosen.h.Arrival) {
+					// an older turn is overtaken by the in-group order's choice (proof it fires — counted at dispatch)
+					overtook = "size-wait"
+					if lrs {
+						overtook = "least-recently-served"
+					}
+					break
+				}
 			}
 		}
 		if qdLast && !s.quantumDone(g, chosen.h.Thread) {
@@ -285,12 +286,26 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		if winner == nil || score > winner.score ||
 			(score == winner.score && chosen.h.Arrival.Before(winner.c.h.Arrival)) ||
 			(score == winner.score && chosen.h.Arrival.Equal(winner.c.h.Arrival) && g.id < winner.c.engine) {
-			winner = &best{c: *chosen, score: score, protected: protected}
+			winner = &best{c: *chosen, score: score, overtook: overtook, protected: protected,
+				protectedBlocks: protectedBlocks, declined: declined}
 		}
 	}
 	if winner != nil {
 		g := s.groups[winner.c.engine]
 		m := g.threads[winner.c.h.Thread]
+		// the in-group order's proofs, counted once per DISPATCH
+		if winner.overtook != "" {
+			s.counters.sizeWaitOvertakes++
+			s.metrics.ObserveDispatchOvertake(engineLabel(g.id), winner.overtook)
+		}
+		if winner.protected {
+			s.counters.protected++
+			s.counters.protectedBlocks += int64(winner.protectedBlocks)
+			s.metrics.ObserveProtect(engineLabel(g.id), "protected", winner.protectedBlocks)
+		} else if winner.declined {
+			s.counters.protectDeclined++
+			s.metrics.ObserveProtect(engineLabel(g.id), "declined", 0)
+		}
 		// the strict rule's streak: protections in a row, closed (and observed) by the next unprotected dispatch
 		if winner.protected {
 			if g.protectStreak == 0 {

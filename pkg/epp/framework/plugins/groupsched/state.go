@@ -262,6 +262,8 @@ type engineGroup struct {
 	// (the strict rule has no bound; this measures what one would have capped).
 	protectStreak int
 	protectSince  time.Time
+	// protectMemo is the engine's last protection decision and its inputs (protect.go)
+	protectMemo *protectMemo
 	// tierCause names what the tier index is being written for right now (seat / dispatch /
 	// passthrough / rebind), so its eviction observer can book a seated block's eviction by cause.
 	tierCause string
@@ -317,6 +319,8 @@ type Scheduler struct {
 	// plainLRS (tests only) turns the strict rule's protection off — leastRecentlyServed becomes the bare time
 	// order, so the replay can compare the two on the same seeds. Never set by configuration.
 	plainLRS bool
+	// noProtectMemo (tests only) recomputes the protection decision on every pass (the memo's equivalence test).
+	noProtectMemo bool
 	// metrics is the Prometheus surface. Every observation is a DIRECT call on it, and every
 	// method is nil-safe, so a bare Scheduler (the unit tests) records nothing without any
 	// wiring.
@@ -402,6 +406,8 @@ type Scheduler struct {
 		// was served before the candidate, the blocks that saved, and dispatches where members were at risk but
 		// no protection was a net save
 		protected, protectedBlocks, protectDeclined int64
+		// protectEvals counts protection decisions actually computed (memo misses) — tests read it
+		protectEvals int64
 	}
 }
 

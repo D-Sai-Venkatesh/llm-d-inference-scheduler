@@ -109,6 +109,16 @@ type Config struct {
 	// are room once the bottom blocker clears; then the head is admitted and the next head does the same.
 	// One out per one in, at the admission's pace (exit reason "quantum-head").
 	RoomVictims bool `json:"roomVictims,omitempty"`
+	// FairRotation (roomGate) is ONE rule for who leaves, the member furthest past its quantum first:
+	// - the BUDGET rotation takes idle members first (longest idle first: nothing is lost), then
+	//   quantum-complete members by MOST turns this stay (ties: oldest dispatch) — instead of oldest
+	//   dispatch, which never picks a fast session (it is never the oldest) and lets it overstay;
+	// - a ROOM-held head sends out quantum-complete members (between turns, or running the turn that
+	//   completes the quantum — that request is its last) by the same order, until the blocks removed
+	//   for THIS head (budget victims included) cover its write. Idle members are skipped there: their
+	//   blocks already count as room. A running victim is marked leaving and goes at its request's end.
+	// Every removed member queues behind the head it left for. Displace is unchanged.
+	FairRotation bool `json:"fairRotation,omitempty"`
 	// NewcomersFirst orders the shared admission queue: true (the default) seats a thread's FIRST turn
 	// before returning threads, then oldest first; false is plain oldest-first for every head.
 	NewcomersFirst bool `json:"newcomersFirst"`
@@ -172,6 +182,9 @@ func (c Config) validate() error {
 	}
 	if c.RoomReserveTokens < 0 {
 		return fmt.Errorf("roomReserveTokens must be >= 0, got %d", c.RoomReserveTokens)
+	}
+	if c.FairRotation && !c.RoomGate {
+		return fmt.Errorf("fairRotation needs roomGate: its room path removes members for a head the room gate holds")
 	}
 	if c.RoomVictims && !c.RoomGate {
 		return fmt.Errorf("roomVictims needs roomGate: it removes members for a head the room gate holds")

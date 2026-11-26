@@ -290,7 +290,22 @@ func (s *Scheduler) sendVictimsFor(g *engineGroup, head *waiter, need int, now t
 	for head.victimBlocks < need {
 		var best *thread
 		for _, m := range g.threads {
-			if m.id == head.id || m.busy() || g.index.Exiting(m.id) || m.busyPeriods < s.cfg.Quantum {
+			if m.id == head.id || g.index.Exiting(m.id) {
+				continue
+			}
+			if s.cfg.FairRotation {
+				// quantum complete between turns, or RUNNING the turn that completes it (that request
+				// is its last); idle members are skipped — their blocks already count as room
+				done := (!m.busy() && m.busyPeriods >= s.cfg.Quantum) || (m.busy() && m.busyPeriods >= s.cfg.Quantum-1)
+				if !done || (!m.busy() && s.silent(m, now)) {
+					continue
+				}
+				if best == nil || s.fairBefore(m, best, now) {
+					best = m
+				}
+				continue
+			}
+			if m.busy() || m.busyPeriods < s.cfg.Quantum {
 				continue
 			}
 			if best == nil || touchedAt(m).Before(touchedAt(best)) ||
@@ -303,6 +318,15 @@ func (s *Scheduler) sendVictimsFor(g *engineGroup, head *waiter, need int, now t
 		}
 		head.victimBlocks += g.index.ChargedBlocks(best.id)
 		s.counters.headVictims++
+		if best.busy() {
+			// a running victim: out of the group now (not dispatched again, its blocks no longer
+			// protected), its in-flight request finishes and still counts on the GPU until it ends
+			g.index.MarkExiting(best.id)
+			best.exitingSince = now
+			best.exitReason = "quantum-head"
+			sent = true
+			continue
+		}
 		s.exit(g, best, "quantum-head", now)
 		// BEHIND THE HEAD IT LEFT FOR, in either queue order: its context is still in the tier, so its
 		// write is small and — ahead of the head — it would re-seat at once with a fresh quantum, leaving
@@ -394,7 +418,7 @@ func (s *Scheduler) seatWaiters(now time.Time) {
 		// Nothing fits BY BUDGET on the chosen engine — or (roomGate) its tier has no room for the
 		// head's write: eviction is the only way such a head ever runs, and it is demand-driven (a head
 		// is waiting right now).
-		if cand.roomHeld && s.cfg.RoomVictims {
+		if cand.roomHeld && (s.cfg.RoomVictims || s.cfg.FairRotation) {
 			// THE HEAD-DRIVEN BINDING QUANTUM: send out quantum-complete members (between turns, oldest
 			// dispatch first) for THIS head, up to its write; then re-evaluate it (their blocks may
 			// already be room) — and if still held, wait: their blocks sink while they are not served.
@@ -428,8 +452,17 @@ func (s *Scheduler) seatWaiters(now time.Time) {
 		// NOTE: a rotation victim is never in flight — the tenure rule refuses in-flight threads — so
 		// there is no mid-flight exit to handle here; that class lives in budgetVictim (eviction.go),
 		// which does reach running threads.
+		if s.cfg.FairRotation {
+			// the budget victim's blocks count toward this head's room quota too (one count per head)
+			head.victimBlocks += cand.g.index.ChargedBlocks(victim.id)
+		}
 		s.exit(cand.g, victim, reason, now)
-		if !s.cfg.NewcomersFirst {
+		if s.cfg.FairRotation {
+			// behind the head it left for, in either queue order (newcomerLess orders by the same key)
+			if w, ok := s.waiters[victim.id]; ok && !entryKey(w).After(entryKey(head)) {
+				w.floor = entryKey(head).Add(time.Nanosecond)
+			}
+		} else if !s.cfg.NewcomersFirst {
 			// THE ROTATION MUST SERVE THE HEAD THAT ASKED FOR IT. exit re-queues a victim with a queued
 			// turn at its ORIGINAL waitingSince; in a plain oldest-first queue that can be older than the
 			// head, and the victim would re-seat at once with a fresh quantum while the head gains nothing.

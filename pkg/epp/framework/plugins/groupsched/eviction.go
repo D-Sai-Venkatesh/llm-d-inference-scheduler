@@ -96,7 +96,9 @@ func (s *Scheduler) rotationVictim(g *engineGroup, now time.Time) (string, *thre
 		}
 		hasWaiting := !m.waitingSince.IsZero()
 		var better bool
-		if s.cfg.VictimOldestDispatch {
+		if s.cfg.FairRotation {
+			better = best == nil || s.fairBefore(m, best, now)
+		} else if s.cfg.VictimOldestDispatch {
 			// the OLDEST TIER RECENCY first: the member whose chain the engine's tier touched longest
 			// ago, whose blocks are therefore the nearest the eviction end (then id)
 			better = best == nil || touchedAt(m).Before(touchedAt(best)) ||
@@ -135,6 +137,25 @@ func (s *Scheduler) rotationVictim(g *engineGroup, now time.Time) (string, *thre
 		}
 	}
 	return bestReason, best
+}
+
+// fairBefore (fairRotation) is the one victim order: idle members first (longest idle first), then by
+// MOST turns this stay — the furthest past the quantum — then oldest dispatch, then id.
+func (s *Scheduler) fairBefore(a, b *thread, now time.Time) bool {
+	ia, ib := s.silent(a, now) && !a.busy(), s.silent(b, now) && !b.busy()
+	if ia != ib {
+		return ia
+	}
+	if ia && !a.lastActivity.Equal(b.lastActivity) {
+		return a.lastActivity.Before(b.lastActivity)
+	}
+	if a.busyPeriods != b.busyPeriods {
+		return a.busyPeriods > b.busyPeriods
+	}
+	if !touchedAt(a).Equal(touchedAt(b)) {
+		return touchedAt(a).Before(touchedAt(b))
+	}
+	return a.id < b.id
 }
 
 // touchedAt is when a member's chain was last touched in its engine's tier: its last dispatch, or its
@@ -236,6 +257,7 @@ func (s *Scheduler) exit(g *engineGroup, m *thread, reason string, now time.Time
 	s.recordEvent("EXIT", m.id, fmt.Sprintf("reason=%s turns=%d fairness_id=%s wire_id=%s",
 		reason, m.seatTurns, fairnessOrNone(m.fairnessID), fairnessOrNone(m.wireID)), now)
 	s.metrics.ObserveExit(engineLabel(g.id), reason)
+	s.metrics.ObserveStayTurns(engineLabel(g.id), reason, m.seatTurns)
 	delete(s.bindings, m.id)
 	// THE RECORDS GO WITH THE THREAD: they name a seat that no longer exists, so no later hook
 	// could act on one (and its settle, if it ever comes, closes nothing rather than a charge against

@@ -364,6 +364,9 @@ func TestRoomGateReplay(t *testing.T) {
 		if len(qdLast) > 2 { // (false, false, true) = newcomers-first + roomVictims
 			cfg.RoomVictims = qdLast[2]
 		}
+		if len(qdLast) > 3 { // (false, false, false, true) = newcomers-first + fairRotation
+			cfg.FairRotation = qdLast[3]
+		}
 		cfg.TierCapacityTokens = tierBlocks * 64
 		cfg.OwnTierIndex = true
 		cfg.RoomGate = true
@@ -457,6 +460,16 @@ func TestRoomGateReplay(t *testing.T) {
 			seed, tc.tier, nfn, nfSnap.Room.SeatedEvicted[tierCauseDisplaced], nfSnap.Room.Held, nfSnap.Served,
 			vn, vnSnap.Room.SeatedEvicted[tierCauseDispatch], vnSnap.Room.SeatedEvicted[tierCauseDispatch+"-eligible"],
 			vnSnap.Room.SeatedEvicted[tierCauseDisplaced], vnSnap.Room.Held, vnSnap.Room.HeadVictims, vnSnap.Served)
+		fr, frSnap := seatedEvictedDisplace(seed, tc.tier, false, false, false, true)
+		if frSnap.Room.Forced != 0 || frSnap.Room.Rotations != 0 || frSnap.Room.SeatedEvicted[tierCauseSeat] != 0 {
+			t.Fatalf("seed %d: NF+fairRotation: no forced seat, no room rotation, no seat-caused protected eviction, got %+v", seed, frSnap.Room)
+		}
+		if frSnap.Served < offSnap.Served/2 {
+			t.Fatalf("seed %d: NF+fairRotation must not starve the workload: served %d vs %d", seed, frSnap.Served, offSnap.Served)
+		}
+		t.Logf("seed %d tier %d: NF+fairRotation: staying evicted %d (dispatch protected %d / eligible %d), displaced %d; held %d; head victims %d; exits %v; served %d",
+			seed, tc.tier, fr, frSnap.Room.SeatedEvicted[tierCauseDispatch], frSnap.Room.SeatedEvicted[tierCauseDispatch+"-eligible"],
+			frSnap.Room.SeatedEvicted[tierCauseDisplaced], frSnap.Room.Held, frSnap.Room.HeadVictims, frSnap.Exits, frSnap.Served)
 		t.Logf("seed %d tier %d: NF+qLastTurn: staying blocks evicted %d (dispatch protected %d / eligible %d), displaced %d; held %d; marks %d; served %d",
 			seed, tc.tier, ln, lnSnap.Room.SeatedEvicted[tierCauseDispatch], lnSnap.Room.SeatedEvicted[tierCauseDispatch+"-eligible"],
 			lnSnap.Room.SeatedEvicted[tierCauseDisplaced], lnSnap.Room.Held, lnSnap.Room.QuantumLastMarks, lnSnap.Served)
@@ -855,5 +868,93 @@ func TestRoomVictimsAreHeadDrivenAndBounded(t *testing.T) {
 				t.Fatalf("%s: q1 re-seated ahead of the head it left for", tc.name)
 			}
 		}
+	}
+}
+
+// fairRotation, budget path: idle members first, then quantum-complete members by MOST turns this stay
+// (the furthest past the quantum) — not oldest dispatch, which would pick the slow one and keep the fast.
+func TestFairRotationBudgetOrder(t *testing.T) {
+	s := roomSched(t, true, func(c *Config) { c.RoomDisplace = true; c.Quantum = 4; c.FairRotation = true; c.NewcomersFirst = true })
+	runTurn(t, s, headN("i", 0, time.Second, chain("i", 50)), epoch) // i: one turn, then silent
+	at := epoch.Add(time.Duration(s.cfg.IdleSeconds+5) * time.Second)
+	for k := 0; k < 5; k++ { // slow: 5 turns, dispatched EARLIER (oldest dispatch)
+		runTurn(t, s, headN("slow", k, time.Second, chain("slow", 50)), at)
+		at = at.Add(time.Second)
+	}
+	for k := 0; k < 9; k++ { // fast: 9 turns, dispatched last
+		runTurn(t, s, headN("fast", k, time.Second, chain("fast", 50)), at)
+		at = at.Add(time.Second)
+	}
+	var order []string
+	for k := 0; k < 3; k++ {
+		s.mu.Lock()
+		_, v := s.rotationVictim(s.groups[""], at)
+		if v != nil {
+			order = append(order, v.id)
+			s.exit(s.groups[""], v, "test", at)
+		}
+		s.mu.Unlock()
+	}
+	if fmt.Sprint(order) != "[i fast slow]" {
+		t.Fatalf("fair order must be idle first, then most turns: got %v", order)
+	}
+}
+
+// fairRotation, room path: a room-held head sends out the quantum-complete member with the most turns
+// first, then one RUNNING the turn that completes its quantum (marked leaving, it goes at its request's
+// end); a mid-quantum member — running or between turns — is never touched.
+func TestFairRotationRoomVictims(t *testing.T) {
+	s := roomSched(t, true, func(c *Config) {
+		c.RoomDisplace = true
+		c.RoomHoldMaxSeconds = 0
+		c.Quantum = 4
+		c.NewcomersFirst = true
+		c.FairRotation = true
+	})
+	at := epoch
+	d := headN("d", 0, time.Second, chain("d", 300))
+	if i := s.Pass([]Head{d}, at); i != 0 {
+		t.Fatal("d must dispatch")
+	}
+	s.AtPod(d.ReqID, "", at) // mid-quantum, running at the bottom: the blocker
+	at = at.Add(time.Second)
+	for k := 0; k < 6; k++ { // f: 6 turns (2 past the quantum), between turns
+		runTurn(t, s, headN("f", k, time.Second, chain("f", 200)), at)
+		at = at.Add(time.Second)
+	}
+	for k := 0; k < 3; k++ { // g: 3 turns, then its 4th (quantum-completing) turn RUNNING
+		runTurn(t, s, headN("g", k, time.Second, chain("g", 200)), at)
+		at = at.Add(time.Second)
+	}
+	g4 := headN("g", 3, time.Second, chain("g", 200))
+	if i := s.Pass([]Head{g4}, at); i != 0 {
+		t.Fatal("g's 4th turn must dispatch")
+	}
+	s.AtPod(g4.ReqID, "", at)
+	at = at.Add(time.Second)
+	runTurn(t, s, headN("m", 0, time.Second, chain("m", 100)), at) // m: mid-quantum, between turns
+	at = at.Add(time.Second)
+	runTurn(t, s, headN("x", 0, time.Second, chain("x", 400)), at)
+	evict(t, s, "x") // free 2000-300-200-200-100-400 = 800
+	at = at.Add(time.Second)
+	z := headN("z", 0, time.Second, chain("z", 1000)) // budget 300+200+200+100+1000 <= 1900; room 800 < 1000
+	s.Pass([]Head{z}, at)
+	if seated(s, "f") {
+		t.Fatal("f (most turns past the quantum) must be sent out first")
+	}
+	s.mu.Lock()
+	gExiting := s.groups[""].index.Exiting("g")
+	s.mu.Unlock()
+	if !gExiting {
+		t.Fatal("g (running its quantum-completing turn) must be marked leaving: f's 200 blocks do not cover z's write")
+	}
+	if !seated(s, "m") || !seated(s, "d") {
+		t.Fatal("mid-quantum members are never victims")
+	}
+	s.FirstChunk(g4.ReqID, at)
+	s.Settle(g4.ReqID, "", at.Add(time.Second))
+	snap := s.Snapshot(at.Add(time.Second))
+	if seated(s, "g") || snap.Exits["quantum-head"] != 2 {
+		t.Fatalf("g must leave at its request's end: seated %v exits %+v", seated(s, "g"), snap.Exits)
 	}
 }

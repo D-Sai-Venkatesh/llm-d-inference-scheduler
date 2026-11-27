@@ -51,6 +51,7 @@ type protectMemo struct {
 	rest     []turnKey
 	j, a     int
 	declined bool
+	skipped  int
 }
 
 // turnKey identifies one queued turn for the memo: its request, its chain (key count + last key), and — for
@@ -75,7 +76,7 @@ func (s *Scheduler) turnKeyOf(g *engineGroup, h Head) turnKey {
 
 // protectDecision is protectFirst through the engine's memo (see protectMemo): recomputed only when something
 // it depends on changed. s.noProtectMemo (tests only) bypasses it.
-func (s *Scheduler) protectDecision(g *engineGroup, x Head, rest []Head) (int, int, bool) {
+func (s *Scheduler) protectDecision(g *engineGroup, x Head, rest []Head) (int, int, bool, int) {
 	if s.noProtectMemo || g.tier == nil {
 		return s.protectFirst(g, x, rest)
 	}
@@ -92,16 +93,17 @@ func (s *Scheduler) protectDecision(g *engineGroup, x Head, rest []Head) (int, i
 		}
 	}
 	if hit {
-		return m.j, m.a, m.declined
+		return m.j, m.a, m.declined, m.skipped
 	}
 	s.counters.protectEvals++
-	j, a, declined := s.protectFirst(g, x, rest)
-	nm := &protectMemo{gen: g.tier.Gen(), waiting: waiting, x: xk, rest: make([]turnKey, len(rest)), j: j, a: a, declined: declined}
+	j, a, declined, skipped := s.protectFirst(g, x, rest)
+	nm := &protectMemo{gen: g.tier.Gen(), waiting: waiting, x: xk, rest: make([]turnKey, len(rest)), j: j, a: a,
+		declined: declined, skipped: skipped}
 	for i, r := range rest {
 		nm.rest[i] = s.turnKeyOf(g, r)
 	}
 	g.protectMemo = nm
-	return j, a, declined
+	return j, a, declined, skipped
 }
 
 // headKeySet is a turn's chain keys as a set.
@@ -144,19 +146,17 @@ func (s *Scheduler) dangerZone(g *engineGroup, h Head) map[Hash]struct{} {
 
 // protectFirst is the strict rule's step 2 for candidate x over the other queued turns (rest, in the time
 // order). It returns the index in rest of the member to serve first (-1 = serve x), that member's protected
-// blocks (a), and whether some member was at risk but no protection was a net save (declined).
-func (s *Scheduler) protectFirst(g *engineGroup, x Head, rest []Head) (int, int, bool) {
+// blocks (a), whether some member was at risk but no protection was a net save (declined), and the blocks of
+// quantum-complete members at risk that were skipped because someone waits outside (observability only).
+func (s *Scheduler) protectFirst(g *engineGroup, x Head, rest []Head) (int, int, bool, int) {
 	dzX := s.dangerZone(g, x)
 	if len(dzX) == 0 {
-		return -1, 0, false
+		return -1, 0, false, 0
 	}
 	waiting := len(s.waiters) > 0
 	var queued map[Hash]struct{} // every queued turn's keys (x's included), built on first need
-	declined := false
+	declined, skipped := false, 0
 	for j, y := range rest {
-		if waiting && s.quantumDone(g, y.Thread) {
-			continue // about to leave: its chain is lost during the exile anyway
-		}
 		a := 0
 		for _, c := range y.Chains {
 			for _, k := range c.Keys {
@@ -166,6 +166,10 @@ func (s *Scheduler) protectFirst(g *engineGroup, x Head, rest []Head) (int, int,
 			}
 		}
 		if a == 0 {
+			continue
+		}
+		if waiting && s.quantumDone(g, y.Thread) {
+			skipped += a // about to leave: its chain is lost during the exile anyway (counted, not protected)
 			continue
 		}
 		if queued == nil {
@@ -188,9 +192,9 @@ func (s *Scheduler) protectFirst(g *engineGroup, x Head, rest []Head) (int, int,
 			}
 		}
 		if a > b {
-			return j, a, false
+			return j, a, false, skipped
 		}
 		declined = true
 	}
-	return -1, 0, declined
+	return -1, 0, declined, skipped
 }

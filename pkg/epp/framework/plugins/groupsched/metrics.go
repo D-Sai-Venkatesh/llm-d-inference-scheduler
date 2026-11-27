@@ -86,6 +86,13 @@ type groupMetrics struct {
 	protectBlocks   *prometheus.CounterVec
 	protectStreak   *prometheus.HistogramVec
 	protectStreakS  *prometheus.HistogramVec
+	protectSkipped  *prometheus.CounterVec
+	protectSkippedB *prometheus.CounterVec
+	claims          *prometheus.CounterVec
+	claimSeconds    *prometheus.HistogramVec
+	claimVictimsEls *prometheus.CounterVec
+	seatedPastClaim *prometheus.CounterVec
+	tokensGivenUp   *prometheus.CounterVec
 }
 
 // subsystem namespaces every series (llm_d_epp_group_*).
@@ -186,6 +193,26 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 	g.protectStreakS = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "protect_streak_seconds",
 		Help:    "seconds from a streak's first protection to the next unprotected dispatch (the candidate's extra wait)",
 		Buckets: []float64{0.5, 1, 2, 4, 8, 16, 30, 60, 120, 240}}, []string{"engine"})
+	g.protectSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "protect_skipped_waiting_total",
+		Help: "dispatches where a quantum-complete queued member had blocks in the candidate's danger zone but was not protected because someone waits outside (anywhere)"},
+		[]string{"engine"})
+	g.protectSkippedB = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "protect_skipped_waiting_blocks_total",
+		Help: "blocks of those skipped members in the danger zone"}, []string{"engine"})
+	g.claims = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "claims_total",
+		Help: "claimOrder: a waiter that fits on no open engine claimed this engine (victims for it only from here)"},
+		[]string{"engine"})
+	g.claimSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{Subsystem: subsystem, Name: "claim_seconds",
+		Help:    "claimOrder: seconds from a waiter's first claim to its seat, by the engine it last claimed",
+		Buckets: []float64{1, 5, 15, 30, 60, 120, 240, 480, 900, 1800}}, []string{"engine"})
+	g.claimVictimsEls = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "claim_victims_elsewhere_total",
+		Help: "claimOrder: victims removed for a waiter on this engine that was then seated elsewhere (should stay near 0)"},
+		[]string{"engine"})
+	g.seatedPastClaim = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "seated_past_claim_total",
+		Help: "claimOrder: seats made while an older waiter was blocked on a claim in the same pass (what head-of-line would have held)"},
+		[]string{"engine"})
+	g.tokensGivenUp = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "residency_tokens_given_up_total",
+		Help: "prompt tokens the warmest engine held beyond the engine a head was seated on (greedy placement's cold cost)"},
+		[]string{"engine"})
 	g.tierPromptTotal = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_dispatched_prompt_tokens_total",
 		Help: "prompt tokens of every turn tier_predicted_cached_tokens_total was read for — its denominator"}, engineLabels)
 
@@ -202,6 +229,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.roomHeld, g.roomForced, g.roomRotations, g.tierWrites, g.seatedEvicted, g.tierPredicted, g.tierPromptTotal,
 		g.roomHold, g.roomBlocker, g.qdDeferred, g.qlMarks, g.stayTurns, g.staySeconds, g.stayBlocks, g.fairTailSaved, g.sizeWaitOver,
 		g.protect, g.protectBlocks, g.protectStreak, g.protectStreakS,
+		g.protectSkipped, g.protectSkippedB, g.claims, g.claimSeconds, g.claimVictimsEls, g.seatedPastClaim, g.tokensGivenUp,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
@@ -318,6 +346,56 @@ func (g *groupMetrics) ObserveProtect(engine, outcome string, blocks int) {
 	if blocks > 0 {
 		g.protectBlocks.WithLabelValues(engine).Add(float64(blocks))
 	}
+}
+
+// ObserveProtectSkippedWaiting counts one dispatch whose danger zone held blocks of a quantum-complete member
+// left unprotected because someone waits outside, and those blocks.
+func (g *groupMetrics) ObserveProtectSkippedWaiting(engine string, blocks int) {
+	if g == nil || g.protectSkipped == nil {
+		return
+	}
+	g.protectSkipped.WithLabelValues(engine).Inc()
+	g.protectSkippedB.WithLabelValues(engine).Add(float64(blocks))
+}
+
+// ObserveClaim counts one new claim on engine.
+func (g *groupMetrics) ObserveClaim(engine string) {
+	if g == nil || g.claims == nil {
+		return
+	}
+	g.claims.WithLabelValues(engine).Inc()
+}
+
+// ObserveClaimSeconds records one claim's duration (first claim → seat).
+func (g *groupMetrics) ObserveClaimSeconds(engine string, seconds float64) {
+	if g == nil || g.claimSeconds == nil {
+		return
+	}
+	g.claimSeconds.WithLabelValues(engine).Observe(seconds)
+}
+
+// ObserveClaimVictimsElsewhere counts victims removed for a waiter on engine that was seated elsewhere.
+func (g *groupMetrics) ObserveClaimVictimsElsewhere(engine string, n int) {
+	if g == nil || g.claimVictimsEls == nil {
+		return
+	}
+	g.claimVictimsEls.WithLabelValues(engine).Add(float64(n))
+}
+
+// ObserveSeatedPastClaim counts one seat made while an older waiter was blocked on a claim.
+func (g *groupMetrics) ObserveSeatedPastClaim(engine string) {
+	if g == nil || g.seatedPastClaim == nil {
+		return
+	}
+	g.seatedPastClaim.WithLabelValues(engine).Inc()
+}
+
+// ObserveTokensGivenUp adds the prompt tokens a seat gave up versus the warmest engine.
+func (g *groupMetrics) ObserveTokensGivenUp(engine string, tokens int64) {
+	if g == nil || g.tokensGivenUp == nil {
+		return
+	}
+	g.tokensGivenUp.WithLabelValues(engine).Add(float64(tokens))
 }
 
 // ObserveProtectStreak records one ended streak: its protections and the candidate's extra wait.

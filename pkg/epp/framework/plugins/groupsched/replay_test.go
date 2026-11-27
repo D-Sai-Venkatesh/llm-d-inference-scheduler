@@ -59,7 +59,8 @@ type replayReq struct {
 
 // replayOpts are the knobs a test may turn; the zero value is the pinned workload.
 type replayOpts struct {
-	noMoves bool // no request is placed on another engine than its seat
+	noMoves bool     // no request is placed on another engine than its seat
+	engines []string // the engines (default a, b, c — engine c leaves at half time and comes back)
 }
 
 func (th *replayThread) chains() []Chain {
@@ -75,6 +76,13 @@ func driveReplay(t *testing.T, s *Scheduler, seed int64, steps int, out *strings
 	t.Helper()
 	rng := rand.New(rand.NewSource(seed))
 	engines := []string{"a", "b", "c"}
+	if len(opts.engines) > 0 {
+		engines = opts.engines
+	}
+	hasC := false
+	for _, e := range engines {
+		hasC = hasC || e == "c"
+	}
 	for _, e := range engines {
 		if err := s.SetNumBlocksFor(e, 64, 500); err != nil {
 			t.Fatal(err)
@@ -107,10 +115,11 @@ func driveReplay(t *testing.T, s *Scheduler, seed int64, steps int, out *strings
 	}
 	for step := 0; step < steps; step++ {
 		now := epoch.Add(time.Duration(step) * time.Second)
-		switch step {
-		case steps / 2:
+		switch {
+		case !hasC:
+		case step == steps/2:
 			fmt.Fprintf(out, "GONE c %d\n", s.RemoveEngine("c", now))
-		case steps/2 + 20:
+		case step == steps/2+20:
 			if err := s.SetNumBlocksFor("c", 64, 500); err != nil {
 				t.Fatal(err)
 			}

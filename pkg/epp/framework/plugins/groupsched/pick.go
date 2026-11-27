@@ -192,6 +192,7 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		protected       bool
 		protectedBlocks int
 		declined        bool
+		skipped         int
 	}
 	var winner *best
 	for _, g := range groups {
@@ -239,13 +240,14 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		// THE STRICT RULE's step 2 (protect.go): the time order's candidate goes, unless its write would evict a
 		// protectable queued member's blocks and serving that member first is a net save. Decided per pass through
 		// the engine's memo; COUNTED only if this choice is the pass's dispatch (below).
-		protected, protectedBlocks, declined := false, 0, false
+		protected, protectedBlocks, declined, skipped := false, 0, false, 0
 		if lrs && !s.plainLRS && g.tier != nil && len(cands) > 1 {
 			rest := make([]Head, len(cands)-1)
 			for k := range rest {
 				rest[k] = cands[k+1].h
 			}
-			j, a, dec := s.protectDecision(g, cands[0].h, rest)
+			j, a, dec, sk := s.protectDecision(g, cands[0].h, rest)
+			skipped = sk
 			if j >= 0 {
 				chosen, protected, protectedBlocks = &cands[j+1], true, a
 			} else {
@@ -287,7 +289,7 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 			(score == winner.score && chosen.h.Arrival.Before(winner.c.h.Arrival)) ||
 			(score == winner.score && chosen.h.Arrival.Equal(winner.c.h.Arrival) && g.id < winner.c.engine) {
 			winner = &best{c: *chosen, score: score, overtook: overtook, protected: protected,
-				protectedBlocks: protectedBlocks, declined: declined}
+				protectedBlocks: protectedBlocks, declined: declined, skipped: skipped}
 		}
 	}
 	if winner != nil {
@@ -305,6 +307,11 @@ func (s *Scheduler) dispatch(heads []Head, now time.Time) int {
 		} else if winner.declined {
 			s.counters.protectDeclined++
 			s.metrics.ObserveProtect(engineLabel(g.id), "declined", 0)
+		}
+		if winner.skipped > 0 {
+			s.counters.protectSkippedWaiting++
+			s.counters.protectSkippedBlocks += int64(winner.skipped)
+			s.metrics.ObserveProtectSkippedWaiting(engineLabel(g.id), winner.skipped)
 		}
 		// the strict rule's streak: protections in a row, closed (and observed) by the next unprotected dispatch
 		if winner.protected {
@@ -440,6 +447,10 @@ func (s *Scheduler) queuedPerSeat(g *engineGroup) float64 {
 // until nothing more can be seated.
 func (s *Scheduler) seatWaiters(now time.Time) {
 	if len(s.waiters) == 0 {
+		return
+	}
+	if s.cfg.ClaimOrder != "" {
+		s.seatWaitersClaims(now) // one blocked head per engine (claims.go)
 		return
 	}
 	budget := len(s.waiters)
@@ -700,6 +711,10 @@ func (s *Scheduler) notePlacement(c *seatChoice, w *waiter, now time.Time) {
 	prompt := PromptTokens(w.chains)
 	cold := max(prompt-c.resident, 0)
 	s.counters.placements[outcome]++
+	if c.bestResident > c.resident {
+		s.counters.tokensGivenUp += c.bestResident - c.resident
+		s.metrics.ObserveTokensGivenUp(engineLabel(c.g.id), c.bestResident-c.resident)
+	}
 	s.counters.seatResident += c.resident
 	s.counters.seatCold += cold
 	s.metrics.ObservePlacement(engineLabel(c.g.id), outcome, c.resident, cold)

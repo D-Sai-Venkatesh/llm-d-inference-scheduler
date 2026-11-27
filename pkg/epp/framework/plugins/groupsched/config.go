@@ -142,6 +142,12 @@ type Config struct {
 	// no exchange rate; cache state decides only who is in a write's danger zone. Needs ownTierIndex. Exclusive
 	// with the other in-group orders (sizeWaitOrder, quantumDoneLast).
 	LeastRecentlyServed bool `json:"leastRecentlyServed,omitempty"`
+	// ClaimOrder turns on ONE BLOCKED HEAD PER ENGINE (claims.go) and names how a blocked waiter picks the engine
+	// it claims: "compute" — fewest tokens to really prefill there, then smallest shortfall (its cost on that
+	// engine minus that engine's free budget); "size" — smallest shortfall only. "" (default) = today's admission,
+	// which works on the queue head alone. Built for the ungated fair line (fairRotation, coldValveOff, no
+	// roomGate). With one engine it decides exactly as today.
+	ClaimOrder string `json:"claimOrder,omitempty"`
 	// NewcomersFirst orders the shared admission queue: true (the default) seats a thread's FIRST turn
 	// before returning threads, then oldest first; false is plain oldest-first for every head.
 	NewcomersFirst bool `json:"newcomersFirst"`
@@ -217,6 +223,15 @@ func (c Config) validate() error {
 		if c.RoomVictims || c.QuantumLastTurn || c.QuantumDoneLast || c.RoomHoldMaxSeconds > 0 {
 			return fmt.Errorf("fairRotation is exclusive with roomVictims, quantumLastTurn, quantumDoneLast and roomHoldMaxSeconds > 0")
 		}
+	}
+	switch c.ClaimOrder {
+	case "":
+	case "compute", "size":
+		if !c.FairRotation || c.RoomGate || !c.ColdValveOff {
+			return fmt.Errorf("claimOrder (one blocked head per engine) is built for the ungated fair line: it needs fairRotation and coldValveOff, and no roomGate")
+		}
+	default:
+		return fmt.Errorf("claimOrder must be \"compute\" or \"size\" (or absent), got %q", c.ClaimOrder)
 	}
 	if c.LeastRecentlyServed && !c.OwnTierIndex {
 		return fmt.Errorf("leastRecentlyServed needs ownTierIndex: its protection step reads each write's danger zone from the group's own tier index")

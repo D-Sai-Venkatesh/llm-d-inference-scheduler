@@ -193,6 +193,11 @@ type waiter struct {
 	// (the wait metrics and the SEAT event read it); the queue orders by entryKey = max(since, floor).
 	// syncQueue never touches it, and the waiter is dropped at its seat or when it vanishes.
 	floor time.Time
+	// claim / claimSince / claimVictims (claimOrder): the engine this waiter holds as its blocked head, when it
+	// first claimed one, and the victims removed for it on its current claim (claims.go).
+	claim        string
+	claimSince   time.Time
+	claimVictims int
 	// roomHeldSince is the first pass the room gate held this head (zero while it is not held): the
 	// roomHoldMaxSeconds last resort is measured from it, never from since (a returner's since is its
 	// whole exile).
@@ -408,6 +413,16 @@ type Scheduler struct {
 		protected, protectedBlocks, protectDeclined int64
 		// protectEvals counts protection decisions actually computed (memo misses) — tests read it
 		protectEvals int64
+		// protectSkippedWaiting / protectSkippedBlocks: dispatches where a quantum-complete queued member had
+		// blocks in the candidate's danger zone but was not protected because someone waits outside (the
+		// simplification that "someone waits" is global across engines), and those blocks
+		protectSkippedWaiting, protectSkippedBlocks int64
+		// claims (claimOrder): new claims, waiters seated while an older waiter held a blocked claim in the same
+		// pass, and victims removed for a waiter that was then seated on another engine (should stay ≈ 0)
+		claims, seatedPastClaim, claimVictimsElsewhere int64
+		// tokensGivenUp: prompt tokens the warmest engine held beyond the chosen engine, summed over seats
+		// (greedy placement's cold cost)
+		tokensGivenUp int64
 	}
 }
 
@@ -801,6 +816,15 @@ type RoomSnapshot struct {
 	Protected       int64 `json:"protected,omitempty"`
 	ProtectedBlocks int64 `json:"protectedBlocks,omitempty"`
 	ProtectDeclined int64 `json:"protectDeclined,omitempty"`
+	// ProtectSkippedWaiting / ProtectSkippedBlocks: see counters.protectSkippedWaiting
+	ProtectSkippedWaiting int64 `json:"protectSkippedWaiting,omitempty"`
+	ProtectSkippedBlocks  int64 `json:"protectSkippedBlocks,omitempty"`
+	// Claims / SeatedPastClaim / ClaimVictimsElsewhere (claimOrder): see counters.claims
+	Claims                int64 `json:"claims,omitempty"`
+	SeatedPastClaim       int64 `json:"seatedPastClaim,omitempty"`
+	ClaimVictimsElsewhere int64 `json:"claimVictimsElsewhere,omitempty"`
+	// TokensGivenUp: see counters.tokensGivenUp
+	TokensGivenUp int64 `json:"tokensGivenUp,omitempty"`
 }
 
 // Snapshot is the whole-policy view of the state machine: DumpState serialises it and the scrape
@@ -908,6 +932,12 @@ func (s *Scheduler) snapshot(now time.Time) Snapshot {
 			room.Protected = s.counters.protected
 			room.ProtectedBlocks = s.counters.protectedBlocks
 			room.ProtectDeclined = s.counters.protectDeclined
+			room.ProtectSkippedWaiting = s.counters.protectSkippedWaiting
+			room.ProtectSkippedBlocks = s.counters.protectSkippedBlocks
+			room.Claims = s.counters.claims
+			room.SeatedPastClaim = s.counters.seatedPastClaim
+			room.ClaimVictimsElsewhere = s.counters.claimVictimsElsewhere
+			room.TokensGivenUp = s.counters.tokensGivenUp
 		}
 		room.Blockers = map[string]int64{}
 		for _, b := range blockerStates {

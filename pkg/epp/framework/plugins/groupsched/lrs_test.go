@@ -192,12 +192,12 @@ func TestStrictRuleSkipsQuantumCompleteWhileSomeoneWaits(t *testing.T) {
 	runTurn(t, s, headN("f", 0, time.Second, chain("f", 165)), epoch.Add(-30*time.Second))
 	g := tierOf(s)
 	n, y := headN("n", 0, time.Second, chain("n", 60)), headN("y", 1, 10*time.Second, chain("y", 32))
-	if j, a, _ := s.protectFirst(g, n, []Head{y}); j != 0 || a != 30 {
+	if j, a, _, _ := s.protectFirst(g, n, []Head{y}); j != 0 || a != 30 {
 		t.Fatalf("nobody waiting: the quantum-complete member is protectable, got j=%d a=%d", j, a)
 	}
 	s.waiters["w"] = &waiter{id: "w", since: epoch}
-	if j, _, _ := s.protectFirst(g, n, []Head{y}); j != -1 {
-		t.Fatalf("someone waiting: a quantum-complete member is not protected, got j=%d", j)
+	if j, _, _, sk := s.protectFirst(g, n, []Head{y}); j != -1 || sk != 30 {
+		t.Fatalf("someone waiting: a quantum-complete member is not protected (and its 30 blocks are reported skipped), got j=%d skipped=%d", j, sk)
 	}
 }
 
@@ -209,21 +209,21 @@ func TestProtectMemoReusesAndRecomputes(t *testing.T) {
 	runTurn(t, s, headN("f", 0, time.Second, chain("f", 165)), epoch.Add(-30*time.Second))
 	g := tierOf(s)
 	n, y := headN("n", 0, time.Second, chain("n", 60)), headN("y", 1, 10*time.Second, chain("y", 32))
-	j1, a1, d1 := s.protectDecision(g, n, []Head{y})
-	j2, a2, d2 := s.protectDecision(g, n, []Head{y})
+	j1, a1, d1, _ := s.protectDecision(g, n, []Head{y})
+	j2, a2, d2, _ := s.protectDecision(g, n, []Head{y})
 	if s.counters.protectEvals != 1 || j1 != j2 || a1 != a2 || d1 != d2 || j1 != 0 {
 		t.Fatalf("unchanged state must reuse the decision: evals %d, (%d %d %v) vs (%d %d %v)", s.counters.protectEvals, j1, a1, d1, j2, a2, d2)
 	}
 	s.waiters["w"] = &waiter{id: "w", since: epoch} // y is quantum-complete: now unprotectable
-	if j, _, _ := s.protectDecision(g, n, []Head{y}); j != -1 || s.counters.protectEvals != 2 {
+	if j, _, _, _ := s.protectDecision(g, n, []Head{y}); j != -1 || s.counters.protectEvals != 2 {
 		t.Fatalf("a waiter must recompute (and y is no longer protectable): j %d evals %d", j, s.counters.protectEvals)
 	}
 	delete(s.waiters, "w")
 	g.tier.AddChain(keys(5, seedFor("other"))) // any tier change bumps its counter
-	if j, _, _ := s.protectDecision(g, n, []Head{y}); j != 0 || s.counters.protectEvals != 3 {
+	if j, _, _, _ := s.protectDecision(g, n, []Head{y}); j != 0 || s.counters.protectEvals != 3 {
 		t.Fatalf("a tier change must recompute: j %d evals %d", j, s.counters.protectEvals)
 	}
-	if _, _, _ = s.protectDecision(g, n, nil); s.counters.protectEvals != 4 {
+	if _, _, _, _ = s.protectDecision(g, n, nil); s.counters.protectEvals != 4 {
 		t.Fatalf("a changed queue must recompute: evals %d", s.counters.protectEvals)
 	}
 }

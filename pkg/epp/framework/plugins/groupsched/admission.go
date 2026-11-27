@@ -296,7 +296,22 @@ func (s *Scheduler) roomGrowsWithout(g *engineGroup, w *waiter, victim *thread, 
 // seatEngine is THE seat-time engine choice: the scheduler gathers the FACTS (per-engine
 // cost, free budget, fit, whether a victim exists) and chooseEngine decides.
 func (s *Scheduler) seatEngine(head *waiter, now time.Time) *seatChoice {
+	return s.seatEngineFor(head, now, nil)
+}
+
+// seatEngineFor is seatEngine over the engines open reports (nil = every engine): claimOrder closes the
+// engines a waiter ahead in the queue already holds as its blocked claim.
+func (s *Scheduler) seatEngineFor(head *waiter, now time.Time, open func(string) bool) *seatChoice {
 	groups := s.activeGroups()
+	if open != nil {
+		kept := groups[:0:0]
+		for _, g := range groups {
+			if open(g.id) {
+				kept = append(kept, g)
+			}
+		}
+		groups = kept
+	}
 	cands := make([]EngineCandidate, 0, len(groups))
 	owners := make([]*engineGroup, 0, len(groups))
 	resident := s.residentTokens(head.chains, groups)

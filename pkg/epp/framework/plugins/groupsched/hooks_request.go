@@ -157,7 +157,7 @@ func (r *GroupScheduler) PreRequest(ctx context.Context, request *fwksched.Infer
 	annotateSpan(ctx, engine, obs)
 	// memberTierEviction: tell the engine's cache policy who stays here (after AtPod, so the list is the one
 	// this dispatch leaves)
-	if n, ok := r.sched.MemberNotice(engine, r.threadOf(request)); ok && writeMemberNotice(request, n) {
+	if n, ok := r.sched.MemberNotice(engine, request.RequestID); ok && writeMemberNotice(request, n) {
 		r.sched.metrics.ObserveMemberNotice(engineLabel(engine), n.Thread != "")
 	}
 	return nil

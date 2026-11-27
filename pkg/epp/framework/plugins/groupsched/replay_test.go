@@ -60,6 +60,7 @@ type replayReq struct {
 // replayOpts are the knobs a test may turn; the zero value is the pinned workload.
 type replayOpts struct {
 	noMoves bool     // no request is placed on another engine than its seat
+	atPod   func(reqID, engine string) // called right after each AtPod (the PreRequest moment)
 	engines []string // the engines (default a, b, c — engine c leaves at half time and comes back)
 }
 
@@ -171,6 +172,9 @@ func driveReplay(t *testing.T, s *Scheduler, seed int64, steps int, out *strings
 				}
 				r.engine, r.atPod = eng, true
 				s.AtPod(rid, eng, now)
+				if opts.atPod != nil {
+					opts.atPod(rid, eng)
+				}
 			case r.atPod && !r.chunked && step >= r.chunkAt:
 				s.FirstChunk(rid, now)
 				r.chunked = true

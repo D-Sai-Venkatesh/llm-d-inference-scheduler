@@ -70,12 +70,17 @@ func (b *BlockIndex) StayingIDs() []string {
 	return out
 }
 
-// MemberNotice is the notice for a request sent to engine on behalf of thread (thread may be "": an
-// untracked request still carries the list). ok is false when memberTierEviction is off or the engine has
-// no group with a tier index.
-func (s *Scheduler) MemberNotice(engine, thread string) (MemberNotice, bool) {
+// MemberNotice is the notice for request reqID sent to engine. The thread is the one the scheduler's OWN
+// request record names (as AtPod resolves it): PreRequest's request is attribute-scoped, so reading thread
+// identity there resolves as absent. An untracked request still carries the list, unnamed. ok is false when
+// memberTierEviction is off or the engine has no group with a tier index.
+func (s *Scheduler) MemberNotice(engine, reqID string) (MemberNotice, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	thread := ""
+	if rec := s.reqs[reqID]; rec != nil {
+		thread = rec.thread
+	}
 	if !s.cfg.MemberTierEviction {
 		return MemberNotice{}, false
 	}

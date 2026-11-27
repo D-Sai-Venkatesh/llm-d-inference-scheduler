@@ -76,19 +76,23 @@ func TestMemberNoticeListsTheStayingThreads(t *testing.T) {
 	g.index.insert("t1", chain("t1", 3))
 	g.index.insert("t3", chain("t3", 3))
 	g.index.MarkExiting("t3")
-	n, ok := s.MemberNotice("a", "t1")
+	s.reqs["r1"], s.reqs["r3"] = &reqRec{thread: "t1"}, &reqRec{thread: "t3"}
+	n, ok := s.MemberNotice("a", "r1")
 	if !ok || fmt.Sprint(n.Members) != "[t1 t2]" || n.Thread != "t1" || n.Source == "" {
 		t.Fatalf("notice for a staying member = %+v ok=%v", n, ok)
 	}
-	if n3, _ := s.MemberNotice("a", "t3"); n3.Thread != "" {
+	if n3, _ := s.MemberNotice("a", "r3"); n3.Thread != "" {
 		t.Fatal("an exiting thread must not be named (the policy records only members)")
 	}
-	if n2, _ := s.MemberNotice("a", "t1"); n2.Source != n.Source {
+	if nu, _ := s.MemberNotice("a", "no-such-request"); nu.Thread != "" || len(nu.Members) != 2 {
+		t.Fatal("an untracked request carries the list, unnamed")
+	}
+	if n2, _ := s.MemberNotice("a", "r1"); n2.Source != n.Source {
 		t.Fatal("one engine group keeps one source")
 	}
 	off, _ := NewScheduler(armCConfig(2000, 8, "compute"))
 	_ = off.SetNumBlocksFor("a", 64, 500)
-	if _, ok := off.MemberNotice("a", "t1"); ok {
+	if _, ok := off.MemberNotice("a", "r1"); ok {
 		t.Fatal("with memberTierEviction off no notice is produced")
 	}
 	// the body keeps every other kv_transfer_params field
@@ -164,5 +168,48 @@ func TestMemberTierReplayEvictsFewerSeatedBlocks(t *testing.T) {
 	}
 	if onSum >= offSum {
 		t.Fatalf("membership eviction must evict fewer seated blocks: off %d on %d", offSum, onSum)
+	}
+}
+
+// THE REAL PATH (member2-void1's defect): at the PreRequest moment the notice must name the dispatched turn's
+// thread from the scheduler's own request record, for (nearly) every tracked dispatch — and only staying members.
+func TestMemberNoticeNamesTheDispatchedThread(t *testing.T) {
+	cfg := armCConfig(1000, 8, "compute")
+	cfg.MemberTierEviction = true
+	s, err := NewScheduler(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tracked, named int
+	opts := replayOpts{noMoves: true, engines: []string{"a"}, atPod: func(rid, eng string) {
+		n, ok := s.MemberNotice(eng, rid)
+		if !ok {
+			t.Fatalf("no notice for %s on %s", rid, eng)
+		}
+		rec := s.reqs[rid]
+		if rec == nil {
+			return // anonymous traffic: unnamed by design
+		}
+		tracked++
+		if n.Thread == "" {
+			return
+		}
+		named++
+		if n.Thread != rec.thread {
+			t.Fatalf("named %q, record says %q", n.Thread, rec.thread)
+		}
+		found := false
+		for _, m := range n.Members {
+			found = found || m == n.Thread
+		}
+		if !found {
+			t.Fatalf("named thread %q is not in the member list", n.Thread)
+		}
+	}}
+	var out strings.Builder
+	driveReplay(t, s, 22, 500, &out, opts, func(int) {})
+	t.Logf("tracked dispatches %d, named %d", tracked, named)
+	if tracked == 0 || named*10 < tracked*9 {
+		t.Fatalf("the notice must name the thread of (nearly) every tracked dispatch: %d of %d", named, tracked)
 	}
 }

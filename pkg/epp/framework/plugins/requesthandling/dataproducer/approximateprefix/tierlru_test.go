@@ -17,6 +17,7 @@ limitations under the License.
 package approximateprefix
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -148,5 +149,31 @@ func TestTierLRUTailKeys(t *testing.T) {
 	}
 	if n := len(l.TailKeys(99, nil)); n != 5 {
 		t.Fatalf("TailKeys is bounded by the resident keys: got %d", n)
+	}
+}
+
+func TestTierLRUDemoteGoesFirstTailFirst(t *testing.T) {
+	tl := NewTierLRU(6)
+	a := []prefixhash.BlockHash{1, 2, 3}
+	b := []prefixhash.BlockHash{11, 12}
+	tl.AddChain(a)
+	tl.AddChain(b) // b is the most recent; a's tail (3) is the next eviction
+	if got := tl.Demote(b); got != 2 {
+		t.Fatalf("Demote held = %d, want 2", got)
+	}
+	// b (the departed thread) now goes first, its LAST block first, then a's from its tail
+	if got := tl.TailKeys(5, nil); fmt.Sprint(got) != fmt.Sprint([]prefixhash.BlockHash{12, 11, 3, 2, 1}) {
+		t.Fatalf("eviction order after Demote = %v", got)
+	}
+	tl.AddChain([]prefixhash.BlockHash{21, 22}) // 1 free slot + one eviction: takes 12 (b's tail)
+	if tl.Contains(12) || !tl.Contains(11) || tl.ResidentPrefix(b) != 1 {
+		t.Fatalf("a write must evict the demoted chain's tail first and leave its prefix")
+	}
+	if tl.ResidentPrefix(a) != 3 {
+		t.Fatalf("a staying chain must be untouched while demoted blocks remain")
+	}
+	tl.AddChain(b[:1]) // the departed thread returns: its own touch refreshes what survived
+	if got := tl.TailKeys(1, nil); got[0] == 11 {
+		t.Fatalf("a refreshed key must leave the eviction end")
 	}
 }

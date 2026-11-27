@@ -70,6 +70,26 @@ func (t *TierLRU) AddChain(keys []prefixhash.BlockHash) {
 	t.gen++
 }
 
+// Demote moves keys — one departing thread's blocks that no staying member holds, in chain order — to the
+// eviction end, so the next writes that need room take them before anything else, the chain's LAST block
+// first (what survives stays a prefix from block 0, which ResidentPrefix relies on). Nothing is dropped
+// here: a key leaves only when an insert needs its room, and a later touch (AddChain) makes it fresh again.
+// It returns how many of keys were held. This is the engine-side policy's own rule (vllm-plugin/
+// gsch_member_policy.py: a departed member's chunks move to the front of vLLM's LRU), so the model and the
+// tier evict the same blocks.
+func (t *TierLRU) Demote(keys []prefixhash.BlockHash) int {
+	n := 0
+	for _, k := range keys {
+		if t.l.MoveBack(k) {
+			n++
+		}
+	}
+	if n > 0 {
+		t.gen++
+	}
+	return n
+}
+
 // ResidentPrefix is how many leading blocks of keys the LRU holds (the indexer's own run search).
 func (t *TierLRU) ResidentPrefix(keys []prefixhash.BlockHash) int {
 	if len(keys) == 0 {

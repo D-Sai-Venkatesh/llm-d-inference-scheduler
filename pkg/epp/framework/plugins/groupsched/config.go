@@ -148,6 +148,14 @@ type Config struct {
 	// which works on the queue head alone. Built for the ungated fair line (fairRotation, coldValveOff, no
 	// roomGate). With one engine it decides exactly as today.
 	ClaimOrder string `json:"claimOrder,omitempty"`
+	// MemberTierEviction is MEMBERSHIP-AWARE CPU-TIER EVICTION: when a thread leaves this engine's staying set,
+	// its blocks that no staying member holds are not dropped but MOVED TO THE EVICTION END of the tier, so the
+	// next write that needs room takes them first and a seated member's blocks go only once every departed block
+	// is gone. The engine applies it through its out-of-tree cache policy (vllm-plugin/gsch_member_policy.py,
+	// eviction_policy "GroupMemberLRU"), told the engine's staying members on every request in
+	// kv_transfer_params["gsch_member"]; the group's own tier index applies the same move, so the model and the
+	// tier evict the same blocks. The cost-fair victim's saved term follows (fairCost). Needs ownTierIndex.
+	MemberTierEviction bool `json:"memberTierEviction,omitempty"`
 	// NewcomersFirst orders the shared admission queue: true (the default) seats a thread's FIRST turn
 	// before returning threads, then oldest first; false is plain oldest-first for every head.
 	NewcomersFirst bool `json:"newcomersFirst"`
@@ -232,6 +240,9 @@ func (c Config) validate() error {
 		}
 	default:
 		return fmt.Errorf("claimOrder must be \"compute\" or \"size\" (or absent), got %q", c.ClaimOrder)
+	}
+	if c.MemberTierEviction && !c.OwnTierIndex {
+		return fmt.Errorf("memberTierEviction needs ownTierIndex: the group's own tier index must move a leaver's blocks to the eviction end exactly as the engine's policy does, or every residency read mispredicts")
 	}
 	if c.LeastRecentlyServed && !c.OwnTierIndex {
 		return fmt.Errorf("leastRecentlyServed needs ownTierIndex: its protection step reads each write's danger zone from the group's own tier index")

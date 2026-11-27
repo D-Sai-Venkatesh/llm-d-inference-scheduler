@@ -121,6 +121,11 @@ func (s *Scheduler) fairCost(g *engineGroup, m *thread, ft fairTail) (cost, save
 			}
 		}
 	}
+	if s.cfg.MemberTierEviction {
+		// m's leaving moves ALL its exclusive blocks to the tier's eviction end, so the head's write takes them
+		// before any staying block: the others lose max(0, t0-excl), and the cost is max(excl, t0)
+		saved = min(excl, ft.t0)
+	}
 	return max(1, excl+ft.t0-saved), saved
 }
 

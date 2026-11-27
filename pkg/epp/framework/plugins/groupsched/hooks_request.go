@@ -155,6 +155,11 @@ func (r *GroupScheduler) PreRequest(ctx context.Context, request *fwksched.Infer
 	r.sched.RecordUntracked(request.RequestID, engine, chargeChains(request), r.now())
 	obs := r.sched.AtPod(request.RequestID, engine, r.now())
 	annotateSpan(ctx, engine, obs)
+	// memberTierEviction: tell the engine's cache policy who stays here (after AtPod, so the list is the one
+	// this dispatch leaves)
+	if n, ok := r.sched.MemberNotice(engine, r.threadOf(request)); ok && writeMemberNotice(request, n) {
+		r.sched.metrics.ObserveMemberNotice(engineLabel(engine), n.Thread != "")
+	}
 	return nil
 }
 

@@ -89,6 +89,8 @@ type groupMetrics struct {
 	protectSkipped  *prometheus.CounterVec
 	protectSkippedB *prometheus.CounterVec
 	claims          *prometheus.CounterVec
+	tierDemoted     *prometheus.CounterVec
+	memberNotices   *prometheus.CounterVec
 	claimSeconds    *prometheus.HistogramVec
 	claimVictimsEls *prometheus.CounterVec
 	seatedPastClaim *prometheus.CounterVec
@@ -198,6 +200,12 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		[]string{"engine"})
 	g.protectSkippedB = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "protect_skipped_waiting_blocks_total",
 		Help: "blocks of those skipped members in the danger zone"}, []string{"engine"})
+	g.tierDemoted = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "tier_demoted_blocks_total",
+		Help: "memberTierEviction: blocks a thread's leaving moved to the eviction end of the group's own tier index (its unshared blocks; the engine's policy makes the same move)"},
+		[]string{"engine"})
+	g.memberNotices = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "member_notices_total",
+		Help: "memberTierEviction: requests that carried the engine's staying members to its cache policy (kv_transfer_params gsch_member), by whether the request's own thread was named"},
+		[]string{"engine", "thread"})
 	g.claims = prometheus.NewCounterVec(prometheus.CounterOpts{Subsystem: subsystem, Name: "claims_total",
 		Help: "claimOrder: a waiter that fits on no open engine claimed this engine (victims for it only from here)"},
 		[]string{"engine"})
@@ -230,6 +238,7 @@ func (g *groupMetrics) register(reg prometheus.Registerer) error {
 		g.roomHold, g.roomBlocker, g.qdDeferred, g.qlMarks, g.stayTurns, g.staySeconds, g.stayBlocks, g.fairTailSaved, g.sizeWaitOver,
 		g.protect, g.protectBlocks, g.protectStreak, g.protectStreakS,
 		g.protectSkipped, g.protectSkippedB, g.claims, g.claimSeconds, g.claimVictimsEls, g.seatedPastClaim, g.tokensGivenUp,
+		g.tierDemoted, g.memberNotices,
 	} {
 		if err := reg.Register(c); err != nil {
 			// A SECOND instantiation in one process (a config reload, or a second plugin config in the
@@ -364,6 +373,26 @@ func (g *groupMetrics) ObserveClaim(engine string) {
 		return
 	}
 	g.claims.WithLabelValues(engine).Inc()
+}
+
+// ObserveTierDemoted counts blocks a leaver's exit moved to the tier index's eviction end.
+func (g *groupMetrics) ObserveTierDemoted(engine string, n int) {
+	if g == nil || g.tierDemoted == nil {
+		return
+	}
+	g.tierDemoted.WithLabelValues(engine).Add(float64(n))
+}
+
+// ObserveMemberNotice counts one request that carried the engine's staying members.
+func (g *groupMetrics) ObserveMemberNotice(engine string, named bool) {
+	if g == nil || g.memberNotices == nil {
+		return
+	}
+	t := "no"
+	if named {
+		t = "yes"
+	}
+	g.memberNotices.WithLabelValues(engine, t).Inc()
 }
 
 // ObserveClaimSeconds records one claim's duration (first claim → seat).

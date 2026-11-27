@@ -56,6 +56,10 @@ type BlockIndex struct {
 	blocksRun map[Hash]int
 	// seats holds every seated thread's record.
 	seats map[string]*seatBlocks
+	// onLeaveStay (memberTierEviction), when set, is told — in chain order, once each — the keys a thread's
+	// leaving the STAY side took out of it (no staying holder left): at MarkExiting, or at Unseat for a thread
+	// that was not exiting. The group moves exactly those to its tier index's eviction end.
+	onLeaveStay func(keys []Hash)
 	// gen advances on every change to the seated / staying sets, so a reader can memoise a walk that
 	// depends on them (the room gate's).
 	gen uint64
@@ -295,6 +299,9 @@ func (b *BlockIndex) Unseat(id string) {
 			b.dec(b.blocksRun, h)
 		}
 	}
+	if !s.exiting {
+		b.leftStay(s) // an exiting thread reported its keys at its mark
+	}
 	delete(b.seats, id)
 }
 
@@ -323,6 +330,30 @@ func (b *BlockIndex) MarkExiting(id string) {
 	s.exiting = true
 	for h := range s.charged {
 		b.dec(b.blocksStay, h)
+	}
+	b.leftStay(s)
+}
+
+// leftStay reports s's keys that have no staying holder any more, in chain order, to onLeaveStay.
+func (b *BlockIndex) leftStay(s *seatBlocks) {
+	if b.onLeaveStay == nil {
+		return
+	}
+	var out []Hash
+	seen := make(map[Hash]struct{})
+	for _, c := range s.chains {
+		for _, h := range c.Keys {
+			if _, dup := seen[h]; dup {
+				continue
+			}
+			seen[h] = struct{}{}
+			if _, ok := s.charged[h]; ok && b.blocksStay[h] == 0 {
+				out = append(out, h)
+			}
+		}
+	}
+	if len(out) > 0 {
+		b.onLeaveStay(out)
 	}
 }
 

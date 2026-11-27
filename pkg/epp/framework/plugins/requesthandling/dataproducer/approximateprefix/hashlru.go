@@ -110,6 +110,31 @@ func (c *hashLRU) Add(key blockHash) {
 	c.pushFront(i)
 }
 
+// MoveBack makes key the NEXT eviction (it moves to the tail) if it is held; it reports whether it was.
+// Nothing is dropped: the key keeps its node, so the node slice stays dense.
+func (c *hashLRU) MoveBack(key blockHash) bool {
+	i, ok := c.index[key]
+	if !ok {
+		return false
+	}
+	if c.tail != i {
+		c.unlink(i)
+		c.pushBack(i)
+	}
+	return true
+}
+
+func (c *hashLRU) pushBack(i uint32) {
+	c.nodes[i].next = nodeNil
+	c.nodes[i].prev = c.tail
+	if c.tail == nodeNil {
+		c.head = i
+	} else {
+		c.nodes[c.tail].next = i
+	}
+	c.tail = i
+}
+
 func (c *hashLRU) moveFront(i uint32) {
 	if c.head == i {
 		return

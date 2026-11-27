@@ -262,6 +262,9 @@ type engineGroup struct {
 	// tier is the group's OWN model of this engine's CPU tier (ownTierIndex): created with the
 	// engine's capacity, touched at every dispatch and (roomGate) recorded at every seat. nil = off.
 	tier *approximateprefix.TierLRU
+	// incarnation names this group's life in its member notices (memberTierEviction): the engine's policy
+	// restarts its epoch on a new one
+	incarnation string
 	// protectStreak / protectSince (leastRecentlyServed): protections in a row on this engine since its last
 	// unprotected dispatch, and when the first of them happened — observed when the next candidate is served
 	// (the strict rule has no bound; this measures what one would have capped).
@@ -390,6 +393,8 @@ type Scheduler struct {
 		roomRotations int64
 		tierWrites    map[string]int64
 		seatedEvicted map[string]int64
+		// tierDemoted (memberTierEviction) counts blocks leavers' exits moved to the tier index's eviction end
+		tierDemoted int64
 		// roomBlocker counts, once per room-held head, what held it (the member state ending the walk)
 		roomBlocker map[string]int64
 		// quantumDoneDeferred counts dispatches where quantumDoneLast served a member within its quantum
@@ -599,6 +604,15 @@ func (s *Scheduler) SetNumBlocksFor(engine string, blockSizeTokens, numBlocks in
 					s.metrics.ObserveSeatedEvicted(engineLabel(gg.id), cause)
 				}
 			})
+			if s.cfg.MemberTierEviction {
+				// a leaver's unshared blocks go to the eviction end — the engine's policy does the same move
+				gg.index.onLeaveStay = func(keys []Hash) {
+					if n := gg.tier.Demote(keys); n > 0 {
+						s.counters.tierDemoted += int64(n)
+						s.metrics.ObserveTierDemoted(engineLabel(gg.id), n)
+					}
+				}
+			}
 		}
 	}
 	return nil

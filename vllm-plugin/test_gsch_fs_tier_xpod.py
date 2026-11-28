@@ -159,6 +159,8 @@ class TestCrossPod(Pair):
 
     def test_index_file_round_trip_and_torn_file_rejected(self):
         p = os.path.join(self.base, "idx.bin"); os.makedirs(self.base, exist_ok=True)
+        T._write_keys(p, [], 3)
+        self.assertEqual(T._read_keys(p, None), (3, []), "an empty index reads back empty")
         ks = keys(59, 5)
         T._write_keys(p, ks, 7)
         self.assertEqual(T._read_keys(p, None), (7, ks))

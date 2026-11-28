@@ -22,7 +22,9 @@ each tier publishes, in its run directory, a snapshot of its index (gsch-index.b
 (only if its run config equals ours), reads its index and its touches. Lookups stay in memory: own index, then the peers'
 snapshots — no RETRY, no disk on the scheduler thread. A load reads each chunk from wherever it is. Touches of peer keys are
 forwarded so the OWNER keeps a moved session's chain recent (otherwise its disk LRU ages it out ~cap / write rate later).
-A peer file is never deleted or indexed here; a failed peer read marks that key bad until the peer's next snapshot. Staleness
+A peer file is never indexed here and never deleted by this code (one exception, inside vLLM's io: a SHORT — corrupt — file
+is unlinked by whoever reads it, as its owner's own read would); a failed peer read marks that key bad until the peer's next
+snapshot. Staleness
 is safe: a snapshot naming a just-evicted file → that read fails → recompute.
 
 Config (kv_connector_extra_config of TieringOffloadingSpec):
@@ -77,14 +79,18 @@ def _write_keys(path: str, keys, seq: int) -> None:
 def _read_keys(path: str, last_seq):
     """(seq, keys) — keys None when the sequence has not changed since last_seq."""
     with open(path, "rb") as f:
-        data = f.read()
-    magic, klen, seq, n = _HDR.unpack_from(data)
-    if magic != _MAGIC or len(data) != _HDR.size + klen * n:
+        head = f.read(_HDR.size)
+        magic, klen, seq, n = _HDR.unpack_from(head)
+        if magic != _MAGIC:
+            raise ValueError(f"bad key file {path}")
+        if seq == last_seq:
+            return seq, None  # unchanged: the header only (the file is ~5 MB at 143K keys)
+        body = f.read()
+    if len(body) != klen * n:
         raise ValueError(f"bad key file {path}")
-    if seq == last_seq:
-        return seq, None
-    body = memoryview(data)[_HDR.size:]
-    return seq, [bytes(body[i * klen:(i + 1) * klen]) for i in range(n)]
+    if n == 0 or klen == 0:
+        return seq, []  # an empty index (a reader that has written nothing yet)
+    return seq, [body[i:i + klen] for i in range(0, klen * n, klen)]
 
 
 class _PeerView:
@@ -353,7 +359,12 @@ class GschFsTier(FileSystemTierManager):
                 with open(mapper.get_config_file_path()) as f:
                     theirs = json.load(f)
             except (OSError, ValueError):
-                return  # not written yet
+                if os.path.exists(os.path.join(run, INDEX_FILE)):  # it publishes, but not under our layout's path
+                    p.refused = run
+                    self.stats["peer_layout_refused"] += 1
+                    logger.warning("GschFsTier: peer run %s has no config at our layout path %s (a different model or "
+                                   "layout); not reading it", run, mapper.get_config_file_path())
+                return  # else: not written yet
             if theirs != json.loads(json.dumps(self.file_mapper.get_run_config())):
                 p.refused = run
                 self.stats["peer_layout_refused"] += 1
@@ -370,6 +381,14 @@ class GschFsTier(FileSystemTierManager):
                 self.stats["peer_reads"] += 1
             p.touch_seq, touched = _read_keys(os.path.join(run, TOUCH_FILE), p.touch_seq)
             if touched:
+                if self._touch_in.qsize() >= 2:  # our scheduler is not stepping (idle): merge, bounded by our key universe
+                    merged = set(touched)
+                    while True:
+                        try:
+                            merged.update(self._touch_in.get_nowait())
+                        except queue.Empty:
+                            break
+                    touched = list(merged)
                 self._touch_in.put(touched)
         except FileNotFoundError:
             pass
@@ -394,12 +413,17 @@ class GschFsTier(FileSystemTierManager):
         return LookupResult.MISS
 
     def touch(self, keys, req_context: ReqContext):
-        idx = self._index
+        idx, rest = self._index, []
         for k in keys:
             if k in idx:
                 idx.move_to_end(k)
-            elif self._peers and len(self._touched_out) < 4_000_000 and self._peer_of(k)[0] >= 0:
-                self._touched_out.add(k)
+            else:
+                rest.append(k)
+        if rest and self._peers and len(self._touched_out) < 4_000_000:
+            for p in self._peers:
+                v = p.view
+                if v is not None:
+                    self._touched_out.update(v.keys.intersection(rest))
 
     # ---- stores (write-through from the CPU tier) ---------------------------------------------------------------------
     def submit_store(self, job_metadata: TransferJob) -> None:
@@ -535,10 +559,11 @@ class GschFsTier(FileSystemTierManager):
                         self._loading.pop(k, None)
                 pb = {job.keys[j] for j in peer_bad}
                 for j in peer_bad:  # a peer's file: never ours to delete; skip it until that peer's next snapshot
-                    i, gen = job.src[j]
+                    i, _gen = job.src[j]
                     p = self._peers[i]
-                    if p.bad_gen != gen:
-                        p.bad, p.bad_gen = set(), gen
+                    cur = p.view.gen if p.view is not None else _gen  # the CURRENT gen: a late or straddling job never erases marks
+                    if p.bad_gen != cur:
+                        p.bad, p.bad_gen = set(), cur
                     p.bad.add(job.keys[j])
                 for k in bad:
                     if k in pb:

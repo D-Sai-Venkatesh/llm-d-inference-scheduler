@@ -16,24 +16,37 @@ Every doubt is a MISS, so vLLM recomputes — today's behaviour. Job ids are onl
 (an unknown id crashes the engine). Loads that pass load_deadline_s cancel their slices that have not started (a started copy
 must finish: aborting it would corrupt the CPU slot).
 
+CROSS-POD READS (peer_roots): engines share one filesystem, each WRITES and EVICTS only its own root_dir. Every peer_sync_s
+each tier publishes, in its run directory, a snapshot of its index (gsch-index.bin) and the peer keys it touched over the last
+3 intervals (gsch-touched.bin), atomically (temp + rename). A background thread follows each peer's newest run directory
+(only if its run config equals ours), reads its index and its touches. Lookups stay in memory: own index, then the peers'
+snapshots — no RETRY, no disk on the scheduler thread. A load reads each chunk from wherever it is. Touches of peer keys are
+forwarded so the OWNER keeps a moved session's chain recent (otherwise its disk LRU ages it out ~cap / write rate later).
+A peer file is never deleted or indexed here; a failed peer read marks that key bad until the peer's next snapshot. Staleness
+is safe: a snapshot naming a just-evicted file → that read fails → recompute.
+
 Config (kv_connector_extra_config of TieringOffloadingSpec):
   "secondary_tiers": [{"type": "GschFsTier", "module_path": "gsch_fs_tier", "root_dir": "/kvtier/<engine>",
-                       "max_bytes": 1000000000000, "n_load_slices": 8, "n_store_slices": 4}]
+                       "max_bytes": 900000000000, "n_load_slices": 8, "n_store_slices": 4,
+                       "peer_roots": ["/kvtier/<other engine>"], "peer_sync_s": 5}]
 """
 from __future__ import annotations
 
 import fcntl
+import json
 import logging
 import os
 import queue
+import struct
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from vllm.v1.kv_offload.base import LookupResult, OffloadKey, ReqContext, ScheduleEndContext
+from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.base import JobId, JobResult, TransferJob
 from vllm.v1.kv_offload.tiering.fs.io import batch_load_block, batch_store_block
 from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
@@ -44,16 +57,66 @@ if TYPE_CHECKING:
 logger = logging.getLogger("vllm.gsch_fs_tier")
 RUN_PREFIX = "gsch-run-"
 _LIVE_ROOTS: set[str] = set()  # POSIX locks are per process: this catches a second tier on one root inside one process
+INDEX_FILE = "gsch-index.bin"
+TOUCH_FILE = "gsch-touched.bin"
+_MAGIC = b"GSCHKEY1"
+_HDR = struct.Struct("<8sHQI")  # magic | key length | sequence | number of keys; then the keys, concatenated
+
+
+def _write_keys(path: str, keys, seq: int) -> None:
+    keys = list(keys)
+    klen = len(keys[0]) if keys else 0
+    keys = [k for k in keys if len(k) == klen]
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(_HDR.pack(_MAGIC, klen, seq, len(keys)))
+        f.write(b"".join(keys))
+    os.replace(tmp, path)  # readers see the old file or the new one, never a torn one
+
+
+def _read_keys(path: str, last_seq):
+    """(seq, keys) — keys None when the sequence has not changed since last_seq."""
+    with open(path, "rb") as f:
+        data = f.read()
+    magic, klen, seq, n = _HDR.unpack_from(data)
+    if magic != _MAGIC or len(data) != _HDR.size + klen * n:
+        raise ValueError(f"bad key file {path}")
+    if seq == last_seq:
+        return seq, None
+    body = memoryview(data)[_HDR.size:]
+    return seq, [bytes(body[i * klen:(i + 1) * klen]) for i in range(n)]
+
+
+class _PeerView:
+    """One immutable snapshot of a peer: swapped in whole by the peer thread, read by the scheduler thread."""
+
+    __slots__ = ("run_dir", "mapper", "keys", "gen")
+
+    def __init__(self, run_dir, mapper, keys, gen):
+        self.run_dir, self.mapper, self.keys, self.gen = run_dir, mapper, keys, gen
+
+
+class _Peer:
+    __slots__ = ("root", "view", "idx_seq", "touch_seq", "bad", "bad_gen", "refused")
+
+    def __init__(self, root):
+        self.root = root
+        self.view: _PeerView | None = None
+        self.idx_seq = self.touch_seq = None  # peer thread only
+        self.bad: set = set()  # scheduler thread only: keys whose read failed in this view generation
+        self.bad_gen = -1
+        self.refused: str | None = None  # a run dir skipped because its layout differs from ours
 
 
 class _Job:
     """One load or store job as this tier split it. Slice outcomes are written by pool threads before the pool marks the
     task done and read on the scheduler thread only after the pool reports the job finished (the stock tier's ordering)."""
 
-    __slots__ = ("kind", "keys", "bounds", "ok", "started", "cancel", "t0")
+    __slots__ = ("kind", "keys", "bounds", "ok", "started", "cancel", "t0", "src")
 
-    def __init__(self, kind: str, keys: list, bounds: list[tuple[int, int]]):
+    def __init__(self, kind: str, keys: list, bounds: list[tuple[int, int]], src: list | None = None):
         self.kind = kind
+        self.src = src  # loads: per key, -1 = our own file, i = peer i (its view generation alongside)
         self.keys = keys
         self.bounds = bounds
         self.ok = [0] * len(bounds)  # per slice: number of leading keys that succeeded
@@ -109,6 +172,9 @@ class GschFsTier(FileSystemTierManager):
         expected_row_bytes: int | None = None,
         enable_kv_events: bool = False,
         locality: str | None = None,
+        peer_roots: list[str] | str | None = None,
+        peer_sync_s: float = 5.0,
+        publish_index: bool = True,
     ):
         if enable_kv_events:
             raise ValueError("GschFsTier does not emit KV events; set enable_kv_events false")
@@ -137,6 +203,17 @@ class GschFsTier(FileSystemTierManager):
         if expected_row_bytes is not None and row != expected_row_bytes:
             raise ValueError(f"GschFsTier: chunk row is {row} B, expected {expected_row_bytes} B")
         self._run_root = run_root
+        self._spec = offloading_spec
+        if isinstance(peer_roots, str):
+            peer_roots = [r for r in peer_roots.split(",") if r.strip()]
+        self._peers = [_Peer(r.strip()) for r in (peer_roots or [])
+                       if os.path.abspath(r.strip()) != self._root_key]
+        self._publish = _as_bool(publish_index) and fresh_dir_per_start
+        self._sync_s = max(0.05, float(peer_sync_s))
+        self._next_sync = 0.0
+        self._outbox: queue.SimpleQueue = queue.SimpleQueue()  # scheduler -> peer thread: (index keys, touched peer keys)
+        self._touched_out: set = set()  # scheduler thread: peer keys touched since the last hand-off
+        self._touch_in: queue.SimpleQueue = queue.SimpleQueue()  # peer thread -> scheduler: keys peers touched
         self._cap_chunks = max(1, int(max_bytes) // row)
         self._backlog_chunks = max(1, int(max_store_backlog_bytes) // row)
         self._n_load_slices = max(1, int(n_load_slices))
@@ -158,14 +235,20 @@ class GschFsTier(FileSystemTierManager):
         self.stats = {k: 0 for k in ("store_jobs", "store_written", "store_dropped_backlog", "store_dropped_space",
                                        "store_dropped_pending_delete", "store_already", "store_failed",
                                        "load_jobs", "load_ok", "load_failed", "deadline_cancels", "evicted",
-                                       "deleted", "delete_errors", "old_runs_removed", "old_files_removed")}
+                                       "deleted", "delete_errors", "old_runs_removed", "old_files_removed",
+                                       "peer_load_ok", "peer_load_failed", "touch_forwarded", "touch_applied",
+                                       "published", "publish_errors", "peer_reads", "peer_read_errors", "peer_switches",
+                                       "peer_layout_refused")}
         self._load_secs: list[tuple[int, float]] = []  # (chunks, seconds) per load job since the last stats line
         self._last_log = time.monotonic()
         if fresh_dir_per_start:
             threading.Thread(target=self._sweep_old_runs, name="gsch_fs_sweep", daemon=True).start()
-        logger.info("GschFsTier: root %s, row %d B, cap %d chunks (%.1f GB), backlog %d chunks, slices load %d / store %d",
-                    run_root, row, self._cap_chunks, self._cap_chunks * row / 1e9, self._backlog_chunks,
-                    self._n_load_slices, self._n_store_slices)
+        if self._peers or self._publish:
+            threading.Thread(target=self._peer_loop, name="gsch_fs_peers", daemon=True).start()
+        logger.info("GschFsTier: root %s, row %d B, cap %d chunks (%.1f GB), backlog %d chunks, slices load %d / store %d, "
+                    "peers %s, publish %s every %.1f s", run_root, row, self._cap_chunks, self._cap_chunks * row / 1e9,
+                    self._backlog_chunks, self._n_load_slices, self._n_store_slices,
+                    [p.root for p in self._peers], self._publish, self._sync_s)
 
     # ---- background housekeeping (never on the scheduler thread) ---------------------------------------------------
     def _delete_loop(self) -> None:
@@ -224,15 +307,99 @@ class GschFsTier(FileSystemTierManager):
             self.stats["old_runs_removed"] += 1
             logger.info("GschFsTier: removed old run %s", p)
 
+    # ---- cross-pod: publish our index + forwarded touches, follow the peers (peer thread) ----------------------------
+    def _peer_loop(self) -> None:
+        seq, window = 0, deque(maxlen=3)  # touches stay published for 3 intervals: a reader polling twice per interval sees each
+        while not self._stop.wait(self._sync_s / 2):
+            index_keys, touched = self._drain_outbox()
+            if index_keys is not None and self._publish:
+                seq += 1
+                window.append(touched)
+                try:
+                    _write_keys(os.path.join(self._run_root, INDEX_FILE), index_keys, seq)
+                    _write_keys(os.path.join(self._run_root, TOUCH_FILE), set().union(*window), seq)
+                    self.stats["published"] += 1
+                except OSError:
+                    self.stats["publish_errors"] += 1
+            for p in self._peers:
+                self._refresh_peer(p)
+
+    def _drain_outbox(self):
+        """The newest index snapshot and the union of every touched set handed off since the last drain (none lost)."""
+        index_keys, touched = None, set()
+        while True:
+            try:
+                index_keys, t = self._outbox.get_nowait()
+            except queue.Empty:
+                return index_keys, touched
+            touched |= t
+
+    def _refresh_peer(self, p: _Peer) -> None:
+        try:
+            runs = [n for n in os.listdir(p.root) if n.startswith(RUN_PREFIX)]
+        except OSError:
+            return
+        if not runs:
+            return
+        run = os.path.join(p.root, max(runs))  # names start with the start time: the newest incarnation
+        v = p.view
+        mapper = v.mapper if v is not None and v.run_dir == run else None
+        if mapper is None:
+            if p.refused == run:
+                return
+            mapper = FileMapper.from_offloading_spec(root_dir=run, offloading_spec=self._spec,
+                                                     blocks_per_file=self._spec.blocks_per_chunk, parallel_agnostic=True)
+            try:
+                with open(mapper.get_config_file_path()) as f:
+                    theirs = json.load(f)
+            except (OSError, ValueError):
+                return  # not written yet
+            if theirs != json.loads(json.dumps(self.file_mapper.get_run_config())):
+                p.refused = run
+                self.stats["peer_layout_refused"] += 1
+                logger.warning("GschFsTier: peer run %s has a different layout; not reading it", run)
+                return
+            p.idx_seq = p.touch_seq = None
+        try:
+            p.idx_seq, ks = _read_keys(os.path.join(run, INDEX_FILE), p.idx_seq)
+            if ks is not None or mapper is not (v.mapper if v is not None else None):
+                if v is None or v.run_dir != run:
+                    self.stats["peer_switches"] += 1
+                p.view = _PeerView(run, mapper, frozenset(ks) if ks is not None else frozenset(),
+                                   (v.gen + 1) if v is not None else 0)
+                self.stats["peer_reads"] += 1
+            p.touch_seq, touched = _read_keys(os.path.join(run, TOUCH_FILE), p.touch_seq)
+            if touched:
+                self._touch_in.put(touched)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, struct.error):
+            self.stats["peer_read_errors"] += 1
+
+    def _peer_of(self, key: OffloadKey):
+        for i, p in enumerate(self._peers):
+            v = p.view
+            if v is not None and key in v.keys:
+                if p.bad_gen == v.gen and key in p.bad:
+                    continue
+                return i, v
+        return -1, None
+
     # ---- lookups and recency ----------------------------------------------------------------------------------------
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        return LookupResult.HIT if key in self._index else LookupResult.MISS
+        if key in self._index:
+            return LookupResult.HIT
+        if self._peers and self._peer_of(key)[0] >= 0:
+            return LookupResult.HIT
+        return LookupResult.MISS
 
     def touch(self, keys, req_context: ReqContext):
         idx = self._index
         for k in keys:
             if k in idx:
                 idx.move_to_end(k)
+            elif self._peers and len(self._touched_out) < 4_000_000 and self._peer_of(k)[0] >= 0:
+                self._touched_out.add(k)
 
     # ---- stores (write-through from the CPU tier) ---------------------------------------------------------------------
     def submit_store(self, job_metadata: TransferJob) -> None:
@@ -295,9 +462,21 @@ class GschFsTier(FileSystemTierManager):
         for k in keys:
             self._loading[k] = self._loading.get(k, 0) + 1
         bounds = _split(len(keys), self._n_load_slices)
-        job = _Job("load", keys, bounds)
+        paths, src = [], None
+        for j, k in enumerate(keys):
+            if k in self._index or not self._peers:
+                paths.append(self.file_mapper.get_file_name(k))
+                continue
+            i, v = self._peer_of(k)
+            if i < 0:
+                paths.append(self.file_mapper.get_file_name(k))  # neither: the read fails cleanly -> recompute
+                continue
+            if src is None:
+                src = [None] * len(keys)
+            src[j] = (i, v.gen)
+            paths.append(v.mapper.get_file_name(k))
+        job = _Job("load", keys, bounds, src)
         self._jobs[job_metadata.job_id] = job
-        paths = [self.file_mapper.get_file_name(k) for k in keys]
         offs = [c * self._block_size for c in cids]
         tasks = [self._task(job, i, "load", paths[lo:hi], offs[lo:hi]) for i, (lo, hi) in enumerate(bounds)]
         self._pool.enqueue_load(job_metadata.job_id, len(tasks), tasks)
@@ -331,10 +510,13 @@ class GschFsTier(FileSystemTierManager):
             job = self._jobs.pop(job_id, None)
             if job is None:  # not ours to report (cannot happen: every pool job is one vLLM gave us)
                 continue
-            good, bad = [], []
+            good, bad, peer_good, peer_bad = [], [], 0, []
             for (lo, hi), n in zip(job.bounds, job.ok):
                 good.extend(job.keys[lo:lo + n])
                 bad.extend(job.keys[lo + n:hi])
+                if job.src is not None:
+                    peer_good += sum(1 for j in range(lo, lo + n) if job.src[j] is not None)
+                    peer_bad.extend(j for j in range(lo + n, hi) if job.src[j] is not None)
             if job.kind == "store":
                 self._writing.difference_update(job.keys)
                 for k in good:
@@ -351,11 +533,22 @@ class GschFsTier(FileSystemTierManager):
                         self._loading[k] = c
                     else:
                         self._loading.pop(k, None)
+                pb = {job.keys[j] for j in peer_bad}
+                for j in peer_bad:  # a peer's file: never ours to delete; skip it until that peer's next snapshot
+                    i, gen = job.src[j]
+                    p = self._peers[i]
+                    if p.bad_gen != gen:
+                        p.bad, p.bad_gen = set(), gen
+                    p.bad.add(job.keys[j])
                 for k in bad:
+                    if k in pb:
+                        continue
                     self._index.pop(k, None)  # failed or cancelled: never served again (no re-promote loop)
                     self._delete(k)  # and no orphan file outside the cap
                 self.stats["load_ok"] += len(good)
                 self.stats["load_failed"] += len(bad)
+                self.stats["peer_load_ok"] += peer_good
+                self.stats["peer_load_failed"] += len(peer_bad)
                 if len(self._load_secs) < 20000:
                     self._load_secs.append((len(job.keys), time.monotonic() - job.t0))
                 out.append(JobResult(job_id=job_id, success=not bad,
@@ -368,15 +561,32 @@ class GschFsTier(FileSystemTierManager):
 
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
         now = time.monotonic()
+        if (self._publish or self._peers) and now >= self._next_sync:
+            self._next_sync = now + self._sync_s
+            self._outbox.put((list(self._index), self._touched_out))
+            self.stats["touch_forwarded"] += len(self._touched_out)
+            self._touched_out = set()
+        idx = self._index
+        while True:
+            try:
+                ks = self._touch_in.get_nowait()
+            except queue.Empty:
+                break
+            for k in ks:  # a peer used our chunks: keep them recent here, their owner
+                if k in idx:
+                    idx.move_to_end(k)
+                    self.stats["touch_applied"] += 1
         for job in self._jobs.values():
             if job.kind == "load" and not job.cancel and now - job.t0 > self._deadline:
                 job.cancel = True
                 self.stats["deadline_cancels"] += 1
         if now - self._last_log >= self._stats_every:
             self._last_log = now
-            logger.info("gsch_fs_tier: %s index=%d (%.1f GB) writing=%d pending_del=%d jobs=%d low_space=%s load_s %s",
+            logger.info("gsch_fs_tier: %s index=%d (%.1f GB) writing=%d pending_del=%d jobs=%d low_space=%s peers=%s load_s %s",
                         self.stats, len(self._index), len(self._index) * self._block_size / 1e9, len(self._writing),
-                        len(self._pending_del), len(self._jobs), self._low_space, _load_summary(self._load_secs))
+                        len(self._pending_del), len(self._jobs), self._low_space,
+                        [(os.path.basename(p.view.run_dir), len(p.view.keys)) if p.view else None for p in self._peers],
+                        _load_summary(self._load_secs))
             self._load_secs = []
 
     def on_request_finished(self, req_context: ReqContext) -> None:

@@ -147,5 +147,34 @@ class TestGroupMemberLRU(unittest.TestCase):
         self.assertEqual(p._lists, {})
 
 
+class TestScanProtection(unittest.TestCase):
+    def test_lookup_hits_are_protected_until_the_next_touch(self):
+        p = G.GroupMemberLRU(100)
+        store(p, K("a0", "a1"), ctx("A", {"A", "B"}, 1))
+        store(p, K("b0", "b1"), ctx("B", {"A", "B"}, 1, rid="r1"))
+        p.touch(K("b0", "b1"), ctx("B", {"B"}, 2, rid="r2"))       # A departs: a1, a0 at the front
+        self.assertEqual(order(p)[:2], ["a1", "a0"])
+        for k in K("a0", "a1"):                                     # A returns: its lookup scan finds them
+            self.assertIsNotNone(p.get(k))
+        ev = p.evict(1, set())                                      # a promotion further down A's chain needs room
+        self.assertEqual([k.decode() for k, _ in ev], ["b1"], "the scan's own HITs are not evicted")
+        p.touch(K("a0", "a1"), ctx("A", {"A", "B"}, 3, rid="r3"))  # the scan's touch ends the protection
+        self.assertEqual(p._scan, set())
+
+    def test_pinned_chunks_leave_the_protection(self):
+        p = G.GroupMemberLRU(100)
+        store(p, K("x0"), ctx("X", {"X"}, 1))
+        p.get(b"x0"); p.mark_non_evictable(b"x0"); p.chunks[b"x0"].ref_cnt = 1  # a transfer read, not a lookup HIT
+        self.assertNotIn(b"x0", p._scan)
+
+    def test_protection_falls_back_when_nothing_else_is_evictable(self):
+        p = G.GroupMemberLRU(100)
+        store(p, K("y0"), ctx("Y", {"Y"}, 1))
+        p.get(b"y0")
+        ev = p.evict(1, set())
+        self.assertEqual([k for k, _ in ev], [b"y0"], "never fail an eviction vLLM needs")
+        self.assertEqual(p.stats["scan_protected_evictions"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

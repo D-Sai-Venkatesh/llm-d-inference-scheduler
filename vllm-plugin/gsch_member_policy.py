@@ -77,11 +77,34 @@ class GroupMemberLRU(LRUCachePolicy):
         self._lists: dict[str, tuple[OffloadKey, ...]] = {}
         # key -> how many staying members' last chains hold it (a shared key is not demoted)
         self._stay: dict[OffloadKey, int] = {}
-        self.stats = {"notices": 0, "lists_accepted": 0, "departed": 0, "demoted": 0}
+        # keys a lookup scan found since the last touch: protected from eviction until that touch, so a request's own
+        # promotions further down its chain cannot evict the prefix it just counted as a HIT (vLLM does not pin them)
+        self._scan: set[OffloadKey] = set()
+        self.stats = {"notices": 0, "lists_accepted": 0, "departed": 0, "demoted": 0, "scan_protected_evictions": 0}
         self._last_log = time.monotonic()
 
     # --- the one override of LRU behaviour -------------------------------------------------------
+    def get(self, key: OffloadKey):
+        chunk = self.chunks.get(key)
+        if chunk is not None and key in self.evictable_chunks:
+            self._scan.add(key)
+        return chunk
+
+    def mark_non_evictable(self, key: OffloadKey) -> None:
+        # a chunk pinned for a transfer (prepare_load / a cascade read) was not a lookup HIT of the scan in progress
+        self._scan.discard(key)
+        super().mark_non_evictable(key)
+
+    def evict(self, n: int, protected: set[OffloadKey]):
+        if self._scan:
+            out = super().evict(n, protected | self._scan)
+            if out is not None:
+                return out
+            self.stats["scan_protected_evictions"] += 1  # not enough room otherwise: fall back to plain order
+        return super().evict(n, protected)
+
     def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
+        self._scan.clear()
         notice = _parse(req_context)
         if notice is not None and not notice.applied:
             notice.applied = True
@@ -142,5 +165,6 @@ class GroupMemberLRU(LRUCachePolicy):
 
     def clear(self) -> None:
         super().clear()
+        self._scan.clear()
         self._lists.clear()
         self._stay.clear()

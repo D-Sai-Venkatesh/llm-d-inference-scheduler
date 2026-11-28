@@ -72,6 +72,15 @@ class TestCrossPod(Pair):
         self.assertTrue(all(os.path.exists(tc.file_mapper.get_file_name(k)) for k in ks))
         self.assertTrue(all(tb.lookup(k, None) is LookupResult.HIT for k in ks))
 
+    def test_a_write_of_a_chunk_the_peer_holds_is_counted(self):
+        tc, ac = self.mk(self.rc, self.rb)
+        tb, ab = self.mk(self.rb, self.rc)
+        ks = keys(63, 3); self.store(tc, ac, ks, [0, 1, 2], 63)
+        self.assertTrue(self.sees(tb, tc, ks))
+        self.store(tb, ab, ks[1:] + keys(64, 2), [0, 1, 2, 3], 64)  # b recomputed two of c's chunks (+ two new ones)
+        self.assertEqual(tb.stats["store_dup_peer"], 2)
+        self.assertEqual(tb.stats["store_written"], 4, "measurement only: the write itself is unchanged")
+
     def test_failed_peer_read_misses_and_never_deletes_the_peers_files(self):
         tc, ac = self.mk(self.rc, self.rb)
         tb, ab = self.mk(self.rb, self.rc, n_load_slices=4)

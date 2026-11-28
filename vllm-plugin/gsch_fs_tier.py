@@ -244,7 +244,7 @@ class GschFsTier(FileSystemTierManager):
                                        "deleted", "delete_errors", "old_runs_removed", "old_files_removed",
                                        "peer_load_ok", "peer_load_failed", "touch_forwarded", "touch_applied",
                                        "published", "publish_errors", "peer_reads", "peer_read_errors", "peer_switches",
-                                       "peer_layout_refused")}
+                                       "peer_layout_refused", "store_dup_peer")}
         self._load_secs: list[tuple[int, float]] = []  # (chunks, seconds) per load job since the last stats line
         self._last_log = time.monotonic()
         if fresh_dir_per_start:
@@ -453,6 +453,11 @@ class GschFsTier(FileSystemTierManager):
             return
         self._make_room(len(new))
         nkeys = [k for k, _ in new]
+        if self._peers:  # measurement only: chunks we write that a peer's disk already holds (recomputed while it was there)
+            for p in self._peers:
+                v = p.view
+                if v is not None:
+                    self.stats["store_dup_peer"] += len(v.keys.intersection(nkeys))
         self._writing.update(nkeys)
         bounds = _split(len(new), self._n_store_slices)
         job = _Job("store", nkeys, bounds)
